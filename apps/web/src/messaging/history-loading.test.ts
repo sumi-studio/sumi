@@ -6,6 +6,7 @@ import {
   installMessagingBackend,
   useMessaging,
 } from "./store";
+import { buildRows } from "./timeline";
 
 const key = "thread:history-thread" as const;
 const place = { kind: "thread", threadId: "history-thread" } as const;
@@ -149,5 +150,99 @@ describe("older message recovery", () => {
       message(50),
       ...current.page,
     ]);
+  });
+});
+
+function range(from: number, to: number): Message[] {
+  return Array.from({ length: to - from + 1 }, (_, index) =>
+    message(from + index),
+  );
+}
+
+function timelineRows() {
+  return buildRows({
+    messages: useMessaging.getState().messagesByPlace[key] ?? [],
+    pending: [],
+    selfKey: "human:self",
+    unreadLineSeq: null,
+    self: { kind: "human", humanId: "self" },
+    now: 1_000,
+  });
+}
+
+describe("search-result jump windows", () => {
+  it("loads both sides of an old target and keeps the missing range reachable", async () => {
+    const { fetch, page } = await openHistory();
+    // 100-seq thread, newest page 51..100 loaded. A search hit at seq 20 must
+    // land in a window that has context on both sides, and the remaining
+    // unloaded range must be surfaced — not silently adjacent.
+    fetch.mockResolvedValueOnce(range(1, 44));
+    await expect(
+      useMessaging.getState().loadPlaceAround(key, 20),
+    ).resolves.toBe(true);
+    // Centered on the target: 25 older + target + 24 newer.
+    expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 45, limit: 50 });
+
+    const loaded = useMessaging.getState().messagesByPlace[key];
+    expect(loaded.map((entry) => entry.seq)).toEqual([
+      ...range(1, 44).map((entry) => entry.seq),
+      ...page.map((entry) => entry.seq),
+    ]);
+    // The window reached the history floor; the top loader is done.
+    expect(useMessaging.getState().hasMoreByPlace[key]).toBe(false);
+
+    // The internal missing range 45..50 is a truthful gap row, not a seam.
+    const gaps = timelineRows().filter((row) => row.kind === "gap");
+    expect(gaps).toEqual([
+      expect.objectContaining({
+        kind: "gap",
+        afterSeq: 44,
+        beforeSeq: 51,
+        missingCount: 6,
+      }),
+    ]);
+
+    // The gap is reachable: filling it joins the windows into one contiguous
+    // history and removes the gap row.
+    fetch.mockResolvedValueOnce(range(45, 50));
+    await useMessaging.getState().loadGap(key, 51);
+    expect(fetch).toHaveBeenCalledWith(place, { beforeSeq: 51, limit: 50 });
+    expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
+    expect(
+      timelineRows().filter((row) => row.kind === "gap"),
+    ).toHaveLength(0);
+
+    // A repeated jump into the now-cached target does not refetch.
+    fetch.mockClear();
+    await expect(
+      useMessaging.getState().loadPlaceAround(key, 20),
+    ).resolves.toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed gap fill retryable without losing either window", async () => {
+    const { fetch, page } = await openHistory();
+    fetch.mockResolvedValueOnce(range(1, 44));
+    await expect(
+      useMessaging.getState().loadPlaceAround(key, 20),
+    ).resolves.toBe(true);
+
+    fetch.mockRejectedValueOnce(new Error("temporary network failure"));
+    await useMessaging.getState().loadGap(key, 51);
+    // Nothing merged, both windows intact, marker cleared, gap still shown.
+    expect(useMessaging.getState().messagesByPlace[key]).toEqual([
+      ...range(1, 44),
+      ...page,
+    ]);
+    expect(useMessaging.getState().loadingGapsByPlace[key]).toEqual([]);
+    expect(
+      timelineRows().some(
+        (row) => row.kind === "gap" && row.beforeSeq === 51,
+      ),
+    ).toBe(true);
+
+    fetch.mockResolvedValueOnce(range(45, 50));
+    await useMessaging.getState().loadGap(key, 51);
+    expect(useMessaging.getState().messagesByPlace[key]).toHaveLength(100);
   });
 });

@@ -43,6 +43,7 @@ function estimateRowSize(row: ListRow): number {
   if (row.kind === "older") return 44;
   if (row.kind === "date") return 36;
   if (row.kind === "unread") return 24;
+  if (row.kind === "gap") return 40;
   return row.grouped ? 30 : 62;
 }
 
@@ -114,7 +115,13 @@ export function MessageList({
       ? (state.hasMoreByPlace[state.activePlaceKey] ?? false)
       : false,
   );
+  const loadingGaps = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.loadingGapsByPlace[state.activePlaceKey] ?? null)
+      : null,
+  );
   const loadOlder = useMessaging((state) => state.loadOlder);
+  const loadGap = useMessaging((state) => state.loadGap);
 
   const virtualizerRef = useRef<ConversationVirtualizerHandle>(null);
   const [atEnd, setAtEnd] = useState(true);
@@ -373,8 +380,49 @@ export function MessageList({
     });
   }, [activePlaceKey, messages, loadOlder]);
 
+  const loadGapAnchored = useCallback(
+    async (afterSeq: number, beforeSeq: number) => {
+      if (!activePlaceKey) return;
+      // 直前の読み込み済みmessageへanchorする——挿入された区間はその直下に
+      // 現れるので、人は読み続けたところからそのまま新しい文脈へ進める。
+      const anchorId = seqToId.get(afterSeq);
+      await loadGap(activePlaceKey, beforeSeq);
+      if (anchorId) {
+        window.requestAnimationFrame(() => {
+          virtualizerRef.current?.scrollToMessage(anchorId, {
+            align: "start",
+            behavior: "auto",
+          });
+        });
+      }
+    },
+    [activePlaceKey, seqToId, loadGap],
+  );
+
   const renderRow = useCallback(
     (row: ListRow) => {
+      if (row.kind === "gap") {
+        const loading = loadingGaps?.includes(row.beforeSeq) ?? false;
+        return (
+          <div className="flex items-center gap-3 px-4 py-2 sm:px-6">
+            <span className="h-px flex-1 bg-border" />
+            <button
+              type="button"
+              disabled={loading}
+              aria-busy={loading}
+              onClick={() =>
+                void loadGapAnchored(row.afterSeq, row.beforeSeq)
+              }
+              className="rounded-full border border-border bg-background px-3 py-1 text-[12px] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
+            >
+              {loading
+                ? "読み込み中…"
+                : `途中の${row.missingCount}件を読み込む`}
+            </button>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        );
+      }
       if (row.kind === "older") {
         return (
           <div className="flex justify-center px-4 py-2">
@@ -491,6 +539,8 @@ export function MessageList({
       deleteMessage2,
       flashMessage,
       loadOlderAnchored,
+      loadGapAnchored,
+      loadingGaps,
       revealedAttachmentIds,
       onRevealAttachment,
       onOpenImage,

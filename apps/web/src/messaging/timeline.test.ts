@@ -358,6 +358,27 @@ describe("buildRows", () => {
     ).toEqual([false, false]);
   });
 
+  it("読み込み済みwindowの断絶をgap行にし、tombstoneはgapにしない", () => {
+    const result = rows(
+      [
+        message({ seq: 1 }),
+        message({ seq: 2, deleted: true }),
+        message({ seq: 3 }),
+        message({ seq: 10 }),
+      ],
+      null,
+    );
+    const kinds = result.map((row) => row.kind);
+    // seq2のtombstoneはロード済みなので1→3にgapは無い。3→10の断絶だけ。
+    expect(kinds).toEqual(["date", "message", "message", "gap", "message"]);
+    const gap = result.find((row) => row.kind === "gap");
+    expect(gap).toMatchObject({
+      afterSeq: 3,
+      beforeSeq: 10,
+      missingCount: 6,
+    });
+  });
+
   it("pendingは末尾に自分のメッセージとして並ぶ", () => {
     const result = buildRows({
       messages: [message({ seq: 1 })],

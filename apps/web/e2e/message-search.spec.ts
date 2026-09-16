@@ -92,11 +92,16 @@ test("Human searches shared messages and reaches the original message", async ({
       });
 
     // The needle messages sit far above the most recent page so the loaded
-    // history cannot contain them before the jump.
-    await sendMessage(post, channelID, `${oldNeedle} tail`);
+    // history cannot contain them before the jump. 80 fillers leave a real
+    // unloaded range between the jump window and the newest page.
+    const needleMessageID = await sendMessage(
+      post,
+      channelID,
+      `${oldNeedle} tail`,
+    );
     await sendMessage(post, channelID, `${japaneseNeedle} の続き`);
     const doomed = await sendMessage(post, channelID, deletedNeedle);
-    for (let index = 0; index < 64; index++) {
+    for (let index = 0; index < 80; index++) {
       await sendMessage(post, channelID, `filler message ${index}`);
     }
     const thread = await post(`/messaging/places/${channelID}/threads`, {
@@ -146,7 +151,7 @@ test("Human searches shared messages and reaches the original message", async ({
     await page.reload();
     await page.getByRole("button", { name: "search-general" }).click();
     await expect(
-      page.getByText("filler message 63", { exact: true }),
+      page.getByText("filler message 79", { exact: true }),
     ).toBeVisible();
     // Older than one page: the needle is not part of the loaded window yet.
     await expect(page.getByText(oldNeedle, { exact: false })).toHaveCount(0);
@@ -160,9 +165,42 @@ test("Human searches shared messages and reaches the original message", async ({
     await artifact("01-search-results.png");
     await hit.click();
 
-    // Acceptance: the original message loads and is scrolled into view.
-    await expect(page.getByText(`${oldNeedle} tail`)).toBeVisible();
+    // Acceptance: the original message loads and is scrolled into view — with
+    // the actual following conversation, not a disconnected window. seq 2
+    // (the Japanese message) must already be readable next to the target.
+    const viewport = page.locator('[data-slot="conversation-viewport"]');
+    await expect(
+      viewport.locator(`[data-message-id="${needleMessageID}"]`),
+    ).toBeVisible();
+    await expect(
+      viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
+    ).toBeVisible();
     await artifact("02-jumped-to-old-message.png");
+
+    // Between the jump window (seq 1..25) and the newest page (seq 34..83)
+    // the unloaded range must surface as a truthful, pageable marker — never
+    // as silently adjacent rows. Scroll down until it mounts.
+    const gapButton = page.getByRole("button", {
+      name: /途中の\d+件を読み込む/,
+    });
+    for (let scrolls = 0; scrolls < 30; scrolls += 1) {
+      if ((await gapButton.count()) > 0) break;
+      await viewport.evaluate((element) => {
+        element.scrollTop += element.clientHeight * 0.8;
+      });
+      await page.waitForTimeout(120);
+    }
+    await expect(gapButton).toHaveText("途中の8件を読み込む");
+    await artifact("03-gap-row.png");
+
+    // Clicking fills the missing range: the windows join into one contiguous
+    // history anchored where the person was reading.
+    await gapButton.click();
+    await expect(gapButton).toHaveCount(0);
+    await expect(
+      page.getByText("filler message 24", { exact: true }),
+    ).toBeVisible();
+    await artifact("04-gap-filled.png");
 
     await search.fill("日本語メッセージ");
     await expect(
@@ -173,14 +211,16 @@ test("Human searches shared messages and reaches the original message", async ({
       .filter({ hasText: japaneseNeedle });
     await expect(japaneseHit).toBeVisible();
     await japaneseHit.click();
-    await expect(page.getByText(`${japaneseNeedle} の続き`)).toBeVisible();
-    await artifact("03-japanese-result.png");
+    await expect(
+      viewport.getByText(`${japaneseNeedle} の続き`, { exact: true }),
+    ).toBeVisible();
+    await artifact("05-japanese-result.png");
 
     await search.fill("zzz-no-match-token");
     await expect(
       page.getByText("一致するメッセージはありません", { exact: true }),
     ).toBeVisible();
-    await artifact("04-no-results.png");
+    await artifact("06-no-results.png");
 
     // Deleted content must not come back through search.
     await search.fill(deletedNeedle);
@@ -196,17 +236,17 @@ test("Human searches shared messages and reaches the original message", async ({
     await expect(threadHit).toBeVisible();
     await threadHit.click();
     await expect(
-      page.getByText(`${threadNeedle} in-thread`),
+      viewport.getByText(`${threadNeedle} in-thread`),
     ).toBeVisible();
-    await artifact("05-thread-result.png");
+    await artifact("07-thread-result.png");
 
     // A Human participant can still find and reach DM history.
     await search.fill(dmSecret);
     const dmHit = page.getByRole("button").filter({ hasText: dmSecret });
     await expect(dmHit).toBeVisible();
     await dmHit.click();
-    await expect(page.getByText(`${dmSecret} body`)).toBeVisible();
-    await artifact("06-dm-result.png");
+    await expect(viewport.getByText(`${dmSecret} body`)).toBeVisible();
+    await artifact("08-dm-result.png");
 
     // Rapid query switching must not resurrect the previous result list.
     await page.getByRole("button", { name: "search-general" }).click();
@@ -292,17 +332,35 @@ async function createChannel(page: Page, channel: string): Promise<string> {
 async function sendMessage(
   post: (path: string, data: Record<string, unknown>) => Promise<{
     status(): number;
+    headers(): Record<string, string>;
     json(): Promise<unknown>;
   }>,
   placeID: string,
   content: string,
 ): Promise<string> {
-  const response = await post(`/messaging/places/${placeID}/messages`, {
-    content,
-    client_nonce: randomUUID(),
-  });
-  expect(response.status()).toBe(201);
-  return asString(asRecord(await response.json()).message_id);
+  // Bulk seeding can exceed the mutation admission burst (64 tokens, 4/s
+  // refill); honor Retry-After instead of failing the fixture.
+  const nonce = randomUUID();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const response = await post(`/messaging/places/${placeID}/messages`, {
+      content,
+      client_nonce: nonce,
+    });
+    if (response.status() !== 429) {
+      expect(response.status()).toBe(201);
+      return asString(asRecord(await response.json()).message_id);
+    }
+    const retryAfter = Number(response.headers()["retry-after"]);
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 500,
+      ),
+    );
+  }
+  throw new Error("message send stayed rate limited");
 }
 
 async function provisionHuman(

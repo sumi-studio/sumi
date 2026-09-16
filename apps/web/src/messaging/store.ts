@@ -466,6 +466,8 @@ interface MessagingState {
   employedAgents: ParticipantRef[];
   hasMoreByPlace: Record<PlaceKey, boolean>;
   loadingOlderByPlace: Record<PlaceKey, boolean>;
+  /** window間の未ロード区間を埋めているfetch。値は各行のbeforeSeq。 */
+  loadingGapsByPlace: Record<PlaceKey, number[]>;
   activePlaceKey: PlaceKey | null;
   /**
    * 編集セッション。対象IDと書きかけの本文は仮想リストの行の外——ここ——に置く。
@@ -573,6 +575,7 @@ interface MessagingState {
   toggleReaction(message: Message, emoji: string): void;
   votePoll(message: Message, optionIds: string[]): Promise<void>;
   loadOlder(key: PlaceKey): Promise<void>;
+  loadGap(key: PlaceKey, beforeSeq: number): Promise<void>;
   resolveReplyLater(markerId: string): void;
   sendTyping(): void;
 }
@@ -2366,6 +2369,8 @@ export const useMessaging = create<MessagingState>((set, get) => {
   };
 
   const PAGE_SIZE = 50;
+  /** loadPlaceAroundでtargetより新しい側に含める件数。target中心の1頁にする。 */
+  const AROUND_NEWER = 24;
 
   /**
    * この場所の履歴を持ったと宣言する。cursorはbackendが握手に載せ、切断中の
@@ -2409,17 +2414,25 @@ export const useMessaging = create<MessagingState>((set, get) => {
       if (
         !(key in state.messagesByPlace) &&
         !(key in state.hasMoreByPlace) &&
-        !(key in state.loadingOlderByPlace)
+        !(key in state.loadingOlderByPlace) &&
+        !(key in state.loadingGapsByPlace)
       ) {
         return {};
       }
       const messagesByPlace = { ...state.messagesByPlace };
       const hasMoreByPlace = { ...state.hasMoreByPlace };
       const loadingOlderByPlace = { ...state.loadingOlderByPlace };
+      const loadingGapsByPlace = { ...state.loadingGapsByPlace };
       delete messagesByPlace[key];
       delete hasMoreByPlace[key];
       delete loadingOlderByPlace[key];
-      return { messagesByPlace, hasMoreByPlace, loadingOlderByPlace };
+      delete loadingGapsByPlace[key];
+      return {
+        messagesByPlace,
+        hasMoreByPlace,
+        loadingOlderByPlace,
+        loadingGapsByPlace,
+      };
     });
   };
 
@@ -2821,6 +2834,7 @@ export const useMessaging = create<MessagingState>((set, get) => {
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",
@@ -3449,8 +3463,14 @@ export const useMessaging = create<MessagingState>((set, get) => {
       ) {
         return false;
       }
+      // 1ページをtarget中心に取る。seq直前だけを取ると「直後の会話」が読めず、
+      // newest pageとの間に断絶だけが残る。前後を両方含め、残った未ロード区間は
+      // gap行として明示する（timeline.ts buildRows参照）。
       const messages = await request.wait((backend) =>
-        backend.fetchMessages(place, { beforeSeq: seq + 1, limit: 50 }),
+        backend.fetchMessages(place, {
+          beforeSeq: seq + AROUND_NEWER + 1,
+          limit: PAGE_SIZE,
+        }),
       );
       if (
         !messages ||
@@ -3460,17 +3480,30 @@ export const useMessaging = create<MessagingState>((set, get) => {
         return false;
       }
       rememberKnownMessages(key, messages, get().lastReadByPlace[key] ?? 0);
-      set((state) => ({
-        messagesByPlace: {
-          ...state.messagesByPlace,
-          [key]: mergeMessagesWithOrphanPolls(
-            key,
-            state.messagesByPlace[key] ?? [],
-            messages,
-            "snapshot",
-          ),
-        },
-      }));
+      set((state) => {
+        const merged = mergeMessagesWithOrphanPolls(
+          key,
+          state.messagesByPlace[key] ?? [],
+          messages,
+          "snapshot",
+        );
+        return {
+          messagesByPlace: {
+            ...state.messagesByPlace,
+            [key]: merged,
+          },
+          // seqは密——先頭が1ならこれより古い履歴は無い。離れたwindowが併存
+          // していても「まだ古いものがあるか」は正確に分かる。
+          ...(merged[0]?.seq === 1
+            ? {
+                hasMoreByPlace: {
+                  ...state.hasMoreByPlace,
+                  [key]: false,
+                },
+              }
+            : {}),
+        };
+      });
       holdPlace(
         place,
         messages.reduce((head, message) => Math.max(head, message.seq), 0),
@@ -4249,6 +4282,83 @@ export const useMessaging = create<MessagingState>((set, get) => {
       }
     },
 
+    async loadGap(key, beforeSeq) {
+      const state = get();
+      const place = parsePlaceKey(key);
+      const current = state.messagesByPlace[key];
+      if (!place || !current || current.length === 0) return;
+      if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 2) return;
+      if ((state.loadingGapsByPlace[key] ?? []).includes(beforeSeq)) return;
+      const holdGeneration = placeHoldGenerations.get(key);
+      if (
+        holdGeneration === undefined ||
+        !holdsPlaceGeneration(key, holdGeneration)
+      ) {
+        return;
+      }
+      set((entry) => ({
+        loadingGapsByPlace: {
+          ...entry.loadingGapsByPlace,
+          [key]: [...(entry.loadingGapsByPlace[key] ?? []), beforeSeq],
+        },
+      }));
+      const request = beginMessagingBackendRequest();
+      try {
+        // Keep the loaded windows and the gap row if the request fails; the
+        // row stays clickable so the person can retry.
+        const missing = await request
+          .wait((backend) =>
+            backend.fetchMessages(place, {
+              beforeSeq,
+              limit: PAGE_SIZE,
+            }),
+          )
+          .catch(() => undefined);
+        if (
+          !missing ||
+          !request.isCurrent() ||
+          !holdsPlaceGeneration(key, holdGeneration)
+        ) {
+          return;
+        }
+        rememberKnownMessages(key, missing, get().lastReadByPlace[key] ?? 0);
+        set((entry) => {
+          const merged = mergeMessagesWithOrphanPolls(
+            key,
+            entry.messagesByPlace[key] ?? [],
+            missing,
+            "snapshot",
+          );
+          return {
+            messagesByPlace: {
+              ...entry.messagesByPlace,
+              [key]: merged,
+            },
+            // 埋めた区間が履歴の底まで届けば、これより古い履歴は無い。
+            ...(merged[0]?.seq === 1
+              ? {
+                  hasMoreByPlace: {
+                    ...entry.hasMoreByPlace,
+                    [key]: false,
+                  },
+                }
+              : {}),
+          };
+        });
+      } finally {
+        if (request.isCurrent() && holdsPlaceGeneration(key, holdGeneration)) {
+          set((entry) => ({
+            loadingGapsByPlace: {
+              ...entry.loadingGapsByPlace,
+              [key]: (entry.loadingGapsByPlace[key] ?? []).filter(
+                (seq) => seq !== beforeSeq,
+              ),
+            },
+          }));
+        }
+      }
+    },
+
     resolveReplyLater(markerId) {
       const request = beginMessagingBackendRequest();
       void request
@@ -4396,6 +4506,7 @@ export function suspendMessagingTransport(): void {
     transportGeneration: messagingSessionGeneration,
     startingDM: null,
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     // A request may have committed before its response was lost. Keep its
     // nonce/intent for the existing explicit retry instead of dropping it.
     pendingByPlace: Object.fromEntries(
@@ -4487,6 +4598,7 @@ function resetMessagingRuntime(
     employedAgents: [],
     hasMoreByPlace: {},
     loadingOlderByPlace: {},
+    loadingGapsByPlace: {},
     activePlaceKey: null,
     editingMessageId: null,
     editDraft: "",

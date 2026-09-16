@@ -29,6 +29,17 @@ export type TimelineRow =
   | { id: string; kind: "unread" }
   | {
       id: string;
+      /** 読み込み済みwindow同士の間にある未ロード区間。seqは疎ではなく、
+       * tombstoneもseqを占有するので、seq差が開く＝実際に未取得がある。 */
+      kind: "gap";
+      /** gap直上（古い側）の読み込み済みseq。 */
+      afterSeq: number;
+      /** gap直下（新しい側）の読み込み済みseq。この直前までを読み込む。 */
+      beforeSeq: number;
+      missingCount: number;
+    }
+  | {
+      id: string;
       kind: "message";
       message: Message;
       grouped: boolean;
@@ -292,7 +303,28 @@ export function buildRows(input: BuildRowsInput): TimelineRow[] {
     previousBroken = false;
   };
 
-  for (const message of input.messages) pushMessage(message, false);
+  // seqは削除済みtombstoneも占有するので、読み込み済み同士のseq差は
+  // 必ず未取得区間を意味する。windowが離れて併存する（検索jumpなど）とき、
+  // 暗黙に隣接させずgap行として明示する。
+  let previousSeq: number | null = null;
+  for (const message of input.messages) {
+    if (
+      !message.deleted &&
+      previousSeq !== null &&
+      message.seq - previousSeq > 1
+    ) {
+      rows.push({
+        id: `gap:${previousSeq}-${message.seq}`,
+        kind: "gap",
+        afterSeq: previousSeq,
+        beforeSeq: message.seq,
+        missingCount: message.seq - previousSeq - 1,
+      });
+      previousBroken = true;
+    }
+    previousSeq = message.seq;
+    pushMessage(message, false);
+  }
   for (const entry of input.pending) {
     pushMessage(
       {
