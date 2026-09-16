@@ -1,0 +1,30 @@
+# Executor host (system unit, root): run one secretary's agent Compose project
+# with /workspace bound to scope %i of the canonical volume. Starting requires
+# a verified mount; stopping or restarting the volume client stops/restarts
+# the executor, so it never keeps a dead (ENOTCONN) bind.
+#   /etc/sumi-files/executor.env  — volume client (UUID and mountpoint are read here)
+#   /etc/sumi-files/agent-%i.env  — SUMI_AGENT_COMPOSE_DIR (checkout with deploy/agent
+#                                   and deploy/files) plus the agent Compose variables
+[Unit]
+Description=Sumi executor for files scope %i
+Requires=sumi-files-mount@executor.service docker.service
+After=sumi-files-mount@executor.service docker.service
+BindsTo=sumi-files-mount@executor.service
+PartOf=sumi-files-mount@executor.service
+# After a volume-client crash the executor is stopped, not restarted, when the
+# client comes back: run `systemctl start sumi-files-executor@<scope>` again.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/sumi-files/agent-%i.env
+ExecStart=/bin/bash -c 'set -a; . /etc/sumi-files/executor.env; set +a; \
+  dir=$$(%h/.local/lib/sumi-files/sumi-files-check "$${SUMI_FILES_MOUNTPOINT}" "$${SUMI_FILES_VOLUME_UUID}" "%i") || exit 2; \
+  cd "$${SUMI_AGENT_COMPOSE_DIR}" && SUMI_FILES_SCOPE_DIR="$$dir" exec docker compose -p "sumi-exec-%i" \
+    -f deploy/agent/compose.yaml -f deploy/files/compose.executor-workspace.yaml up -d --force-recreate'
+ExecStop=/bin/bash -c 'cd "$${SUMI_AGENT_COMPOSE_DIR}" && SUMI_FILES_SCOPE_DIR=/nonexistent docker compose -p "sumi-exec-%i" \
+  -f deploy/agent/compose.yaml -f deploy/files/compose.executor-workspace.yaml stop'
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

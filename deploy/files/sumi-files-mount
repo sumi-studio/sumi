@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# sumi-files-mount — run one JuiceFS client of the canonical Sumi files volume
+# in the foreground (systemd `sumi-files-mount@.service`, or a supervisor).
+#
+#   sumi-files-mount ENV_FILE
+#
+# ENV_FILE (mode 0600, root-owned; never in the repository):
+#   SUMI_FILES_ROLE          service | executor
+#   SUMI_FILES_JUICEFS       JuiceFS binary (default /usr/local/bin/juicefs)
+#   SUMI_FILES_META_URL      postgres://USER@HOST:PORT/DB?sslmode=... (no password)
+#   META_PASSWORD            metadata database password
+#   SUMI_FILES_VOLUME_UUID   the volume this host must mount (refuses others)
+#   SUMI_FILES_MOUNTPOINT    e.g. /var/lib/sumi-files/mnt
+#   SUMI_FILES_CACHE_DIR     local block cache, e.g. /var/cache/sumi-files
+#   SUMI_FILES_CACHE_SIZE_MIB (default 10240)
+#   SUMI_FILES_OWNER         uid:gid every client squashes to (default 10002:10002)
+#
+# Object-storage credentials live in the volume settings written by
+# `juicefs format`; anyone holding the metadata credential can read them, so
+# the credential file belongs to the host, never to an executor container.
+set -euo pipefail
+
+env_file="${1:-}"
+[[ -n "$env_file" && -r "$env_file" ]] || {
+  echo "usage: sumi-files-mount ENV_FILE" >&2
+  exit 2
+}
+if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]]; then
+  echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
+  exit 2
+fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
+jfs="${SUMI_FILES_JUICEFS:-/usr/local/bin/juicefs}"
+role="${SUMI_FILES_ROLE:?SUMI_FILES_ROLE is required}"
+meta="${SUMI_FILES_META_URL:?SUMI_FILES_META_URL is required}"
+want_uuid="${SUMI_FILES_VOLUME_UUID:?SUMI_FILES_VOLUME_UUID is required}"
+mnt="${SUMI_FILES_MOUNTPOINT:?SUMI_FILES_MOUNTPOINT is required}"
+cache_dir="${SUMI_FILES_CACHE_DIR:?SUMI_FILES_CACHE_DIR is required}"
+cache_mib="${SUMI_FILES_CACHE_SIZE_MIB:-10240}"
+owner="${SUMI_FILES_OWNER:-10002:10002}"
+: "${META_PASSWORD:?META_PASSWORD is required}"
+export META_PASSWORD
+
+case "$meta" in
+  *://*:*@*) echo "refused: put the metadata password in META_PASSWORD, not the URL" >&2; exit 2 ;;
+esac
+
+case "$role" in
+  service) bg=() ;;
+  # Background jobs (trash, compaction, session cleanup) run on the always-on
+  # service client only; executors come and go.
+  executor) bg=(--no-bgjob) ;;
+  *) echo "refused: SUMI_FILES_ROLE must be service or executor" >&2; exit 2 ;;
+esac
+
+if awk -v mp="$mnt" '$5 == mp { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+  echo "refused: $mnt is already a mountpoint; unmount it first (sumi-files-umount)" >&2
+  exit 2
+fi
+mkdir -p "$mnt" "$cache_dir"
+chmod 0700 "$cache_dir"
+
+# Refuse to mount a different volume than the pinned one (a re-formatted or
+# mistyped metadata database would otherwise mount an empty namespace).
+# The status output includes object-storage settings: keep it in memory only.
+if ! status="$("$jfs" status "$meta" 2>/dev/null)"; then
+  echo "refused: metadata engine unreachable or not a formatted volume" >&2
+  exit 3
+fi
+got_uuid="$(grep -o '"UUID": *"[^"]*"' <<<"$status" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+unset status
+if [[ "$got_uuid" != "$want_uuid" ]]; then
+  echo "refused: metadata engine holds volume ${got_uuid:-unknown}, expected $want_uuid" >&2
+  exit 2
+fi
+
+# Zero metadata caching is a service correctness requirement
+# (contracts/files-api.yaml) and gives executors the same view without a
+# freshness window. --all-squash gives the file service and every executor
+# one owner, so either side can edit what the other created.
+exec "$jfs" mount \
+  --no-usage-report \
+  --attr-cache=0 --entry-cache=0 --dir-entry-cache=0 --negative-entry-cache=0 \
+  --all-squash "$owner" \
+  --backup-meta 0 \
+  --cache-dir "$cache_dir" --cache-size "$cache_mib" \
+  "${bg[@]}" \
+  "$meta" "$mnt"

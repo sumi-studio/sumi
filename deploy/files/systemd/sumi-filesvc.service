@@ -1,0 +1,24 @@
+# Scoped file API over the service client's mount (user unit on the WSL alpha
+# origin). Bound to that client: if the mount unit stops, filesvc stops with
+# it; while the mount is merely absent (e.g. a manual remount)
+# FILESV_REQUIRE_MOUNT=1 answers 503 mount_unavailable instead of writing
+# into the bare directory.
+#   env file ~/.config/sumi-files/filesvc.env (0600):
+#     FILESV_LISTEN FILESV_ROOT FILESV_DB_URL FILESV_TOKENS FILESV_REQUIRE_MOUNT=1
+[Unit]
+Description=Sumi files API (filesvc)
+Requires=sumi-files-mount@service.service
+After=sumi-files-mount@service.service
+PartOf=sumi-files-mount@service.service
+
+[Service]
+Type=simple
+EnvironmentFile=%E/sumi-files/filesvc.env
+ExecStartPre=/bin/bash -c 'test "$${FILESV_REQUIRE_MOUNT}" = 1 || { echo "refused: FILESV_REQUIRE_MOUNT must be 1 in Cloud placement" >&2; exit 2; }'
+ExecStart=%h/.local/lib/sumi-files/filesvc
+Restart=on-failure
+RestartSec=3
+UMask=0022
+
+[Install]
+WantedBy=default.target
