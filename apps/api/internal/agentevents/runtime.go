@@ -2615,6 +2615,16 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 		if existing.Seq != last+1 {
 			return fmt.Errorf("durable event log is non-contiguous: got %d after %d", existing.Seq, last)
 		}
+		// The same envelope checks eventCatchUpScan enforces on replay:
+		// a record this file would refuse to replay must not fold into
+		// session guards or be appended after. These fail closed with the
+		// record's bytes preserved — only a torn tail may be truncated.
+		if existing.Event.Seq == nil || *existing.Event.Seq != existing.Seq {
+			return fmt.Errorf("durable event record seq mismatch: outer %d, inner %v", existing.Seq, existing.Event.Seq)
+		}
+		if existing.Event.PersonalityAgentID != personalityAgentID {
+			return fmt.Errorf("durable event record personality agent mismatch: got %q, want %q", existing.Event.PersonalityAgentID, personalityAgentID)
+		}
 		last = existing.Seq
 		foldRunMarkerLocked(st, existing.Event.Event)
 		// Session guards follow the same committed-state rule as run

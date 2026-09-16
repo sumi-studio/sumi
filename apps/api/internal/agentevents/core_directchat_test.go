@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1623,5 +1624,122 @@ func TestCoreDirectChatMalformedTailStillFailsClosed(t *testing.T) {
 	}
 	if !bytes.Contains(raw, []byte("bad")) {
 		t.Fatal("malformed record was silently truncated")
+	}
+}
+
+// TestCoreDirectChatGuardPathRejectsReplayRefusedRecords is the C-1
+// regression: a committed-log record that passes JSON/envelope format but
+// breaks a replay invariant (inner seq mismatch or absent, or a foreign
+// persona) must fail refresh, guard folding, command admission, and any
+// further append — with the valid prefix and the corrupt bytes preserved.
+func TestCoreDirectChatGuardPathRejectsReplayRefusedRecords(t *testing.T) {
+	foreign := pid7(t)
+	approvalLine := func(outer, inner uint64, persona, requestID string) string {
+		return fmt.Sprintf(
+			`{"seq":%d,"event":{"audience":"direct_chat","seq":%d,"personality_agent_id":%q,"event":{"type":"approval_requested","request":{"id":%q,"tool_call_id":"c1","tool_name":"journal.note","action":{"reviewable":{"text":"x"}},"args_summary":{"text":"x"}}}}}`+"\n",
+			outer, inner, persona, requestID)
+	}
+	cases := []struct {
+		name      string
+		line      func(nextSeq uint64, pa string) string
+		requestID string // approval request id carried by the corrupt record, if any
+		errSubstr string
+	}{
+		{
+			name: "persona-mismatch",
+			line: func(n uint64, pa string) string {
+				return approvalLine(n, n, foreign, "req-foreign")
+			},
+			requestID: "req-foreign",
+			errSubstr: "personality agent mismatch",
+		},
+		{
+			name: "inner-seq-mismatch",
+			line: func(n uint64, pa string) string {
+				return approvalLine(n, n+7, pa, "req-misseq")
+			},
+			requestID: "req-misseq",
+			errSubstr: "seq mismatch",
+		},
+		{
+			// A volatile event type is the only nil-seq envelope format
+			// validation lets through; durable types already refuse nil seq
+			// at decode. Either way refresh must not fold the record.
+			name: "inner-seq-nil",
+			line: func(n uint64, pa string) string {
+				return fmt.Sprintf(
+					`{"seq":%d,"event":{"audience":"direct_chat","personality_agent_id":%q,"event":{"type":"error","message":"x"}}}`+"\n",
+					n, pa)
+			},
+			errSubstr: "seq mismatch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCoreDirectChatFixture(t)
+			a, gwA := f.adapter, f.gateway
+			env := f.sendOn(t, a, "k1", "first")
+			f.hostComplete(t, "direct-chat:"+env.CommandID, "reply-1")
+			syncOn(t, a, f.pa)
+			nextSeq := uint64(len(durableEvents(t, gwA, f.pa))) + 1
+
+			eventsPath := filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".jsonl")
+			line := tc.line(nextSeq, f.pa)
+			ef, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatalf("open events: %v", err)
+			}
+			if _, err := ef.WriteString(line); err != nil {
+				t.Fatalf("corrupt write: %v", err)
+			}
+			if err := ef.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			rawBefore, err := os.ReadFile(eventsPath)
+			if err != nil {
+				t.Fatalf("read events: %v", err)
+			}
+
+			// Replay fails closed on the injected record.
+			if _, err := gwA.EventCatchUp(f.ctx, f.pa, 0); err == nil {
+				t.Fatal("EventCatchUp served a record replay must refuse")
+			}
+			// The refresh/guard path fails the same record before folding it.
+			refreshErr := gwA.RefreshDurableEventTail(f.ctx, f.pa)
+			if refreshErr == nil {
+				t.Fatal("refresh folded a record replay refuses")
+			}
+			if !strings.Contains(refreshErr.Error(), tc.errSubstr) {
+				t.Fatalf("refresh error %q does not name the %s", refreshErr, tc.errSubstr)
+			}
+			if tc.requestID != "" {
+				if gwA.IsApprovalPending(f.pa, tc.requestID) {
+					t.Fatal("refused record folded into this persona's pending approvals")
+				}
+				server := &BrowserServer{Events: gwA}
+				reason, reject := server.checkCommandState(f.ctx, f.pa,
+					browserCommandHead{Type: "approval_decision", RequestID: tc.requestID})
+				if !reject || reason != RejectUnavailable {
+					t.Fatalf("admission must fail closed as unavailable; got reject=%v reason=%q", reject, reason)
+				}
+			}
+			// A projector sweep must not append after the refused record.
+			env2 := f.sendOn(t, a, "k2", "second")
+			f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+			syncErr := a.syncPersona(f.ctx, f.pa)
+			if syncErr == nil {
+				t.Fatal("projector appended after a record replay refuses")
+			}
+			if !strings.Contains(syncErr.Error(), tc.errSubstr) {
+				t.Fatalf("sync error %q does not name the %s", syncErr, tc.errSubstr)
+			}
+			rawAfter, err := os.ReadFile(eventsPath)
+			if err != nil {
+				t.Fatalf("read events after: %v", err)
+			}
+			if !bytes.Equal(rawAfter, rawBefore) {
+				t.Fatal("corrupt tail was rewritten or appended after")
+			}
+		})
 	}
 }
