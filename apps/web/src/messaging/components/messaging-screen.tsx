@@ -62,6 +62,16 @@ interface PendingJumpTarget {
 interface PendingJump extends PendingJumpTarget {
   transportGeneration: number;
   routeObserved: boolean;
+  /** 同じ論理jumpを追う世代。経路確定でobjectが作り直されても変わらない。 */
+  attempt: number;
+}
+
+/** 周辺履歴のfetchが決着したあとの正直な結果。failureは再試行できる。 */
+interface JumpOutcome {
+  target: PendingJumpTarget;
+  status: "failed" | "not_found";
+  transportGeneration: number;
+  attempt: number;
 }
 
 interface ViewingImage {
@@ -417,6 +427,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
   const [membersOpen, setMembersOpen] = useState(true);
   const [threadsOpen, setThreadsOpen] = useState(false);
   const [pendingJump, setPendingJump] = useState<PendingJump | null>(null);
+  const [jumpOutcome, setJumpOutcome] = useState<JumpOutcome | null>(null);
+  // pendingJumpの同期mirror。fetch決着時にstateの反映を待たずに、直近の
+  // 置き換え・取消し（place/account/transportの切替や新しいjump）を判定する。
+  const pendingJumpRef = useRef<PendingJump | null>(null);
+  const jumpAttemptRef = useRef(0);
+  const assignPendingJump = useCallback((next: PendingJump | null) => {
+    pendingJumpRef.current = next;
+    setPendingJump(next);
+  }, []);
   const [viewingImage, setViewingImage] = useState<ViewingImage | null>(null);
   const [revealedForPlace, setRevealedForPlace] = useState<{
     placeKey: PlaceKey | null;
@@ -464,7 +483,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       placeKey === pendingJump.placeKey &&
       !pendingJump.routeObserved
     ) {
-      setPendingJump({ ...pendingJump, routeObserved: true });
+      assignPendingJump({ ...pendingJump, routeObserved: true });
     } else if (
       pendingJump?.routeObserved &&
       placeKey !== pendingJump.placeKey
@@ -472,7 +491,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       // Once the target URL was actually observed, a later raw route is an
       // explicit navigation away. Do not retain the old hit until a future
       // ordinary visit to that thread.
-      setPendingJump(null);
+      assignPendingJump(null);
     }
     if (!selectedPlaceKey) {
       clearPlaceSelection();
@@ -487,7 +506,7 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
         threadLoadError !== undefined ||
         pendingJump?.placeKey !== pendingThreadKey
       ) {
-        setPendingJump(null);
+        assignPendingJump(null);
       }
       return;
     }
@@ -502,18 +521,31 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     threadLoadError,
     pendingJump,
     placeKey,
+    assignPendingJump,
   ]);
 
   useEffect(() => {
-    setPendingJump((pending) =>
+    const pending = pendingJumpRef.current;
+    assignPendingJump(
       pending?.transportGeneration === transportGeneration ? pending : null,
     );
-  }, [transportGeneration]);
+    setJumpOutcome((outcome) =>
+      outcome?.transportGeneration === transportGeneration ? outcome : null,
+    );
+  }, [transportGeneration, assignPendingJump]);
 
   useEffect(() => {
     if (selectedPlaceKey?.startsWith("channel:"))
       void loadThreads(selectedPlaceKey).catch(() => undefined);
   }, [selectedPlaceKey, loadThreads]);
+
+  // jump結果はそのplaceを見ている間だけの表示。場所を離れたら捨てて、
+  // あとから戻ってきたときに古い失敗を見せない。
+  useEffect(() => {
+    setJumpOutcome((outcome) =>
+      outcome && outcome.target.placeKey === selectedPlaceKey ? outcome : null,
+    );
+  }, [selectedPlaceKey]);
 
   useEffect(() => {
     if (
@@ -554,26 +586,32 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     const rawSeq = params.get("m");
     const seq = rawSeq === null ? null : Number(rawSeq);
     if (seq !== null && Number.isSafeInteger(seq) && seq > 0) {
-      setPendingJump({
+      jumpAttemptRef.current += 1;
+      setJumpOutcome(null);
+      assignPendingJump({
         placeKey,
         seq,
         transportGeneration,
         routeObserved: true,
+        attempt: jumpAttemptRef.current,
       });
       window.history.replaceState(null, "", window.location.pathname);
     }
-  }, [ready, placeKey, transportGeneration]);
+  }, [ready, placeKey, transportGeneration, assignPendingJump]);
 
   const requestJump = useCallback(
     (jump: PendingJumpTarget) => {
       placeNavigate(jump.placeKey);
-      setPendingJump({
+      jumpAttemptRef.current += 1;
+      setJumpOutcome(null);
+      assignPendingJump({
         ...jump,
         transportGeneration,
         routeObserved: placeKey === jump.placeKey,
+        attempt: jumpAttemptRef.current,
       });
     },
-    [placeNavigate, placeKey, transportGeneration],
+    [placeNavigate, placeKey, transportGeneration, assignPendingJump],
   );
 
   // Route selection creates a history hold synchronously. A jump to an old
@@ -586,8 +624,50 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     ) {
       return;
     }
-    void loadPlaceAround(pendingJump.placeKey, pendingJump.seq);
-  }, [pendingJump, activePlaceKey, loadPlaceAround, transportGeneration]);
+    void Promise.resolve(
+      loadPlaceAround(pendingJump.placeKey, pendingJump.seq),
+    ).then(
+      (result) => {
+        // 別のjumpやplace/account/transportの切替で退役した結果は捨てる。
+        if (pendingJumpRef.current?.attempt !== pendingJump.attempt) return;
+        if (result === "cancelled") {
+          // 保持世代やtransportが切り替わった打ち切りは失敗ではない。
+          // ただし未解決のまま残して以後のjumpを塞がないようpendingは終わらせる。
+          assignPendingJump(null);
+          return;
+        }
+        if (result === "missing") {
+          // seq自体が履歴に存在しない（lastSeqより先等）か届かない場合は
+          // ここで終える。削除済みはtombstoneが返るので"found"側に来る。
+          assignPendingJump(null);
+          setJumpOutcome({
+            target: pendingJump,
+            status: "not_found",
+            transportGeneration: pendingJump.transportGeneration,
+            attempt: pendingJump.attempt,
+          });
+        }
+      },
+      () => {
+        // transport失敗も未解決のまま放置しない。次の選択・再試行は新しい
+        // attemptとして普通に動く。
+        if (pendingJumpRef.current?.attempt !== pendingJump.attempt) return;
+        assignPendingJump(null);
+        setJumpOutcome({
+          target: pendingJump,
+          status: "failed",
+          transportGeneration: pendingJump.transportGeneration,
+          attempt: pendingJump.attempt,
+        });
+      },
+    );
+  }, [
+    pendingJump,
+    activePlaceKey,
+    loadPlaceAround,
+    transportGeneration,
+    assignPendingJump,
+  ]);
 
   // 対象placeのメッセージが手元に揃った時点でジャンプを実行する。
   useEffect(() => {
@@ -608,10 +688,16 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
       } else if (pendingJump.seq !== undefined) {
         listRef.current?.jumpToSeq(pendingJump.seq);
       }
-      setPendingJump(null);
+      assignPendingJump(null);
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [pendingJump, activePlaceKey, messagesByPlace, transportGeneration]);
+  }, [
+    pendingJump,
+    activePlaceKey,
+    messagesByPlace,
+    transportGeneration,
+    assignPendingJump,
+  ]);
 
   if (!ready) {
     return (
@@ -627,6 +713,15 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
     Object.keys(threadsById).length > 0;
   const selectedPlaceIsLoaded =
     selectedPlaceKey !== null && activePlaceKey === selectedPlaceKey;
+  // 表示するのは現在地・現transport・未決着jumpなしの3条件を満たす結果だけ。
+  // 古い世代や別の場所の失敗をここへ混ぜない。
+  const visibleJumpOutcome =
+    jumpOutcome &&
+    jumpOutcome.target.placeKey === selectedPlaceKey &&
+    jumpOutcome.transportGeneration === transportGeneration &&
+    pendingJump === null
+      ? jumpOutcome
+      : null;
   const selectedChannel = selectedPlaceKey?.startsWith("channel:")
     ? channels.find(
         (channel) => `channel:${channel.channelId}` === selectedPlaceKey,
@@ -734,6 +829,25 @@ export function MessagingScreen({ placeKey }: { placeKey?: PlaceKey }) {
             {selectedPlaceIsLoaded ? (
               <>
                 <CallStage />
+                {visibleJumpOutcome ? (
+                  <div
+                    role="alert"
+                    className="shrink-0 border-b bg-amber-500/10 px-4 py-1.5 text-center text-[12px] text-amber-700 sm:px-6 dark:text-amber-400"
+                  >
+                    {visibleJumpOutcome.status === "not_found"
+                      ? "そのメッセージは存在しないか、アクセスできません。"
+                      : "そのメッセージへ移動できませんでした。接続を確認してください。"}
+                    {visibleJumpOutcome.status === "failed" ? (
+                      <button
+                        type="button"
+                        onClick={() => requestJump(visibleJumpOutcome.target)}
+                        className="ml-2 rounded border border-current px-2 py-0.5 font-medium hover:bg-amber-500/10 focus-visible:outline-2 focus-visible:outline-offset-2"
+                      >
+                        再試行
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
                 <MessageList
                   handleRef={listRef}
                   revealedAttachmentIds={revealedAttachmentIds}

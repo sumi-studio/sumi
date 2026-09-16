@@ -23,6 +23,7 @@ import { MessageItem } from "./message-item";
 /** selectorは毎回同じ参照を返す必要がある（新しい[]を作ると無限再レンダー）。 */
 const NO_PENDING: PendingMessage[] = [];
 const NO_NAMES: string[] = [];
+const EMPTY_SET: ReadonlySet<string> = new Set();
 
 /** placeごとのスクロール位置記憶。最下部付近はInfinity（=常に最新へ）。 */
 const placeScrollMemory = new Map<string, number>();
@@ -43,6 +44,8 @@ function estimateRowSize(row: ListRow): number {
   if (row.kind === "older") return 44;
   if (row.kind === "date") return 36;
   if (row.kind === "unread") return 24;
+  if (row.kind === "gap") return 40;
+  if (row.kind === "deleted") return 28;
   return row.grouped ? 30 : 62;
 }
 
@@ -114,12 +117,33 @@ export function MessageList({
       ? (state.hasMoreByPlace[state.activePlaceKey] ?? false)
       : false,
   );
+  const loadingGaps = useMessaging((state) =>
+    state.activePlaceKey
+      ? (state.loadingGapsByPlace[state.activePlaceKey] ?? null)
+      : null,
+  );
+  const transportGeneration = useMessaging(
+    (state) => state.transportGeneration,
+  );
   const loadOlder = useMessaging((state) => state.loadOlder);
+  const loadGap = useMessaging((state) => state.loadGap);
 
   const virtualizerRef = useRef<ConversationVirtualizerHandle>(null);
   const [atEnd, setAtEnd] = useState(true);
   const atEndRef = useRef(true);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  // 検索結果やpermalinkから辿った対象が削除済みだったとき、そのseq位置に出す
+  // 標識。placeを離れたり別の対象へjumpしたら消す。
+  const [deletedMarkerSeq, setDeletedMarkerSeq] = useState<number | null>(null);
+  // 同じseqへの再選択を一度きりのscrollにするための世代。scroll完了の記録は
+  // attempt単位で持ち、frameが取り消されたときは未完了のままやり直せる。
+  const [deletedJumpAttempt, setDeletedJumpAttempt] = useState(0);
+  const deletedScrollDoneRef = useRef(-1);
+  // gap補填が失敗した行のid。失敗はその行の上にだけ出し、placeやsessionの
+  // 差し替えでは全部捨てる——別の会話や世代へ古い失敗を持ち込まない。
+  const [failedGaps, setFailedGaps] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const highlightTimer = useRef<number | null>(null);
   const visibleIdsRef = useRef<string[]>([]);
   const positionedPlaceRef = useRef<string | null>(null);
@@ -142,11 +166,20 @@ export function MessageList({
       unreadLineSeq,
       self,
       now: Date.now(),
+      deletedTargetSeq: deletedMarkerSeq,
     });
     return hasMore
       ? ([{ id: "__older__", kind: "older" } as OlderRow, ...built] as const)
       : built;
-  }, [messages, pending, selfKey, unreadLineSeq, self, hasMore]);
+  }, [
+    messages,
+    pending,
+    selfKey,
+    unreadLineSeq,
+    self,
+    hasMore,
+    deletedMarkerSeq,
+  ]);
 
   const messagesById = useMemo(() => {
     const map = new Map<string, Message>();
@@ -175,6 +208,7 @@ export function MessageList({
   }, [replyLaterById, selfKey, membersByKey]);
 
   const flashMessage = useCallback((messageId: string) => {
+    setDeletedMarkerSeq(null);
     virtualizerRef.current?.scrollToMessage(messageId, {
       align: "center",
       behavior: "auto",
@@ -187,17 +221,86 @@ export function MessageList({
     );
   }, []);
 
+  // 削除済みのjump対象は行として存在しないので、tombstone位置に「削除されて
+  // います」標識を出してそこへ運ぶ。標識行は次のrenderでitemsに入るため、
+  // scrollはeffect側で行う（下のuseEffect参照）。同じseqの再選択でも
+  // attemptが進むので必ず運び直される。
+  const markDeletedTarget = useCallback((seq: number) => {
+    setHighlightedId(null);
+    if (highlightTimer.current) window.clearTimeout(highlightTimer.current);
+    setDeletedMarkerSeq(seq);
+    setDeletedJumpAttempt((attempt) => attempt + 1);
+  }, []);
+
+  // 引用元jumpなど画面上の行から呼ばれる経路。propsとして各行へ渡されるので
+  // identityを安定させるため、最新のmessagesByIdはref越しに読む。
+  const messagesByIdRef = useRef(messagesById);
+  messagesByIdRef.current = messagesById;
+  const jumpToMessage = useCallback(
+    (messageId: string) => {
+      const message = messagesByIdRef.current.get(messageId);
+      if (message?.deleted) {
+        markDeletedTarget(message.seq);
+        return;
+      }
+      flashMessage(messageId);
+    },
+    [markDeletedTarget, flashMessage],
+  );
+
   useImperativeHandle(
     handleRef,
     () => ({
-      jumpToMessage: flashMessage,
+      jumpToMessage,
       jumpToSeq: (seq) => {
         const id = seqToId.get(seq);
-        if (id) flashMessage(id);
+        if (!id) return;
+        if (messagesById.get(id)?.deleted) {
+          markDeletedTarget(seq);
+          return;
+        }
+        flashMessage(id);
       },
     }),
-    [flashMessage, seqToId],
+    [jumpToMessage, flashMessage, markDeletedTarget, messagesById, seqToId],
   );
+
+  // 削除標識行がitemsに入ったあと、その行へviewportを運ぶ。tombstone自体が
+  // jump後のfetchで届くこともあるので、標識行が現れるまでscrollを持ち越す。
+  useEffect(() => {
+    if (deletedMarkerSeq === null) {
+      deletedScrollDoneRef.current = -1;
+      return;
+    }
+    if (deletedScrollDoneRef.current === deletedJumpAttempt) return;
+    if (!rows.some((row) => row.id === `deleted:${deletedMarkerSeq}`)) return;
+    const attempt = deletedJumpAttempt;
+    const frame = window.requestAnimationFrame(() => {
+      // 完了は実際にscrollを発行できたときだけ記録する。このframeがrows更新で
+      // 取り消されても未完了のまま残り、次のrenderでやり直せる。
+      const didScroll = virtualizerRef.current?.scrollToMessage(
+        `deleted:${deletedMarkerSeq}`,
+        { align: "center", behavior: "auto" },
+      );
+      if (didScroll) deletedScrollDoneRef.current = attempt;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [deletedMarkerSeq, deletedJumpAttempt, rows]);
+
+  // placeを離れたら削除標識とgap失敗は消す（render中のstate調整。effectだと
+  // 同一placeのjump後にも遅れて消えかねない）。sessionの差し替えでもgap失敗
+  // を捨てる——別の会話や世代へ古い失敗を見せない。
+  const previousScopeRef = useRef({ activePlaceKey, transportGeneration });
+  if (
+    previousScopeRef.current.activePlaceKey !== activePlaceKey ||
+    previousScopeRef.current.transportGeneration !== transportGeneration
+  ) {
+    const placeChanged =
+      previousScopeRef.current.activePlaceKey !== activePlaceKey;
+    previousScopeRef.current = { activePlaceKey, transportGeneration };
+    if (placeChanged) setDeletedMarkerSeq(null);
+    setFailedGaps(EMPTY_SET);
+  }
 
   // 現在位置をplaceごとに記憶し続ける（自前実装。routerの要素復元は
   // 「直前ページの位置を新placeへ引き継ぐ」仕様が仮想リストと衝突するため不使用）。
@@ -373,8 +476,87 @@ export function MessageList({
     });
   }, [activePlaceKey, messages, loadOlder]);
 
+  const loadGapAnchored = useCallback(
+    async (afterSeq: number, beforeSeq: number) => {
+      if (!activePlaceKey) return;
+      const rowId = `gap:${afterSeq}-${beforeSeq}`;
+      setFailedGaps((current) => {
+        if (!current.has(rowId)) return current;
+        const next = new Set(current);
+        next.delete(rowId);
+        return next;
+      });
+      // 直前の読み込み済みmessageへanchorする——挿入された区間はその直下に
+      // 現れるので、人は読み続けたところからそのまま新しい文脈へ進める。
+      // afterSeqがtombstone（描画されない）のこともある。そのときは出ている
+      // 削除標識、なければ同じ側で最も近い描画済み行へanchorする。
+      let anchorId =
+        deletedMarkerSeq === afterSeq ? `deleted:${afterSeq}` : undefined;
+      if (!anchorId) {
+        for (const message of messages ?? []) {
+          if (message.seq > afterSeq) break;
+          if (!message.deleted) anchorId = message.messageId;
+        }
+      }
+      const result = await loadGap(activePlaceKey, beforeSeq);
+      if (result === "failed") {
+        // 行はそのまま残すが、何が起きたかをその行の上にだけ正直に出す。
+        // place/session差し替えでrowIdが別会話へ紛れ込むことはない——
+        // render時にそのscopeの行だけがこのsetを引く。
+        setFailedGaps((current) => new Set(current).add(rowId));
+        return;
+      }
+      if (result !== "filled" || !anchorId) return;
+      window.requestAnimationFrame(() => {
+        virtualizerRef.current?.scrollToMessage(anchorId, {
+          align: "start",
+          behavior: "auto",
+        });
+      });
+    },
+    [activePlaceKey, messages, deletedMarkerSeq, loadGap],
+  );
+
   const renderRow = useCallback(
     (row: ListRow) => {
+      if (row.kind === "gap") {
+        const loading = loadingGaps?.includes(row.beforeSeq) ?? false;
+        const failed = failedGaps.has(row.id);
+        return (
+          <div className="flex items-center gap-3 px-4 py-2 sm:px-6">
+            <span className="h-px flex-1 bg-border" />
+            <button
+              type="button"
+              disabled={loading}
+              aria-busy={loading}
+              onClick={() => void loadGapAnchored(row.afterSeq, row.beforeSeq)}
+              className={`rounded-full border bg-background px-3 py-1 text-[12px] transition-colors disabled:opacity-60 ${
+                failed
+                  ? "border-amber-500/40 text-amber-700 hover:bg-amber-500/10 dark:text-amber-400"
+                  : "border-border text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {loading
+                ? "読み込み中…"
+                : failed
+                  ? "読み込めませんでした · 再試行"
+                  : "この間の会話を読み込む"}
+            </button>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        );
+      }
+      if (row.kind === "deleted") {
+        return (
+          <div className="flex items-center gap-3 px-4 py-1.5 sm:px-6">
+            <span className="h-px flex-1 bg-border" />
+            <span className="text-[11px] text-muted-foreground">
+              このメッセージは削除されています
+            </span>
+            <span className="h-px flex-1 bg-border" />
+          </div>
+        );
+      }
       if (row.kind === "older") {
         return (
           <div className="flex justify-center px-4 py-2">
@@ -438,7 +620,7 @@ export function MessageList({
             onCopyLink={copyLink}
             onEdit={editMessage}
             onDelete={deleteMessage2}
-            onJumpTo={flashMessage}
+            onJumpTo={jumpToMessage}
             revealedAttachmentIds={revealedAttachmentIds}
             onRevealAttachment={onRevealAttachment}
             onOpenImage={onOpenImage}
@@ -489,8 +671,11 @@ export function MessageList({
       copyLink,
       editMessage,
       deleteMessage2,
-      flashMessage,
+      jumpToMessage,
       loadOlderAnchored,
+      loadGapAnchored,
+      loadingGaps,
+      failedGaps,
       revealedAttachmentIds,
       onRevealAttachment,
       onOpenImage,
