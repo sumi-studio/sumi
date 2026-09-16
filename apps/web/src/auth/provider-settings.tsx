@@ -1579,7 +1579,10 @@ function providerSettingsError(error: unknown): string {
       case "last_login_method":
         return "最後のログイン方法は解除できません。先に別の方法を追加してください。";
       case "provider_operation_pending":
-        return "別のログイン方法の変更が処理中です。保留中の変更を再開してください。";
+        // The fencing operation belongs to another nonce — a lost browser
+        // record's unlink settling, or a change in flight elsewhere — so it
+        // cannot be resumed here. It settles on its own; retry shortly.
+        return "別のログイン方法の変更を処理しています。しばらく待ってからもう一度お試しください。";
       case "provider_unavailable":
         return "結果をまだ確認できません。接続を確認して再試行してください。";
       case "flow_expired":

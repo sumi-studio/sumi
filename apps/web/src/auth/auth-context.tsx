@@ -1714,9 +1714,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       try {
         live = await getSumiSession();
       } catch {
-        // The broadcast proves the old session ended; a read we cannot
-        // complete cannot prove a replacement session exists.
-        live = { authenticated: false };
+        // The broadcast proves the old session ended, but a read we cannot
+        // complete cannot establish what replaced it. Drop this tab's local
+        // authority while keeping the shared Firebase identity — it may now
+        // belong to a newer session this read could not see; the next
+        // successful read adopts or clears it.
+        nextGeneration();
+        teardownSessionState();
+        return;
       }
       if (live.authenticated) {
         if (

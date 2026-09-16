@@ -445,6 +445,21 @@ func (c *kosekiAuthFlowController) ProviderMethods(ctx context.Context, claims a
 	if err != nil {
 		return agentevents.ProviderMethodsResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
+	// Local credential state is read before the remote account: an active row
+	// implies its remote mutation already landed, because activation only ever
+	// follows a server-verified token or a completed browser-side link. A
+	// remote read that omits such a binding is therefore genuinely absent, not
+	// a snapshot taken before the commit.
+	credentialSubjects := make(map[string]string, 2)
+	for _, provider := range []string{"google.com", "github.com"} {
+		subject, credErr := c.store.ActiveProviderSubject(ctx, claims.UserID, provider)
+		if errors.Is(credErr, pgx.ErrNoRows) {
+			subject = ""
+		} else if credErr != nil {
+			return agentevents.ProviderMethodsResult{}, agentevents.ErrBrowserAuthProviderUnavailable
+		}
+		credentialSubjects[provider] = subject
+	}
 	readCtx, cancel := context.WithTimeout(ctx, providerUnlinkSagaTimeout)
 	defer cancel()
 	account, err := c.providers.ProviderAccount(readCtx, uid)
@@ -461,20 +476,35 @@ func (c *kosekiAuthFlowController) ProviderMethods(ctx context.Context, claims a
 	}
 	result := agentevents.ProviderMethodsResult{Providers: []string{}, Email: emailMethod}
 	for _, provider := range []string{"google.com", "github.com"} {
-		credentialSubject, credErr := c.store.ActiveProviderSubject(ctx, claims.UserID, provider)
-		if errors.Is(credErr, pgx.ErrNoRows) {
-			credentialSubject = ""
-		} else if credErr != nil {
-			return agentevents.ProviderMethodsResult{}, agentevents.ErrBrowserAuthProviderUnavailable
-		}
+		credentialSubject := credentialSubjects[provider]
 		remoteSubject, present := account.ProviderSubjects[provider]
 		if present && credentialSubject != "" && remoteSubject == credentialSubject {
 			result.Providers = append(result.Providers, provider)
 			continue
 		}
-		if credentialSubject != "" {
-			_ = c.store.DisableStaleProviderCredential(ctx, claims.UserID, uid, provider, credentialSubject)
+		if credentialSubject == "" {
+			continue
 		}
+		// Re-validate the stale observation at decision time under the
+		// credential row lock: a relink whose remote mutation landed after
+		// this read must never be retired by it.
+		_ = c.store.DisableStaleProviderCredential(ctx, claims.UserID, uid, provider, credentialSubject,
+			func(recheckCtx context.Context) (bool, error) {
+				recheckCtx, recheckCancel := context.WithTimeout(recheckCtx, providerUnlinkSagaTimeout)
+				defer recheckCancel()
+				current, err := c.providers.ProviderAccount(recheckCtx, uid)
+				if errors.Is(err, errFirebaseUserGone) {
+					return true, nil
+				}
+				if err != nil {
+					return false, err
+				}
+				if current.UID != uid {
+					return false, agentevents.ErrBrowserAuthProviderUnavailable
+				}
+				subject, present := current.ProviderSubjects[provider]
+				return !present || subject != credentialSubject, nil
+			})
 	}
 	return result, nil
 }

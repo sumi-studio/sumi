@@ -2407,6 +2407,67 @@ describe("cross-tab session end", () => {
     );
     expect(authMocks.signOut).not.toHaveBeenCalled();
   });
+
+  it("keeps the shared Firebase identity when the verification read fails", async () => {
+    let live: unknown = {
+      authenticated: true,
+      authorityBindingId: authorityBindingA,
+      user: { id: "user-a", displayName: "Before" },
+    };
+    authMocks.getSumiSession.mockImplementation(() => Promise.resolve(live));
+    const firebaseAuth = { currentUser: { uid: "firebase-user-a" } };
+    authMocks.getFirebaseAuth.mockReturnValue(firebaseAuth);
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "authenticated",
+      ),
+    );
+
+    // The other tab logged out and already signed in again as user-b, but
+    // this tab's verification read cannot complete: a transport failure does
+    // not establish that the newer identity is gone.
+    authMocks.getSumiSession.mockImplementation(() =>
+      Promise.reject(new TypeError("fetch failed")),
+    );
+    publishSessionEnded("other-tab");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("session-state")).toHaveTextContent(
+        "unauthenticated",
+      ),
+    );
+    expect(screen.getByTestId("user-id")).toHaveTextContent("none");
+    // Local authority was dropped conservatively, but the shared identity the
+    // newer session relies on is preserved — not signed out on an
+    // unverifiable read.
+    expect(authMocks.clearDirectChatAuthority).toHaveBeenCalled();
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+    expect(authMocks.logoutSumiSession).not.toHaveBeenCalled();
+
+    // The next successful read establishes the current authority and adopts
+    // the newer session — its Firebase identity is still there to serve it.
+    authMocks.getSumiSession.mockImplementation(() =>
+      Promise.resolve({
+        authenticated: true,
+        authorityBindingId: authorityBindingB,
+        user: { id: "user-b", displayName: "Bee" },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "refresh session" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("user-id")).toHaveTextContent("user-b"),
+    );
+    expect(screen.getByTestId("session-state")).toHaveTextContent(
+      "authenticated",
+    );
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+  });
 });
 
 function dispatchPersistedPageShow() {

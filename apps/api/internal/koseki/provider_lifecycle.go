@@ -509,20 +509,61 @@ func (s *Store) SettleProviderUnlink(ctx context.Context, operationID, firebaseU
 // unlink for the same UID and provider suppresses the heal: the backend-owned
 // saga still owns that credential's transition and settles it explicitly.
 // Rows are only ever disabled here, never re-enabled.
-func (s *Store) DisableStaleProviderCredential(ctx context.Context, humanID, firebaseUID, provider, providerSubject string) error {
+//
+// The decision is revalidated at write time rather than trusting the caller's
+// earlier observation: the exact credential row is locked FOR UPDATE, which
+// serializes the heal against CompleteProviderLink and
+// syncVerifiedProviderTx (their remote mutations precede their local writes),
+// and remoteStillGone must re-confirm the absence from a fresh remote read
+// taken while that lock is held. A binding that committed, or whose remote
+// identity reappeared, after the caller's snapshot is never retired by it.
+func (s *Store) DisableStaleProviderCredential(ctx context.Context, humanID, firebaseUID, provider, providerSubject string, remoteStillGone func(ctx context.Context) (bool, error)) error {
 	if humanID == "" || firebaseUID == "" || provider == "" || providerSubject == "" {
 		return ErrInvalidAuthFlow
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE credentials SET active=false, unlinked_at=now()
-		WHERE human_id=$1 AND provider=$2 AND external_subject=$3 AND active
-			AND NOT EXISTS (
-				SELECT 1 FROM provider_operations
-				WHERE firebase_uid=$4 AND provider=$2 AND status='pending' AND operation='unlink'
-			)`, humanID, provider, providerSubject, firebaseUID)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var stillActive bool
+	err = tx.QueryRow(ctx, `SELECT active FROM credentials
+		WHERE human_id=$1 AND provider=$2 AND external_subject=$3 FOR UPDATE`,
+		humanID, provider, providerSubject).Scan(&stillActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The row the earlier observation rested on no longer exists in this
+		// form; there is nothing left for it to retire.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock stale provider credential: %w", err)
+	}
+	if !stillActive {
+		return nil
+	}
+	var fenced bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM provider_operations
+			WHERE firebase_uid=$1 AND provider=$2 AND status='pending' AND operation='unlink'
+		)`, firebaseUID, provider).Scan(&fenced); err != nil {
+		return fmt.Errorf("check pending provider unlink: %w", err)
+	}
+	if fenced {
+		return nil
+	}
+	gone, err := remoteStillGone(ctx)
+	if err != nil {
+		return fmt.Errorf("revalidate stale provider credential: %w", err)
+	}
+	if !gone {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE credentials SET active=false, unlinked_at=now()
+		WHERE human_id=$1 AND provider=$2 AND external_subject=$3 AND active`,
+		humanID, provider, providerSubject); err != nil {
 		return fmt.Errorf("disable stale provider credential: %w", err)
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) FailProviderOperation(ctx context.Context, operationID, nonce, terminalOutcome string) (SecurityEvent, error) {
