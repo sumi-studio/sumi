@@ -133,6 +133,9 @@ func TestCoreInvitationEffectsClaimListAndAccept(t *testing.T) {
 	if memberID == "" || acceptOp.Response["workspace_id"] != created.WorkspaceID {
 		t.Fatalf("accept response = %+v", acceptOp.Response)
 	}
+	if acceptOp.Response["left_at"] != nil {
+		t.Fatalf("fresh accept left_at = %v, want null (active tenure)", acceptOp.Response["left_at"])
+	}
 	var memberCount int
 	if err := w.pool.QueryRow(ctx, `
 		SELECT count(*) FROM workspace_members
@@ -198,6 +201,9 @@ func TestCoreInvitationEffectsClaimListAndAccept(t *testing.T) {
 		tenureRead.Response["workspace_member_id"] != memberID {
 		t.Fatalf("consumed-invite tenure read = %+v fresh=%t err=%v", tenureRead, fresh, err)
 	}
+	if tenureRead.Response["left_at"] != nil {
+		t.Fatalf("active tenure read left_at = %v, want null", tenureRead.Response["left_at"])
+	}
 	if err := w.pool.QueryRow(ctx, `
 		SELECT count(*) FROM workspace_members
 		WHERE workspace_id = $1 AND member_kind = 'personality_agent'
@@ -207,6 +213,51 @@ func TestCoreInvitationEffectsClaimListAndAccept(t *testing.T) {
 	}
 	if memberCount != 1 {
 		t.Fatalf("memberships after tenure read = %d, want 1", memberCount)
+	}
+
+	// Closed tenure: the Human removes the secretary, then a fresh claim of
+	// the consumed invite returns the recorded tenure with left_at set —
+	// the receipt distinguishes "member" from "recorded, closed" without
+	// resurrecting the membership. An exact replay of the earlier op still
+	// returns the historical receipt (left_at null at that commit).
+	if err := w.store.RemoveMember(ctx, created.WorkspaceID, memberID, w.humanA); err != nil {
+		t.Fatalf("remove member: %v", err)
+	}
+	if _, _, err := core.SavePlan(ctx, w.agentA.ID, res.Turn.TurnID, lease.Generation, int64(4),
+		agentstate.Decision{
+			Text: "retry closed",
+			Calls: []agentstate.PlanCall{{CallID: "c", Tool: WorkspaceInvitationAcceptTool, Route: "normal",
+				Request: map[string]any{"invitation_id": invite.InviteID}}},
+		}); err != nil {
+		t.Fatalf("save plan 4: %v", err)
+	}
+	closedRead, _, fresh, err := core.ClaimOperation(ctx, w.agentA.ID, res.Turn.TurnID,
+		lease.Generation, "turn-1:op:4", WorkspaceInvitationAcceptTool, 4,
+		map[string]any{"invitation_id": invite.InviteID})
+	if err != nil || !fresh || closedRead.Status != "done" {
+		t.Fatalf("closed-tenure claim = %+v fresh=%t err=%v", closedRead, fresh, err)
+	}
+	leftAt, _ := closedRead.Response["left_at"].(string)
+	if closedRead.Response["workspace_member_id"] != memberID || leftAt == "" {
+		t.Fatalf("closed-tenure response = %+v, want member %s with left_at set",
+			closedRead.Response, memberID)
+	}
+	if err := w.pool.QueryRow(ctx, `
+		SELECT count(*) FROM workspace_members
+		WHERE workspace_id = $1 AND member_kind = 'personality_agent'
+		  AND member_id = $2 AND left_at IS NULL`,
+		created.WorkspaceID, w.agentA.ID).Scan(&memberCount); err != nil {
+		t.Fatal(err)
+	}
+	if memberCount != 0 {
+		t.Fatalf("active memberships after closed-tenure read = %d, want 0 (no resurrection)", memberCount)
+	}
+	replay, _, freshAgain, err := core.ClaimOperation(ctx, w.agentA.ID, res.Turn.TurnID,
+		lease.Generation, "turn-1:op:3", WorkspaceInvitationAcceptTool, 3,
+		map[string]any{"invitation_id": invite.InviteID})
+	if err != nil || freshAgain || replay.Response["left_at"] != nil {
+		t.Fatalf("exact replay = %+v fresh=%t err=%v, want stored active receipt",
+			replay, freshAgain, err)
 	}
 }
 

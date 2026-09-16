@@ -93,7 +93,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "workspace_invitation.accept",
     description:
-      "Accept one Workspace invitation addressed to you by its invitation_id, joining that Workspace as yourself under your current membership. Use workspace_invitation.list to find acceptable invitations first.",
+      "Accept one Workspace invitation addressed to you by its invitation_id, joining that Workspace as yourself under your current membership. The response records the tenure at the moment the invitation was resolved — a consumed invitation returns its recorded membership, whose left_at is set if that tenure has already closed. Use workspace_invitation.list to find acceptable invitations first.",
     parameters: {
       type: "object",
       properties: {

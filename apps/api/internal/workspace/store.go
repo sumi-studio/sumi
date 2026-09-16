@@ -252,8 +252,9 @@ func (s *Store) workspacePageFor(
 	return workspaceListPage{Items: items, HasMore: hasMore}, nil
 }
 
-// targetedInvitationPageFor returns one bounded live keyset page for the
-// exact PersonalityAgent authenticated by local-control.  The query filters
+// targetedInvitationPageFor returns one bounded live keyset page for one
+// exact PersonalityAgent — served to local-control callers and to the core
+// claim transaction, which passes its own tx as db.  The query filters
 // invalidated issuer tenures and authority in the same statement, excludes a
 // target that already has an active membership, and never treats the cursor
 // as target or Workspace authority.

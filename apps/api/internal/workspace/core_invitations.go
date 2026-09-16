@@ -4,8 +4,10 @@ package workspace
 // effects are registered on the agentstate store, the secretary's
 // workspace_invitation.list / workspace_invitation.accept calls execute
 // inside the operation-claim transaction, so the operation record and the
-// membership/invite-commit commit or roll back together — the guarantee the
-// runtime's local-control endpoints provided as separate HTTP calls.
+// membership/invite-commit commit or roll back together. Local-control gave
+// the runtime membership+invite atomicity; the core path additionally pairs
+// that commit with the durable operation receipt — a record of the tenure
+// at the time of the result, not a promise of current membership.
 
 import (
 	"context"
@@ -108,6 +110,16 @@ func (s *Store) applyInvitationAccept(
 	if err != nil {
 		return nil, coreInvitationFailure(err)
 	}
+	// The receipt describes the tenure as committed at this result, not a
+	// promise of current membership: a same-target retry of a consumed
+	// invite returns the recorded tenure, which may already be closed
+	// (left_at set, e.g. the Human removed the secretary). The nullable
+	// left_at matches the local-control membership wire so the model can
+	// distinguish "member" from "recorded, closed tenure".
+	var leftAt any
+	if membership.LeftAt != nil {
+		leftAt = membership.LeftAt.UTC().Format(time.RFC3339Nano)
+	}
 	return map[string]any{
 		"workspace_member_id": membership.WorkspaceMemberID,
 		"workspace_id":        membership.WorkspaceID,
@@ -119,6 +131,7 @@ func (s *Store) applyInvitationAccept(
 		"owner":        membership.Owner,
 		"role_ids":     membership.RoleIDs,
 		"joined_at":    membership.JoinedAt.UTC().Format(time.RFC3339Nano),
+		"left_at":      leftAt,
 	}, nil
 }
 
