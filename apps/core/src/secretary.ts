@@ -1287,7 +1287,7 @@ export class Secretary {
       // the wire contract the agentstate body limit applies to. Individually
       // valid arguments (e.g. two near-cap uploads) can exceed it in
       // aggregate, so the bound lives on the whole decision, not per call.
-      const planBytes = Buffer.byteLength(
+      const planBytes = utf8Bytes(
         JSON.stringify({
           generation: gen,
           turn_id: candidate.turnId,
@@ -1296,7 +1296,6 @@ export class Secretary {
           calls: candidate.calls,
           usage: candidate.usage,
         }),
-        "utf8",
       );
       if (planBytes <= PLAN_REQUEST_MAX_BYTES) {
         planBody = candidate;
@@ -1520,7 +1519,7 @@ export function summarizeToolResults(
     };
     let size = 0;
     try {
-      size = Buffer.byteLength(JSON.stringify(r.result ?? null), "utf8");
+      size = utf8Bytes(JSON.stringify(r.result ?? null));
     } catch {
       size = OUTPUT_RESULT_SUMMARY_BYTES + 1;
     }
@@ -1545,6 +1544,14 @@ function scrubJson(v: unknown): unknown {
     );
   }
   return v;
+}
+
+// UTF-8 byte length of a serialized value. TextEncoder is the portable
+// primitive — Node's Buffer does not exist on the workerd host, and the
+// plan/result budgets must measure identically on every runtime.
+const utf8Encoder = new TextEncoder();
+function utf8Bytes(s: string): number {
+  return utf8Encoder.encode(s).length;
 }
 
 /**

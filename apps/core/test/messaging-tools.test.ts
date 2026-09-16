@@ -73,6 +73,26 @@ test("oversized tool results leave the turn summary bounded", () => {
   assert.equal(typeof large!.result_bytes, "number");
 });
 
+test("tool result budgeting measures UTF-8 bytes, not string length", () => {
+  // 40k three-byte characters serialize to ~120 KB — under the 64 KiB
+  // verbatim budget in code units but far over it on the wire. A
+  // .length-based measure would let that ride the commit body.
+  const jp = "あ".repeat(40_000);
+  const [entry] = summarizeToolResults([
+    {
+      call_id: "c1",
+      tool: "messaging.open",
+      result: { content_text: jp },
+      replayed: false,
+    },
+  ]);
+  assert.equal(entry!.result, undefined);
+  assert.equal(
+    entry!.result_bytes,
+    new TextEncoder().encode(JSON.stringify({ content_text: jp })).length,
+  );
+});
+
 const ATTACHMENT = {
   attachment_id: "01h2v3attachment0000000000000a",
   filename: "図.png",

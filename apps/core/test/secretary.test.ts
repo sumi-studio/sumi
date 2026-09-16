@@ -1996,6 +1996,36 @@ test("a persistently oversized decision fails honestly — nothing unrecorded ra
   assert.ok(!evs.some((e) => e.kind === "tool_result"));
 });
 
+// The plan budget is a UTF-8 byte contract — the wire size the state
+// service limits. Multibyte text crosses it long before its character count
+// reaches the bound; a code-unit (.length) measure would record the
+// unrecordable plan and fail opaquely at the server instead.
+test("a multibyte decision is measured in UTF-8 bytes at the plan boundary", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-jp", "レポートをまとめて");
+
+  // ~4.5 MB of UTF-8 in 1.5M characters — under the budget as a code-unit
+  // count, over it on the wire. The scripted provider re-emits it on every
+  // consult, so the bounded re-plan exhausts into the recorded failure.
+  const provider = new ScriptedProvider({ text: "あ".repeat(1_500_000) });
+  const s = new Secretary(cfg(state, "test-1", { provider }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+
+  assert.equal(provider.consultations.length, 3); // initial + 2 re-plans
+  const input = state.inputs.find((i) => i.input_id === "in-jp")!;
+  assert.equal(input.status, "done");
+  const outbox = await state.outbox(PERSONA, 0);
+  const failed = outbox.find((o) => o.kind === "turn_failed");
+  assert.ok(failed, "multibyte oversize must resolve as a recorded failure");
+  assert.match(
+    (failed!.payload as { error: string }).error,
+    /request budget/,
+  );
+  assert.equal(state.plans.size, 0);
+});
+
 test("an oversized plan's tool calls never reach the operation ledger", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
