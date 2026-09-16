@@ -198,7 +198,7 @@ test("base comparison rejects malformed candidate and base history", () => {
   );
 });
 
-test("base comparison rejects two versions and a forward gap", () => {
+test("base comparison accepts a contiguous multi-version append", () => {
   const twoVersions =
     sealed +
     nextPair +
@@ -206,17 +206,18 @@ test("base comparison rejects two versions and a forward gap", () => {
     "\n" +
     line(18, "profiles", "up", "7") +
     "\n";
-  assert.throws(
-    () =>
-      validateCandidateAgainstBase({
-        baseManifest: sealed,
-        baseActual: sealed,
-        candidateManifest: twoVersions,
-        candidateActual: twoVersions,
-      }),
-    /exactly one new migration version/,
+  assert.equal(
+    validateCandidateAgainstBase({
+      baseManifest: sealed,
+      baseActual: sealed,
+      candidateManifest: twoVersions,
+      candidateActual: twoVersions,
+    }),
+    "contiguous extension of 2 versions",
   );
+});
 
+test("base comparison rejects a skipped or non-contiguous new version", () => {
   const gap =
     sealed +
     line(18, "profiles", "down", "8") +
@@ -232,6 +233,69 @@ test("base comparison rejects two versions and a forward gap", () => {
         candidateActual: gap,
       }),
     /immediately follow sealed maximum/,
+  );
+
+  const nonContiguous =
+    sealed +
+    nextPair +
+    line(19, "profiles", "down", "8") +
+    "\n" +
+    line(19, "profiles", "up", "7") +
+    "\n";
+  assert.throws(
+    () =>
+      validateCandidateAgainstBase({
+        baseManifest: sealed,
+        baseActual: sealed,
+        candidateManifest: nonContiguous,
+        candidateActual: nonContiguous,
+      }),
+    /immediately follow sealed maximum/,
+  );
+});
+
+test("base comparison rejects an incomplete or replayed append", () => {
+  const missingDown = `${sealed}${line(17, "workspace", "up", "e")}\n`;
+  assert.throws(
+    () =>
+      validateCandidateAgainstBase({
+        baseManifest: sealed,
+        baseActual: sealed,
+        candidateManifest: missingDown,
+        candidateActual: missingDown,
+      }),
+    /matching up\/down pair/,
+  );
+
+  const replayedOldVersion =
+    sealed +
+    line(15, "other", "down", "f") +
+    "\n" +
+    line(15, "other", "up", "e") +
+    "\n";
+  assert.throws(
+    () =>
+      validateCandidateAgainstBase({
+        baseManifest: sealed,
+        baseActual: sealed,
+        candidateManifest: replayedOldVersion,
+        candidateActual: replayedOldVersion,
+      }),
+    /canonical filename order|immediately follow sealed maximum/,
+  );
+});
+
+test("extend still refuses more than one new version", () => {
+  const twoVersions =
+    sealed +
+    nextPair +
+    line(18, "profiles", "down", "8") +
+    "\n" +
+    line(18, "profiles", "up", "7") +
+    "\n";
+  assert.throws(
+    () => validateExtension(sealed, twoVersions),
+    /exactly one new migration version/,
   );
 });
 

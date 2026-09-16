@@ -104,7 +104,10 @@ export function validateExactSeal(expectedText, actualText) {
   }
 }
 
-export function validateExtension(expectedText, actualText) {
+// appendedEntries performs the shared immutable-prefix check: every sealed
+// base line must survive byte-for-byte in the same canonical position, so the
+// only permitted difference is a suffix of appended entries.
+function appendedEntries(expectedText, actualText) {
   validateSeal(expectedText);
   validateSeal(actualText);
   const expected = entries(expectedText);
@@ -116,8 +119,14 @@ export function validateExtension(expectedText, actualText) {
       );
     }
   }
-  const added = actual.slice(expected.length);
-  const sealedMaximum = Math.max(...expected.map((entry) => entry.version));
+  return {
+    added: actual.slice(expected.length),
+    sealedMaximum: Math.max(...expected.map((entry) => entry.version)),
+  };
+}
+
+export function validateExtension(expectedText, actualText) {
+  const { added, sealedMaximum } = appendedEntries(expectedText, actualText);
   const addedVersions = new Set(added.map((entry) => entry.version));
   if (addedVersions.size !== 1) {
     throw new Error("extend must seal exactly one new migration version");
@@ -138,6 +147,36 @@ export function validateExtension(expectedText, actualText) {
       `migration version ${newVersion} must add one matching up/down pair`,
     );
   }
+}
+
+// validateContiguousAppend verifies a candidate manifest against an immutable
+// base seal. Unlike `extend` — the authoring command that deliberately seals
+// one new version per invocation — a candidate can legitimately accumulate
+// several valid appends, so verification accepts a nonempty contiguous run of
+// new versions after the sealed maximum. validateSeal already guarantees each
+// appended version is a complete same-stem up/down pair, and canonical entry
+// ordering plus the prefix check keep appended versions ascending after every
+// preserved base entry.
+export function validateContiguousAppend(expectedText, actualText) {
+  const { added, sealedMaximum } = appendedEntries(expectedText, actualText);
+  const addedVersions = [];
+  for (const entry of added) {
+    if (addedVersions[addedVersions.length - 1] !== entry.version) {
+      addedVersions.push(entry.version);
+    }
+  }
+  if (addedVersions.length === 0) {
+    throw new Error("candidate seal is missing the sealed base entries");
+  }
+  for (const [index, version] of addedVersions.entries()) {
+    const expected = sealedMaximum + 1 + index;
+    if (version !== expected) {
+      throw new Error(
+        `new migration version ${version} must immediately follow sealed maximum ${sealedMaximum} without gaps`,
+      );
+    }
+  }
+  return addedVersions;
 }
 
 // validateCandidateAgainstBase compares two complete snapshots. baseManifest
@@ -166,8 +205,10 @@ export function validateCandidateAgainstBase({
   if (candidateManifest === baseManifest) {
     return "unchanged seal";
   }
-  validateExtension(baseManifest, candidateManifest);
-  return "one-version extension";
+  const addedVersions = validateContiguousAppend(baseManifest, candidateManifest);
+  return addedVersions.length === 1
+    ? "one-version extension"
+    : `contiguous extension of ${addedVersions.length} versions`;
 }
 
 async function gitOutput(root, args) {
