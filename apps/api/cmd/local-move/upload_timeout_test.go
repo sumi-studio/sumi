@@ -5,6 +5,7 @@ package main
 // exercised against an owned endpoint with a short test configuration.
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,6 +257,128 @@ func TestUploadStopsWhenTheAnswerStallsAfterHeaders(t *testing.T) {
 	}
 	c.provision(uid, sid)
 	expect(t, m.Resume(c.ctx), exitDone, out, "Choose a model connection")
+}
+
+// transferTail is the HTTP/1.1 chunked last-chunk terminator. It can only be
+// written after the request body reader returned EOF — i.e. after
+// progress.done is already true. Holding this write stands in for a kernel
+// send queue that fills exactly at the end of the body.
+var transferTail = []byte("\r\n0\r\n\r\n")
+
+type tailBlockConn struct {
+	net.Conn
+	tail    []byte
+	held    chan<- struct{}
+	release <-chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *tailBlockConn) Write(b []byte) (int, error) {
+	joined := append(append([]byte(nil), c.tail...), b...)
+	if bytes.HasSuffix(joined, transferTail) {
+		select {
+		case c.held <- struct{}{}:
+		default:
+		}
+		// A kernel-blocked socket write does not outlive its socket: the
+		// hold ends when the connection closes, the way closing a wedged
+		// conn releases a real pending write.
+		select {
+		case <-c.release:
+		case <-c.closed:
+		}
+	}
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.tail = append(c.tail, b[:n]...)
+		if len(c.tail) > len(transferTail) {
+			c.tail = c.tail[len(c.tail)-len(transferTail):]
+		}
+	}
+	return n, err
+}
+
+func (c *tailBlockConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// A socket that stops accepting bytes exactly at the chunked terminator is
+// the post-EOF liveness gap: the body's last byte has been read, so only the
+// transport's final buffered write is still outstanding. The attempt must
+// end on the answer bound, the seal untouched, and a healthy resume must
+// still finish the same move.
+func TestUploadStopsWhenTheFinalWriteSticks(t *testing.T) {
+	c := setupMove(t)
+	uid := "fixture-tail-" + c.pid[24:]
+	sid, moveURL := c.newSession(uid)
+	fillSecretary(t, c, 30, 4096)
+
+	quiet := make(chan struct{})
+	t.Cleanup(func() { close(quiet) })
+	c.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPut {
+			return false
+		}
+		_, _ = io.CopyN(io.Discard, r.Body, 1024)
+		select {
+		case <-quiet:
+		case <-r.Context().Done():
+		}
+		return true
+	})
+
+	m, out := c.mover()
+	m.stall = 300 * time.Millisecond
+	answerBound(m, 400*time.Millisecond)
+
+	held := make(chan struct{}, 8)
+	release := make(chan struct{})
+	tr := m.client.Transport.(*http.Transport)
+	dial := tr.DialContext
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &tailBlockConn{Conn: conn, held: held, release: release, closed: make(chan struct{})}, nil
+	}
+	t.Cleanup(func() { close(release) })
+
+	done := make(chan int, 1)
+	go func() { done <- m.Start(c.ctx, moveURL) }()
+	select {
+	case code := <-done:
+		if code != exitPending {
+			t.Fatalf("start against a stuck final write: %d\n%s", code, out)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("a stuck final write held the command past its bound:\n%s", out)
+	}
+	if len(held) == 0 {
+		t.Fatal("the final terminator write was never exercised")
+	}
+	if !strings.Contains(out.String(), "stays sealed") {
+		t.Fatalf("output does not say where the secretary stands:\n%s", out)
+	}
+	if a := authority(t, c.local, c.pid); a != "sealed" {
+		t.Fatalf("authority after the stuck final write: %s", a)
+	}
+	if n := exportRows(t, c.local, c.pid); n != 1 {
+		t.Fatalf("export rows after the stuck final write: %d", n)
+	}
+	if s := c.sessionStatus(sid); s != "awaiting_bundle" {
+		t.Fatalf("session after the stuck final write: %s", s)
+	}
+
+	// The released stuck writes are done; a healthy command on the same
+	// recorded move finishes it.
+	c.setIntercept(nil)
+	m2, out2 := c.mover()
+	expect(t, m2.Resume(c.ctx), exitPending, out2, "waiting for the registration")
+	c.provision(uid, sid)
+	expect(t, m2.Resume(c.ctx), exitDone, out2, "Choose a model connection")
 }
 
 // A slow connection that keeps moving is not a stall: the upload finishes

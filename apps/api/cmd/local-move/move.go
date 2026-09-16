@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -675,7 +676,18 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 
 	body := &progress{r: pr}
 	body.last.Store(time.Now().UnixNano())
-	var stalled atomic.Bool
+	var stalled, tailExpired, answered atomic.Bool
+	// The body's last byte leaving the reader is not the end of the write:
+	// the transport still flushes the chunked terminator, and that write can
+	// block on a socket that stopped accepting bytes at exactly that point —
+	// while the response-header bound only arms once the write completes.
+	// From body EOF until Cloud's answer starts, the answer bound owns the
+	// wait; once the first response byte arrives the read-side bounds take
+	// over. (WroteRequest cannot mark the boundary: it fires inside the
+	// request write, before the blocking flush.)
+	uctx = httptrace.WithClientTrace(uctx, &httptrace.ClientTrace{
+		GotFirstResponseByte: func() { answered.Store(true) },
+	})
 	watch := make(chan struct{})
 	defer close(watch)
 	go func() {
@@ -688,14 +700,20 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 			case <-uctx.Done():
 				return
 			case <-tick.C:
-				if body.done.Load() {
-					// The whole bundle is out. Waiting for the answer is
-					// not a stall — Cloud is verifying and importing it —
-					// and answerTimeout bounds that wait instead.
+				last := time.Unix(0, body.last.Load())
+				if !body.done.Load() {
+					if time.Since(last) >= m.stall {
+						stalled.Store(true)
+						cancel()
+						return
+					}
+					continue
+				}
+				if answered.Load() {
 					return
 				}
-				if time.Since(time.Unix(0, body.last.Load())) >= m.stall {
-					stalled.Store(true)
+				if time.Since(last) >= m.answer {
+					tailExpired.Store(true)
 					cancel()
 					return
 				}
@@ -707,6 +725,10 @@ func (m *mover) upload(ctx context.Context, st *moveState) error {
 	if stalled.Load() && ctx.Err() == nil {
 		return fmt.Errorf("%w: %v for %s; the secretary stays sealed and the bundle is sent again",
 			errUnreachable, errStalled, m.stall)
+	}
+	if tailExpired.Load() && !answered.Load() && ctx.Err() == nil {
+		return fmt.Errorf("%w: the bundle was sent but no answer came for %s; the secretary stays sealed and the bundle is sent again",
+			errUnreachable, m.answer)
 	}
 	if err != nil {
 		return err
