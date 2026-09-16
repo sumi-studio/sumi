@@ -50,6 +50,11 @@ type CoreDirectChat struct {
 
 	mu       sync.Mutex
 	personas map[string]*coreDirectChatPersona
+	// idleReadHook is test-only synchronization invoked inside
+	// closeRunIfIdle after the idleness read resolves and before the
+	// conditional END append — a regression parks the sweep in exactly the
+	// window a stale idle observation races, without sleeps.
+	idleReadHook func()
 }
 
 type coreDirectChatPersona struct {
@@ -469,8 +474,21 @@ func (c *CoreDirectChat) emit(ctx context.Context, personaID string, st *coreDir
 // committed log state under the event-file lock: a stale projector that
 // thinks a run is open commits nothing, and a stale projector that thinks
 // none is open still closes one another writer left behind.
+//
+// The idleness read itself can go stale: a second projector may commit a new
+// busy period between LiveDirectChatInputs and this append. The END request
+// therefore carries the event tail observed BEFORE the PG read; under the
+// append lock the gateway refuses it if the committed tail moved — an input
+// admitted with nothing projected yet may legitimately follow this END and
+// open its own run, but a committed live approval (or any other new event)
+// must not lose its run. A refused END is re-evaluated on the next sweep
+// with a fresh mark.
 func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string) error {
+	mark := c.Gateway.observedEventTail(personaID)
 	live, err := c.Core.LiveDirectChatInputs(ctx, personaID)
+	if c.idleReadHook != nil {
+		c.idleReadHook()
+	}
 	if err != nil {
 		return err
 	}
@@ -478,7 +496,7 @@ func (c *CoreDirectChat) closeRunIfIdle(ctx context.Context, personaID string) e
 		return nil
 	}
 	return c.Gateway.AppendProjectedEvents(ctx, personaID,
-		[]ProjectedEvent{{RunMarker: RunMarkerEnd}})
+		[]ProjectedEvent{{RunMarker: RunMarkerEnd, IfTail: &mark}})
 }
 
 func (c *CoreDirectChat) projectJournal(ctx context.Context, personaID string, st *coreDirectChatPersona) error {

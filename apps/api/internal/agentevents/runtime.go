@@ -85,7 +85,6 @@ type DurableGateway struct {
 	// interval after an event is durably appended but before its derived state
 	// is updated.
 	stateMu          sync.RWMutex
-	stateRebuilt     map[string]bool
 	runInFlight      map[string]bool
 	pendingApprovals map[string]map[string]bool
 }
@@ -94,6 +93,10 @@ type personalityAgentLogState struct {
 	eventSeq  uint64
 	eventSize int64
 	eventCRC  uint32
+	// tailObserved records that a refresh under the event-file lock has
+	// folded this persona's committed log into the session guards — the
+	// diagnostic distinction between "verified idle" and "never looked".
+	tailObserved bool
 	// runStarts/runOpen are the committed run-marker state, folded from
 	// every event line as it is observed under the event-file lock (own
 	// appends and other writers' tails alike). Projected lifecycle markers
@@ -321,7 +324,6 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		MaxBrowserSessionRevocations: maxRevokedSessions,
 		tails:                        make(map[string]*personalityAgentLogState),
 		browserSubscribers:           make(map[string]map[uint64]chan browserVolatileBatch),
-		stateRebuilt:                 make(map[string]bool),
 		runInFlight:                  make(map[string]bool),
 		pendingApprovals:             make(map[string]map[string]bool),
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
@@ -1152,9 +1154,18 @@ func (g *DurableGateway) withCurrentGeneration(
 	return call()
 }
 
+// errTornDurableEventTail marks a partial final event record — a crash mid-
+// write left bytes that no newline terminated. Unlike every other decode
+// failure this is repairable: the next writer would truncate the record under
+// the event-file lock anyway, so read paths may do the same and re-verify.
+var errTornDurableEventTail = errors.New("durable event log tail is torn")
+
 // EventCatchUp returns the durable event suffix after lastConsumedSeq. It
 // verifies the complete retained log on every read, so a gap or corrupt record
 // fails closed rather than being silently skipped during browser reconnect.
+// A torn final record is first repaired under the exclusive event-file lock —
+// the same truncation the append path performs — then re-verified; malformed
+// complete records and non-contiguous data remain hard errors.
 func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID string, lastConsumedSeq uint64) ([]Envelope, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1165,6 +1176,17 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID st
 	if lastConsumedSeq > maxJSONSafeInteger {
 		return nil, fmt.Errorf("browser event cursor %d exceeds JSON-safe integer range", lastConsumedSeq)
 	}
+	out, err := g.eventCatchUpScan(ctx, personalityAgentID, lastConsumedSeq)
+	if errors.Is(err, errTornDurableEventTail) {
+		if repairErr := g.RefreshDurableEventTail(ctx, personalityAgentID); repairErr != nil {
+			return nil, err
+		}
+		out, err = g.eventCatchUpScan(ctx, personalityAgentID, lastConsumedSeq)
+	}
+	return out, err
+}
+
+func (g *DurableGateway) eventCatchUpScan(ctx context.Context, personalityAgentID string, lastConsumedSeq uint64) ([]Envelope, error) {
 	path := g.eventPath(personalityAgentID)
 	file, err := g.newFile(path, os.O_RDONLY, 0o600)
 	if os.IsNotExist(err) {
@@ -1188,6 +1210,9 @@ func (g *DurableGateway) EventCatchUp(ctx context.Context, personalityAgentID st
 		if len(trimmed) != 0 {
 			var record durableEventRecord
 			if err := json.Unmarshal(trimmed, &record); err != nil {
+				if errors.Is(readErr, io.EOF) && isIncompleteJSONError(err) {
+					return nil, fmt.Errorf("decode durable event log for browser replay: %w", errTornDurableEventTail)
+				}
 				return nil, fmt.Errorf("decode durable event log for browser replay: %w", err)
 			}
 			if record.Seq != previous+1 {
@@ -1381,7 +1406,7 @@ func (g *DurableGateway) LastReceivedEventSeq(ctx context.Context, claims TokenC
 		return 0, fmt.Errorf("lock durable event log for read: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
-	if err := g.refreshEventTailLocked(file, st); err != nil {
+	if err := g.refreshEventTailLocked(file, st, claims.PersonalityAgentID); err != nil {
 		return 0, err
 	}
 	return st.eventSeq, nil
@@ -1689,6 +1714,34 @@ type ProjectedEvent struct {
 	Event     json.RawMessage
 	DedupKey  [sha256.Size]byte
 	RunMarker string
+	// IfTail is a staleness precondition for callers that decided this
+	// emission on an observation made outside the event-file lock (for
+	// example an idleness read against PG): the element is emitted only if
+	// the committed tail under the lock still equals the mark the caller
+	// captured with observedEventTail BEFORE that observation. A skipped
+	// element consumes no seq and no marker identity; the caller re-
+	// evaluates on its next pass.
+	IfTail *EventTailMark
+}
+
+// EventTailMark identifies one committed event-log tail: the seq plus the
+// running CRC of the log's content, so an equality check under the append
+// lock detects every committed change — appends, rewrites, truncations —
+// since the mark was taken.
+type EventTailMark struct {
+	Seq uint64
+	CRC uint32
+}
+
+// observedEventTail returns the event-log tail this gateway last folded
+// under the event-file lock. It is a cheap read of committed state — a mark
+// older than another writer's commits simply fails the IfTail check once and
+// the caller re-marks with the refreshed tail on its next pass.
+func (g *DurableGateway) observedEventTail(personalityAgentID string) EventTailMark {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	st := g.stateFor(personalityAgentID)
+	return EventTailMark{Seq: st.eventSeq, CRC: st.eventCRC}
 }
 
 // Run-marker kinds understood by AppendProjectedEvents.
@@ -1955,7 +2008,7 @@ func (g *DurableGateway) AppendProjectedEvents(
 		return fmt.Errorf("lock durable event log for projected append: %w", err)
 	}
 	defer func() { _ = unlockDurableFile(file) }()
-	if err := g.refreshEventTailLocked(file, st); err != nil {
+	if err := g.refreshEventTailLocked(file, st, personalityAgentID); err != nil {
 		return err
 	}
 
@@ -1984,10 +2037,18 @@ func (g *DurableGateway) AppendProjectedEvents(
 	}
 
 	// Pass 1: which content elements are new? Markers are decided in pass 2.
+	// The staleness precondition (IfTail) is evaluated against the just-
+	// refreshed committed tail — st.eventSeq/eventCRC do not change while the
+	// batch emits, so an element decided on a stale observation is skipped
+	// here and in pass 2 alike.
 	commit := make([]bool, len(events))
 	elemKey := make([][sha256.Size]byte, len(events))
 	for i, pe := range events {
 		if pe.RunMarker != "" {
+			continue
+		}
+		if pe.IfTail != nil &&
+			(st.eventSeq != pe.IfTail.Seq || st.eventCRC != pe.IfTail.CRC) {
 			continue
 		}
 		key := pe.DedupKey
@@ -2013,6 +2074,12 @@ func (g *DurableGateway) AppendProjectedEvents(
 	simOpen := st.runOpen
 	simStarts := st.runStarts
 	for i, pe := range events {
+		if pe.IfTail != nil &&
+			(st.eventSeq != pe.IfTail.Seq || st.eventCRC != pe.IfTail.CRC) {
+			// The observation this element was decided on is no longer
+			// current — skip without consuming a seq or marker identity.
+			continue
+		}
 		var eventBytes json.RawMessage
 		var key [sha256.Size]byte
 		switch pe.RunMarker {
@@ -2137,7 +2204,7 @@ func (g *DurableGateway) appendDurableEventLocked(
 	}
 	defer func() { _ = unlockDurableFile(file) }()
 
-	if err := g.refreshEventTailLocked(file, st); err != nil {
+	if err := g.refreshEventTailLocked(file, st, personalityAgentID); err != nil {
 		return err
 	}
 	if record.Seq != st.eventSeq+1 {
@@ -2232,32 +2299,56 @@ func (g *DurableGateway) applyEventStateLocked(personalityAgentID string, event 
 	}
 }
 
-// EnsureAgentSessionStateRebuilt reconstructs the in-flight and pending-approval
-// command guard state for personalityAgentID from the durable event log. It is called
-// by the browser WebSocket before command admission begins so that guards remain
-// authoritative across API process restarts. If the durable log is corrupt,
-// non-contiguous, or otherwise unreadable, reconstruction returns an error and
-// the caller must fail closed rather than admitting commands.
-func (g *DurableGateway) EnsureAgentSessionStateRebuilt(ctx context.Context, personalityAgentID string) error {
-	g.mu.Lock()
+// RefreshDurableEventTail advances this process's cached view of the committed
+// event log under the exclusive event-file lock: records another writer
+// appended are folded into run and session-guard state, and a torn or
+// unterminated tail left by a crashed writer is truncated exactly as the
+// append path repairs it. Read/guard paths that must reflect committed state
+// call this before consulting the in-memory maps. Malformed complete records
+// and non-contiguous data still fail closed.
+func (g *DurableGateway) RefreshDurableEventTail(ctx context.Context, personalityAgentID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := ValidatePersonalityAgentID(personalityAgentID); err != nil {
+		return err
+	}
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return err
+	}
 	defer g.mu.Unlock()
-
-	if g.stateRebuilt[personalityAgentID] {
+	st := g.stateFor(personalityAgentID)
+	file, err := g.newFile(g.eventPath(personalityAgentID), os.O_RDWR, 0o600)
+	if os.IsNotExist(err) {
+		// No committed log: guards must reflect an empty history.
+		g.resetEventTailLocked(st, personalityAgentID)
+		st.tailObserved = true
 		return nil
 	}
-
-	events, err := g.EventCatchUp(ctx, personalityAgentID, 0)
 	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock durable event log for tail refresh: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+	return g.refreshEventTailLocked(file, st, personalityAgentID)
+}
+
+// EnsureAgentSessionStateRebuilt refreshes the in-flight and pending-approval
+// command guard state for personalityAgentID from the committed event log.
+// It is called by the browser WebSocket before command admission begins so
+// that guards remain authoritative across API process restarts — and against
+// writers on other processes: every call folds the newly committed tail
+// rather than latching a one-shot rebuild, so a pending approval committed
+// by a sibling API process becomes visible without a restart. If the durable
+// log is corrupt, non-contiguous, or otherwise unreadable, refresh returns an
+// error and the caller must fail closed rather than admitting commands.
+func (g *DurableGateway) EnsureAgentSessionStateRebuilt(ctx context.Context, personalityAgentID string) error {
+	if err := g.RefreshDurableEventTail(ctx, personalityAgentID); err != nil {
 		return fmt.Errorf("rebuild agent session state: %w", err)
 	}
-
-	g.stateMu.Lock()
-	for _, envelope := range events {
-		g.applyEventStateLocked(personalityAgentID, envelope.Event)
-	}
-	g.stateRebuilt[personalityAgentID] = true
-	g.stateMu.Unlock()
-
 	return nil
 }
 
@@ -2423,7 +2514,24 @@ func (g *DurableGateway) appendCommandAck(
 	})
 }
 
-func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *personalityAgentLogState) error {
+// resetEventTailLocked drops the cached committed-tail position so the caller
+// rescans the log from the beginning. Session guards derived from the same
+// committed records are cleared alongside it: the rescan refolds them from
+// scratch, and a stale entry must never outlive the history that minted it.
+func (g *DurableGateway) resetEventTailLocked(st *personalityAgentLogState, personalityAgentID string) {
+	st.eventSeq = 0
+	st.eventSize = 0
+	st.eventCRC = 0
+	st.runStarts = 0
+	st.runOpen = false
+	st.tailObserved = false
+	g.stateMu.Lock()
+	delete(g.pendingApprovals, personalityAgentID)
+	delete(g.runInFlight, personalityAgentID)
+	g.stateMu.Unlock()
+}
+
+func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *personalityAgentLogState, personalityAgentID string) error {
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("seek durable event log: %w", err)
@@ -2439,17 +2547,9 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 		if crc == st.eventCRC {
 			return nil
 		}
-		st.eventSeq = 0
-		st.eventSize = 0
-		st.eventCRC = 0
-		st.runStarts = 0
-		st.runOpen = false
+		g.resetEventTailLocked(st, personalityAgentID)
 	} else if size < st.eventSize {
-		st.eventSeq = 0
-		st.eventSize = 0
-		st.eventCRC = 0
-		st.runStarts = 0
-		st.runOpen = false
+		g.resetEventTailLocked(st, personalityAgentID)
 	}
 	if st.eventSize > 0 && size > st.eventSize {
 		// Before scanning an appended tail, confirm the existing prefix has
@@ -2459,11 +2559,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 			return fmt.Errorf("checksum durable event log prefix: %w", err)
 		}
 		if prefixCRC != st.eventCRC {
-			st.eventSeq = 0
-			st.eventSize = 0
-			st.eventCRC = 0
-			st.runStarts = 0
-			st.runOpen = false
+			g.resetEventTailLocked(st, personalityAgentID)
 		}
 	}
 
@@ -2521,6 +2617,11 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 		}
 		last = existing.Seq
 		foldRunMarkerLocked(st, existing.Event.Event)
+		// Session guards follow the same committed-state rule as run
+		// markers: every record another writer appended since this process
+		// last looked is folded now, under the event lock, so command
+		// admission on this process sees them without waiting for a restart.
+		g.updateAgentSessionStateLocked(personalityAgentID, existing.Event.Event)
 
 		if readErr == io.EOF {
 			if len(line) > 0 && line[len(line)-1] != '\n' {
@@ -2543,6 +2644,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 	st.eventSeq = last
 	st.eventSize = offset
 	st.eventCRC = crc
+	st.tailObserved = true
 	return nil
 }
 

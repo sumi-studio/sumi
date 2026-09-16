@@ -1,6 +1,7 @@
 package agentevents
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1209,9 +1210,9 @@ func TestCoreDirectChatPhantomIndexRecordDoesNotSuppress(t *testing.T) {
 	}
 }
 
-// A torn event tail (crash mid-line) must fail reads closed, then heal on
-// the next write: refreshEventTailLocked truncates the partial record and
-// the projector appends cleanly.
+// A torn event tail (crash mid-line) heals on the next access: read paths
+// repair the partial record under the event lock and serve the committed
+// prefix, so the projector appends cleanly.
 func TestCoreDirectChatTornEventTailHealsOnAppend(t *testing.T) {
 	f := newCoreDirectChatFixture(t)
 	a, gwA := f.adapter, f.gateway
@@ -1232,9 +1233,16 @@ func TestCoreDirectChatTornEventTailHealsOnAppend(t *testing.T) {
 		t.Fatalf("torn close: %v", err)
 	}
 
-	if _, err := gwA.EventCatchUp(f.ctx, f.pa, 0); err == nil {
-		t.Fatal("torn event tail was silently served")
+	// The read path repairs the torn record under the event lock and serves
+	// the committed prefix — never the partial bytes themselves.
+	prefix, err := gwA.EventCatchUp(f.ctx, f.pa, 0)
+	if err != nil {
+		t.Fatalf("torn tail not repaired on read: %v", err)
 	}
+	if n := len(durableEvents(t, gwA, f.pa)); len(prefix) != n {
+		t.Fatalf("catch-up after repair returned %d events, log holds %d", len(prefix), n)
+	}
+	assertEnvelopeIntegrity(t, prefix)
 
 	env2 := f.sendOn(t, a, "k2", "second")
 	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
@@ -1286,5 +1294,334 @@ func TestCoreDirectChatStaleProjectorNoContradictoryReceipt(t *testing.T) {
 	}
 	if len(statuses) != 1 || statuses[0] != "applied" {
 		t.Fatalf("decision command has contradictory receipts: %v", statuses)
+	}
+}
+
+// F271: a projector whose idleness read goes stale must not close a run
+// another projector opened. closeRunIfIdle anchors the END to the event
+// tail observed before the PG read; the parked-hook rendezvous reproduces
+// the exact race window deterministically — no sleeps.
+func TestCoreDirectChatStaleIdleEndRefusedKeepsApproval(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	// A sweeps once at idle so its persona state is loaded; nothing commits.
+	syncOn(t, a, f.pa)
+
+	// Park A inside closeRunIfIdle after LiveDirectChatInputs resolved to 0
+	// and before the END append — the interleaving the review reproduced
+	// with a sleep, here a real rendezvous.
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	a.idleReadHook = func() {
+		close(parked)
+		<-release
+	}
+	staleEnd := make(chan error, 1)
+	go func() { staleEnd <- a.closeRunIfIdle(context.Background(), f.pa) }()
+	select {
+	case <-parked:
+	case <-time.After(15 * time.Second):
+		t.Fatal("closeRunIfIdle did not reach the post-read rendezvous")
+	}
+
+	// B (second projector: own gateway over the same dir and PG store)
+	// projects a whole new busy period — run opens, approval parks, the
+	// input stays 'waiting'.
+	b, gwB := f.newProjector(t)
+	env := f.sendOn(t, b, "k1", "hold this")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env.CommandID)
+	syncOn(t, b, f.pa)
+
+	mid := eventTypes(durableEvents(t, gwB, f.pa))
+	if !containsEvent(mid, "agent_start") || !containsEvent(mid, "approval_requested") {
+		t.Fatalf("busy period not projected by B: %v", mid)
+	}
+	if containsEvent(mid, "agent_end") {
+		t.Fatalf("run closed before the stale request lands: %v", mid)
+	}
+	if live, err := f.core.LiveDirectChatInputs(f.ctx, f.pa); err != nil || live != 1 {
+		t.Fatalf("parked input must be live: live=%d err=%v", live, err)
+	}
+
+	// Release A. Its END was decided on the pre-busy-period tail; under the
+	// append lock the committed tail has moved, so it must be refused.
+	close(release)
+	if err := <-staleEnd; err != nil {
+		t.Fatalf("stale closeRunIfIdle: %v", err)
+	}
+	a.idleReadHook = nil
+
+	after := durableEvents(t, gwB, f.pa)
+	types := eventTypes(after)
+	if containsEvent(types, "agent_end") {
+		t.Fatalf("stale END committed mid-busy-period: %v", types)
+	}
+	if !gwB.IsApprovalPending(f.pa, approvalID) {
+		t.Fatal("approval must still be pending after the refused END")
+	}
+
+	// The pending approval resolves and the turn completes — the whole busy
+	// period must land in ONE run, closed by a later genuine idle pass (A's
+	// own next sweep, with a fresh mark).
+	if _, err := f.core.ResolveApproval(f.ctx, f.pa, approvalID, agentstate.ApprovalDecision{
+		Decision: "approve_once", DecisionID: "d1", DecidedByKind: "human", DecidedByID: f.user,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env.CommandID, "resumed reply")
+	syncOn(t, a, f.pa)
+
+	final := durableEvents(t, gwA, f.pa)
+	assertEnvelopeIntegrity(t, final)
+	types = eventTypes(final)
+	if n := countEvent(types, "agent_start"); n != 1 {
+		t.Fatalf("busy period must stay one run; types=%v", types)
+	}
+	if n := countEvent(types, "agent_end"); n != 1 || types[len(types)-1] != "agent_end" {
+		t.Fatalf("genuine idle close must land exactly once at the tail; types=%v", types)
+	}
+	if n := countEvent(types, "approval_resolved"); n != 1 {
+		t.Fatalf("approval_resolved missing: %v", types)
+	}
+	// A replayed sweep must not mint a second end.
+	syncOn(t, a, f.pa)
+	syncOn(t, b, f.pa)
+	if n := countEvent(eventTypes(durableEvents(t, gwA, f.pa)), "agent_end"); n != 1 {
+		t.Fatalf("replayed sweeps minted extra ends; n=%d", n)
+	}
+}
+
+// Same staleness without an approval: the refused END must not split one
+// logical busy period into two durable runs.
+func TestCoreDirectChatStaleIdleEndDoesNotSplitBusyPeriod(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a := f.adapter
+	syncOn(t, a, f.pa)
+
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	a.idleReadHook = func() {
+		close(parked)
+		<-release
+	}
+	staleEnd := make(chan error, 1)
+	go func() { staleEnd <- a.closeRunIfIdle(context.Background(), f.pa) }()
+	select {
+	case <-parked:
+	case <-time.After(15 * time.Second):
+		t.Fatal("closeRunIfIdle did not reach the post-read rendezvous")
+	}
+
+	// B projects only the start of the busy period: an 'await' commit keeps
+	// the input claimed while its user message is already on the wire.
+	b, gwB := f.newProjector(t)
+	env := f.sendOn(t, b, "k1", "first half")
+	in, _, err := f.core.GetInput(f.ctx, f.pa, "direct-chat:"+env.CommandID)
+	if err != nil {
+		t.Fatalf("get input: %v", err)
+	}
+	lease, err := f.core.AcquireWriter(f.ctx, f.pa, "test-host", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	loaded, err := f.core.LoadTurn(f.ctx, f.pa, lease.Generation, "", 100)
+	if err != nil || loaded.Turn == nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := f.core.CommitTurn(f.ctx, f.pa, loaded.Turn.TurnID, lease.Generation,
+		agentstate.CommitRequest{
+			Outcome: "await",
+			Events:  []agentstate.EventInput{f.inputReceived(in, 1)},
+		}); err != nil {
+		t.Fatalf("await commit: %v", err)
+	}
+	if err := f.core.ReleaseWriter(f.ctx, f.pa, "test-host", lease.Generation); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	syncOn(t, b, f.pa)
+
+	if live, _ := f.core.LiveDirectChatInputs(f.ctx, f.pa); live != 1 {
+		t.Fatalf("claimed input must be live: %d", live)
+	}
+	close(release)
+	if err := <-staleEnd; err != nil {
+		t.Fatalf("stale closeRunIfIdle: %v", err)
+	}
+	a.idleReadHook = nil
+
+	types := eventTypes(durableEvents(t, gwB, f.pa))
+	if containsEvent(types, "agent_end") {
+		t.Fatalf("stale END split the busy period: %v", types)
+	}
+
+	// Finish the turn: the tail of the same busy period joins the same run.
+	f.runHostTurn(t, []agentstate.EventInput{
+		{Kind: "assistant_message", Payload: map[string]any{"text": "second half", "round": 0}},
+	}, agentstate.CommitRequest{Outcome: "complete"})
+	syncOn(t, b, f.pa)
+	types = eventTypes(durableEvents(t, gwB, f.pa))
+	if n := countEvent(types, "agent_start"); n != 1 {
+		t.Fatalf("busy period must not split; types=%v", types)
+	}
+	if n := countEvent(types, "agent_end"); n != 1 {
+		t.Fatalf("busy period must close exactly once; types=%v", types)
+	}
+}
+
+// F-B2: a browser attached to one API process must see state another
+// process committed. Guards fold the committed event tail under the event
+// lock — at socket attach AND again inside the admission check — so an
+// already-open socket on the non-committing process admits a decision for
+// an approval it never projected. Under the old latch this socket stayed
+// permanently blind until restart.
+func TestCoreDirectChatCrossProcessGuardSeesCommittedApprovals(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	gwA := f.gateway            // A: the browser-facing process
+	b, gwB := f.newProjector(t) // B: the projecting process
+	serverA := &BrowserServer{Events: gwA}
+
+	// A's socket attaches and rebuilds while nothing is pending.
+	if err := gwA.EnsureAgentSessionStateRebuilt(f.ctx, f.pa); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	decisionHead := func(requestID string) browserCommandHead {
+		return browserCommandHead{Type: "approval_decision", RequestID: requestID}
+	}
+	if _, reject := serverA.checkCommandState(f.ctx, f.pa, decisionHead("req-none")); !reject {
+		t.Fatal("decision admitted with no approval pending")
+	}
+
+	// B commits a busy period that parks on an approval. A never re-attaches
+	// and appends nothing — the stale local maps are the defect's baseline.
+	env1 := f.sendOn(t, b, "k1", "hold this")
+	_, approvalID := f.hostPark(t, "direct-chat:"+env1.CommandID)
+	syncOn(t, b, f.pa)
+	if !gwB.IsApprovalPending(f.pa, approvalID) {
+		t.Fatal("committing gateway blind to its own approval")
+	}
+
+	// The already-open socket on A aborts/decides against committed state:
+	// admission refreshes the durable tail under the event lock first.
+	if reason, reject := serverA.checkCommandState(f.ctx, f.pa, browserCommandHead{Type: "abort"}); reject {
+		t.Fatalf("abort rejected though B's run is committed open: %q", reason)
+	}
+	if reason, reject := serverA.checkCommandState(f.ctx, f.pa, decisionHead(approvalID)); reject {
+		t.Fatalf("decision for B's committed approval rejected on A: %q", reason)
+	}
+
+	// A admits the decision for real; B's reconciler resolves the parked
+	// turn and projects approval_resolved.
+	decision := fmt.Sprintf(`{"type":"approval_decision","request_id":%q,"decision":{"type":"approve_once"}}`, approvalID)
+	if _, err := f.adapter.Append(f.ctx, f.provenance(), "k2", json.RawMessage(decision)); err != nil {
+		t.Fatalf("decision append: %v", err)
+	}
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "resumed")
+	syncOn(t, b, f.pa)
+
+	events := durableEvents(t, gwB, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	if n := countEvent(eventTypes(events), "approval_resolved"); n != 1 {
+		t.Fatalf("approval_resolved missing: %v", eventTypes(events))
+	}
+
+	// Resolution is visible to A as well: a replayed decision is rejected,
+	// and the abort window closed with the run.
+	if reason, reject := serverA.checkCommandState(f.ctx, f.pa, decisionHead(approvalID)); !reject || reason != RejectNotAllowed {
+		t.Fatalf("replayed decision after resolve: reject=%v reason=%q", reject, reason)
+	}
+	if reason, reject := serverA.checkCommandState(f.ctx, f.pa, browserCommandHead{Type: "abort"}); !reject || reason != RejectNotAllowed {
+		t.Fatalf("abort admitted after run closed: reject=%v reason=%q", reject, reason)
+	}
+}
+
+// F-B3: an API restart against a torn event tail must recover. The fresh
+// projector's first sweep reads the log before any append — the read path
+// now repairs the partial record under the event lock, then projection
+// resumes on the committed prefix without duplicating or losing events.
+func TestCoreDirectChatFreshProjectorHealsTornTail(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+	committed := durableEvents(t, gwA, f.pa)
+
+	// Crash mid-append: a partial final record with no terminating newline.
+	eventsPath := filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".jsonl")
+	ef, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open events: %v", err)
+	}
+	if _, err := ef.WriteString(`{"seq":9,"event":{"type":"message_end"`); err != nil {
+		t.Fatalf("torn write: %v", err)
+	}
+	if err := ef.Close(); err != nil {
+		t.Fatalf("torn close: %v", err)
+	}
+
+	// Simulated API restart: fresh gateway + projector over the same dir.
+	// Under the old contract every sweep failed in loadProjectionState.
+	b, gwB := f.newProjector(t)
+	syncOn(t, b, f.pa)
+
+	// History serves the committed prefix — the torn bytes are gone.
+	replay, err := gwB.EventCatchUp(f.ctx, f.pa, 0)
+	if err != nil {
+		t.Fatalf("post-repair catch-up: %v", err)
+	}
+	if len(replay) != len(committed) {
+		t.Fatalf("repaired prefix holds %d events, want %d", len(replay), len(committed))
+	}
+	assertEnvelopeIntegrity(t, replay)
+
+	// Projection resumes on the repaired tail: new work appends cleanly.
+	env2 := f.sendOn(t, b, "k2", "second")
+	f.hostComplete(t, "direct-chat:"+env2.CommandID, "reply-2")
+	syncOn(t, b, f.pa)
+	events := durableEvents(t, gwB, f.pa)
+	assertEnvelopeIntegrity(t, events)
+	if texts := messageTexts(events, "assistant"); len(texts) != 2 {
+		t.Fatalf("assistant messages after fresh-projector repair: %v", texts)
+	}
+}
+
+// A newline-terminated record that is not valid JSON is corruption, not a
+// torn tail: no path may silently truncate it — reads keep failing closed.
+func TestCoreDirectChatMalformedTailStillFailsClosed(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	a, gwA := f.adapter, f.gateway
+
+	env1 := f.sendOn(t, a, "k1", "first")
+	f.hostComplete(t, "direct-chat:"+env1.CommandID, "reply-1")
+	syncOn(t, a, f.pa)
+
+	eventsPath := filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".jsonl")
+	ef, err := os.OpenFile(eventsPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open events: %v", err)
+	}
+	if _, err := ef.WriteString("{\"seq\":9,\"event\":{bad\n"); err != nil {
+		t.Fatalf("malformed write: %v", err)
+	}
+	if err := ef.Close(); err != nil {
+		t.Fatalf("malformed close: %v", err)
+	}
+
+	if _, err := gwA.EventCatchUp(f.ctx, f.pa, 0); err == nil {
+		t.Fatal("malformed complete record silently served")
+	}
+	b, _ := f.newProjector(t)
+	if err := b.syncPersona(f.ctx, f.pa); err == nil {
+		t.Fatal("fresh projector sweep succeeded on malformed tail")
+	}
+	// The record must still be there — repair must not eat real corruption.
+	raw, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("bad")) {
+		t.Fatal("malformed record was silently truncated")
 	}
 }
