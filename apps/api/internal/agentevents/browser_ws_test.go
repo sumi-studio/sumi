@@ -2472,13 +2472,14 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "abort"}); !reject {
+	ctx := context.Background()
+	if reason, reject := server.checkCommandState(ctx, personalityAgentID, browserCommandHead{Type: "abort"}); !reject {
 		t.Fatal("expected abort to be rejected when no run is in flight")
 	} else if reason != RejectNotAllowed {
 		t.Fatalf("expected not_allowed, got %q", reason)
 	}
 
-	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-1"}); !reject {
+	if reason, reject := server.checkCommandState(ctx, personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-1"}); !reject {
 		t.Fatal("expected approval_decision to be rejected when no approval is pending")
 	} else if reason != RejectNotAllowed {
 		t.Fatalf("expected not_allowed, got %q", reason)
@@ -2488,7 +2489,7 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"agent_start"}`)}); err != nil {
 		t.Fatalf("receive agent_start: %v", err)
 	}
-	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "abort"}); reject {
+	if reason, reject := server.checkCommandState(ctx, personalityAgentID, browserCommandHead{Type: "abort"}); reject {
 		t.Fatalf("expected abort to be accepted during in-flight run, got %q", reason)
 	}
 
@@ -2496,10 +2497,10 @@ func TestBrowserServerCommandStateGuards(t *testing.T) {
 	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat, Seq: &seq, PersonalityAgentID: personalityAgentID, Event: json.RawMessage(`{"type":"approval_requested","request":{"id":"request-1","tool_call_id":"call-1","tool_name":"read_file","action":{"reviewable":"read"},"args_summary":"read"}}`)}); err != nil {
 		t.Fatalf("receive approval_requested: %v", err)
 	}
-	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-1"}); reject {
+	if reason, reject := server.checkCommandState(ctx, personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-1"}); reject {
 		t.Fatalf("expected approval_decision to be accepted for pending request, got %q", reason)
 	}
-	if reason, reject := server.checkCommandState(personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-2"}); !reject || reason != RejectNotAllowed {
+	if reason, reject := server.checkCommandState(ctx, personalityAgentID, browserCommandHead{Type: "approval_decision", RequestID: "request-2"}); !reject || reason != RejectNotAllowed {
 		t.Fatalf("expected approval_decision to be rejected for unknown request, got reject=%v reason=%q", reject, reason)
 	}
 }

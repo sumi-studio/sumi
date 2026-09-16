@@ -58,12 +58,14 @@ person/secretary ─ (caller with a scope token) ─ filesvc :8780 (WSL origin, 
 | `apps/files/cmd/filesvc` | Scoped file API. |
 | `apps/files/objstore` | `sumi-fabric-obj`: S3-compatible object store on a SQLite Durable Object. Verifies AWS SigV4 (header form). |
 | `deploy/files/sumi-files-format` | Creates the volume once; refuses an already formatted database; prints the UUID. |
-| `deploy/files/sumi-files-mount` | Runs one JuiceFS client with the required flags. Refuses a metadata database holding a different volume UUID, or an existing mount. |
+| `deploy/files/sumi-files-mount` | Runs one JuiceFS client with the required flags. Refuses a metadata database holding a different volume UUID, a live existing mount, or an unresponsive non-JuiceFS mount; removes a dead JuiceFS corpse before mounting; keeps the mountpoint's parent private to the client uid. |
 | `deploy/files/sumi-files-check` | Passes only for a live `fuse.juicefs` mount of the pinned volume root with zero metadata cache; with a scope, prints the directory to bind. |
+| `deploy/files/sumi-files-executor-launch` / `sumi-files-executor-stop` | Thin drivers around `deploy/agent/supervisor` `prepare`/`activate`/`stop` for one scope (the compact PAID). |
 | `deploy/files/systemd/sumi-files-mount@.service` | Volume client unit (`service` instance on the origin as a user unit; `executor` instance on executor hosts as a system unit). |
-| `deploy/files/systemd/sumi-filesvc.service` | `filesvc`, bound to the service client. |
-| `deploy/files/systemd/sumi-files-executor@.service` | Starts one secretary's agent Compose project with `/workspace` bound to scope `%i`; stops with the volume client. |
-| `deploy/files/compose.executor-workspace.yaml` | Compose override replacing the executor's local `workspace` volume with the scope bind. |
+| `deploy/files/systemd/sumi-filesvc.service` | `filesvc`, bound to the service client; restarted with it. |
+| `deploy/files/systemd/sumi-files-executor@.service` | Runs one secretary's runtime through the supervisor lifecycle with `/workspace` bound to scope `%i` (the compact PAID); stops and restarts with the volume client. |
+| `deploy/files/compose.executor-workspace.yaml` | Compose override the supervisor adds to the full agent graph in files scope mode: `prepare` and `executor` bind the scope as `/workspace`. |
+| `deploy/files/compose.prepare-workspace.yaml` | Compose override the supervisor adds to the prepare-only graph in files scope mode: `prepare` binds the scope as `/workspace`. |
 | `scripts/operations/files-cloud-probe.mjs` | Post-deploy probe: API round trip, refusals, and (with `--mount-dir`) cross-client visibility. |
 
 `sumi-files-check` refusal codes: `not_mounted`, `wrong_fstype`,
@@ -129,7 +131,8 @@ JuiceFS's own metadata dump (`--backup-meta 0`).
 ### 3. Install on the origin (user units)
 
 ```sh
-install -d ~/.local/lib/sumi-files ~/.config/sumi-files ~/.local/state/sumi-files/mnt ~/.cache/sumi-files
+install -d ~/.local/lib/sumi-files ~/.config/sumi-files ~/.cache/sumi-files
+install -d -m 0700 ~/.local/state/sumi-files ~/.local/state/sumi-files/mnt
 (cd apps/files && go build -buildvcs=false -o ~/.local/lib/sumi-files/filesvc ./cmd/filesvc)
 install -m 0755 deploy/files/sumi-files-{format,mount,check} ~/.local/lib/sumi-files/
 install -m 0755 <pinned juicefs 1.4.1 binary> ~/.local/lib/sumi-files/juicefs
@@ -201,24 +204,62 @@ node scripts/operations/files-cloud-probe.mjs --api http://127.0.0.1:8780 \
 ### 5. Executor hosts (system units, root)
 
 ```sh
-install -d /root/.local/lib/sumi-files /etc/sumi-files /var/lib/sumi-files/mnt /var/cache/sumi-files
-install -m 0755 deploy/files/sumi-files-{mount,check} <juicefs 1.4.1> /root/.local/lib/sumi-files/
-install -m 0644 deploy/files/systemd/sumi-files-mount@.service deploy/files/systemd/sumi-files-executor@.service /etc/systemd/system/
+install -d /root/.local/lib/sumi-files /etc/sumi-files /var/cache/sumi-files
+install -d -m 0700 /var/lib/sumi-files /var/lib/sumi-files/mnt
+install -m 0755 deploy/files/sumi-files-{mount,check,executor-launch,executor-stop} \
+  <juicefs 1.4.1> /root/.local/lib/sumi-files/
+install -m 0644 deploy/files/systemd/sumi-files-mount@.service \
+  deploy/files/systemd/sumi-files-executor@.service /etc/systemd/system/
 ```
+
+`/var/lib/sumi-files` must stay mode 0700 owned by root: `--all-squash` makes
+every scope readable and writable by one owner, so the private parent is the
+only host-level boundary between scopes — the mount script refuses a shared,
+group/other-accessible parent and tightens a dedicated one.
 
 `/etc/sumi-files/executor.env` (0600, root): as `service.env` with
 `SUMI_FILES_ROLE=executor`, `SUMI_FILES_JUICEFS=/root/.local/lib/sumi-files/juicefs`,
 `SUMI_FILES_MOUNTPOINT=/var/lib/sumi-files/mnt`,
 `SUMI_FILES_CACHE_DIR=/var/cache/sumi-files` and `sslmode=require`.
-`/etc/sumi-files/agent-<scope>.env`: `SUMI_AGENT_COMPOSE_DIR` (a checkout
-holding `deploy/agent` and `deploy/files`) and the agent Compose variables.
+
+Each secretary's scope is its compact personality-agent id (the UUID without
+hyphens); it is the instance name and the Compose project suffix, so one name
+identifies the scope, the unit and the project everywhere. Create the scope
+through the API (`mkdir` under `<mnt>/<compact PAID>`) before enabling the
+executor unit — a missing scope is refused, never created silently.
+
+`/etc/sumi-files/agent-<compact PAID>.env` (0600, root):
+
+```sh
+SUMI_PERSONALITY_AGENT_ID=<uuidv7>
+SUMI_AGENT_COMPOSE_DIR=/opt/sumi      # checkout holding deploy/agent and deploy/files
+# plus the full supervisor launch environment: SUMI_GATEWAY_URL,
+# SUMI_LOCAL_CONTROL_SERVER_UID, SUMI_LOCAL_CONTROL_SOCKET_GID,
+# SUMI_LOCAL_CONTROL_BEARER, SUMI_AGENT_WRAPPING_KEY(+_ID),
+# SUMI_APPROVAL_SECRET_DIGEST_KEY, the provider/reviewer keys and presets,
+# and SUMI_RUNTIME_SELECTION_FINGERPRINT (64 lowercase hex).
+```
+
+The unit launches through `deploy/agent/supervisor` — the same actions the
+runtime provisioner drives: `prepare` (epoch allocation, prepare graph with
+the scope bound as /workspace) then `activate` (secret materialization,
+runtime/executor/broker with the scope bound). `SUMI_FILES_MOUNTPOINT`,
+`SUMI_FILES_VOLUME_UUID` and `SUMI_FILES_CHECK=/root/.local/lib/sumi-files/sumi-files-check`
+come from `executor.env`; the supervisor re-verifies the scope inside both
+actions. Activation also requires the secretary's local-control listener to
+exist already at `/run/sumi/local-control/<compact PAID>/control.sock` with
+the configured uid/gid — the control plane binds it between prepare and
+activate, so for a unit-driven launch the listener must be provisioned first
+(the same precondition the provisioner relies on). The compose anchor binary
+must be installed at `/usr/local/libexec/sumi-compose-anchor` (it is built
+from `apps/api/cmd/compose-anchor` and shipped in the provisioner image).
 
 ```sh
 systemctl daemon-reload
 systemctl enable --now sumi-files-mount@executor.service
-systemctl enable --now sumi-files-executor@<scope>.service
+systemctl enable --now sumi-files-executor@<compact PAID>.service
 node scripts/operations/files-cloud-probe.mjs --api <filesvc URL reachable from this host> \
-  --token-file <probe-token-file> --scope <scope> --mount-dir /var/lib/sumi-files/mnt/<scope>
+  --token-file <probe-token-file> --scope <compact PAID> --mount-dir /var/lib/sumi-files/mnt/<compact PAID>
 ```
 
 The root volume client adds `allow_other`, which Docker and uid 10002 need.
@@ -233,9 +274,13 @@ an API write and a Linux write cross between two JuiceFS clients.
 2. Inside the executor, write a file under `/workspace`; read and list it
    through the API with no other step.
 3. `systemctl restart sumi-files-mount@executor.service`: the executor unit
-   restarts with it and sees the same files. `kill -9` the client: the
-   running executor gets `Transport endpoint is not connected`, not old
-   files; start the executor unit again once the client is back. Restart `sumi-filesvc` and read a
+   restarts with it and sees the same files. `kill -9` the client: the mount
+   unit restarts itself — the new client removes the dead FUSE corpse
+   (verified `fuse.juicefs`, still unresponsive) and remounts — and an enabled
+   executor unit is pulled back in by the mount's `WantedBy`, re-running
+   prepare/activate with a fresh epoch. The executor never sees old files:
+   while the client was dead its scope bind answered
+   `Transport endpoint is not connected`. Restart `sumi-filesvc` and read a
    file: `X-File-Version` is unchanged.
 4. `systemctl --user stop sumi-files-mount@service` stops `filesvc` too; if
    the mount disappears while `filesvc` runs, API calls answer 503
@@ -245,9 +290,11 @@ an API write and a Linux write cross between two JuiceFS clients.
 
 ## Rollback
 
-- Executors: `systemctl disable --now sumi-files-executor@<scope>` and start
-  the agent project without `compose.executor-workspace.yaml` (host-local
-  `workspace` volume). Files already in the volume stay there.
+- Executors: `systemctl disable --now sumi-files-executor@<scope>`; its
+  ExecStop runs the supervisor `stop` action, which brings the project down
+  and removes the materialized secret tree. To run the same secretary on a
+  host-local workspace, launch it through the supervisor without the
+  `SUMI_FILES_*` environment. Files already in the volume stay there.
 - Files API: `systemctl --user disable --now sumi-filesvc sumi-files-mount@service`.
   Callers get connection refused, not wrong files.
 - The Worker, the volume data (DO storage) and both databases are kept.
@@ -316,9 +363,15 @@ Primary sources, read 2026-09-16:
   a new client mounts; it never falls back to a stale copy. After SIGTERM
   with a bind still held, the client unmounts the host mountpoint but keeps
   serving that bind until it is killed. `sumi-files-executor@` is `BindsTo`
-  and `PartOf` the volume client: a restart of the client restarts the
-  executor; after a client crash the executor is stopped and must be started
-  again (`systemctl start sumi-files-executor@<scope>`).
+  and `PartOf` the volume client: stopping or restarting the client stops the
+  executor. On a whole-client crash (`SIGKILL`) the mount unit's
+  `Restart=on-failure` brings a new client up; `sumi-files-mount` removes the
+  dead FUSE corpse itself (it refuses a live mount or an unresponsive
+  non-JuiceFS mount), `ExecStartPost` re-verifies the volume, and the mount's
+  `WantedBy` pulls enabled dependents — the executor re-launches through the
+  supervisor with a new epoch, `sumi-filesvc` restarts on the origin. The
+  mount's parent directory must stay private (0700, owned by the client uid):
+  under `--all-squash` it is the only host-level boundary between scopes.
 - **`FILESV_TOKENS` is static.** Grants change only by editing the env file
   and restarting `filesvc`. Issuing per-secretary scope tokens from account
   authorization, and routing Cloud callers to `filesvc`, are separate

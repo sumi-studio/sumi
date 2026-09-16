@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# sumi-files-executor-stop SCOPE — tear down the secretary's supervisor
+# project (containers down, materialized secret tree removed). This must work
+# without the canonical files mount: PartOf propagation also reaches it while
+# the volume client is stopping or has already crashed.
+set -euo pipefail
+
+[[ -n "${1:-}" ]] || { echo "usage: sumi-files-executor-stop SCOPE" >&2; exit 2; }
+: "${SUMI_PERSONALITY_AGENT_ID:?SUMI_PERSONALITY_AGENT_ID is required in agent env}"
+: "${SUMI_AGENT_COMPOSE_DIR:?SUMI_AGENT_COMPOSE_DIR is required in agent env}"
+exec "${SUMI_AGENT_COMPOSE_DIR}/deploy/agent/supervisor" stop

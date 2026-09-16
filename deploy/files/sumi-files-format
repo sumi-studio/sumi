@@ -15,6 +15,10 @@
 set -euo pipefail
 env_file="${1:-}"
 [[ -n "$env_file" && -r "$env_file" ]] || { echo "usage: sumi-files-format ENV_FILE" >&2; exit 2; }
+if [[ "$(stat -c %a "$env_file")" != 600 && "$(stat -c %a "$env_file")" != 400 ]]; then
+  echo "refused: credential file $env_file must be mode 0600 or 0400" >&2
+  exit 2
+fi
 set -a
 # shellcheck disable=SC1090
 . "$env_file"

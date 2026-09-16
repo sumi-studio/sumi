@@ -4,7 +4,7 @@
 #
 #   sumi-files-mount ENV_FILE
 #
-# ENV_FILE (mode 0600, root-owned; never in the repository):
+# ENV_FILE (mode 0600 or 0400, owned by the client user; never in the repository):
 #   SUMI_FILES_ROLE          service | executor
 #   SUMI_FILES_JUICEFS       JuiceFS binary (default /usr/local/bin/juicefs)
 #   SUMI_FILES_META_URL      postgres://USER@HOST:PORT/DB?sslmode=... (no password)
@@ -57,11 +57,85 @@ case "$role" in
   *) echo "refused: SUMI_FILES_ROLE must be service or executor" >&2; exit 2 ;;
 esac
 
-if awk -v mp="$mnt" '$5 == mp { found = 1 } END { exit !found }' /proc/self/mountinfo; then
-  echo "refused: $mnt is already a mountpoint; unmount it first (sumi-files-umount)" >&2
+[[ "$mnt" == /* && "$mnt" != */ && "$mnt" != *[[:space:]]* ]] || {
+  echo "refused: SUMI_FILES_MOUNTPOINT must be absolute, without trailing slash or whitespace" >&2
+  exit 2
+}
+
+# Host traversal guard: --all-squash collapses every scope to one owner, so
+# once a host user can reach the mountpoint at all they can read, write and
+# rename every scope on the volume. The only host-level boundary is the path
+# leading to the mountpoint: its parent must be private to the client uid.
+# A dedicated parent (containing nothing but the mountpoint) is tightened in
+# place; a shared parent that is group/other-accessible is refused, never
+# silently chmodded, because other entries may rely on its permissions.
+mnt_parent="$(dirname "$mnt")"
+if [[ -L "$mnt_parent" ]]; then
+  echo "refused: mountpoint parent $mnt_parent must be a real directory, not a symlink" >&2
   exit 2
 fi
-mkdir -p "$mnt" "$cache_dir"
+if [[ ! -d "$mnt_parent" ]]; then
+  install -d -m 0700 "$mnt_parent" || {
+    echo "refused: cannot create private mountpoint parent $mnt_parent" >&2
+    exit 2
+  }
+fi
+[[ "$(stat -c %u "$mnt_parent")" == "$(id -u)" ]] || {
+  echo "refused: mountpoint parent $mnt_parent must be owned by the client uid $(id -u)" >&2
+  exit 2
+}
+if (( (8#$(stat -c %a "$mnt_parent") & 077) != 0 )); then
+  shopt -s nullglob dotglob
+  parent_entries=("$mnt_parent"/*)
+  shopt -u nullglob dotglob
+  if (( ${#parent_entries[@]} == 0 )) ||
+    { (( ${#parent_entries[@]} == 1 )) && [[ "${parent_entries[0]}" == "$mnt" ]]; }; then
+    chmod 0700 "$mnt_parent" || {
+      echo "refused: cannot make mountpoint parent $mnt_parent private" >&2
+      exit 2
+    }
+  else
+    echo "refused: mountpoint parent $mnt_parent is shared and group/other-accessible; move the mountpoint under a dedicated private directory" >&2
+    exit 2
+  fi
+fi
+
+# fstype of the last mountinfo entry at the mountpoint (empty when none).
+mount_fstype() {
+  awk -v mp="$mnt" '
+    { sep = 0; for (i = 7; i <= NF; i++) if ($i == "-") { sep = i; break } }
+    sep && $5 == mp { fstype = $(sep + 1) }
+    END { if (fstype != "") print fstype }' /proc/self/mountinfo
+}
+
+fstype="$(mount_fstype)"
+if [[ -n "$fstype" ]]; then
+  if timeout 5 stat -- "$mnt" >/dev/null 2>&1; then
+    echo "refused: $mnt is already a mountpoint; unmount it first" >&2
+    exit 2
+  fi
+  # A killed JuiceFS client leaves the FUSE mount registered but dead: every
+  # lookup answers ENOTCONN and systemd never ran ExecStop. Such a corpse is
+  # safe to remove only while it is still dead and only when it really is a
+  # JuiceFS mount — never unmount a live filesystem or another driver's dead
+  # mount that happens to occupy the path.
+  if [[ "$fstype" != "fuse.juicefs" ]]; then
+    echo "refused: $mnt holds an unresponsive $fstype mount; unmount it first" >&2
+    exit 2
+  fi
+  if timeout 5 stat -- "$mnt" >/dev/null 2>&1 || [[ "$(mount_fstype)" != "fuse.juicefs" ]]; then
+    echo "refused: $mnt changed state during recovery; unmount it first" >&2
+    exit 2
+  fi
+  umount "$mnt" 2>/dev/null || fusermount3 -u "$mnt" 2>/dev/null ||
+    umount -l "$mnt" 2>/dev/null || fusermount3 -uz "$mnt" 2>/dev/null || true
+  if [[ -n "$(mount_fstype)" ]]; then
+    echo "refused: dead FUSE mount at $mnt did not unmount" >&2
+    exit 2
+  fi
+fi
+install -d -m 0700 "$mnt"
+mkdir -p "$cache_dir"
 chmod 0700 "$cache_dir"
 
 # Refuse to mount a different volume than the pinned one (a re-formatted or

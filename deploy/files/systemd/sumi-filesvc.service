@@ -2,7 +2,8 @@
 # origin). Bound to that client: if the mount unit stops, filesvc stops with
 # it; while the mount is merely absent (e.g. a manual remount)
 # FILESV_REQUIRE_MOUNT=1 answers 503 mount_unavailable instead of writing
-# into the bare directory.
+# into the bare directory. WantedBy on the mount unit restores filesvc when
+# the client restarts after an ordinary crash — no manual start needed.
 #   env file ~/.config/sumi-files/filesvc.env (0600):
 #     FILESV_LISTEN FILESV_ROOT FILESV_DB_URL FILESV_TOKENS FILESV_REQUIRE_MOUNT=1
 [Unit]
@@ -21,4 +22,4 @@ RestartSec=3
 UMask=0022
 
 [Install]
-WantedBy=default.target
+WantedBy=default.target sumi-files-mount@service.service

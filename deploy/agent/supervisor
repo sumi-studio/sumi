@@ -491,9 +491,58 @@ require_launch_environment() {
   validate_local_control_socket
 }
 
+# Verified canonical-files scope gate for launch-shaped actions. It must pass
+# before any Compose `up` binds a workspace: a missing scope, a stopped client,
+# a dead FUSE corpse, or a mistyped volume all fail the launch instead of
+# silently substituting the host-local workspace volume.
+require_files_scope() {
+  (( FILES_WORKSPACE_MODE )) || return 0
+  local resolved
+  if ! resolved="$("${SUMI_FILES_CHECK}" --wait "${SUMI_FILES_CHECK_WAIT_SECONDS:-30}" \
+      "${SUMI_FILES_MOUNTPOINT}" "${SUMI_FILES_VOLUME_UUID}" "${PAID_COMPACT}")"; then
+    fail "canonical files scope ${PAID_COMPACT} is unavailable on ${SUMI_FILES_MOUNTPOINT}"
+  fi
+  [[ "${resolved}" == "${SUMI_FILES_SCOPE_DIR}" ]] ||
+    fail "canonical files scope resolved to ${resolved}, expected ${SUMI_FILES_SCOPE_DIR}"
+}
+
 require_paid
 readonly PAID_COMPACT="${SUMI_PERSONALITY_AGENT_ID//-/}"
 readonly SUMI_COMPOSE_PROJECT="sumi-${PAID_COMPACT}"
+
+# Canonical-files scope mode (Cloud executor placement). When the three
+# SUMI_FILES_* variables are set — all or none — this secretary's workspace is
+# the verified scope directory <mountpoint>/<compact PAID> on the canonical
+# JuiceFS volume, applied as a bind override to both the prepare-only and the
+# full agent graph. sumi-files-check must pass for that exact scope on every
+# launch-shaped action, so a missing or dead mount fails the launch instead of
+# silently starting on a host-local workspace volume.
+FILES_WORKSPACE_MODE=0
+SUMI_FILES_SCOPE_DIR=
+if [[ -n "${SUMI_FILES_MOUNTPOINT:-}" || -n "${SUMI_FILES_VOLUME_UUID:-}" ||
+  -n "${SUMI_FILES_CHECK:-}" ]]; then
+  for files_name in SUMI_FILES_MOUNTPOINT SUMI_FILES_VOLUME_UUID SUMI_FILES_CHECK; do
+    [[ -n "${!files_name:-}" ]] ||
+      fail "scope mode requires ${files_name} when any SUMI_FILES_* variable is set"
+  done
+  [[ "${SUMI_FILES_MOUNTPOINT}" == /* && "${SUMI_FILES_MOUNTPOINT}" != */ &&
+    "${SUMI_FILES_MOUNTPOINT}" != *[[:space:]]* ]] ||
+    fail "SUMI_FILES_MOUNTPOINT must be absolute, without trailing slash or whitespace"
+  [[ -x "${SUMI_FILES_CHECK}" ]] ||
+    fail "SUMI_FILES_CHECK must be an executable sumi-files-check binary"
+  FILES_WORKSPACE_MODE=1
+  SUMI_FILES_SCOPE_DIR="${SUMI_FILES_MOUNTPOINT}/${PAID_COMPACT}"
+  export SUMI_FILES_SCOPE_DIR
+  for files_override in \
+    "${SUPERVISOR_DIR}/../files/compose.executor-workspace.yaml" \
+    "${SUPERVISOR_DIR}/../files/compose.prepare-workspace.yaml"; do
+    [[ -f "${files_override}" ]] ||
+      fail "scope mode requires ${files_override}"
+  done
+fi
+readonly FILES_EXECUTOR_OVERRIDE="${SUPERVISOR_DIR}/../files/compose.executor-workspace.yaml"
+readonly FILES_PREPARE_OVERRIDE="${SUPERVISOR_DIR}/../files/compose.prepare-workspace.yaml"
+
 declare SUPERVISOR_LOCK_FD
 declare LOCAL_CONTROL_TRUST_SNAPSHOT
 declare SUMI_LOCAL_CONTROL_HOST_DIR
@@ -623,17 +672,50 @@ sleep_cleanup_milliseconds() {
   sleep_milliseconds "${requested_milliseconds}"
 }
 
+# compose_file_args_for <array> <launch|prepare|lifecycle> — emit the --file
+# list for one graph. In files scope mode the workspace bind override joins
+# the launch and prepare graphs so every Compose invocation (config, ps, run,
+# up) sees the same merged project and never the host-local workspace volume.
+compose_file_args_for() {
+  local -n _files_out="$1"
+  local _files_graph="$2"
+  case "${_files_graph}" in
+    launch)
+      _files_out=(--file "${COMPOSE_FILE}")
+      if (( FILES_WORKSPACE_MODE )); then
+        _files_out+=(--file "${FILES_EXECUTOR_OVERRIDE}")
+      fi
+      ;;
+    prepare)
+      _files_out=(--file "${PREPARE_COMPOSE_FILE}")
+      if (( FILES_WORKSPACE_MODE )); then
+        _files_out+=(--file "${FILES_PREPARE_OVERRIDE}")
+      fi
+      ;;
+    lifecycle)
+      _files_out=(--file "${LIFECYCLE_COMPOSE_FILE}")
+      ;;
+    *)
+      fail "unknown compose graph ${_files_graph}"
+      ;;
+  esac
+}
+
 launch_compose() {
+  local -a file_args=()
+  compose_file_args_for file_args launch
   run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${COMPOSE_FILE}" \
+    "${file_args[@]}" \
     "$@"
 }
 
 lifecycle_compose() {
+  local -a file_args=()
+  compose_file_args_for file_args lifecycle
   run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${LIFECYCLE_COMPOSE_FILE}" \
+    "${file_args[@]}" \
     "$@"
 }
 
@@ -665,18 +747,22 @@ run_bounded_cleanup_lifecycle_compose() {
 }
 
 prepare_compose() {
+  local -a file_args=()
+  compose_file_args_for file_args prepare
   run_external docker compose \
     --project-name "${SUMI_COMPOSE_PROJECT}" \
-    --file "${PREPARE_COMPOSE_FILE}" \
+    "${file_args[@]}" \
     "$@"
 }
 
 run_tracked_compose() {
-  local compose_file="$1"
+  local graph="$1"
   shift
+  local -a file_args=()
+  compose_file_args_for file_args "${graph}"
   local status identity
   setsid "${COMPOSE_ANCHOR}" /bin/bash -p -c 'exec docker "$@"' bash \
-    compose --project-name "${SUMI_COMPOSE_PROJECT}" --file "${compose_file}" \
+    compose --project-name "${SUMI_COMPOSE_PROJECT}" "${file_args[@]}" \
     "$@" 3>&- 4>&- &
   ACTIVE_COMPOSE_PID=$!
   if ! wait_for_tracked_compose_anchor_stopped "${ACTIVE_COMPOSE_PID}"; then
@@ -1262,6 +1348,7 @@ case "${action}" in
   validate)
     require_docker
     require_launch_environment
+    require_files_scope
     configure_apparmor_profile
     validate_compose_redacted
     revalidate_local_control_socket
@@ -1270,6 +1357,7 @@ case "${action}" in
     acquire_supervisor_lock
     require_docker
     require_tracked_compose_support
+    require_files_scope
     configure_apparmor_profile
     validate_prepare_compose_redacted
     # The API installs exact-generation authorization and creates the PAID
@@ -1278,14 +1366,14 @@ case "${action}" in
     arm_partial_generation_cleanup
     # `down` synchronously stops and joins every old-generation container.
     # Only after it returns may the allocator issue a replacement generation.
-    run_tracked_compose "${LIFECYCLE_COMPOSE_FILE}" \
+    run_tracked_compose lifecycle \
       down --remove-orphans --timeout "${SUMI_COMPOSE_TIMEOUT}" >/dev/null
     remove_runtime_secret_tree
     prepare_status=0
     # Same bounded stderr contract as activation below: the provisioner captures
     # and value-redacts it on failure. Discarding it left a failed prepare with
     # no stated cause at all.
-    if run_tracked_compose "${PREPARE_COMPOSE_FILE}" up --detach --wait \
+    if run_tracked_compose prepare up --detach --wait \
       >/dev/null; then
       prepare_status=0
     else
@@ -1308,6 +1396,7 @@ case "${action}" in
     require_expected_epoch
     set_runtime_secret_host_dir "${EPOCH_GENERATION}"
     require_launch_environment
+    require_files_scope
     configure_apparmor_profile
     validate_compose_redacted
     revalidate_local_control_socket
@@ -1320,7 +1409,7 @@ case "${action}" in
     # The provisioner captures and value-redacts this bounded stderr stream on
     # failure. Keep activation diagnostics available so a daemon rejection is
     # classified instead of collapsing to an opaque timeout.
-    if run_tracked_compose "${COMPOSE_FILE}" up --detach --no-deps \
+    if run_tracked_compose launch up --detach --no-deps \
       executor broker runtime >/dev/null; then
       activation_status=0
     else

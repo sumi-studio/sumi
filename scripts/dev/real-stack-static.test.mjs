@@ -328,7 +328,10 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   assert.match(launcher, /SUMI_BROWSER_SESSION_AUDIENCE=sumi:web/);
   assert.match(launcher, /SUMI_BROWSER_WS_ALLOWED_ORIGINS=\$\{WEB_ORIGIN\}/);
   assert.match(launcher, /SUMI_AUTH_ALLOW_INSECURE_COOKIES=true/);
-  const apiBlock = launcher.slice(apiStart, executorStart);
+  const apiBlock = launcher.slice(
+    launcher.indexOf("declare -a api_environment=("),
+    executorStart,
+  );
   assert.match(
     apiBlock,
     /"SUMI_MESSAGING_PUSH_SUBJECT=\$\{MESSAGING_PUSH_SUBJECT\}"/,
@@ -389,6 +392,155 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   );
 });
 
+test("the explicit core runtime wires the dev pool to the wake sweep", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+
+  // The documented entrypoint keeps the working Rust runtime as the default;
+  // the new core is deliberately opt-in until ordinary Direct Chat adoption
+  // is accepted.
+  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-rust\}"/);
+  assert.match(launcher, /--runtime rust\|core/);
+  assert.match(
+    launcher,
+    /fail "--runtime must be core or rust \(got \$\{RUNTIME_MODE\}\)"/,
+  );
+
+  // Validation is split: the Rust branch still requires the single-agent
+  // identity and provider key contract, while the core branch validates the
+  // provider-env contract apps/core actually consumes.
+  const rustValidator = launcherFunction(
+    launcher,
+    "validate_rust_runtime_configuration",
+  );
+  assert.match(rustValidator, /require_value SUMI_PERSONALITY_AGENT_ID/);
+  assert.match(rustValidator, /SUMI_MODEL_PRESET \\\n\s+SUMI_MODEL_API_KEY_ENV/);
+  const coreValidator = launcherFunction(
+    launcher,
+    "validate_core_runtime_configuration",
+  );
+  assert.doesNotMatch(coreValidator, /SUMI_PERSONALITY_AGENT_ID/);
+  assert.doesNotMatch(coreValidator, /SUMI_MODEL_API_KEY_ENV/);
+  assert.match(coreValidator, /mock \| none\)/);
+  assert.match(
+    coreValidator,
+    /SUMI_MODEL_PROVIDER must be mock, fixture, openai, or none/,
+  );
+  assert.match(
+    launcher,
+    /core\) validate_core_runtime_configuration ;;\n\s+rust\) validate_rust_runtime_configuration ;;/,
+  );
+
+  // The API receives the core state token, the runtime credential, the wake
+  // target, and the core Direct Chat backend switch only in core mode;
+  // local-control env stays on the rust branch so the legacy attention path
+  // cannot engage underneath the core.
+  const apiCoreBlock = launcher.slice(
+    launcher.indexOf("# Mounts /internal/core"),
+    launcher.indexOf('log "starting API"'),
+  );
+  for (const entry of [
+    '"SUMI_CORE_STATE_TOKEN=${SUMI_CORE_STATE_TOKEN}"',
+    '"SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"',
+    '"SUMI_CORE_WAKE_URL=http://${DEV_POOL_LISTEN}"',
+    '"SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"',
+    '"SUMI_DIRECT_CHAT_BACKEND=core"',
+    '"SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}"',
+    '"SUMI_LOCAL_CONTROL_ENABLED=1"',
+  ]) {
+    assert.ok(apiCoreBlock.includes(entry), entry);
+  }
+  assert.ok(
+    apiCoreBlock.indexOf('"SUMI_CORE_STATE_TOKEN=') <
+      apiCoreBlock.indexOf('"SUMI_LOCAL_CONTROL_ENABLED=1"'),
+  );
+  assert.match(
+    apiCoreBlock,
+    /SUMI_DIRECT_CHAT_BACKEND=core"\n  \)\nelse\n  api_environment\+=\(/,
+  );
+
+  // The dev pool is the wake target: it runs apps/core's Node host and is
+  // gated between API readiness and Vite, in the launch sequence only in
+  // core mode.
+  const poolFunction = launcherFunction(launcher, "start_dev_pool");
+  assert.match(poolFunction, /node src\/host\/dev-pool\.ts/);
+  assert.match(poolFunction, /"SUMI_STATE_URL=\$\{API_ORIGIN\}"/);
+  assert.match(poolFunction, /"SUMI_DEV_POOL_LISTEN=\$\{DEV_POOL_LISTEN\}"/);
+  assert.match(
+    poolFunction,
+    /"SUMI_CORE_WAKE_TOKEN=\$\{SUMI_CORE_WAKE_TOKEN\}"/,
+  );
+  assert.match(
+    poolFunction,
+    /"SUMI_CORE_RUNTIME_TOKEN=\$\{SUMI_CORE_RUNTIME_TOKEN\}"/,
+  );
+  assert.match(poolFunction, /"SUMI_MODEL_PROVIDER=\$\{SUMI_MODEL_PROVIDER:-mock\}"/);
+  assert.match(
+    poolFunction,
+    /wait_for_http "http:\/\/\$\{DEV_POOL_LISTEN\}\/health" "\$\{DEV_POOL_PID\}" "dev core pool"/,
+  );
+  assert.match(
+    poolFunction,
+    /assert_exact_tcp_listener "\$\{DEV_POOL_LISTEN\}"/,
+  );
+  assert.match(
+    launcher,
+    /if \[\[ "\$\{RUNTIME_MODE\}" == "core" \]\]; then\n  start_dev_pool\nelse\n  start_loopback_gateway_relay/,
+  );
+  const apiGate = launcher.search(
+    /wait_for_http "\$\{API_ORIGIN\}\/health" "\$\{API_PID\}" "API"/,
+  );
+  const poolStart = launcher.indexOf("  start_dev_pool\nelse");
+  const viteStart = launcher.search(/log "starting Vite at \$\{WEB_ORIGIN\}"/);
+  assert.ok(apiGate < poolStart && poolStart < viteStart);
+
+  // The Rust toolchain is required only on the transitional path.
+  assert.match(
+    launcher,
+    /if \[\[ "\$\{RUNTIME_MODE\}" == "rust" \]\]; then\n  require_command cargo/,
+  );
+  assert.match(
+    launcher,
+    /if \[\[ "\$\{RUNTIME_MODE\}" == "rust" \]\]; then\n  log "building the Rust PersonalityAgent entrypoint"/,
+  );
+
+  // The core credentials are generated per run with distinct roles: the
+  // state token mounts /internal/core, the runtime token authenticates
+  // pool children, and the wake token authenticates the API's sweep.
+  assert.match(launcher, /SUMI_CORE_STATE_TOKEN="\$\(random_token\)"/);
+  assert.match(launcher, /SUMI_CORE_RUNTIME_TOKEN="\$\(random_token\)"/);
+  assert.match(launcher, /SUMI_CORE_WAKE_TOKEN="\$\(random_token\)"/);
+
+  // The pool listener is loopback-only and collides with nothing else.
+  const poolListenValidator = launcherFunction(
+    launcher,
+    "validate_dev_pool_listen",
+  );
+  assert.match(poolListenValidator, /127\\\.0\\\.0\\\.1/);
+  assert.match(
+    launcher,
+    /SUMI_PUBLIC_LISTEN collides with the dev core pool port/,
+  );
+
+  // The web port stays 5173 by default; SUMI_DEV_WEB_PORT only overrides it
+  // through the same bounded validation as the other listeners, and the
+  // launcher hands it to Vite so the server binds the validated value.
+  const webPortValidator = launcherFunction(launcher, "validate_web_port");
+  assert.match(
+    webPortValidator,
+    /WEB_PORT="\$\{SUMI_DEV_WEB_PORT:-\$\{WEB_PORT_DEFAULT\}\}"/,
+  );
+  assert.match(webPortValidator, /outside 1\.\.65535/);
+  assert.match(
+    webPortValidator,
+    /SUMI_DEV_WEB_PORT collides with a reserved local-stack port/,
+  );
+  assert.match(
+    webPortValidator,
+    /SUMI_DEV_WEB_PORT collides with the dev core pool port/,
+  );
+  assert.match(launcher, /"SUMI_DEV_PORT=\$\{WEB_PORT\}"/);
+});
+
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
   const [makefile, packageJSON] = await Promise.all([
     source("Makefile"),
@@ -396,10 +548,16 @@ test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async
   ]);
   assert.match(
     makefile,
-    /dev: ## Start the supported authenticated local Sumi stack/,
+    /dev: ## Start the supported authenticated local Sumi stack \(Rust runtime for now\)/,
+  );
+  assert.match(
+    makefile,
+    /dev-core: ## Start the stack on the accepted TypeScript secretary core\n\tpnpm dev:core/,
   );
   const scripts = JSON.parse(packageJSON).scripts;
   assert.equal(scripts.dev, "bash scripts/dev/real-stack");
+  assert.equal(scripts["dev:core"], "bash scripts/dev/real-stack --runtime core");
+  assert.equal(scripts["dev:rust"], "bash scripts/dev/real-stack --runtime rust");
   assert.equal(scripts["dev:workspaces"], "turbo run dev");
 });
 

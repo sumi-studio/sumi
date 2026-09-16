@@ -7,6 +7,8 @@
   },
   "scripts": {
     "dev": "bash scripts/dev/real-stack",
+    "dev:core": "bash scripts/dev/real-stack --runtime core",
+    "dev:rust": "bash scripts/dev/real-stack --runtime rust",
     "dev:check": "bash scripts/dev/real-stack --check",
     "dev:workspaces": "turbo run dev",
     "build": "turbo run build",

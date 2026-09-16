@@ -264,6 +264,41 @@ test("durable empty provider failure is visible instead of disappearing", () => 
   );
 });
 
+test("a no-model-connection failure carries its classified cause", () => {
+  let session = createAgentSession();
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 1,
+    event: { type: "agent_start" },
+  });
+  session = apply(session, {
+    audience: "direct_chat",
+    seq: 2,
+    event: {
+      type: "message_end",
+      message_id: AssistantMessageId,
+      message: {
+        ...assistantMessage(""),
+        stop_reason: "error",
+        error_message:
+          "model: the selected model connection is 接続しない (none)",
+        provider_code: "no_model_connection",
+      },
+    },
+  });
+  assert.deepEqual(
+    session.conversation.entries[`message-error:${AssistantMessageId}`],
+    {
+      kind: "error",
+      id: `message-error:${AssistantMessageId}`,
+      runId: "run:1",
+      message: "model: the selected model connection is 接続しない (none)",
+      retryable: false,
+      cause: "no_model_connection",
+    },
+  );
+});
+
 test("durable tool start and end upsert without volatile tool-call events", () => {
   let session = createAgentSession();
   session = apply(session, {
