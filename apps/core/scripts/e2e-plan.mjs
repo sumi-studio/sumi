@@ -802,15 +802,15 @@ async function main() {
   // the same oldest input before any later queued work — head-of-line
   // starvation at process cadence. The recorded failure must be bounded.
   //
-  // 6a — oversized *complete* commit: a ~840 KB multibyte reply keeps
-  // savePlan under the 1 MiB limit, but the commit body
+  // 6a — oversized *complete* commit: a ~3.36 MB multibyte reply keeps
+  // savePlan under the current 4 MiB limit, but the commit body
   // (assistant_message event + output) doubles past it → 400 "read body"
   // → tiers land with a bounded honest error. The turn is observably
   // failed — not fabricated — and the input resolves.
-  log("scenario 6: >1MiB commit resolves bounded; queue proceeds");
+  log("scenario 6: >4MiB commit resolves bounded; queue proceeds");
   const in12 = (await submit("input-twelve")).json.input.input_id;
   const big = runChild({
-    SUMI_SCRIPT: JSON.stringify({ textSize: 140_000 }), // ~840 KB reply
+    SUMI_SCRIPT: JSON.stringify({ textSize: 560_000 }), // ~3.36 MB reply
   });
   assert(
     !big.includes("fatal"),
@@ -841,7 +841,7 @@ async function main() {
   const in13 = (await submit("input-thirteen")).json.input.input_id;
   const in14 = (await submit("input-fourteen")).json.input.input_id;
   const giant = runChild({
-    SUMI_SCRIPT: JSON.stringify({ throwSize: 260_000 }), // ~1.5 MB error
+    SUMI_SCRIPT: JSON.stringify({ throwSize: 1_040_000 }), // ~6.24 MB error
     SUMI_MAX_ATTEMPTS: "50",
   });
   // The error is bounded at the source (8 KiB), so the first commit
