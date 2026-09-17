@@ -140,6 +140,26 @@ B_ID="$(id_of "$B_HOME")"
   && ok "real user shim untouched by installs" \
   || bad "real user shim mutated!"
 
+echo "== a failed install never repoints the CLI shim"
+# A distribution-acceptance run reproduced this: a fresh install that dies
+# resolving the database (no docker, no --db-url) had already repointed
+# ~/.local/bin/sumi-local to its half-written payload — over the working
+# install's entry. The shim is the publication step; it must move only once
+# the install is known-good.
+SHIM_BEFORE="$(readlink "$OSH/.local/bin/sumi-local" 2>/dev/null || echo __absent__)"
+NODOCKER_BIN="$FIX/nodocker-bin"; mkdir -p "$NODOCKER_BIN"
+for t in /usr/bin/* /bin/*; do
+  n="${t##*/}"; [[ $n == docker ]] || ln -sfn "$t" "$NODOCKER_BIN/$n"
+done
+ln -sfn "$(command -v go)" "$NODOCKER_BIN/go"
+ln -sfn "$(command -v node)" "$NODOCKER_BIN/node"
+expect_die "install with no db-url and no docker fails" "no database configured" \
+  env HOME="$OSH" PATH="$NODOCKER_BIN" SUMI_LOCAL_HOME="$FIX/home-nd" \
+      SUMI_LOCAL_PREFIX="$FIX/prefix-nd" "$SRC" install
+[[ $(readlink "$OSH/.local/bin/sumi-local" 2>/dev/null || echo __absent__) == "$SHIM_BEFORE" ]] \
+  && ok "failed install left the CLI shim untouched ($SHIM_BEFORE)" \
+  || bad "failed install repointed shim -> $(readlink "$OSH/.local/bin/sumi-local" 2>/dev/null)"
+
 echo "== start both; distinct resources"
 a start >/dev/null; b start >/dev/null
 A_CTR="sumi-local-pg-$A_ID"; B_CTR="sumi-local-pg-$B_ID"

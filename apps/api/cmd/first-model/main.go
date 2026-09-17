@@ -132,14 +132,24 @@ func (s *fmServer) submitMessage(w http.ResponseWriter, r *http.Request) {
 		SourceSurface: "first-model",
 	})
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, agentstate.ErrBadRequest) {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]any{"error": err.Error()})
+		writeJSON(w, submitErrorStatus(err), map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"input": in})
+}
+
+// submitErrorStatus maps SubmitInput failures: caller problems stay 4xx —
+// a malformed request is 400, a replayed input_id carrying a different
+// request is a 409 conflict — while genuine internal failures stay 500.
+func submitErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, agentstate.ErrBadRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, agentstate.ErrTurnConflict):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func (s *fmServer) outbox(w http.ResponseWriter, r *http.Request) {
