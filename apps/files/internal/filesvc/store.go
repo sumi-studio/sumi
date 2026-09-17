@@ -3113,6 +3113,19 @@ func (s *Store) sweepOrphanNames(ctx context.Context, view ReconView) []int64 {
 	for scope := range scopes {
 		reattach = append(reattach, s.sweepScopeNames(ctx, scope, view)...)
 	}
+	// Sightings recorded for scopes this pass did not enumerate are stale:
+	// a vanished scope offered no listing that could have confirmed the
+	// name persisted, so the deferral must restart if the scope returns —
+	// otherwise a transient same-named ghost would mint a fencing recover
+	// intent on first re-sighting.
+	s.orphanSeen.Range(func(k, _ any) bool {
+		key := k.(string)
+		sc, _, _ := strings.Cut(key, "\x00")
+		if !scopes[sc] {
+			s.orphanSeen.Delete(key)
+		}
+		return true
+	})
 	return reattach
 }
 
@@ -3270,24 +3283,37 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	// intent's record is re-judged by the tombstone scan.
 	if iid, ok := stageNameID(name); ok {
 		var exists, resolved bool
+		var ipath string
 		if err := s.pool.QueryRow(dctx,
-			`SELECT true, resolved_at IS NOT NULL FROM file_op
+			`SELECT true, resolved_at IS NOT NULL, path FROM file_op
 			  WHERE id=$1 AND scope=$2 AND root=$3`,
-			iid, scope, s.rootID).Scan(&exists, &resolved); err == nil && exists {
-			if _, err := s.pool.Exec(dctx,
-				`UPDATE file_op SET names =
-				    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
-				    || $2::jsonb
-				  WHERE id=$1`,
-				iid, mustJSON([]nameRec{{Name: name, Dir: dir}})); err == nil {
-				log.Printf("reconcile: private name %s/%s re-attached to intent %d", dir, name, iid)
-				if resolved {
-					// Its tombstone scan already ran (or just resolved)
-					// this pass — the caller re-judges it now so the
-					// record is not stranded until the next scan cadence.
-					return iid
+			iid, scope, s.rootID).Scan(&exists, &resolved, &ipath); err == nil && exists {
+			// The record's Dir encodes the discovered directory — but an
+			// empty Dir means "the intent's own parent dir" (nameDir), so
+			// a name found at scope root cannot be truthfully journaled
+			// for an intent whose path lives in a subdirectory: it would
+			// resolve to the parent dir, never own the name, and every
+			// later sweep would append another copy while the object
+			// stays parked at the root. That case falls through to the
+			// recover-intent path, whose own journal resolves Dir:"" to
+			// "" — the name's actual location.
+			pdir, _ := splitRel(ipath)
+			if dir != "" || pdir == "" {
+				if _, err := s.pool.Exec(dctx,
+					`UPDATE file_op SET names =
+					    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
+					    || $2::jsonb
+					  WHERE id=$1`,
+					iid, mustJSON([]nameRec{{Name: name, Dir: dir}})); err == nil {
+					log.Printf("reconcile: private name %s/%s re-attached to intent %d", dir, name, iid)
+					if resolved {
+						// Its tombstone scan already ran (or just resolved)
+						// this pass — the caller re-judges it now so the
+						// record is not stranded until the next scan cadence.
+						return iid
+					}
+					return 0
 				}
-				return 0
 			}
 		}
 	}

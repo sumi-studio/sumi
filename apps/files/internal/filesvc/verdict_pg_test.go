@@ -239,6 +239,12 @@ func TestPGReceiptConfirmedRemoveAppliedAtReconcile(t *testing.T) {
 		map[string]string{"If-Version": "none"}); w.Code != 200 {
 		t.Fatalf("seed write: %d %s", w.Code, w.Body)
 	}
+	// The applied verdict needs a bound durable identity to prove the
+	// present occupant is not the declared object — unbound filesystems
+	// (overlayfs, unverified mounts) can only receipt diverged.
+	if info, ok, _ := svc.probe("ws", "orig.txt")(); !ok || info.oidCls != idBound {
+		t.Skip("fixture filesystem cannot bind durable object identity — see TestJuiceFSConfirmedRemoveReceiptsApplied for the verified-mount path")
+	}
 	rh := reqHash("remove", "orig.txt", ivCanon(IfVersion{Mode: "any"}))
 	it := declareKeyed(t, st, "ws", "remove", "orig.txt", IfVersion{Mode: "any"},
 		"", "op:rm-ok", rh, svc.probe("ws", "orig.txt"))

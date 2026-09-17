@@ -280,3 +280,234 @@ func TestStageNameID(t *testing.T) {
 		}
 	}
 }
+
+// namesLen returns the journal record count on an intent row.
+func namesLen(t *testing.T, s *Store, id int64) int {
+	t.Helper()
+	var n int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT COALESCE(jsonb_array_length(names),0) FROM file_op WHERE id=$1`,
+		id).Scan(&n); err != nil {
+		t.Fatalf("names len of intent %d: %v", id, err)
+	}
+	return n
+}
+
+// A .filesv-op-o<id>-* name discovered at scope ROOT whose embedded id
+// belongs to an intent with a SUBDIRECTORY path cannot be journaled on
+// that intent: a record's empty Dir resolves to the intent's own parent
+// dir (nameDir), not to the root where the name was found. Re-attaching
+// would append a record that never owns the name — every later sweep
+// would append another copy while the object stays parked under its
+// private name forever. The sweep must instead route the name through
+// the ordinary orphan path: one deferral, then a recover intent whose
+// own journal resolves Dir:"" to the root — surfacing the bytes visibly.
+func testRootOrphanSubdirIntent(t *testing.T, resolve bool) {
+	dsn := pgDSN(t)
+	s, _, dir := finalStore(t, dsn)
+	ctx := context.Background()
+
+	putFile(t, dir, "ws/sub/.keep", "x")
+	iid := deadOwnerIntent(t, s, "ws", "sub/f.txt", nil)
+	journalStage(t, s, iid) // intent's real slot, journaled in "sub"
+	if resolve {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE file_op SET resolved_at=now() WHERE id=$1`, iid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	misplaced := fmt.Sprintf("%so%d-a0-ffffeeeeddcc", opStagePrefix, iid)
+	putFile(t, dir, "ws/"+misplaced, "misplaced-root-object")
+
+	for i := 0; i < 3; i++ {
+		forceSweep(t, s)
+	}
+	if n := namesLen(t, s, iid); n != 1 {
+		t.Fatalf("repeated sweeps appended unfaithful records: names=%d, want 1", n)
+	}
+	if n := recoverIntents(t, s); n != 1 {
+		t.Fatalf("root orphan not adopted by a recover intent: %d", n)
+	}
+	if durExists(t, dir, "ws/"+misplaced) {
+		t.Fatal("root orphan still parked under its private name")
+	}
+	if where := scanTreeFor(t, dir, "ws", []byte("misplaced-root-object")); where == "" || containsPrivateSeg(where) {
+		t.Fatalf("root orphan bytes not surfaced visibly: %q", where)
+	}
+}
+
+func TestOrphanSweepRootNameSubdirIntentPending(t *testing.T) {
+	testRootOrphanSubdirIntent(t, false)
+}
+
+func TestOrphanSweepRootNameSubdirIntentResolved(t *testing.T) {
+	testRootOrphanSubdirIntent(t, true)
+}
+
+// The same root-level name CAN re-attach to an intent whose own path is
+// at the root: there, a record's empty Dir faithfully resolves to "".
+// The journal gains exactly one record — owned on every later pass, so
+// no duplicates — and the intent's settleNames surfaces the object.
+func TestOrphanSweepRootNameRootIntentReattaches(t *testing.T) {
+	dsn := pgDSN(t)
+	s, _, dir := finalStore(t, dsn)
+	ctx := context.Background()
+
+	putFile(t, dir, "ws/.keep", "x")
+	iid := deadOwnerIntent(t, s, "ws", "f.txt", nil)
+	journalStage(t, s, iid) // intent's real slot, journaled at root
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE file_op SET resolved_at=now() WHERE id=$1`, iid); err != nil {
+		t.Fatal(err)
+	}
+	misplaced := fmt.Sprintf("%so%d-a0-ffffeeeeddcc", opStagePrefix, iid)
+	putFile(t, dir, "ws/"+misplaced, "root-object-root-intent")
+
+	for i := 0; i < 3; i++ {
+		forceSweep(t, s)
+	}
+	// Exactly one record journals the discovered name — the reattach — plus
+	// the capture/surface records settleNames adds. No duplicate appends.
+	var raw []byte
+	if err := s.pool.QueryRow(ctx, `SELECT names FROM file_op WHERE id=$1`, iid).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var recs []nameRec
+	if err := json.Unmarshal(raw, &recs); err != nil {
+		t.Fatal(err)
+	}
+	dups := 0
+	for _, r := range recs {
+		if r.Name == misplaced {
+			dups++
+		}
+	}
+	if dups != 1 {
+		t.Fatalf("repeated sweeps appended duplicate records: %d records name %s", dups, misplaced)
+	}
+	if durExists(t, dir, "ws/"+misplaced) {
+		t.Fatal("root orphan still parked under its private name")
+	}
+	if where := scanTreeFor(t, dir, "ws", []byte("root-object-root-intent")); where == "" || containsPrivateSeg(where) {
+		t.Fatalf("root orphan bytes not surfaced visibly: %q", where)
+	}
+}
+
+// A sighting recorded for a scope that subsequently disappears entirely —
+// no version rows, no intents, not listed on the filesystem — is stale:
+// nothing confirmed the name persisted. If the scope returns with a
+// transient same-named ghost, the deferral must restart rather than
+// minting a fencing recover intent on first re-sighting.
+func TestOrphanSweepScopeDisappearanceResetsSighting(t *testing.T) {
+	dsn := pgDSN(t)
+	s, _, dir := finalStore(t, dsn)
+
+	putFile(t, dir, "ws/sub/.filesv-op-o4242-a0-deadbeef", "orphan")
+	forceSweep(t, s) // first sighting — deferred
+	if n := recoverIntents(t, s); n != 0 {
+		t.Fatalf("first sighting minted %d recover intents", n)
+	}
+
+	// The whole scope vanishes; the pass cannot enumerate it.
+	if err := os.RemoveAll(filepath.Join(dir, "ws")); err != nil {
+		t.Fatal(err)
+	}
+	forceSweep(t, s)
+
+	// The scope returns carrying a same-named transient ghost: a fresh
+	// first sighting — deferred, not recovered.
+	putFile(t, dir, "ws/sub/.filesv-op-o4242-a0-deadbeef", "orphan-again")
+	forceSweep(t, s)
+	if n := recoverIntents(t, s); n != 0 {
+		t.Fatalf("stale sighting survived scope disappearance: %d recover intents", n)
+	}
+	forceSweep(t, s) // persistent across a clean boundary — recovered
+	if n := recoverIntents(t, s); n != 1 {
+		t.Fatalf("returned persistent orphan not recovered (%d)", n)
+	}
+	if where := scanTreeFor(t, dir, "ws", []byte("orphan-again")); where == "" || containsPrivateSeg(where) {
+		t.Fatalf("orphan content lost or left hidden: %q", where)
+	}
+}
+
+// failOnceListView fails ListStaged for one directory one time — an
+// observation failure mid-pass, as a wedged/lagging mount can produce.
+type failOnceListView struct {
+	ReconView
+	failDir string
+	fired   *bool
+}
+
+func (v failOnceListView) ListStaged(scope, dir, prefix string) ([]string, error) {
+	if dir == v.failDir && !*v.fired {
+		*v.fired = true
+		return nil, errors.New("injected listing failure")
+	}
+	return v.ReconView.ListStaged(scope, dir, prefix)
+}
+
+// An observation failure inside a scope pass prunes first-sighting
+// records for names it could not list: a true orphan whose listing
+// errors once needs a fresh deferral — recovery is delayed, never
+// accelerated, by failed observations.
+func TestOrphanSweepSightingResetsOnListFailure(t *testing.T) {
+	dsn := pgDSN(t)
+	s, root, dir := finalStore(t, dsn)
+
+	putFile(t, dir, "ws/sub/.filesv-op-o4242-a0-deadbeef", "true-orphan")
+
+	forceSweep(t, s) // first sighting — deferred
+	if n := recoverIntents(t, s); n != 0 {
+		t.Fatalf("first sighting minted %d recover intents", n)
+	}
+
+	// Second sweep: the listing of "sub" fails — the sighting is pruned.
+	fired := false
+	s.SetReconcileView(authPinned(root, func(v ReconView) ReconView {
+		return failOnceListView{ReconView: v, failDir: "sub", fired: &fired}
+	}))
+	forceSweep(t, s)
+	s.SetReconcileView(authPinned(root, nil))
+
+	// Third sweep must behave as a FIRST sighting again — still no mint.
+	forceSweep(t, s)
+	if n := recoverIntents(t, s); n != 0 {
+		t.Fatalf("sighting survived a failed observation — recover minted early (%d)", n)
+	}
+	// Fourth sweep: two consecutive successful sightings — recovered.
+	forceSweep(t, s)
+	if n := recoverIntents(t, s); n != 1 {
+		t.Fatalf("persistent orphan not recovered after two clean sightings (%d)", n)
+	}
+}
+
+// A store restart loses the in-memory sighting set: a genuine orphan
+// takes one extra sweep to recover. Bounded and safe — the object stays
+// parked under its private name the whole time.
+func TestOrphanSweepRestartResetsSighting(t *testing.T) {
+	dsn := pgDSN(t)
+	s, root, dir := finalStore(t, dsn)
+
+	putFile(t, dir, "ws/sub/.keep", "x")
+	putFile(t, dir, "ws/sub/.filesv-op-o4242-a0-deadbeef", "orphan-across-restart")
+
+	forceSweep(t, s) // first sighting
+	if n := recoverIntents(t, s); n != 0 {
+		t.Fatalf("first sighting minted %d recover intents", n)
+	}
+	s.Close()
+
+	s2 := newPGStore(t, dsn, dir)
+	s2.SetReconcileView(authPinned(root, nil))
+	forceSweep(t, s2) // first sighting for the new instance — deferred again
+	if n := recoverIntents(t, s2); n != 0 {
+		t.Fatalf("restart lost the deferral: %d recover intents", n)
+	}
+	forceSweep(t, s2) // persistent — recovered
+	if n := recoverIntents(t, s2); n != 1 {
+		t.Fatalf("orphan not recovered after restart + two sightings (%d)", n)
+	}
+	if where := scanTreeFor(t, dir, "ws", []byte("orphan-across-restart")); where == "" || containsPrivateSeg(where) {
+		t.Fatalf("orphan content lost or left hidden: %q", where)
+	}
+}

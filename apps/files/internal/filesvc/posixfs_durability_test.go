@@ -837,3 +837,28 @@ func TestDiscardStagedForeignParkKeepsEvidence(t *testing.T) {
 // unjournaled deposits, and every occupied name is captured into a
 // freshly declared name before judgment — PG witnesses in
 // late_repair_pg_test.go cover the same interleavings.
+
+// jfsUUIDFromConfig reads the producer's real schema: JuiceFS 1.4.x
+// serves the volume UUID inside the format block it recorded at format
+// time (Format.UUID), not at top level. Missing or malformed input
+// degrades to "" (identity unbound) rather than failing — mount
+// verification is independent of identity capability.
+func TestJFSUUIDFromConfig(t *testing.T) {
+	real := `{"AttrTimeout":0,"EntryTimeout":0,"DirEntryTimeout":0,"NegEntryTimeout":0,` +
+		`"Format":{"Name":"vol","UUID":"5a1b72bc-b9ec-4a72-813b-2f4dc4cd6d07"}}`
+	if got := jfsUUIDFromConfig([]byte(real)); got != "5a1b72bc-b9ec-4a72-813b-2f4dc4cd6d07" {
+		t.Errorf("producer-schema config: got %q", got)
+	}
+	for _, bad := range []string{
+		`{}`,
+		`{"UUID":"5a1b72bc-b9ec-4a72-813b-2f4dc4cd6d07"}`, // top-level only — not the producer schema
+		`{"Format":{}}`,
+		`{"Format":"not-an-object"}`,
+		`{"Format":{"UUID":42}}`,
+		`{malformed`,
+	} {
+		if got := jfsUUIDFromConfig([]byte(bad)); got != "" {
+			t.Errorf("jfsUUIDFromConfig(%s) = %q, want unbound", bad, got)
+		}
+	}
+}
