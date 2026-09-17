@@ -244,28 +244,37 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		return Receipt{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	authority, held, err := lockPersona(ctx, tx, personaID)
+	authority, _, err := lockPersona(ctx, tx, personaID)
 	if err != nil {
 		return Receipt{}, err
 	}
-	if heldBy(held, transferID) && (authority == "sealed" || authority == "transferred") {
-		rec, err := ledger(ctx, tx, "export", transferID, false)
-		if err != nil {
-			return Receipt{}, err
+	// The ledger is the transfer's durable truth and is consulted before
+	// the persona's current hold: a replayed Seal returns the recorded
+	// receipt — still sealed, or completed — even after the hold moved on
+	// through Complete or a return reclaim's rebind. An aborted export is
+	// different: the transfer id died with it, so reusing it is a conflict
+	// exactly as before.
+	rec, err := ledger(ctx, tx, "export", transferID, false)
+	switch {
+	case err == nil:
+		if rec.PersonaID != personaID {
+			return Receipt{}, fmt.Errorf("%w: transfer_id %s was already used for persona %s",
+				ErrTransferConflict, transferID, rec.PersonaID)
 		}
 		if rec.DestinationID != destinationID {
 			return Receipt{}, fmt.Errorf("%w: transfer %s was sealed for destination %s",
 				ErrTransferConflict, transferID, rec.DestinationID)
 		}
+		if rec.Status == "aborted" {
+			return Receipt{}, fmt.Errorf("%w: transfer_id %s was already used and aborted",
+				ErrTransferConflict, transferID)
+		}
 		return rec, tx.Commit(ctx)
+	case !errors.Is(err, ErrTransferNotFound):
+		return Receipt{}, err
 	}
 	if authority != "active" {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
-	}
-	if _, err := ledger(ctx, tx, "export", transferID, false); err == nil {
-		return Receipt{}, fmt.Errorf("%w: transfer_id %s was already used", ErrTransferConflict, transferID)
-	} else if !errors.Is(err, ErrTransferNotFound) {
-		return Receipt{}, err
 	}
 
 	// Taking the lease row waits for an in-flight mutation of the current
@@ -477,7 +486,7 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 	if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&sealedAt); err != nil {
 		return Receipt{}, err
 	}
-	rec := Receipt{
+	rec = Receipt{
 		Direction:     "export",
 		TransferID:    transferID,
 		PersonaID:     personaID,
@@ -532,11 +541,29 @@ func (s *Service) Complete(ctx context.Context, personaID, transferID, activateP
 	if err != nil {
 		return Receipt{}, err
 	}
-	if rec.PersonaID != personaID || !heldBy(held, transferID) {
-		return Receipt{}, fmt.Errorf("%w: persona is not held by transfer %s", ErrTransferConflict, transferID)
+	if rec.PersonaID != personaID {
+		return Receipt{}, fmt.Errorf("%w: transfer %s belongs to another persona", ErrTransferConflict, transferID)
 	}
 	if rec.Status == "completed" {
+		// The recorded terminal state is the durable truth and outlives
+		// the persona's hold: a return reclaim rebinds transfer_id to the
+		// inbound transfer, so a retried Complete after a lost response
+		// must resolve to the receipt rather than a false "not held"
+		// conflict. A caller presenting a different activate_proof is a
+		// mismatch, not a replay — no arbitrary proof is accepted, and
+		// the newer hold is never touched.
+		if activateProof != "" && activateProof != rec.ActivateProof {
+			return Receipt{}, fmt.Errorf("%w: %s is not the activate_proof recorded for transfer %s",
+				ErrTransferConflict, activateProof, transferID)
+		}
 		return rec, tx.Commit(ctx)
+	}
+	if rec.Status == "aborted" {
+		return Receipt{}, fmt.Errorf("%w: transfer %s was aborted; it cannot be completed",
+			ErrTransferConflict, transferID)
+	}
+	if !heldBy(held, transferID) {
+		return Receipt{}, fmt.Errorf("%w: persona is not held by transfer %s", ErrTransferConflict, transferID)
 	}
 	if authority != "sealed" {
 		return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
@@ -834,8 +861,41 @@ func (s *Service) Retire(ctx context.Context, personaID, transferID, destination
 		if authority != "staged" || !heldBy(held, transferID) {
 			return Receipt{}, fmt.Errorf("%w: persona authority is %s", ErrTransferConflict, authority)
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM core_personas WHERE persona_id = $1`, personaID); err != nil {
-			return Receipt{}, fmt.Errorf("retire staged persona: %w", err)
+		if rec.Supersedes == "" {
+			// First arrival: the persona row was minted by this import, so
+			// deleting it removes everything the transfer brought.
+			if _, err := tx.Exec(ctx, `DELETE FROM core_personas WHERE persona_id = $1`, personaID); err != nil {
+				return Receipt{}, fmt.Errorf("retire staged persona: %w", err)
+			}
+		} else {
+			// A cancelled return: the persona row predates the import and
+			// carries this placement's own history — finished jobs, usage
+			// facts, reservations, call state — which must not die with
+			// the staged copy. The incoming carried rowset and its staged
+			// writer lease are deleted, and the row returns to the
+			// surrendered state the completed export still owns. Nothing
+			// reactivates here: 'transferred' admits no input or writer,
+			// the source's abort restores its authority, and a later
+			// return under the same lineage can reclaim the slot again.
+			for i := len(coreTables) - 1; i >= 0; i-- {
+				t := coreTables[i]
+				if _, err := tx.Exec(ctx, `DELETE FROM `+t.name+` WHERE persona_id = $1`, personaID); err != nil {
+					return Receipt{}, fmt.Errorf("clear cancelled return %s: %w", t.name, err)
+				}
+			}
+			if _, err := tx.Exec(ctx,
+				`DELETE FROM core_writer_leases WHERE persona_id = $1`, personaID); err != nil {
+				return Receipt{}, fmt.Errorf("clear cancelled return writer lease: %w", err)
+			}
+			if tag, err := tx.Exec(ctx, `
+				UPDATE core_personas SET authority = 'transferred', transfer_id = $2
+				WHERE persona_id = $1 AND authority = 'staged' AND transfer_id = $3`,
+				personaID, rec.Supersedes, transferID); err != nil {
+				return Receipt{}, fmt.Errorf("restore surrendered persona: %w", err)
+			} else if tag.RowsAffected() != 1 {
+				return Receipt{}, fmt.Errorf("%w: staged reclaim of persona %s changed during retire",
+					ErrTransferConflict, personaID)
+			}
 		}
 		rec.RetireProof = transferProof(rec.key, "retire", transferID, personaID, own)
 		if err := commit(ctx, tx, "import", transferID, "retired", &rec); err != nil {

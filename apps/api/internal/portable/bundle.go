@@ -313,14 +313,21 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 //
 // supersedes is the caller's lineage assertion: the export transfer under
 // which this placement gave the persona up. When the persona slot is absent
-// the call is exactly Import — the fresh-target case needs no lineage. When
-// the slot holds a row it must be this persona in 'transferred' authority,
-// held by the named export whose ledger row is 'completed': the provably
-// surrendered frozen copy. Anything else — an active, sealed or staged
-// persona, a different transfer's hold, or a surrender this placement never
-// completed — is refused, so a return never overwrites a live or unrelated
-// secretary and never replaces a copy whose outbound transfer is still
-// in flight.
+// the call is exactly Import — the fresh-target case needs no lineage, the
+// assertion is vacuous, and the recorded receipt carries Supersedes="".
+// When the slot holds a row it must be this persona in 'transferred'
+// authority, held by the named export whose ledger row is 'completed': the
+// provably surrendered frozen copy. Anything else — an active, sealed or
+// staged persona, a different transfer's hold, or a surrender this
+// placement never completed — is refused, so a return never overwrites a
+// live or unrelated secretary and never replaces a copy whose outbound
+// transfer is still in flight.
+//
+// On replay the recorded lineage is asserted like the other admission
+// parameters: a staging that was an actual reclaim answers a different
+// non-empty supersedes with a conflict, while an absent-slot staging
+// recorded no lineage and accepts any assertion, and an ordinary Import
+// retry asserts nothing and returns the truthful recorded receipt.
 //
 // Reclaim replaces the carried rowset inside the import transaction: every
 // carried table's rows of the frozen copy are deleted and the bundle's rows
@@ -398,6 +405,19 @@ func (s *Service) importBundle(ctx context.Context, r io.Reader, humanID *string
 			(prior.HumanID != nil && *prior.HumanID != *humanID) {
 			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with a different human_id",
 				ErrTransferConflict, hdr.TransferID)
+		}
+		// Lineage replays like the other admission parameters: when the
+		// staging was an actual reclaim, its recorded supersedes is what
+		// the slot decision was made under, and a different non-empty
+		// assertion conflicts rather than silently answering with the
+		// original lineage. An absent-slot staging recorded no lineage —
+		// supersedes was vacuous then, so any assertion on replay is
+		// consistent with what ran. An empty assertion (an ordinary
+		// Import call replaying a reclaim) asserts nothing and returns
+		// the truthful recorded receipt.
+		if prior.Supersedes != "" && supersedes != "" && supersedes != prior.Supersedes {
+			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported as the return of export %s",
+				ErrTransferConflict, hdr.TransferID, prior.Supersedes)
 		}
 	}
 	reclaim := false

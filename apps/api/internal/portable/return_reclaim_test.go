@@ -380,8 +380,15 @@ func TestReturnRetireAfterReclaim(t *testing.T) {
 	if retired.RetireProof == "" {
 		t.Fatal("retire produced no proof")
 	}
-	if _, err := local.state.PersonaState(ctx, pid); !errors.Is(err, agentstate.ErrPersonaNotFound) {
-		t.Fatalf("persona after retire: %v", err)
+	// A cancelled return does not delete the persona row — that would take
+	// this placement's own history with it. The row returns to the
+	// surrendered state the completed export still owns, with the incoming
+	// carried state gone.
+	if a := authority(t, local, pid); a != "transferred" {
+		t.Fatalf("authority after retired return %s, want transferred", a)
+	}
+	if n := countRows(t, local, `SELECT count(*) FROM core_inputs WHERE persona_id = $1`, pid); n != 0 {
+		t.Fatalf("carried inputs after retired return: %d", n)
 	}
 	// The source's abort restores the cloud copy.
 	must(cloud.svc.Abort(ctx, pid, "home-0005", retired.RetireProof))
@@ -392,9 +399,14 @@ func TestReturnRetireAfterReclaim(t *testing.T) {
 	if _, _, err := local.svc.ImportReturning(ctx, bytes.NewReader(home), nil, false, "out-0005"); !errors.Is(err, ErrTransferConflict) {
 		t.Fatalf("re-import of a retired return: %v, want conflict", err)
 	}
-	// The completed forward export still stands as lineage.
+	// The completed forward export still stands as lineage — and the slot
+	// can be reclaimed again under it by a fresh return.
 	if exp := must(local.svc.Status(ctx, "export", "out-0005")); exp.Status != "completed" {
 		t.Fatalf("forward export after retire: %s", exp.Status)
+	}
+	home2 := sendHome(t, cloud, local, pid, "home-0005b")
+	if _, created, err := local.svc.ImportReturning(ctx, bytes.NewReader(home2), nil, false, "out-0005"); err != nil || !created {
+		t.Fatalf("second reclaim after retired return: created=%v err=%v", created, err)
 	}
 }
 
