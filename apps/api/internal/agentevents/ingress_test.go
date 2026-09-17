@@ -1031,3 +1031,54 @@ func TestUserCommandIngress_InactiveButNotTransferredStillFailsGeneric(t *testin
 		t.Fatalf("expected 500 for in-flight authority, got %d", resp.StatusCode)
 	}
 }
+
+// A command admitted before the transfer keeps its original acceptance:
+// replaying the same idempotent request after the move answers 201 with the
+// same durable identity (the committed core input replays in any authority),
+// a changed body under the same key conflicts, and only a genuinely new
+// command is answered 410 secretary_moved. Exercises the real adapter +
+// Postgres path rather than a fake appender.
+func TestUserCommandIngress_ReplayedAcceptedCommandStaysCreatedAfterTransfer(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	verifier := &fakeSessionVerifier{personalityAgentID: f.pa}
+	ingress, err := NewUserCommandIngress(f.adapter, verifier)
+	if err != nil {
+		t.Fatalf("new ingress: %v", err)
+	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	post := func(text string) (int, map[string]any) {
+		resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands",
+			[]byte(`{"type":"user_message","text":"`+text+`","attachments":[]}`), f.pa)
+		defer resp.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return resp.StatusCode, body
+	}
+
+	code, first := post("admitted before the move")
+	if code != http.StatusCreated || first["command_id"] == "" {
+		t.Fatalf("initial admission: %d %v", code, first)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+
+	code, replay := post("admitted before the move")
+	if code != http.StatusCreated ||
+		replay["command_id"] != first["command_id"] ||
+		replay["seq"] != first["seq"] {
+		t.Fatalf("accepted command replayed as %d %v, want 201 %+v", code, replay, first)
+	}
+	if code, conflict := post("mutated retry"); code != http.StatusConflict ||
+		conflict["reject_reason"] != string(RejectIdempotencyConflict) {
+		t.Fatalf("changed payload: %d %v, want 409 idempotency_conflict", code, conflict)
+	}
+}
