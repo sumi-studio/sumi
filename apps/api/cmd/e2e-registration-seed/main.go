@@ -19,19 +19,31 @@
 //	                                 epoch were created by the real POST /auth/flows,
 //	                                 and invite consumption still runs for real at
 //	                                 confirm. The synthetic firebase uid is prefixed
-//	                                 "synthetic-" and can never collide with a real
-//	                                 account credential.
+//	                                 "synthetic-" as a marker; it is not a
+//	                                 namespace guarantee against real credentials.
+//	                                 Ownership is proven by the flow's nonce —
+//	                                 the same authority credential resolve,
+//	                                 confirm, and status already require —
+//	                                 supplied via SUMI_E2E_REG_SEED_NONCE_FILE
+//	                                 and never printed, plus the expected
+//	                                 verified email which must match the bound
+//	                                 invite's email.
 //
 //	SUMI_E2E_REG_SEED_DATABASE_URL  postgres://... (already migrated)
 //	SUMI_E2E_REG_SEED_EMAIL         invite recipient (invite mode); for
-//	                              resolve-synthetic, the verified email when the
-//	                              bound invite carries none
+//	                              resolve-synthetic, the required expected
+//	                              verified email
+//	SUMI_E2E_REG_SEED_NONCE_FILE    resolve-synthetic only: path to a file
+//	                              containing the flow's base64url nonce (the
+//	                              recovery credential persisted at flow-start)
 //	SUMI_E2E_REG_SEED_DISPLAY_NAME  optional persona label (secretary mode) /
 //	                              verified display name (resolve-synthetic)
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -39,6 +51,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -54,7 +67,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) < 1 || len(args) > 2 {
-		return errors.New("usage: e2e-registration-seed <invite|secretary|verify|verify-local> [persona]")
+		return errors.New("usage: e2e-registration-seed <invite|secretary|resolve-synthetic|verify|verify-local> [id]")
 	}
 	env := func(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 	databaseURL := env("SUMI_E2E_REG_SEED_DATABASE_URL")
@@ -110,7 +123,15 @@ func run(ctx context.Context, args []string) error {
 		if len(args) != 2 {
 			return errors.New("resolve-synthetic requires a flow id")
 		}
-		return resolveSynthetic(ctx, pool, args[1], env("SUMI_E2E_REG_SEED_EMAIL"), env("SUMI_E2E_REG_SEED_DISPLAY_NAME"))
+		nonce, err := readNonceFile(env("SUMI_E2E_REG_SEED_NONCE_FILE"))
+		if err != nil {
+			return err
+		}
+		email := env("SUMI_E2E_REG_SEED_EMAIL")
+		if email == "" {
+			return errors.New("SUMI_E2E_REG_SEED_EMAIL is required for resolve-synthetic — the expected verified identity must be stated explicitly")
+		}
+		return resolveSynthetic(ctx, pool, args[1], nonce, email, env("SUMI_E2E_REG_SEED_DISPLAY_NAME"))
 
 	case "verify":
 		if len(args) != 2 {
@@ -129,63 +150,149 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 
+// readNonceFile loads the flow's ownership nonce from a private file. The
+// nonce is a credential — it authorizes resolve/confirm/status on the flow —
+// so it is never taken from argv, never echoed, and never included in errors.
+func readNonceFile(path string) (string, error) {
+	if path == "" {
+		return "", errors.New("SUMI_E2E_REG_SEED_NONCE_FILE is required for resolve-synthetic — the flow's nonce proves ownership")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read nonce file: %w", err)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// ownershipNonceHash derives the stored nonce identity exactly as production
+// does (koseki validateNonce: base64url-decode 32 bytes, SHA-256). The nonce
+// itself never touches the database.
+func ownershipNonceHash(nonce string) ([]byte, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(nonce)
+	if err != nil || len(decoded) != 32 {
+		return nil, errors.New("nonce file does not contain a valid flow nonce")
+	}
+	digest := sha256.Sum256(decoded)
+	return digest[:], nil
+}
+
 // resolveSynthetic turns an owned pending sign-up flow into the state a real
 // POST /auth/flows/resolve produces after a verified OAuth token:
 // confirmation_required + create_account + a verified credential identity.
-// It synthesizes ONLY the external-IdP proof — the flow must already exist,
-// be pending, be a provider sign-up, and carry a live enrollment invite whose
-// email (when set) becomes the verified identity's email so invite
-// consumption at confirm still exercises its real check. Everything else —
-// nonce authority, browser epoch binding, confirm, invite consumption,
-// transfer claim — runs on the unmodified production path.
-func resolveSynthetic(ctx context.Context, pool *pgxpool.Pool, flowID, email, displayName string) error {
-	var inviteID string
-	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(enrollment_invite_id::text,'')
+// It synthesizes ONLY the external-IdP proof — and only on the exact flow the
+// nonce authorizes. The flow must already exist, be pending, be a provider
+// sign-up, and carry a live enrollment invite whose email (when set) must
+// equal the expected verified email so invite consumption at confirm still
+// exercises its real check. Every precondition is evaluated inside one
+// transaction under FOR UPDATE, so a concurrent resolve, confirm, invite
+// consumption, or revocation is serialized against this mutation. Everything
+// else — nonce authority, browser epoch binding, confirm, invite
+// consumption, transfer claim — runs on the unmodified production path.
+func resolveSynthetic(ctx context.Context, pool *pgxpool.Pool, flowID, nonce, email, displayName string) error {
+	nonceHash, err := ownershipNonceHash(nonce)
+	if err != nil {
+		return err
+	}
+	expectedEmail, err := koseki.NormalizeEmail(email)
+	if err != nil {
+		return fmt.Errorf("expected email: %w", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The nonce hash is part of the row identity — exactly like the
+	// production scanAuthFlowForUpdate — so a wrong nonce selects nothing and
+	// no row is locked or mutated.
+	var status, intent, channel, inviteID string
+	var expiresAt time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT status, intent, channel,
+			COALESCE(enrollment_invite_id::text,''), expires_at
 		FROM auth_flows
-		WHERE flow_id = $1 AND status = 'pending' AND intent = 'sign_up'
-		  AND channel = 'provider' AND expires_at > now()`,
-		flowID).Scan(&inviteID); err != nil {
-		return fmt.Errorf("flow lookup (must be a live pending provider sign-up): %w", err)
+		WHERE flow_id = $1 AND nonce_hash = $2
+		FOR UPDATE`,
+		flowID, nonceHash).Scan(&status, &intent, &channel, &inviteID, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if qerr := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM auth_flows WHERE flow_id = $1)`,
+			flowID).Scan(&exists); qerr != nil {
+			return fmt.Errorf("flow lookup: %w", qerr)
+		}
+		if !exists {
+			return errors.New("no such auth flow")
+		}
+		return errors.New("the supplied nonce does not authorize this flow — refusing to mutate it")
+	}
+	if err != nil {
+		return fmt.Errorf("flow lookup: %w", err)
+	}
+	if status != "pending" {
+		return fmt.Errorf("flow status is %q — only pending flows may be resolved", status)
+	}
+	if intent != "sign_up" || channel != "provider" {
+		return fmt.Errorf("flow is %s/%s — only pending provider sign-up flows may be resolved", intent, channel)
+	}
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT $1::timestamptz > clock_timestamp()`, expiresAt).Scan(&live); err != nil {
+		return fmt.Errorf("flow expiry check: %w", err)
+	}
+	if !live {
+		return errors.New("flow has expired")
 	}
 	if inviteID == "" {
 		return errors.New("flow carries no enrollment invite — refusing to synthesize an uninvited registration")
 	}
+
+	// The bound invite must still be live, checked under the same row lock
+	// production uses so a concurrent consume/revoke cannot slip past.
 	var inviteEmail string
-	err := pool.QueryRow(ctx, `
-		SELECT COALESCE(email,'') FROM enrollment_invites
-		WHERE invite_id = $1 AND revoked_at IS NULL AND consumed_at IS NULL`,
-		inviteID).Scan(&inviteEmail)
+	var inviteExpires time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(email,''), expires_at FROM enrollment_invites
+		WHERE invite_id = $1 AND revoked_at IS NULL AND consumed_at IS NULL
+		FOR UPDATE`,
+		inviteID).Scan(&inviteEmail, &inviteExpires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errors.New("the bound invite is consumed or revoked — refusing")
+	}
 	if err != nil {
 		return fmt.Errorf("invite lookup: %w", err)
 	}
-	verifiedEmail := inviteEmail
-	if verifiedEmail == "" {
-		verifiedEmail = email
+	if err := tx.QueryRow(ctx, `SELECT $1::timestamptz > clock_timestamp()`, inviteExpires).Scan(&live); err != nil {
+		return fmt.Errorf("invite expiry check: %w", err)
 	}
-	if verifiedEmail == "" {
-		return errors.New("invite carries no email; pass SUMI_E2E_REG_SEED_EMAIL for the verified address")
+	if !live {
+		return errors.New("the bound invite has expired — refusing")
 	}
-	if email != "" && inviteEmail != "" && email != inviteEmail {
-		return fmt.Errorf("given email %q does not match the bound invite email %q", email, inviteEmail)
+	if inviteEmail != "" && inviteEmail != expectedEmail {
+		return errors.New("expected email does not match the bound invite's email — refusing")
 	}
+
 	if displayName == "" {
 		displayName = "Synthetic Registrant"
 	}
 	firebaseUID := "synthetic-" + uuid.Must(uuid.NewV7()).String()
-	tag, err := pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE auth_flows SET status='confirmation_required',
 			confirmation_action='create_account', firebase_uid=$2,
 			provider_subject=$3, verified_display_name=$4,
 			verified_email=$5, email_verified=true, proved_at=now()
-		WHERE flow_id=$1 AND status='pending'`,
+		WHERE flow_id=$1 AND nonce_hash=$6 AND status='pending'`,
 		flowID, firebaseUID, "synthetic-"+uuid.Must(uuid.NewV7()).String(),
-		displayName, verifiedEmail)
+		displayName, expectedEmail, nonceHash)
 	if err != nil {
 		return fmt.Errorf("resolve synthetic: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
 		return errors.New("flow changed underfoot — not pending anymore")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
 	}
 	fmt.Println(firebaseUID)
 	return nil
