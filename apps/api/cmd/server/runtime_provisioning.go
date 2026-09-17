@@ -568,6 +568,7 @@ func (p *provisionedProcess) Wait() error {
 	// an explicit Stop retires the process. Returning from Wait would release
 	// manager ownership and allow an overlapping replacement.
 	observationLost := false
+	workspaceUnhealthy := false
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	defer cancelMonitor()
 	p.stopMu.Lock()
@@ -628,6 +629,26 @@ func (p *provisionedProcess) Wait() error {
 			if inspection.Phase != runtimeprovision.PhaseActive ||
 				inspection.Epoch == nil || *inspection.Epoch != p.epoch {
 				return p.retireAfterMonitorFailure(spawn.ErrRuntimeEpochLost)
+			}
+			// An unhealthy canonical workspace bind (e.g. the FUSE client died
+			// and remounted while the executor's old bind still points at the
+			// dead connection) is not a phase loss: the runtime keeps serving
+			// what does not need /workspace, and repair stays the documented
+			// generation-fenced stop→prepare→activate. Log the transition only.
+			if inspection.ExecutorWorkspace == runtimeprovision.ExecutorWorkspaceUnhealthy {
+				if !workspaceUnhealthy {
+					log.Printf("spawn: executor workspace bind unhealthy: agent=%q generation=%d; recover via provisioner stop/prepare/activate",
+						p.epoch.PersonalityAgentID, p.epoch.Generation)
+					workspaceUnhealthy = true
+				}
+			} else if workspaceUnhealthy &&
+				inspection.ExecutorWorkspace == runtimeprovision.ExecutorWorkspaceHealthy {
+				// Only explicit healthy evidence ends the unhealthy state:
+				// "starting" and a temporarily absent report are not proof
+				// the bind became usable, and announcing recovery on them
+				// would lie about the workspace and flap the transition log.
+				log.Printf("spawn: executor workspace bind healthy again: agent=%q", p.epoch.PersonalityAgentID)
+				workspaceUnhealthy = false
 			}
 		}
 	}

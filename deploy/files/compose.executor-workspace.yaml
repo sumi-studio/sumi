@@ -14,11 +14,28 @@
 # The host's JuiceFS client must run as root (it adds allow_other), so the
 # Docker daemon and uid 10002 can reach the mount. The container receives
 # only this one directory — no metadata or object-storage credential and no
-# other scope. If the host's JuiceFS client dies and is restarted by systemd,
-# the executor unit is stopped by PartOf and started again by the mount's
-# WantedBy dependency once the mount verifies (sumi-files-executor@.service).
+# other scope.
+#
+# When the executor runs under the runtime provisioner (no systemd executor
+# unit), a killed-and-remounted FUSE client leaves this container's existing
+# /workspace bind attached to the dead connection (ENOTCONN). The healthcheck
+# below is the bounded probe that surfaces that fact: `test -d` is a shell
+# builtin that only stats the mount — it needs no fork and no external binary,
+# so it stays runnable under the agent's restricted seccomp profile — and the
+# daemon-side timeout bounds the probe even if a stalled FUSE client parks the
+# stat in uninterruptible sleep. The supervisor reports the result as
+# executor_workspace on inspect-epoch. Phase and health are deliberately
+# separate — the runtime stays up; the documented operator recovery
+# (stop → prepare → activate) obtains a fresh bind at a new generation.
 services:
+  # The ai.sumi.files-volume-uuid label records the volume each container was
+  # created against. Docker path strings cannot prove which volume a running
+  # bind captured — a same-path volume swap would fool a host-side path check
+  # — so inspect-epoch classifies the workspace from this immutable label
+  # instead of re-verifying the path.
   prepare:
+    labels:
+      ai.sumi.files-volume-uuid: ${SUMI_FILES_VOLUME_UUID:?run sumi-files-check first}
     volumes:
       - type: bind
         source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
@@ -26,6 +43,8 @@ services:
         bind:
           create_host_path: false
   executor:
+    labels:
+      ai.sumi.files-volume-uuid: ${SUMI_FILES_VOLUME_UUID:?run sumi-files-check first}
     volumes:
       - type: bind
         source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
@@ -33,3 +52,9 @@ services:
         read_only: false
         bind:
           create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /workspace"]
+      interval: 10s
+      timeout: 10s
+      retries: 1
+      start_period: 5s

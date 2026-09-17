@@ -45,7 +45,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	service, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{StateDirectory: stateDirectory})
+	service, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{
+		StateDirectory: stateDirectory,
+		Files: runtimeprovision.FilesEnvironment{
+			Mountpoint: os.Getenv("SUMI_FILES_MOUNTPOINT"),
+			VolumeUUID: os.Getenv("SUMI_FILES_VOLUME_UUID"),
+			CheckPath:  os.Getenv("SUMI_FILES_CHECK"),
+		},
+	})
 	if err != nil {
 		return err
 	}

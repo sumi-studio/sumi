@@ -327,19 +327,44 @@ Recovery semantics here differ from a dedicated executor host in one way:
 there is no `sumi-files-executor@` unit to `BindsTo` the mount, so after a
 client crash + remount the *running* executor's stale `/workspace` bind keeps
 answering ENOTCONN (a bind captures the dead FUSE connection; a remount does
-not propagate into an existing child-directory bind). **Verified:** 60+
-seconds after the client was killed and the mount auto-recovered, the
-runtime/executor/broker containers were all still `Up`, the runtime still
-answered, `/v1/inspect` still reported `phase: active`, and no local-control
-state change was published — nothing in the current topology detects the
-stale workspace bind. Recovery is therefore an explicit lifecycle action, not
-automatic:
+not propagate into an existing child-directory bind). The executor container
+carries a bounded healthcheck (`test -d /workspace`, no fork required under
+the agent's seccomp profile), so the stale bind is reported — not silently
+ignored: the container shows `(unhealthy)` and `/v1/inspect` reports
+`executor_workspace: "unhealthy"` while `phase` stays `active`. Live-phase
+inspection also reports `files_scope`, which classifies the workspace from
+the mount shape plus the epoch's own canonical-volume label — the
+`ai.sumi.files-volume-uuid` label the compose overrides stamp on prepare and
+executor containers at create time. The label, not the mount path, carries
+the identity: a path string cannot prove which volume a running bind
+captured, because a same-path volume swap leaves the old bind serving the old
+volume while the host path verifies as the new one. The states are `"bound"`
+(the epoch's recorded volume is the configured one — a legitimate remount at
+a different path is covered, because the label names the volume, not the
+path), `"foreign"` (a host-path bind exists but the epoch's recorded volume
+differs or it never recorded one — including a pre-repair epoch with no
+label), `"local"` (a positively observed non-bind workspace — the ordinary
+named volume — with no canonical claim), and `"unknown"` (a container exists
+but the mount inspection failed or returned no `/workspace` entry). The
+provisioner reconciles the state against the durable record: a missing record
+is re-created only on `bound`, `local` keeps the never-bound contract, and
+without a durable record, `foreign`, `unknown`, or absent evidence on a live
+epoch refuse adoption through `prepare` and launch through `activate` from a
+prepared epoch. Repeating `activate` on an already active epoch remains a
+status read: it does not launch containers or heal a binding record. These
+checks prevent retargeting merely because a binding record was lost or the
+workspace could not be classified. Workspace
+usability and runtime liveness are deliberately separate facts — the runtime
+keeps serving what does not need the workspace — and repair is still an
+explicit lifecycle action (no in-place rebind exists):
 
 ```sh
 # bounded operator recovery for one secretary (provisioner control socket):
 curl --unix-socket /run/sumi/runtime-provisioner/control.sock \
   -d '{"version":1,"personality_agent_id":"<paid>"}' http://local/v1/inspect
-# -> note epoch.generation / rpc_boot_nonce / opaque_prepared_handle
+# -> phase "active" + executor_workspace "unhealthy" means: running, but the
+#    workspace bind is dead; note generation / rpc_boot_nonce /
+#    opaque_prepared_handle
 curl -X POST --unix-socket /run/sumi/runtime-provisioner/control.sock \
   -d '{"version":1,"personality_agent_id":"<paid>","generation":<gen>,
        "rpc_boot_nonce":"<nonce>","opaque_prepared_handle":"<handle>"}' \
@@ -352,12 +377,14 @@ curl -X POST --unix-socket /run/sumi/runtime-provisioner/control.sock \
 ```
 
 The new activate creates a fresh executor whose bind sees the remounted
-volume — the same files, a new generation (verified: gens 7→8→9→10 across
-two kill cycles, all data intact, `ready`+receipt republished each time).
-The provisioner's own view does update on remount via the `rslave` bind, so
-the scope gate passes again without restarting the provisioner. Detecting a
-stale `/workspace` bind automatically (e.g. executor health wiring or a
-supervisor watch) is a separate product gap — nothing here performs it.
+volume — the same files, a new generation (verified: gens 7→8→9→10 and
+11→12→13 across kill cycles, all data intact, `ready`+receipt republished
+each time). The provisioner's own view does update on remount via the
+`rslave` bind, so the scope gate passes again without restarting the
+provisioner. Automatically recreating the executor on `unhealthy` is a
+deliberate non-goal here: an executor may hold in-flight workspace work, so
+repair goes through the generation-fenced lifecycle above rather than a
+background restart.
 
 ## Verify with real use
 
@@ -396,13 +423,43 @@ supervisor watch) is a separate product gap — nothing here performs it.
   Files already in the volume stay there; the volume UUID and data are never
   re-formatted for rollback or credential rotation.
 - Provisioner (co-located topology): stopping affected runtimes through
-  `/v1/stop` is the safe rollback. **Do not** recreate the provisioner with
-  the `compose.provisioner-files.yaml` overlay removed while any secretary is
-  bound to the canonical volume — with `SUMI_FILES_*` absent the scope gate
-  is inert and a subsequent launch silently binds the host-local workspace,
-  which does not contain the secretary's files. To take files mode off,
-  either keep affected runtimes stopped/refused until canonical support is
-  restored, or restore the files-capable image and the same binding/UUID.
+  `/v1/stop` is the safe rollback — stop/abort/reconcile are never gated on
+  the files configuration. Once a secretary has launched in files scope
+  mode, the provisioner records its canonical volume UUID in
+  `files-bindings.json` under the owner-only provisioner state directory
+  (the durable `provisioner-control` volume). A recreated provisioner whose
+  `SUMI_FILES_*` configuration is absent or points at a different volume now
+  **refuses** `prepare`/`activate` for that secretary with `conflict` — no
+  host-local workspace is substituted, and no launch reaches Compose. The
+  refusal covers adopt as well as launch: a `prepare` that would merely
+  report the still-running epoch also refuses, so changed configuration can
+  never overwrite the recorded volume. A binding record lost with the state
+  directory is only re-created on verified physical evidence — `files_scope:
+  "bound"`, meaning the epoch's own label records the configured volume —
+  never on environment alone and never on a reused host path. If inspection
+  reports `foreign`, `unknown`, or no scope on a live epoch without a durable
+  record, `prepare` adoption and prepared-epoch `activate` refuse until the
+  epoch is stopped and relaunched deliberately;
+  epochs created before the label existed have no recorded claim and report
+  `foreign`, so they recover through the same fenced teardown, not through
+  inference.
+  Binding-state repair rules: remove or repair a `files-bindings.json` entry
+  only while the provisioner is **stopped**; editing it live races the
+  daemon's atomic republish. A corrupt or wrongly-permissioned authority file
+  prevents the provisioner from starting at all — `stop`/`inspect` included —
+  by design (fail closed, never guess the binding). And if the record **and**
+  every old-generation container are gone, the prior volume is unknowable:
+  the next launch under the current configuration is accepted and records
+  that volume. Keep the state directory durable.
+  Observation limit worth knowing: `inspect` holds the per-secretary lock for
+  the duration of its filesystem checks. A mount that is wedged-but-alive
+  (not ENOTCONN — answering nothing) can stall `stat` past `timeout`'s
+  SIGTERM in uninterruptible sleep, delaying `stop` for that one secretary
+  until the caller cancels or the 15-minute operation cap fires. Other
+  secretaries are unaffected; this is an accepted limit, not a silent retry.
+  Files already in the volume stay
+  there; the volume UUID and data are never re-formatted for rollback or
+  credential rotation.
 - Files API: `systemctl --user disable --now sumi-filesvc sumi-files-mount@service`.
   Callers get connection refused, not wrong files.
 - The Worker, the volume data (DO storage) and both databases are kept.
