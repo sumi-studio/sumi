@@ -1241,16 +1241,21 @@ func (p *posixRoot) verifyPinnedMount(rfd *os.File) error {
 
 // jfsUUIDFromConfig extracts the JuiceFS volume UUID from a verified
 // /.config body — the durable namespace leg for object identity on
-// JuiceFS. An absent or malformed field degrades identity to unbound,
+// JuiceFS. The client serves the format block it recorded at format
+// time: the UUID lives at Format.UUID (JuiceFS 1.4.x), not at top
+// level. An absent or malformed field degrades identity to unbound,
 // never fails the mount check (freshness verdicts stay independent of
 // identity capability).
 func jfsUUIDFromConfig(cfg []byte) string {
-	var c map[string]any
+	var c struct {
+		Format struct {
+			UUID string `json:"UUID"`
+		} `json:"Format"`
+	}
 	if err := json.Unmarshal(cfg, &c); err != nil {
 		return ""
 	}
-	u, _ := c["UUID"].(string)
-	return u
+	return c.Format.UUID
 }
 
 func (v *rootView) Stat(scope, path string) (FileInfo, error) {
