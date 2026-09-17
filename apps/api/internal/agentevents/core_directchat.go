@@ -62,8 +62,14 @@ type coreDirectChatPersona struct {
 	seen       map[[sha256.Size]byte]struct{}
 	journalSeq int64
 	commandSeq uint64
-	turnInput  map[string]string // turn_id -> input_id, for surface attribution
-	inputKind  map[string]string // input_id -> source_surface
+	// disposedCommands holds the command_id of every committed
+	// command_disposition. A command's first terminal receipt is final:
+	// the reconciler must never emit a second disposition for it, even
+	// after a restart or an authority change that would classify the same
+	// failure differently.
+	disposedCommands map[string]struct{}
+	turnInput        map[string]string // turn_id -> input_id, for surface attribution
+	inputKind        map[string]string // input_id -> source_surface
 	// The wire's run model allows one active run per session (agent_end
 	// clears the pending approval prompt), while the core may genuinely
 	// interleave inputs — e.g. a second message processed while the first
@@ -277,9 +283,10 @@ func (c *CoreDirectChat) notePersona(personalityAgentID string) {
 
 func newCoreDirectChatPersona() *coreDirectChatPersona {
 	return &coreDirectChatPersona{
-		seen:      make(map[[sha256.Size]byte]struct{}),
-		turnInput: make(map[string]string),
-		inputKind: make(map[string]string),
+		seen:             make(map[[sha256.Size]byte]struct{}),
+		disposedCommands: make(map[string]struct{}),
+		turnInput:        make(map[string]string),
+		inputKind:        make(map[string]string),
 	}
 }
 
@@ -430,14 +437,25 @@ func (c *CoreDirectChat) syncPersona(ctx context.Context, personaID string) erro
 // restart nor an overlapping projector can act on a stale cached view.
 func (c *CoreDirectChat) loadProjectionState(ctx context.Context, personaID string, st *coreDirectChatPersona) error {
 	seen := make(map[[sha256.Size]byte]struct{})
+	disposed := make(map[string]struct{})
 	envelopes, err := c.Gateway.EventCatchUp(ctx, personaID, 0)
 	if err != nil {
 		return err
 	}
 	for _, env := range envelopes {
 		seen[sha256.Sum256(env.Event)] = struct{}{}
+		if eventType(env.Event) != "command_disposition" {
+			continue
+		}
+		var disposition struct {
+			CommandID string `json:"command_id"`
+		}
+		if err := json.Unmarshal(env.Event, &disposition); err == nil && disposition.CommandID != "" {
+			disposed[disposition.CommandID] = struct{}{}
+		}
 	}
 	st.seen = seen
+	st.disposedCommands = disposed
 	st.loaded = true
 	return nil
 }
@@ -611,9 +629,24 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 	if err != nil {
 		return err
 	}
+	// A transferred secretary's commands are all rejected for the same
+	// reason — it moved — regardless of which command shape failed. One
+	// read per sweep keeps the reason honest for every command kind.
+	moved := false
+	if authority, aerr := c.Core.PersonaAuthority(ctx, personaID); aerr == nil {
+		moved = authority == "transferred"
+	}
 	for _, env := range commands {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if _, done := st.disposedCommands[env.CommandID]; done {
+			// The command already has a terminal receipt. It is never
+			// re-dispositioned — a restarted projector or a changed
+			// authority must not mint a second one with a different
+			// reason.
+			st.commandSeq = env.Seq
+			continue
 		}
 		var head browserCommandHead
 		if err := json.Unmarshal(env.Command, &head); err != nil {
@@ -632,7 +665,7 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 			case errors.Is(lookupErr, agentstate.ErrInputNotFound):
 				if err := c.ensureMessageInput(ctx, env.Provenance, env); err != nil {
 					if isPermanentCoreSubmitError(err) {
-						if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); aerr != nil {
+						if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", commandRejectReason(err, moved)); aerr != nil {
 							return aerr
 						}
 					} else {
@@ -651,25 +684,31 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 				return lookupErr
 			}
 		} else if head.Type == "approval_decision" {
-			if !c.hasDisposition(env, st) {
-				err := c.applyApprovalDecision(ctx, env.Provenance, env)
-				switch {
-				case err == nil:
-				case errors.Is(err, agentstate.ErrApprovalConflict):
-					if aerr := c.appendDisposition(ctx, personaID, st, env, "superseded", ""); aerr != nil {
-						return aerr
-					}
-				case errors.Is(err, agentstate.ErrApprovalNotFound),
-					errors.Is(err, agentstate.ErrApprovalForbidden):
-					if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); aerr != nil {
-						return aerr
-					}
-				default:
-					return err
+			err := c.applyApprovalDecision(ctx, env.Provenance, env)
+			switch {
+			case err == nil:
+			case errors.Is(err, agentstate.ErrApprovalConflict):
+				if aerr := c.appendDisposition(ctx, personaID, st, env, "superseded", ""); aerr != nil {
+					return aerr
 				}
+			case errors.Is(err, agentstate.ErrApprovalNotFound),
+				errors.Is(err, agentstate.ErrApprovalForbidden),
+				errors.Is(err, agentstate.ErrPersonaInactive):
+				// An inactive persona takes no decisions; transferred is
+				// terminal. Close it rejected rather than letting the
+				// command wedge every sweep.
+				if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", commandRejectReason(err, moved)); aerr != nil {
+					return aerr
+				}
+			default:
+				return err
 			}
-		} else if !c.hasDisposition(env, st) {
-			if err := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); err != nil {
+		} else {
+			reason := string(RejectNotAllowed)
+			if moved {
+				reason = string(RejectSecretaryMoved)
+			}
+			if err := c.appendDisposition(ctx, personaID, st, env, "rejected", reason); err != nil {
 				return err
 			}
 		}
@@ -678,17 +717,38 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 	return nil
 }
 
-// hasDisposition reports whether this command already has a terminal
-// disposition in the durable log (applied or rejected are the only terminal
-// states this adapter emits).
-func (c *CoreDirectChat) hasDisposition(env CommandEnvelope, st *coreDirectChatPersona) bool {
-	for _, status := range []string{"applied", "rejected", "superseded"} {
-		raw := dispositionEvent(env, status, "")
-		if _, ok := st.seen[sha256.Sum256(raw)]; ok {
-			return true
-		}
+// commandDispositionKey is the durable dedup identity of a command's
+// terminal receipt: one command_id admits exactly one command_disposition,
+// whatever its status or reject_reason. The lock-level dedup in
+// AppendProjectedEvents then refuses a second receipt for the same command
+// even when a restarted or overlapping projector would classify the command
+// differently — the first committed terminal result stays final.
+func commandDispositionKey(commandID string) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write([]byte("sumi-core-direct-chat\x00command-disposition\x00"))
+	h.Write([]byte(commandID))
+	var key [sha256.Size]byte
+	copy(key[:], h.Sum(nil))
+	return key
+}
+
+// commandDispositionDedupKey returns the durable dedup identity of a
+// committed command_disposition event — the same command-scoped key
+// appendDisposition writes under — or false when the event is not a
+// disposition carrying a command_id. The gateway's dedup-index recovery
+// uses it so a rebuilt index reproduces the real key; hashing the stored
+// content can never match a key derived from the command_id, which would
+// leave a stale projector free to commit a second terminal receipt.
+func commandDispositionDedupKey(event json.RawMessage) ([sha256.Size]byte, bool) {
+	var head struct {
+		Type      string `json:"type"`
+		CommandID string `json:"command_id"`
 	}
-	return false
+	if json.Unmarshal(event, &head) != nil ||
+		head.Type != "command_disposition" || head.CommandID == "" {
+		return [sha256.Size]byte{}, false
+	}
+	return commandDispositionKey(head.CommandID), true
 }
 
 func (c *CoreDirectChat) appendDisposition(
@@ -698,18 +758,18 @@ func (c *CoreDirectChat) appendDisposition(
 	env CommandEnvelope,
 	status, reason string,
 ) error {
-	raw := dispositionEvent(env, status, reason)
-	key := sha256.Sum256(raw)
-	if _, ok := st.seen[key]; ok {
+	if _, done := st.disposedCommands[env.CommandID]; done {
 		return nil
 	}
+	raw := dispositionEvent(env, status, reason)
 	// Dispositions are receipts, not run content: they never open a run and
 	// land inside whatever run happens to be open.
 	if err := c.Gateway.AppendProjectedEvents(ctx, personaID,
-		[]ProjectedEvent{{Event: raw, DedupKey: key}}); err != nil {
+		[]ProjectedEvent{{Event: raw, DedupKey: commandDispositionKey(env.CommandID)}}); err != nil {
 		return err
 	}
-	st.seen[key] = struct{}{}
+	st.seen[sha256.Sum256(raw)] = struct{}{}
+	st.disposedCommands[env.CommandID] = struct{}{}
 	return nil
 }
 
@@ -718,6 +778,18 @@ func isPermanentCoreSubmitError(err error) bool {
 		errors.Is(err, agentstate.ErrTurnConflict) ||
 		errors.Is(err, agentstate.ErrBadRequest) ||
 		errors.Is(err, agentstate.ErrPersonaBound)
+}
+
+// commandRejectReason picks the reject_reason for a command's terminal
+// disposition. A secretary transferred to another placement reports
+// secretary_moved — durable history and reconnected browsers then tell the
+// person where the conversation went — while every other permanent refusal
+// stays not_allowed.
+func commandRejectReason(err error, moved bool) string {
+	if moved || errors.Is(err, agentstate.ErrPersonaTransferred) {
+		return string(RejectSecretaryMoved)
+	}
+	return string(RejectNotAllowed)
 }
 
 // ---------------------------------------------------------------------------

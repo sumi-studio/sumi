@@ -861,6 +861,57 @@ test("immediate rejection removes provisional history and supports restore/disca
   assert.deepEqual(store.getState().recoverableDrafts, []);
 });
 
+test("secretary_moved rejection keeps the text recoverable with a moved reason", () => {
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+    idempotencyKey: () => "moved",
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("still there?"), true);
+  transport.emit({
+    type: "command_rejected",
+    idempotency_key: "moved",
+    reject_reason: "secretary_moved",
+  });
+  assert.equal(
+    store.getState().lastError,
+    "This secretary moved to Sumi Cloud. Continue the conversation there.",
+  );
+  assert.deepEqual(store.getState().recoverableDrafts, [
+    {
+      idempotencyKey: "moved",
+      text: "still there?",
+      reason: "secretary_moved",
+    },
+  ]);
+});
+
+test("secretary_moved durable disposition recovers the draft on replay", () => {
+  const key = "moved-replay";
+  const transport = new FakeTransport();
+  const store = createConversationStore({
+    transport,
+    outbox: new PrivateOutbox(),
+    idempotencyKey: () => key,
+  });
+  store.getState().connect();
+  assert.equal(store.getState().sendMessage("replayed"), true);
+  transport.emit(accepted(key, CommandId, 21));
+  transport.emit(
+    disposition(4, CommandId, 21, "rejected", "secretary_moved"),
+  );
+  assert.deepEqual(store.getState().recoverableDrafts, [
+    {
+      idempotencyKey: key,
+      text: "replayed",
+      reason: "secretary_moved",
+      commandId: CommandId,
+    },
+  ]);
+});
+
 test("rejection for a non-message command does not claim recovery persistence failed", () => {
   const transport = new FakeTransport();
   const store = createConversationStore({
@@ -1280,7 +1331,10 @@ function disposition(
   commandId: string,
   commandSeq: number,
   status: "applied" | "superseded" | "rejected",
-  rejectReason?: "not_allowed",
+  rejectReason?: Extract<
+    CommandDispositionEvent,
+    { status: "rejected" }
+  >["reject_reason"],
 ): DirectChatServerFrame {
   return {
     type: "event",

@@ -1,4 +1,7 @@
-import type { DirectChatServerFrame } from "./direct-chat-socket";
+import {
+  describeCommandRejectReason,
+  type DirectChatServerFrame,
+} from "./direct-chat-socket";
 
 export type FeedItem = {
   id: string;
@@ -40,7 +43,7 @@ export class DirectChatTimeline {
       this.appendOnce(`reject-${frame.idempotency_key}`, {
         id: `reject-${frame.idempotency_key}`,
         kind: "system",
-        text: `Command rejected: ${frame.reject_reason}`,
+        text: describeCommandRejectReason(frame.reject_reason),
       });
       return this.feed;
     }

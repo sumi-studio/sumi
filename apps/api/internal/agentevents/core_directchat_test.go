@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
@@ -29,6 +31,7 @@ type coreDirectChatFixture struct {
 	t       *testing.T
 	ctx     context.Context
 	core    *agentstate.Store
+	pool    *pgxpool.Pool
 	adapter *CoreDirectChat
 	gateway *DurableGateway
 	dir     string
@@ -68,6 +71,7 @@ func newCoreDirectChatFixture(t *testing.T) *coreDirectChatFixture {
 		t:       t,
 		ctx:     context.Background(),
 		core:    core,
+		pool:    pool,
 		adapter: adapter,
 		gateway: gateway,
 		dir:     dir,
@@ -712,9 +716,13 @@ func countEvent(types []string, want string) int {
 	return n
 }
 
-// Two projector instances over the same stores — a restarted API overlapping
-// its predecessor — must commit each fact once. The durable dedup index is
-// the guard; the per-process seen map alone cannot be.
+// Independent projector instances over the same durable files — restarted
+// API processes overlapping their predecessor — must commit each fact once.
+// The durable dedup index is the guard; the per-process seen map alone
+// cannot be. Production invokes syncPersona serially per adapter (one Run
+// goroutine sweeps personas in order), so each goroutine here is a fully
+// separate projector: its own command store, gateway, and adapter, sharing
+// only the on-disk logs — the contention a real overlapping process sees.
 func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 	f := newCoreDirectChatFixture(t)
 	env := f.sendMessage(t, "key-1", "once only")
@@ -727,23 +735,24 @@ func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 		{Kind: "assistant_message", Payload: map[string]any{"text": "reply", "round": 0}},
 	}, agentstate.CommitRequest{Outcome: "complete"})
 
-	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
-	if err != nil {
-		t.Fatalf("second gateway: %v", err)
-	}
-	adapter2 := &CoreDirectChat{Core: f.core, Gateway: gateway2}
-
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			a := f.adapter
-			g := f.gateway
-			if i%2 == 1 {
-				a, g = adapter2, gateway2
+			commands, err := OpenCommandStore(f.gateway.commands.dir)
+			if err != nil {
+				errs <- err
+				return
 			}
+			defer commands.Close()
+			g, err := OpenDurableGateway(f.dir, commands)
+			if err != nil {
+				errs <- err
+				return
+			}
+			a := &CoreDirectChat{Core: f.core, Gateway: g}
 			if err := a.syncPersona(f.ctx, f.pa); err != nil {
 				errs <- err
 				return
@@ -751,7 +760,7 @@ func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 			if _, err := g.EventCatchUp(f.ctx, f.pa, 0); err != nil {
 				errs <- err
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 	close(errs)
@@ -1741,5 +1750,557 @@ func TestCoreDirectChatGuardPathRejectsReplayRefusedRecords(t *testing.T) {
 				t.Fatal("corrupt tail was rewritten or appended after")
 			}
 		})
+	}
+}
+
+// A command sent after the secretary transferred is durable, synchronously
+// refused with ErrPersonaTransferred, and closed by the reconciler with a
+// terminal rejected/secretary_moved disposition — not retried forever, not
+// silently lost, and not labelled with a generic reason that hides the move.
+func TestCoreDirectChatTransferredPersonaRejectsMoved(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+
+	env := f.sendMessage(t, "key-before", "sent before the move")
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`,
+		f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+
+	movedEnv, err := f.adapter.Append(f.ctx, f.provenance(), "key-after",
+		json.RawMessage(`{"type":"user_message","text":"after the move","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaTransferred) ||
+		!errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("append after transfer: %v", err)
+	}
+	if movedEnv.CommandID == "" || movedEnv.Seq != 2 {
+		t.Fatalf("moved command lost its durable identity: %+v", movedEnv)
+	}
+	// No core input may be admitted for the transferred persona.
+	if _, _, err := f.core.GetInput(f.ctx, f.pa, "direct-chat:"+movedEnv.CommandID); !errors.Is(err, agentstate.ErrInputNotFound) {
+		t.Fatalf("transferred persona queued an input: %v", err)
+	}
+
+	f.sweep(t)
+	events := durableEvents(t, f.gateway, f.pa)
+	var dispositions []map[string]any
+	for _, e := range events {
+		var ev map[string]any
+		if err := json.Unmarshal(e.Event, &ev); err != nil {
+			continue
+		}
+		if ev["type"] == "command_disposition" {
+			dispositions = append(dispositions, ev)
+		}
+	}
+	if len(dispositions) != 2 {
+		t.Fatalf("dispositions: %v", dispositions)
+	}
+	// The pre-move command's input was admitted while active — applied.
+	if dispositions[0]["command_id"] != env.CommandID || dispositions[0]["status"] != "applied" {
+		t.Fatalf("pre-move disposition: %v", dispositions[0])
+	}
+	if dispositions[1]["command_id"] != movedEnv.CommandID ||
+		dispositions[1]["status"] != "rejected" ||
+		dispositions[1]["reject_reason"] != string(RejectSecretaryMoved) {
+		t.Fatalf("post-move disposition: %v", dispositions[1])
+	}
+
+	// Re-sweeping after restart must not append duplicates or retry.
+	restarted := &CoreDirectChat{Core: f.core, Gateway: f.gateway}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("resync after restart: %v", err)
+	}
+	if after := durableEvents(t, f.gateway, f.pa); len(after) != len(events) {
+		t.Fatalf("resync appended %d duplicate events", len(after)-len(events))
+	}
+}
+
+// A sealed persona mid-move is inactive but NOT moved: its rejected
+// disposition must stay not_allowed, never claim the secretary is gone.
+func TestCoreDirectChatSealedPersonaStaysNotAllowed(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`,
+		f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	_, err := f.adapter.Append(f.ctx, f.provenance(), "key-sealed",
+		json.RawMessage(`{"type":"user_message","text":"mid move","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) ||
+		errors.Is(err, agentstate.ErrPersonaTransferred) {
+		t.Fatalf("sealed append: %v", err)
+	}
+	f.sweep(t)
+	var rejected map[string]any
+	for _, e := range durableEvents(t, f.gateway, f.pa) {
+		var ev map[string]any
+		if json.Unmarshal(e.Event, &ev) == nil && ev["type"] == "command_disposition" {
+			rejected = ev
+		}
+	}
+	if rejected["status"] != "rejected" || rejected["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("sealed disposition: %v", rejected)
+	}
+}
+
+func commandDispositions(t *testing.T, g *DurableGateway, pa string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, e := range durableEvents(t, g, pa) {
+		var ev map[string]any
+		if json.Unmarshal(e.Event, &ev) == nil && ev["type"] == "command_disposition" {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// A command's first terminal disposition is final: a command rejected
+// not_allowed while the persona was sealed keeps that receipt after the
+// transfer completes and the projector restarts — no secretary_moved
+// revision, no duplicate disposition. Regression for the defect where a
+// restarted projector rescanned the command (commandSeq resets to 0) and
+// appended a second, differently-reasoned receipt, which then broke
+// CommandDispositionFor.
+func TestCoreDirectChatDispositionStaysFinalAcrossTransferAndRestart(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env, err := f.adapter.Append(f.ctx, f.provenance(), "sealed-key",
+		json.RawMessage(`{"type":"user_message","text":"during seal","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append err=%v", err)
+	}
+	f.sweep(t)
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("sealed dispositions: %v", dispositions)
+	}
+
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+	// A restarted projector rebuilds its cursors from the durable log and
+	// rescans every command; the committed receipt must stay the only one.
+	restarted := &CoreDirectChat{Core: f.core, Gateway: f.gateway}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("post-restart sweep: %v", err)
+	}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("second post-restart sweep: %v", err)
+	}
+	dispositions = commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 {
+		t.Fatalf("restart appended a second disposition: %v", dispositions)
+	}
+	if dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("terminal disposition was revised: %v", dispositions[0])
+	}
+	disposition, found, derr := f.gateway.CommandDispositionFor(f.ctx, env)
+	if derr != nil || !found {
+		t.Fatalf("CommandDispositionFor after restart: found=%v err=%v", found, derr)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(disposition, &parsed); err != nil ||
+		parsed["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("lookup returned %s", disposition)
+	}
+}
+
+// A sibling projector whose in-memory view predates the committed receipt
+// (it loaded before the first projector's disposition landed) must still be
+// refused by the command-scoped durable dedup identity under the event-file
+// lock — even when its fresher authority read would classify the command
+// differently.
+func TestCoreDirectChatStaleProjectorCannotDoubleDispose(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env, err := f.adapter.Append(f.ctx, f.provenance(), "stale-key",
+		json.RawMessage(`{"type":"user_message","text":"stale view","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append err=%v", err)
+	}
+
+	// Sibling projector on its own gateway loads its projection state
+	// before the first projector's receipt commits.
+	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	sibling := &CoreDirectChat{Core: f.core, Gateway: gateway2}
+	st2 := sibling.personaState(f.pa)
+	if err := sibling.loadProjectionState(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling load: %v", err)
+	}
+
+	// First projector disposes the command while sealed; the transfer then
+	// completes, so the sibling's stale state now computes secretary_moved.
+	f.sweep(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("sibling projector committed a second disposition: %v", dispositions)
+	}
+	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+		t.Fatalf("CommandDispositionFor: found=%v err=%v", found, derr)
+	}
+}
+
+// A restart must still reconcile commands that never got a terminal
+// receipt: rescanning is how pending work survives a projector restart.
+// Both shapes are covered — an admitted user_message earns "applied", and
+// a durable abort-type command earns its rejected receipt exactly once.
+func TestCoreDirectChatRestartStillReconcilesUndisposedCommands(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	env := f.sendMessage(t, "pending-key", "admitted before restart")
+	abortEnv, err := f.adapter.Append(f.ctx, f.provenance(), "abort-key",
+		json.RawMessage(`{"type":"abort"}`))
+	if err != nil {
+		t.Fatalf("append abort: %v", err)
+	}
+	// No sweep before the "restart": neither command has a receipt yet.
+	restarted := &CoreDirectChat{Core: f.core, Gateway: f.gateway}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("post-restart sweep: %v", err)
+	}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("second post-restart sweep: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 2 {
+		t.Fatalf("expected exactly one receipt per command, got %v", dispositions)
+	}
+	byID := map[string]map[string]any{}
+	for _, d := range dispositions {
+		byID[d["command_id"].(string)] = d
+	}
+	if byID[env.CommandID]["status"] != "applied" {
+		t.Fatalf("admitted command disposition: %v", byID[env.CommandID])
+	}
+	if byID[abortEnv.CommandID]["status"] != "rejected" ||
+		byID[abortEnv.CommandID]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("abort disposition: %v", byID[abortEnv.CommandID])
+	}
+	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, abortEnv); derr != nil || !found {
+		t.Fatalf("abort CommandDispositionFor: found=%v err=%v", found, derr)
+	}
+}
+
+func dedupIndexPath(f *coreDirectChatFixture) string {
+	return filepath.Join(f.dir, "events-"+safeFileID(f.pa)+".dedup")
+}
+
+func readDedupIndex(t *testing.T, f *coreDirectChatFixture) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(dedupIndexPath(f))
+	if err != nil {
+		t.Fatalf("read dedup index: %v", err)
+	}
+	return raw
+}
+
+// A sibling projector whose in-memory view predates the committed receipt
+// must still be refused after the dedup index is lost wholesale: index
+// recovery has to reproduce the receipt's command-scoped key from the
+// stored command_id — hashing the stored content cannot — or the stale
+// sibling commits a second terminal disposition and CommandDispositionFor
+// breaks. Regression for the recovery-gap variant of the duplicate-
+// disposition defect.
+func TestCoreDirectChatLostDedupIndexStaleProjectorCannotDoubleDispose(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env, err := f.adapter.Append(f.ctx, f.provenance(), "lost-index-key",
+		json.RawMessage(`{"type":"user_message","text":"stale view","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append err=%v", err)
+	}
+
+	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	sibling := &CoreDirectChat{Core: f.core, Gateway: gateway2}
+	st2 := sibling.personaState(f.pa)
+	if err := sibling.loadProjectionState(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling load: %v", err)
+	}
+
+	f.sweep(t)
+	if err := os.Remove(dedupIndexPath(f)); err != nil {
+		t.Fatalf("remove dedup index: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("lost-index stale projector committed a second disposition: %v", dispositions)
+	}
+	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+		t.Fatalf("CommandDispositionFor: found=%v err=%v", found, derr)
+	}
+	// The rebuilt index must carry the command-scoped preimage, not the
+	// content hash that could never refuse this append again.
+	idx := readDedupIndex(t, f)
+	want := commandDispositionKey(env.CommandID)
+	if len(idx)%sha256.Size != 0 || len(idx) == 0 ||
+		!bytes.Equal(idx[len(idx)-sha256.Size:], want[:]) {
+		t.Fatalf("rebuilt index does not end with the command-scoped key: %x", idx)
+	}
+}
+
+// The lost-index gap does not need an authority change: a stale sibling
+// recomputing the *same* reason emits byte-identical content under the
+// command-scoped key, which a content-hash rebuild cannot match — so the
+// duplicate commits even for identical receipts.
+func TestCoreDirectChatLostDedupIndexSameReasonReplayRefused(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env, err := f.adapter.Append(f.ctx, f.provenance(), "same-reason-key",
+		json.RawMessage(`{"type":"user_message","text":"same reason","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append err=%v", err)
+	}
+
+	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	sibling := &CoreDirectChat{Core: f.core, Gateway: gateway2}
+	st2 := sibling.personaState(f.pa)
+	if err := sibling.loadProjectionState(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling load: %v", err)
+	}
+
+	f.sweep(t)
+	if err := os.Remove(dedupIndexPath(f)); err != nil {
+		t.Fatalf("remove dedup index: %v", err)
+	}
+	// Authority stays sealed: the sibling recomputes the identical
+	// not_allowed receipt for the same command.
+	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("same-reason replay committed a second disposition: %v", dispositions)
+	}
+	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+		t.Fatalf("CommandDispositionFor: found=%v err=%v", found, derr)
+	}
+}
+
+// A torn index tail — a preimage lost mid-write — must re-cover the
+// committed disposition with its command-scoped key, and the index must
+// stay preimage-aligned with the committed lines it covers.
+func TestCoreDirectChatTornDedupIndexStaleProjectorCannotDoubleDispose(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env1, err := f.adapter.Append(f.ctx, f.provenance(), "torn-one",
+		json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append 1 err=%v", err)
+	}
+	env2, err := f.adapter.Append(f.ctx, f.provenance(), "torn-two",
+		json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append 2 err=%v", err)
+	}
+
+	// The sibling loads before either receipt commits, so its in-memory
+	// view is stale and only the durable dedup identity can refuse it.
+	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	sibling := &CoreDirectChat{Core: f.core, Gateway: gateway2}
+	st2 := sibling.personaState(f.pa)
+	if err := sibling.loadProjectionState(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling load: %v", err)
+	}
+
+	f.sweep(t)
+	f.sweep(t)
+
+	// Tear the tail: keep the first preimage, drop the second plus a
+	// half-written record — the documented torn-write shape.
+	eventCount := int64(len(durableEvents(t, f.gateway, f.pa)))
+	if eventCount != 2 {
+		t.Fatalf("expected 2 committed events, got %d", eventCount)
+	}
+	idx := readDedupIndex(t, f)
+	if int64(len(idx)) != eventCount*sha256.Size {
+		t.Fatalf("index preimage count %d does not match %d events", len(idx)/sha256.Size, eventCount)
+	}
+	torn := int64(sha256.Size) + 10
+	if err := os.Truncate(dedupIndexPath(f), torn); err != nil {
+		t.Fatalf("truncate dedup index: %v", err)
+	}
+
+	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 2 {
+		t.Fatalf("torn-index stale projector committed extra dispositions: %v", dispositions)
+	}
+	for _, env := range []CommandEnvelope{env1, env2} {
+		if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+			t.Fatalf("CommandDispositionFor %s: found=%v err=%v", env.CommandID, found, derr)
+		}
+	}
+	// The torn preimage must be re-covered by the command-scoped key and
+	// the index brought back to exactly one record per committed line.
+	idx = readDedupIndex(t, f)
+	if int64(len(idx)) != eventCount*sha256.Size {
+		t.Fatalf("index preimage count %d no longer matches %d events", len(idx)/sha256.Size, eventCount)
+	}
+	want := commandDispositionKey(env2.CommandID)
+	if !bytes.Equal(idx[len(idx)-sha256.Size:], want[:]) {
+		t.Fatalf("re-covered preimage is not the command-scoped key: %x", idx[len(idx)-sha256.Size:])
+	}
+}
+
+// An intact index whose disposition record was written under the legacy
+// content-hash identity (pre-command-scoped builds) must still refuse a
+// stale sibling: recovery reproduces the command-scoped key from the
+// committed line even when every line already has an index record.
+func TestCoreDirectChatLegacyKeyedDispositionStillRefusesStaleProjector(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env, err := f.adapter.Append(f.ctx, f.provenance(), "legacy-key",
+		json.RawMessage(`{"type":"user_message","text":"legacy","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append err=%v", err)
+	}
+
+	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
+	if err != nil {
+		t.Fatalf("second gateway: %v", err)
+	}
+	sibling := &CoreDirectChat{Core: f.core, Gateway: gateway2}
+	st2 := sibling.personaState(f.pa)
+	if err := sibling.loadProjectionState(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling load: %v", err)
+	}
+
+	f.sweep(t)
+	events := durableEvents(t, f.gateway, f.pa)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 committed event, got %d", len(events))
+	}
+	// Rewrite the sole index record as a legacy content-hash preimage:
+	// the shape every pre-command-scoped build left on disk.
+	legacy := sha256.Sum256(events[0].Event)
+	if err := os.WriteFile(dedupIndexPath(f), legacy[:], 0o600); err != nil {
+		t.Fatalf("rewrite dedup index: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
+		t.Fatalf("sibling reconcile: %v", err)
+	}
+
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("legacy-keyed index allowed a second disposition: %v", dispositions)
+	}
+	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+		t.Fatalf("CommandDispositionFor: found=%v err=%v", found, derr)
+	}
+}
+
+// A preimage of an event that never committed must be truncated, not
+// trusted: a phantom command-scoped key in the index cannot suppress the
+// real disposition when the command later reaches a projector.
+func TestCoreDirectChatPhantomDedupKeyDoesNotSuppressDisposition(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	env1, err := f.adapter.Append(f.ctx, f.provenance(), "phantom-committed",
+		json.RawMessage(`{"type":"user_message","text":"committed","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append 1 err=%v", err)
+	}
+	f.sweep(t)
+
+	env2, err := f.adapter.Append(f.ctx, f.provenance(), "phantom-pending",
+		json.RawMessage(`{"type":"user_message","text":"pending","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append 2 err=%v", err)
+	}
+	// Forge the torn-write shape where a preimage outlived its event:
+	// the index holds the pending command's disposition key although no
+	// such event ever committed.
+	phantom := commandDispositionKey(env2.CommandID)
+	ix, err := os.OpenFile(dedupIndexPath(f), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatalf("open dedup index: %v", err)
+	}
+	if _, err := ix.Write(phantom[:]); err != nil {
+		ix.Close()
+		t.Fatalf("write phantom key: %v", err)
+	}
+	ix.Close()
+
+	f.sweep(t)
+	dispositions := commandDispositions(t, f.gateway, f.pa)
+	if len(dispositions) != 2 {
+		t.Fatalf("phantom key suppressed a real disposition: %v", dispositions)
+	}
+	byID := map[string]map[string]any{}
+	for _, d := range dispositions {
+		byID[d["command_id"].(string)] = d
+	}
+	for _, env := range []CommandEnvelope{env1, env2} {
+		if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
+			t.Fatalf("CommandDispositionFor %s: found=%v err=%v", env.CommandID, found, derr)
+		}
+	}
+	if byID[env2.CommandID]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("pending command disposition: %v", byID[env2.CommandID])
 	}
 }

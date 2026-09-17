@@ -104,11 +104,22 @@ type personalityAgentLogState struct {
 	// a caller's cached view.
 	runStarts uint64
 	runOpen   bool
-	acks      map[uint64]CommandAck
-	ackOrder  []ackCacheEntry
-	ackSize   int64
-	ackCRC    uint32
-	lastUsed  uint64
+	// commandKeys caches the command-scoped dedup identity of every
+	// committed command_disposition discovered while scanning the log.
+	// Covered lines trust their index record as preimage, but a
+	// disposition committed under an older content-hash key still claims
+	// its command-scoped identity here — an intact index alone cannot
+	// refuse a second receipt for such a command. commandKeysOK marks
+	// that the committed prefix has been scanned at least once this
+	// process lifetime; any scan forced by missing index coverage
+	// refreshes the same set.
+	commandKeys   map[[sha256.Size]byte]struct{}
+	commandKeysOK bool
+	acks          map[uint64]CommandAck
+	ackOrder      []ackCacheEntry
+	ackSize       int64
+	ackCRC        uint32
+	lastUsed      uint64
 }
 
 type ackCacheEntry struct {
@@ -1865,13 +1876,17 @@ func (g *DurableGateway) projectedKeySet(
 			keys[k] = struct{}{}
 		}
 	}
-	if covered < int64(st.eventSeq) {
+	if covered < int64(st.eventSeq) || !st.commandKeysOK {
 		// Committed lines with no stored key (runtime-path writes, torn-index
 		// drops, or an index lost wholesale) are re-covered and the index is
 		// brought current. Anonymous lifecycle markers recover their exact
 		// explicit key positionally — the k-th committed marker of a kind is
-		// runMarkerKey(kind,k) — because their bare {"type":...} content
-		// cannot reproduce it by hashing.
+		// runMarkerKey(kind,k) — and command_disposition lines recover their
+		// command-scoped key from the stored command_id, because neither
+		// identity can be reproduced by hashing the stored content. The walk
+		// also runs once per process lifetime with an intact index so
+		// dispositions indexed under older content-hash records still claim
+		// their command-scoped identity in st.commandKeys.
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			index.Close()
 			return nil, nil, fmt.Errorf("seek event log for dedup rebuild: %w", err)
@@ -1903,6 +1918,22 @@ func (g *DurableGateway) projectedKeySet(
 					endOrd++
 				default:
 					k = sha256.Sum256(rec.Event.Event)
+					if dk, ok := commandDispositionDedupKey(rec.Event.Event); ok {
+						// A committed command_disposition's real dedup
+						// identity is its command_id, not its content:
+						// the uncovered-line preimage below is the
+						// command-scoped key, and the recovered identity
+						// is remembered so covered lines indexed under
+						// an older content-hash record still refuse a
+						// second receipt. Index records already on disk
+						// stay untouched — one preimage per committed
+						// line is preserved.
+						if st.commandKeys == nil {
+							st.commandKeys = make(map[[sha256.Size]byte]struct{})
+						}
+						st.commandKeys[dk] = struct{}{}
+						k = dk
+					}
 				}
 				if int64(seq) > covered {
 					keys[k] = struct{}{}
@@ -1918,6 +1949,15 @@ func (g *DurableGateway) projectedKeySet(
 			}
 		}
 		if backfill.Len() > 0 {
+			// Truncations above do not move the file offset: a torn or
+			// phantom drop to zero leaves it at the old size, and the
+			// write would land mid-file leaving a garbage leading record
+			// and every preimage permanently misaligned. Reposition at
+			// the post-truncation end before writing.
+			if _, err := index.Seek(0, io.SeekEnd); err != nil {
+				index.Close()
+				return nil, nil, fmt.Errorf("seek dedup index end before backfill: %w", err)
+			}
 			if _, err := index.Write(backfill.Bytes()); err != nil {
 				index.Close()
 				return nil, nil, fmt.Errorf("backfill dedup index: %w", err)
@@ -1927,6 +1967,14 @@ func (g *DurableGateway) projectedKeySet(
 				return nil, nil, fmt.Errorf("sync dedup index backfill: %w", err)
 			}
 		}
+		st.commandKeysOK = true
+	}
+	// Dispositions indexed under older content-hash records carry their
+	// command-scoped identity in st.commandKeys; merge it so this call's
+	// guard set covers every committed receipt's true key even on calls
+	// that did not scan.
+	for dk := range st.commandKeys {
+		keys[dk] = struct{}{}
 	}
 	if _, err := index.Seek(0, io.SeekEnd); err != nil {
 		index.Close()
@@ -2054,6 +2102,14 @@ func (g *DurableGateway) AppendProjectedEvents(
 		key := pe.DedupKey
 		if key == ([sha256.Size]byte{}) {
 			key = sha256.Sum256(pe.Event)
+			if dk, ok := commandDispositionDedupKey(pe.Event); ok {
+				// A command_disposition emitted without an explicit
+				// DedupKey still keys on its command_id — the same
+				// identity index recovery reconstructs — so write and
+				// recovery can never disagree about what the committed
+				// line covers.
+				key = dk
+			}
 		}
 		elemKey[i] = key
 		if _, seen := keys[key]; !seen {
@@ -2525,6 +2581,10 @@ func (g *DurableGateway) resetEventTailLocked(st *personalityAgentLogState, pers
 	st.runStarts = 0
 	st.runOpen = false
 	st.tailObserved = false
+	// A rewritten log must be re-scanned: recovered command identities
+	// minted by the old history must not outlive it.
+	st.commandKeys = nil
+	st.commandKeysOK = false
 	g.stateMu.Lock()
 	delete(g.pendingApprovals, personalityAgentID)
 	delete(g.runInFlight, personalityAgentID)

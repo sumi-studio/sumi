@@ -725,12 +725,30 @@ test("accepts only exact durable command disposition shapes", () => {
       status: "rejected",
       reject_reason: "not_allowed",
     },
+    {
+      type: "command_disposition",
+      command_id,
+      command_seq: 7,
+      status: "rejected",
+      reject_reason: "secretary_moved",
+    },
   ]) {
     assert.equal(
       parseDirectChatServerFrame(event(1, disposition), 0)?.type,
       "event",
     );
   }
+  assert.equal(
+    parseDirectChatServerFrame(
+      {
+        type: "command_rejected",
+        idempotency_key: "moved-key",
+        reject_reason: "secretary_moved",
+      },
+      0,
+    )?.type,
+    "command_rejected",
+  );
 
   for (const disposition of [
     {

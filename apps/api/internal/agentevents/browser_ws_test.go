@@ -21,7 +21,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
+	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
+	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
 type dispositionBeforeAppendReturn struct {
@@ -2955,5 +2958,275 @@ func TestBrowserWebSocketRejectsUnauthorizedSessionsBeforeAnyCloseCode(t *testin
 				t.Fatal("unauthorized dial completed a handshake")
 			}
 		})
+	}
+}
+
+// movedCommandAppender durably allocates the command then reports the
+// transferred persona — the same contract CoreDirectChat.Append has when
+// the durable append commits but the core refuses the input.
+type movedCommandAppender struct{ inner fakeCommandAppender }
+
+func (a *movedCommandAppender) Append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, error) {
+	env, _ := a.inner.Append(ctx, provenance, idempotencyKey, command)
+	return env, fmt.Errorf("%w: %w", agentstate.ErrPersonaInactive, agentstate.ErrPersonaTransferred)
+}
+
+// A command sent to a transferred secretary over the live socket is a
+// terminal moved rejection — the socket stays open and the durable command
+// was recorded for the reconciler's secretary_moved disposition.
+func TestBrowserWebSocketTransferredPersonaRejectsWithMoved(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newAuthorizedBrowserServer(sessions, &movedCommandAppender{}, gateway)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	claims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	conn := dialBrowserWS(t, httpServer, signBrowserSession(t, testSecret, claims), personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "unavailable")
+
+	command := browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "moved-command",
+		Command:        json.RawMessage(`{"type":"user_message","text":"are you there","attachments":[]}`),
+	}
+	if err := conn.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var rejected browserCommandRejectedFrame
+	if err := conn.ReadJSON(&rejected); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Type != "command_rejected" ||
+		rejected.IdempotencyKey != command.IdempotencyKey ||
+		rejected.RejectReason != RejectSecretaryMoved {
+		t.Fatalf("unexpected moved rejection: %+v", rejected)
+	}
+
+	// The socket stays usable for the terminal answer and the command is
+	// durable — the fake appended before reporting the move.
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "moved-command-2",
+		Command:        json.RawMessage(`{"type":"user_message","text":"still moved","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second browserCommandRejectedFrame
+	if err := conn.ReadJSON(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second.RejectReason != RejectSecretaryMoved {
+		t.Fatalf("second rejection: %+v", second)
+	}
+}
+
+// Regression for the duplicate-terminal-disposition defect: an abort command
+// rejected while sealed keeps exactly that receipt after the transfer
+// completes and the projector restarts. Replaying it over a reconnected
+// WebSocket must reach CommandDispositionFor, find the single committed
+// receipt, and answer command_accepted — not error the lookup and drop the
+// connection (the pre-fix behavior once two dispositions existed).
+func TestBrowserWebSocketReplayedCommandKeepsSoleDispositionAfterTransferRestart(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Create(t)
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	core := agentstate.NewStore(pool)
+	pa := pid7(t)
+	humanID := pid7(t)
+	if _, err := pool.Exec(ctx,
+		"INSERT INTO humans (human_id) VALUES ($1)", humanID); err != nil {
+		t.Fatalf("insert human: %v", err)
+	}
+	if _, _, err := core.EnsurePersona(ctx, pa, &humanID, "Test Secretary"); err != nil {
+		t.Fatalf("ensure persona: %v", err)
+	}
+
+	tmp := t.TempDir()
+	storeDir := filepath.Join(tmp, "commands")
+	runtimeDir := filepath.Join(tmp, "runtime")
+	store, gateway, err := openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &CoreDirectChat{Core: core, Gateway: gateway}
+
+	// Open a run so the abort command passes the in-flight guard.
+	if err := gateway.AppendProjectedEvents(ctx, pa, []ProjectedEvent{
+		{Event: json.RawMessage(`{"type":"agent_start"}`)},
+	}); err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionClaims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: pa,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	cookie := signBrowserSession(t, testSecret, sessionClaims)
+
+	newServer := func(a *CoreDirectChat, g *DurableGateway) *httptest.Server {
+		server := newAuthorizedBrowserServer(sessions, a, g)
+		server.AllowedOrigins = []string{browserAuthTestOrigin}
+		mux := http.NewServeMux()
+		mux.Handle("GET /direct-chat/ws", server)
+		return httptest.NewServer(mux)
+	}
+	lastSeq := func(g *DurableGateway) uint64 {
+		t.Helper()
+		var last uint64
+		for _, e := range durableEvents(t, g, pa) {
+			if e.Seq != nil {
+				last = *e.Seq
+			}
+		}
+		return last
+	}
+	sendAbort := func(conn *websocket.Conn) browserCommandAcceptedFrame {
+		t.Helper()
+		if err := conn.WriteJSON(browserCommandFrame{
+			Type:           "command",
+			IdempotencyKey: "abort-lost-acceptance",
+			Command:        json.RawMessage(`{"type":"abort"}`),
+		}); err != nil {
+			t.Fatalf("send abort: %v", err)
+		}
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var accepted browserCommandAcceptedFrame
+		if err := conn.ReadJSON(&accepted); err != nil {
+			t.Fatalf("read command answer: %v", err)
+		}
+		return accepted
+	}
+
+	// First admission: the command is durably appended and accepted. The
+	// accepted frame is the receipt the reconnect below pretends to lose.
+	httpServer := newServer(adapter, gateway)
+	conn := dialBrowserWS(t, httpServer, cookie, pa)
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: lastSeq(gateway)}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	accepted := sendAbort(conn)
+	if accepted.Type != "command_accepted" || accepted.CommandID == "" {
+		t.Fatalf("first abort admission: %+v", accepted)
+	}
+	conn.Close()
+	httpServer.Close()
+
+	// The persona seals mid-move; the reconciler gives the abort its one
+	// terminal receipt: rejected/not_allowed.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	if err := adapter.syncPersona(ctx, pa); err != nil {
+		t.Fatalf("sealed sweep: %v", err)
+	}
+	dispositions := commandDispositions(t, gateway, pa)
+	if len(dispositions) != 1 ||
+		dispositions[0]["command_id"] != accepted.CommandID ||
+		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("sealed dispositions: %v", dispositions)
+	}
+
+	// The transfer completes and the process restarts: the gateway and
+	// adapter are reopened over the same durable directories.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.runtimeDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, gateway, err = openGatewayAt(t, storeDir, runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	defer gateway.runtimeDir.Close()
+	restarted := &CoreDirectChat{Core: core, Gateway: gateway}
+	if err := restarted.syncPersona(ctx, pa); err != nil {
+		t.Fatalf("post-restart sweep: %v", err)
+	}
+	if got := commandDispositions(t, gateway, pa); len(got) != 1 {
+		t.Fatalf("restart appended a second disposition: %v", got)
+	}
+
+	// Reopen a run so the replayed abort passes the in-flight guard on the
+	// reconnected socket. The marker batch carries a terminal receipt for a
+	// second (distinct) abort command so something commits alongside it.
+	env2, err := restarted.Append(ctx, testDirectChatProvenance(pa), "abort-two",
+		json.RawMessage(`{"type":"abort"}`))
+	if err != nil {
+		t.Fatalf("second abort append: %v", err)
+	}
+	if err := gateway.AppendProjectedEvents(ctx, pa, []ProjectedEvent{
+		{RunMarker: RunMarkerStart},
+		{Event: dispositionEvent(env2, "rejected", string(RejectSecretaryMoved)),
+			DedupKey: commandDispositionKey(env2.CommandID)},
+	}); err != nil {
+		t.Fatalf("reopen run: %v", err)
+	}
+
+	// The browser reconnects and resends the command whose acceptance it
+	// lost: the single committed receipt comes back on the acceptance.
+	httpServer = newServer(restarted, gateway)
+	defer httpServer.Close()
+	conn = dialBrowserWS(t, httpServer, cookie, pa)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: lastSeq(gateway)}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "ready")
+	replayed := sendAbort(conn)
+	if replayed.Type != "command_accepted" ||
+		replayed.CommandID != accepted.CommandID ||
+		replayed.Seq != accepted.Seq {
+		t.Fatalf("replayed abort lost its identity: %+v", replayed)
+	}
+	var disposition struct {
+		Status       string `json:"status"`
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := json.Unmarshal(replayed.Disposition, &disposition); err != nil {
+		t.Fatalf("replayed acceptance carried no disposition: %v", err)
+	}
+	if disposition.Status != "rejected" ||
+		disposition.RejectReason != string(RejectNotAllowed) {
+		t.Fatalf("authoritative disposition changed: %s", replayed.Disposition)
 	}
 }

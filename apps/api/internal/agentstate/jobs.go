@@ -235,7 +235,7 @@ func (s *Store) submitJobTx(ctx context.Context, tx pgx.Tx, personaID, jobID, ki
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return Job{}, false, err
 		}
-		return Job{}, false, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
+		return Job{}, false, inactiveAuthorityError(authority)
 	}
 	if err != nil {
 		return Job{}, false, fmt.Errorf("submit job: %w", dataErr(err))

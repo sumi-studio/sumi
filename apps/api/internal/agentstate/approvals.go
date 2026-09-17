@@ -326,8 +326,7 @@ func (s *Store) ResolveApproval(ctx context.Context, personaID, apprID string, r
 		return nil, err
 	}
 	if p.Authority != "active" {
-		return nil, fmt.Errorf("%w: persona authority is %s; it takes no new approval decisions",
-			ErrPersonaInactive, p.Authority)
+		return nil, inactiveAuthorityError(p.Authority)
 	}
 	if p.HumanID == nil {
 		return nil, fmt.Errorf("%w: persona is not bound to a human; no one may decide",

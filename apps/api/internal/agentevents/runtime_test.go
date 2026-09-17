@@ -3,6 +3,7 @@ package agentevents
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -2241,5 +2242,71 @@ func TestIdleRuntimeClaimDoesNotHoldGatewayWhileWaitingForAckLock(t *testing.T) 
 	}
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A torn index whose drop leaves zero full records must rebuild aligned.
+// Truncate does not move the file offset: tearing the sole preimage (a
+// 16-byte half record) used to leave the offset at 16, so the backfilled
+// preimage landed mid-file — a garbage leading record and every key
+// permanently off a record boundary, silently stripping durable dedup
+// from the committed line. The rebuilt index must carry the real content
+// hash at a boundary, and a reopened gateway must refuse the replay from
+// durable records alone — in-memory key maps must not be what saves it.
+func TestAppendProjectedEventsTornIndexRealignsBackfill(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	pa := pid7(t)
+	first := json.RawMessage(`{"type":"turn_start"}`)
+	second := json.RawMessage(`{"type":"turn_end","message":null,"tool_results":[]}`)
+	ctx := context.Background()
+
+	if err := gateway.AppendProjectedEvents(ctx, pa, []ProjectedEvent{{Event: first}}); err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	indexPath := gateway.dedupIndexPath(pa)
+	idx, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	wantFirst := sha256.Sum256(first)
+	if len(idx) != sha256.Size || !bytes.Equal(idx, wantFirst[:]) {
+		t.Fatalf("initial index is not one content preimage: %x", idx)
+	}
+
+	// Tear mid-record: a half-written preimage (16 of 32 bytes) survives.
+	if err := os.Truncate(indexPath, 16); err != nil {
+		t.Fatalf("tear index: %v", err)
+	}
+	// A second ordinary projected event forces the rebuild.
+	if err := gateway.AppendProjectedEvents(ctx, pa, []ProjectedEvent{{Event: second}}); err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	idx, err = os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("read rebuilt index: %v", err)
+	}
+	wantSecond := sha256.Sum256(second)
+	if len(idx) != 2*sha256.Size ||
+		!bytes.Equal(idx[:sha256.Size], wantFirst[:]) ||
+		!bytes.Equal(idx[sha256.Size:], wantSecond[:]) {
+		t.Fatalf("rebuilt index is not aligned preimages %x, %x: %x",
+			wantFirst[:8], wantSecond[:8], idx)
+	}
+
+	// Process-equivalent reopen: a gateway with no in-memory state must
+	// refuse replaying the first event from the durable index alone.
+	reopened, err := OpenDurableGateway(gateway.dir, gateway.commands)
+	if err != nil {
+		t.Fatalf("reopen gateway: %v", err)
+	}
+	if err := reopened.AppendProjectedEvents(ctx, pa, []ProjectedEvent{{Event: first}}); err != nil {
+		t.Fatalf("reopened replay: %v", err)
+	}
+	events, err := reopened.EventCatchUp(ctx, pa, 0)
+	if err != nil {
+		t.Fatalf("catch up: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("reopened gateway committed a deduped replay; events=%d", len(events))
 	}
 }

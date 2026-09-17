@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
@@ -57,6 +58,7 @@ type fakeCommandAppender struct {
 	mu      sync.Mutex
 	calls   []appendCall
 	nextSeq uint64
+	failErr error
 }
 
 type appendCall struct {
@@ -188,13 +190,17 @@ func (f *fakeCommandAppender) Append(ctx context.Context, provenance DirectChatP
 		IdempotencyKey:     idempotencyKey,
 		Command:            command,
 	})
-	return CommandEnvelope{
+	env := CommandEnvelope{
 		Seq:                f.nextSeq,
 		CommandID:          fmt.Sprintf("00000000-0000-4000-8000-%012d", f.nextSeq),
 		PersonalityAgentID: provenance.PersonalityAgentID,
 		Provenance:         provenance,
 		Command:            command,
-	}, nil
+	}
+	if f.failErr != nil {
+		return env, f.failErr
+	}
+	return env, nil
 }
 
 func (f *fakeCommandAppender) callCount() int {
@@ -958,5 +964,121 @@ func TestUserCommandIngressRejectsIdleStopRaceBeforeDurableAppend(t *testing.T) 
 	}
 	if appender.callCount() != 0 {
 		t.Fatal("command accepted after idle stop claimed")
+	}
+}
+
+func TestUserCommandIngress_TransferredPersonaReportsMoved(t *testing.T) {
+	appender := &movedCommandAppender{}
+	verifier := &fakeSessionVerifier{personalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab"}
+	ingress, err := NewUserCommandIngress(appender, verifier)
+	if err != nil {
+		t.Fatalf("new ingress: %v", err)
+	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands",
+		[]byte(`{"type":"user_message","text":"still there?","attachments":[]}`),
+		"018f47a2-9b3c-7def-8abc-0123456789ab")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("expected 410, got %d", resp.StatusCode)
+	}
+	var got struct {
+		Error        string `json:"error"`
+		CommandID    string `json:"command_id"`
+		Seq          uint64 `json:"seq"`
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode moved response: %v", err)
+	}
+	if got.Error != "secretary_moved" || got.RejectReason != string(RejectSecretaryMoved) {
+		t.Fatalf("unexpected moved body: %+v", got)
+	}
+	// The command was durably allocated: its identity is reported so the
+	// caller can reconcile it against the terminal rejected disposition.
+	if got.CommandID == "" || got.Seq == 0 {
+		t.Fatalf("moved response lost durable command identity: %+v", got)
+	}
+}
+
+func TestUserCommandIngress_InactiveButNotTransferredStillFailsGeneric(t *testing.T) {
+	// A sealed/staged (in-flight move) persona must not claim the secretary
+	// moved — it stays an ordinary append failure.
+	appender := &fakeCommandAppender{}
+	appender.failErr = fmt.Errorf("%w: persona authority is sealed", agentstate.ErrPersonaInactive)
+	verifier := &fakeSessionVerifier{personalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab"}
+	ingress, err := NewUserCommandIngress(appender, verifier)
+	if err != nil {
+		t.Fatalf("new ingress: %v", err)
+	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands",
+		[]byte(`{"type":"user_message","text":"mid move","attachments":[]}`),
+		"018f47a2-9b3c-7def-8abc-0123456789ab")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for in-flight authority, got %d", resp.StatusCode)
+	}
+}
+
+// A command admitted before the transfer keeps its original acceptance:
+// replaying the same idempotent request after the move answers 201 with the
+// same durable identity (the committed core input replays in any authority),
+// a changed body under the same key conflicts, and only a genuinely new
+// command is answered 410 secretary_moved. Exercises the real adapter +
+// Postgres path rather than a fake appender.
+func TestUserCommandIngress_ReplayedAcceptedCommandStaysCreatedAfterTransfer(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	verifier := &fakeSessionVerifier{personalityAgentID: f.pa}
+	ingress, err := NewUserCommandIngress(f.adapter, verifier)
+	if err != nil {
+		t.Fatalf("new ingress: %v", err)
+	}
+	ingress.AllowedOrigins = []string{testBrowserOrigin}
+	ingress.Authorizer = allowDirectChatAuthorizer{}
+	ingress.LifecycleFence = directchat.NewLifecycleFence()
+	server := httptest.NewServer(newCommandMux(ingress))
+	defer server.Close()
+
+	post := func(text string) (int, map[string]any) {
+		resp := postWithSessionCookie(t, server.URL+"/direct-chat/commands",
+			[]byte(`{"type":"user_message","text":"`+text+`","attachments":[]}`), f.pa)
+		defer resp.Body.Close()
+		var body map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return resp.StatusCode, body
+	}
+
+	code, first := post("admitted before the move")
+	if code != http.StatusCreated || first["command_id"] == "" {
+		t.Fatalf("initial admission: %d %v", code, first)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+
+	code, replay := post("admitted before the move")
+	if code != http.StatusCreated ||
+		replay["command_id"] != first["command_id"] ||
+		replay["seq"] != first["seq"] {
+		t.Fatalf("accepted command replayed as %d %v, want 201 %+v", code, replay, first)
+	}
+	if code, conflict := post("mutated retry"); code != http.StatusConflict ||
+		conflict["reject_reason"] != string(RejectIdempotencyConflict) {
+		t.Fatalf("changed payload: %d %v, want 409 idempotency_conflict", code, conflict)
 	}
 }
