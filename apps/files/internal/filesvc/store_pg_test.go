@@ -37,7 +37,7 @@ func resetTables(t *testing.T, dsn string) {
 	}
 	defer conn.Close(context.Background())
 	_, err = conn.Exec(context.Background(),
-		`TRUNCATE file_version, file_event, file_op;
+		`TRUNCATE file_version, file_event, file_op, file_receipt;
 		 DELETE FROM store_meta;
 		 SELECT setval('file_version_seq', 1, false)`)
 	// Tables may not exist before first migrate — that's fine, the
@@ -55,7 +55,7 @@ func resetTables(t *testing.T, dsn string) {
 		}
 		defer conn.Close(context.Background())
 		if _, err := conn.Exec(context.Background(),
-			`TRUNCATE file_version, file_event, file_op;
+			`TRUNCATE file_version, file_event, file_op, file_receipt;
 			 DELETE FROM store_meta;
 			 SELECT setval('file_version_seq', 1, false)`); err != nil {
 			t.Fatalf("reset: %v", err)
@@ -497,10 +497,10 @@ func TestPGApplyIsIdempotent(t *testing.T) {
 	})
 	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
 		path: "f.txt", version: 46}
-	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false); err != nil {
+	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false, "applied"); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false)
+	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false, "applied")
 	if !errors.Is(err, errIntentSettled) {
 		t.Fatalf("second apply = %v, want errIntentSettled", err)
 	}
@@ -617,10 +617,10 @@ func TestPGDropFencedForeignOwner(t *testing.T) {
 	if s.dropIntent(ctx, it) {
 		t.Fatal("dropIntent deleted under a foreign owner")
 	}
-	if s.dropIntentGhosts(ctx, it, true) {
+	if s.dropIntentGhosts(ctx, it, true, "") {
 		t.Fatal("dropIntentGhosts deleted under a foreign owner")
 	}
-	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", false); err == nil {
+	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", false, "applied"); err == nil {
 		t.Fatal("apply ran under a foreign owner")
 	}
 	if n := intentCount(t, s); n != 1 {
@@ -1567,7 +1567,7 @@ func TestPGStaleWritePreservesSuccessor(t *testing.T) {
 	// The stale op declares while "old" is current — then its actor is
 	// paused (its fs effect stays queued).
 	stale, err := s1.declare(ctx, "ws", "write", "a.txt", "",
-		IfVersion{Mode: "any"}, sha("stale"), probeOf(root, "ws", "a.txt"),
+		IfVersion{Mode: "any"}, sha("stale"), OpIdentity{}, probeOf(root, "ws", "a.txt"),
 		probeOf(root, "ws", "a.txt"))
 	if err != nil {
 		t.Fatalf("stale declare: %v", err)

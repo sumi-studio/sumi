@@ -45,6 +45,9 @@ type BrowserServer struct {
 	// Spawner optionally lazily starts the target agent runtime on connect
 	// (ADR 0010). A nil Spawner assumes the agent is already running.
 	Spawner DirectChatSpawner
+	// Files, when set, backs the /files/* person routes (RegisterFileRoutes).
+	// Nil fails those routes closed.
+	Files FileBackend
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration

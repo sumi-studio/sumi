@@ -36,6 +36,10 @@ export const originRoutes = Object.freeze({
     // Keep transfer API requests out of the SPA fallback. The API origin
     // returns 404 until the registrar is mounted with production auth.
     "/api/secretary-transfer/",
+    // Person file workspace: the API proxies these ops to the private
+    // filesvc with session-derived scope; filesvc itself is never on the
+    // public edge.
+    "/files/",
     "/workspaces/",
     "/workspace-invites/",
     "/apps/",
@@ -85,6 +89,7 @@ export const deniedRoutes = Object.freeze({
     "/direct-chat",
     "/docs",
     "/e2e",
+    "/files",
     "/jenkinsfile",
     "/makefile",
     "/messaging",

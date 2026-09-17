@@ -162,6 +162,64 @@ func TestVerifiedRemoveStalePreservesSuccessor(t *testing.T) {
 	}
 }
 
+// A remove whose declared object is a NON-EMPTY directory is a truthful
+// dir_not_empty refusal, not a false external_change: the captured
+// object's identity verified — its own members refused the unlink. The
+// dir and every member are restored whole and nothing is committed.
+func TestVerifiedRemoveNonEmptyDirRefusal(t *testing.T) {
+	p, dir := durRoot(t)
+	if _, _, err := p.mkdir("ws", "d"); err != nil {
+		t.Fatalf("seed mkdir: %v", err)
+	}
+	if _, _, err := p.atomicWrite("ws", "d/f.txt", []byte("child"), true,
+		durIntent("", "", "")); err != nil {
+		t.Fatalf("seed member: %v", err)
+	}
+	fpD := durFP(t, p, "ws", "d")
+	committed, err := p.remove("ws", "d", durIntent("", fpD, opStagePrefix+"ne1"))
+	if !errors.Is(err, ErrNotEmpty) || committed {
+		t.Fatalf("non-empty dir remove = (%v, %v), want (false, ErrNotEmpty)", committed, err)
+	}
+	if got := durRead(t, dir, "ws/d/f.txt"); got != "child" {
+		t.Fatalf("member after refused remove = %q", got)
+	}
+	if !durExists(t, dir, "ws/d") {
+		t.Fatal("refused remove deleted the directory")
+	}
+	if durExists(t, dir, "ws/"+opStagePrefix+"ne1") {
+		t.Fatal("captured dir not restored to its public name")
+	}
+
+	// A genuinely diverged object still reports external_change: a
+	// different dir object occupying the path is not the declared one.
+	if err := os.RemoveAll(filepath.Join(dir, "ws/d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "ws/d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	committed, err = p.remove("ws", "d", durIntent("", fpD, opStagePrefix+"ne2"))
+	if !errors.Is(err, ErrExternalChange) || committed {
+		t.Fatalf("swapped dir remove = (%v, %v), want (false, external_change)", committed, err)
+	}
+	if !durExists(t, dir, "ws/d") || durExists(t, dir, "ws/"+opStagePrefix+"ne2") {
+		t.Fatal("foreign dir not restored intact")
+	}
+
+	// And an empty directory still removes cleanly.
+	if _, _, err := p.mkdir("ws", "empty"); err != nil {
+		t.Fatalf("seed empty dir: %v", err)
+	}
+	fpE := durFP(t, p, "ws", "empty")
+	committed, err = p.remove("ws", "empty", durIntent("", fpE, opStagePrefix+"ne3"))
+	if err != nil || !committed {
+		t.Fatalf("empty dir remove = (%v, %v)", committed, err)
+	}
+	if durExists(t, dir, "ws/empty") {
+		t.Fatal("empty dir survived its remove")
+	}
+}
+
 // Stale rename must restore both names: the successor's destination
 // object and the stale op's own source.
 func TestVerifiedRenameStalePreservesSuccessor(t *testing.T) {
