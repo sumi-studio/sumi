@@ -40,9 +40,9 @@ export interface SignInMethods {
 /**
  * The sign-in methods this deployment can start, anonymously — the server's
  * own capability, so a disabled channel (for example email while no sender is
- * configured) is never offered as a dead control. The read fails open: a
- * missing or malformed answer leaves the caller showing the full set, and the
- * flow start still refuses an unavailable method honestly.
+ * configured) is never offered as a dead control. The read is retried by the
+ * caller: a missing or malformed answer rejects, and only an affirmative
+ * `email_code` entry enables an email submit.
  */
 export async function getSignInMethods(): Promise<SignInMethods> {
   const body = await getAuthJSON("/auth/methods");

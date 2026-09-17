@@ -85,23 +85,34 @@ export function LoginScreen() {
     useState<EmailLinkInspection | null>(null);
   const linkInspectionStarted = useRef(false);
   const codeInput = useRef<HTMLInputElement>(null);
-  // null = the deployment's answer has not landed (or failed): show the full
-  // set — the flow start still refuses an unavailable method honestly. false =
-  // the server says email sign-in is not offered: never render a dead submit.
-  const [emailAvailable, setEmailAvailable] = useState<boolean | null>(null);
+  // The deployment's own answer about email sign-in. "checking" = the read is
+  // in flight; "unknown" = it failed and can be retried. An email submit is
+  // enabled only on "available" — an affirmative server answer — so a disabled
+  // or unreachable capability never leaves a dead form. OAuth stays usable in
+  // every state.
+  const [emailAvailability, setEmailAvailability] = useState<
+    "checking" | "available" | "unavailable" | "unknown"
+  >("checking");
+  const [emailCheckAttempt, setEmailCheckAttempt] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: emailCheckAttempt is the explicit retry trigger.
   useEffect(() => {
     if (!configured) return;
     let mounted = true;
+    setEmailAvailability("checking");
     void getSignInMethods().then(
       (methods) => {
-        if (mounted) setEmailAvailable(methods.emailCode);
+        if (mounted)
+          setEmailAvailability(methods.emailCode ? "available" : "unavailable");
       },
-      () => {},
+      () => {
+        if (mounted) setEmailAvailability("unknown");
+      },
     );
     return () => {
       mounted = false;
     };
-  }, [configured]);
+  }, [configured, emailCheckAttempt]);
+  const emailUsable = emailAvailability === "available";
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: invitationAttempt explicitly retries inspection.
   useEffect(() => {
@@ -127,14 +138,17 @@ export function LoginScreen() {
     };
   }, [invitation, invitationAttempt]);
 
-  // Inspecting a link is read-only. Only this browser's own flow continues
-  // without a choice, and never over an active session.
+  // Inspecting a link is read-only, but it only runs once the deployment has
+  // confirmed email sign-in — on a disabled deployment the inspect route is
+  // unmounted and the pending link needs its own exit, not a doomed request.
+  // Only this browser's own flow continues without a choice, and never over an
+  // active session.
   useEffect(() => {
     if (
       linkInspectionStarted.current ||
       !configured ||
       !emailLinkPending ||
-      emailAvailable === false ||
+      !emailUsable ||
       (sessionState !== "unauthenticated" && sessionState !== "authenticated")
     ) {
       return;
@@ -158,15 +172,17 @@ export function LoginScreen() {
   }, [
     configured,
     continueEmailLink,
-    emailAvailable,
+    emailUsable,
     emailLinkPending,
     inspectEmailLink,
     sessionState,
   ]);
 
-  // The code form follows proofs finished in another tab or browser.
+  // The code form follows proofs finished in another tab or browser. Polling
+  // only runs while email sign-in is confirmed usable — a stale flow on a
+  // disabled deployment must not keep issuing known-invalid requests.
   useEffect(() => {
-    if (!emailCode || emailLinkPending || emailAvailable === false) return;
+    if (!emailCode || emailLinkPending || !emailUsable) return;
     const poll = globalThis.setInterval(() => {
       void refreshEmailCode().catch((nextError: unknown) => {
         if (
@@ -183,7 +199,7 @@ export function LoginScreen() {
       globalThis.clearInterval(poll);
       globalThis.clearInterval(tick);
     };
-  }, [emailCode, emailAvailable, emailLinkPending, refreshEmailCode]);
+  }, [emailCode, emailUsable, emailLinkPending, refreshEmailCode]);
 
   // A back/forward-cache restore revives this component with the spinner that
   // was showing when the tab left for the provider. The awaited navigation
@@ -223,6 +239,7 @@ export function LoginScreen() {
     if (
       busy ||
       !configured ||
+      !emailUsable ||
       (intent === "sign_up" && invitationStatus !== "valid")
     )
       return;
@@ -241,7 +258,7 @@ export function LoginScreen() {
   };
 
   const submitCode = async (value: string) => {
-    if (busy || value.length !== 6) return;
+    if (busy || value.length !== 6 || !emailUsable) return;
     setBusy("code");
     setError(null);
     setNotice(null);
@@ -264,7 +281,7 @@ export function LoginScreen() {
   };
 
   const handleResend = async () => {
-    if (busy) return;
+    if (busy || !emailUsable) return;
     setBusy("resend");
     setError(null);
     setNotice(null);
@@ -282,7 +299,7 @@ export function LoginScreen() {
   };
 
   const handleContinueLink = async (switchAccount: boolean) => {
-    if (busy || !linkInspection) return;
+    if (busy || !linkInspection || !emailUsable) return;
     setBusy("link");
     setError(null);
     try {
@@ -304,6 +321,21 @@ export function LoginScreen() {
     setLinkInspection(null);
     setError(null);
     dismissEmailLink();
+  };
+
+  const retryEmailAvailability = () => {
+    setError(null);
+    setEmailCheckAttempt((attempt) => attempt + 1);
+  };
+
+  // The working exit from a pending email step that can no longer complete:
+  // clears the saved flow and returns to the method picker, where the OAuth
+  // buttons stay usable regardless of email capability.
+  const handleCancelEmailToMethods = () => {
+    setError(null);
+    setNotice(null);
+    setCode("");
+    cancelEmailCode();
   };
 
   // A redirect that came back without a session reports itself here: its
@@ -403,6 +435,7 @@ export function LoginScreen() {
             ) : emailLinkPending ? (
               <EmailLinkPanel
                 authenticated={authenticated}
+                availability={emailAvailability}
                 busy={busy !== null}
                 inspection={linkInspection}
                 sessionUnavailable={sessionState === "unavailable"}
@@ -410,6 +443,7 @@ export function LoginScreen() {
                   void handleContinueLink(switchAccount)
                 }
                 onDismiss={handleDismissLink}
+                onRetry={retryEmailAvailability}
               />
             ) : confirmation ? (
               confirmation.action === "create_account" ? (
@@ -480,121 +514,128 @@ export function LoginScreen() {
                 </div>
               )
             ) : emailCode ? (
-              <div className="space-y-4">
-                {emailAvailable === false && (
-                  <p
-                    role="status"
-                    className="rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
-                  >
-                    メールでのログインは現在利用できません。このコードは確認できないため、キャンセルして別の方法でログインしてください。
+              !emailUsable ? (
+                // A code step saved while email was still offered. The
+                // capability answer now says the verify route cannot run —
+                // the code input, submit, autofill-submit and resend are all
+                // withheld, and nothing claims a code was just sent.
+                <EmailCodeBlockedPanel
+                  availability={emailAvailability}
+                  busy={busy !== null}
+                  onRetry={retryEmailAvailability}
+                  onUseOtherMethod={handleCancelEmailToMethods}
+                />
+              ) : (
+                <div className="space-y-4">
+                  {emailCode.recovery && (
+                    <p
+                      role="status"
+                      className="rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+                    >
+                      このメールアドレスは既存のアカウントに登録されています。確認コードでログインすると、選択したログイン方法を追加します。
+                    </p>
+                  )}
+                  <p className="text-muted-foreground text-sm leading-6">
+                    <span className="break-all font-medium text-foreground">
+                      {emailCode.email}
+                    </span>
+                    に6桁の確認コードを送信しました。
                   </p>
-                )}
-                {emailCode.recovery && (
-                  <p
-                    role="status"
-                    className="rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
-                  >
-                    このメールアドレスは既存のアカウントに登録されています。確認コードでログインすると、選択したログイン方法を追加します。
-                  </p>
-                )}
-                <p className="text-muted-foreground text-sm leading-6">
-                  <span className="break-all font-medium text-foreground">
-                    {emailCode.email}
-                  </span>
-                  に6桁の確認コードを送信しました。
-                </p>
-                <form
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void submitCode(code);
-                  }}
-                  className="space-y-3"
-                >
-                  <label htmlFor="sumi-auth-code" className="sr-only">
-                    確認コード
-                  </label>
-                  <input
-                    ref={codeInput}
-                    id="sumi-auth-code"
-                    name="one-time-code"
-                    type="text"
-                    inputMode="numeric"
-                    autoComplete="one-time-code"
-                    // biome-ignore lint/a11y/noAutofocus: the code field is the only next step after sending the email.
-                    autoFocus
-                    required
-                    value={code}
-                    onChange={(event) => handleCodeChange(event.target.value)}
-                    disabled={busy !== null || !configured}
-                    placeholder="000000"
-                    aria-describedby="sumi-auth-code-help"
-                    className="h-11 w-full rounded-lg border bg-background px-3 text-center text-base tabular-nums tracking-[0.3em] outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50"
-                  />
-                  <Button
-                    type="submit"
-                    disabled={busy !== null || code.length !== 6}
-                    className="h-11 w-full rounded-lg"
-                  >
-                    {busy === "code" && (
-                      <LoaderCircle className="size-5 animate-spin" />
-                    )}
-                    確認して続ける
-                  </Button>
-                </form>
-                <p
-                  id="sumi-auth-code-help"
-                  role="status"
-                  className={
-                    emailCode.challenge?.delivery === "failed"
-                      ? "rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
-                      : "text-muted-foreground text-xs leading-5"
-                  }
-                >
-                  {emailCode.challenge?.delivery === "failed"
-                    ? "メールを送信できませんでした。アドレスを確認して、コードを再送信してください。"
-                    : `メール内のリンクからも続けられます。${
-                        codeExpiry ? `コードは${codeExpiry}まで有効です。` : ""
-                      }`}
-                </p>
-                {notice && (
-                  <p
-                    role="status"
-                    className="rounded-lg bg-emerald-50 px-3 py-2.5 text-emerald-800 text-sm dark:bg-emerald-950/30 dark:text-emerald-200"
-                  >
-                    {notice}
-                  </p>
-                )}
-                <div className="flex items-center justify-between gap-2">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      setError(null);
-                      setNotice(null);
-                      setCode("");
-                      cancelEmailCode();
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void submitCode(code);
                     }}
-                    disabled={busy !== null}
+                    className="space-y-3"
                   >
-                    メールアドレスを変更
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => void handleResend()}
-                    disabled={busy !== null || resendWait > 0}
+                    <label htmlFor="sumi-auth-code" className="sr-only">
+                      確認コード
+                    </label>
+                    <input
+                      ref={codeInput}
+                      id="sumi-auth-code"
+                      name="one-time-code"
+                      type="text"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      // biome-ignore lint/a11y/noAutofocus: the code field is the only next step after sending the email.
+                      autoFocus
+                      required
+                      value={code}
+                      onChange={(event) => handleCodeChange(event.target.value)}
+                      disabled={busy !== null || !configured}
+                      placeholder="000000"
+                      aria-describedby="sumi-auth-code-help"
+                      className="h-11 w-full rounded-lg border bg-background px-3 text-center text-base tabular-nums tracking-[0.3em] outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50"
+                    />
+                    <Button
+                      type="submit"
+                      disabled={busy !== null || code.length !== 6}
+                      className="h-11 w-full rounded-lg"
+                    >
+                      {busy === "code" && (
+                        <LoaderCircle className="size-5 animate-spin" />
+                      )}
+                      確認して続ける
+                    </Button>
+                  </form>
+                  <p
+                    id="sumi-auth-code-help"
+                    role="status"
+                    className={
+                      emailCode.challenge?.delivery === "failed"
+                        ? "rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+                        : "text-muted-foreground text-xs leading-5"
+                    }
                   >
-                    {busy === "resend" && (
-                      <LoaderCircle className="size-4 animate-spin" />
-                    )}
-                    {resendWait > 0
-                      ? `再送信（${resendWait}秒）`
-                      : "コードを再送信"}
-                  </Button>
+                    {emailCode.challenge?.delivery === "failed"
+                      ? "メールを送信できませんでした。アドレスを確認して、コードを再送信してください。"
+                      : `メール内のリンクからも続けられます。${
+                          codeExpiry
+                            ? `コードは${codeExpiry}まで有効です。`
+                            : ""
+                        }`}
+                  </p>
+                  {notice && (
+                    <p
+                      role="status"
+                      className="rounded-lg bg-emerald-50 px-3 py-2.5 text-emerald-800 text-sm dark:bg-emerald-950/30 dark:text-emerald-200"
+                    >
+                      {notice}
+                    </p>
+                  )}
+                  <div className="flex items-center justify-between gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setError(null);
+                        setNotice(null);
+                        setCode("");
+                        cancelEmailCode();
+                      }}
+                      disabled={busy !== null}
+                    >
+                      メールアドレスを変更
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => void handleResend()}
+                      disabled={busy !== null || resendWait > 0}
+                    >
+                      {busy === "resend" && (
+                        <LoaderCircle className="size-4 animate-spin" />
+                      )}
+                      {resendWait > 0
+                        ? `再送信（${resendWait}秒）`
+                        : "コードを再送信"}
+                    </Button>
+                  </div>
                 </div>
-              </div>
+              )
             ) : (
               <>
                 {invitationStatus === "valid" ? (
@@ -651,7 +692,7 @@ export function LoginScreen() {
                     )}
                   </p>
                 )}
-                {emailAvailable !== false ? (
+                {emailUsable ? (
                   <>
                     <form onSubmit={handleStartEmailCode} className="space-y-3">
                       <label htmlFor="sumi-auth-email" className="sr-only">
@@ -687,6 +728,29 @@ export function LoginScreen() {
                       <span className="h-px flex-1 bg-border" />
                     </div>
                   </>
+                ) : emailAvailability === "checking" ? (
+                  <p
+                    role="status"
+                    className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2.5 text-muted-foreground text-sm"
+                  >
+                    <LoaderCircle className="size-4 animate-spin" />
+                    利用できるログイン方法を確認しています…
+                  </p>
+                ) : emailAvailability === "unknown" ? (
+                  <p
+                    role="status"
+                    className="rounded-lg bg-muted px-3 py-2.5 text-muted-foreground text-sm"
+                  >
+                    メールでのログインが利用できるか確認できませんでした。
+                    <button
+                      type="button"
+                      className="ml-1 underline underline-offset-4"
+                      onClick={retryEmailAvailability}
+                      disabled={busy !== null}
+                    >
+                      再試行
+                    </button>
+                  </p>
                 ) : (
                   <p
                     role="status"
@@ -745,20 +809,88 @@ export function LoginScreen() {
   );
 }
 
+function EmailCodeBlockedPanel({
+  availability,
+  busy,
+  onRetry,
+  onUseOtherMethod,
+}: {
+  availability: "checking" | "unavailable" | "unknown";
+  busy: boolean;
+  onRetry: () => void;
+  onUseOtherMethod: () => void;
+}) {
+  const otherMethodButton = (label: string) => (
+    <Button
+      type="button"
+      variant="outline"
+      onClick={onUseOtherMethod}
+      disabled={busy}
+      className="h-11 w-full rounded-lg"
+    >
+      {label}
+    </Button>
+  );
+  if (availability === "checking") {
+    return (
+      <div className="space-y-4 text-center">
+        <LoaderCircle className="mx-auto size-6 animate-spin" />
+        <p className="text-muted-foreground text-sm leading-6">
+          メールでのログインが利用できるか確認しています…
+        </p>
+        {otherMethodButton("キャンセル")}
+      </div>
+    );
+  }
+  if (availability === "unknown") {
+    return (
+      <div className="space-y-4">
+        <p className="text-muted-foreground text-sm leading-6">
+          メールでのログインが利用できるか確認できませんでした。コードの確認はできません。
+        </p>
+        <Button
+          type="button"
+          onClick={onRetry}
+          disabled={busy}
+          className="h-11 w-full rounded-lg"
+        >
+          再試行
+        </Button>
+        {otherMethodButton("別の方法でログイン")}
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      <p
+        role="status"
+        className="rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+      >
+        メールでのログインは現在利用できません。このコードは確認できません。別の方法でログインしてください。
+      </p>
+      {otherMethodButton("別の方法でログイン")}
+    </div>
+  );
+}
+
 function EmailLinkPanel({
   authenticated,
+  availability,
   busy,
   inspection,
   sessionUnavailable,
   onContinue,
   onDismiss,
+  onRetry,
 }: {
   authenticated: boolean;
+  availability: "checking" | "available" | "unavailable" | "unknown";
   busy: boolean;
   inspection: EmailLinkInspection | null;
   sessionUnavailable: boolean;
   onContinue: (switchAccount: boolean) => void;
   onDismiss: () => void;
+  onRetry: () => void;
 }) {
   const closeButton = (label: string) => (
     <Button
@@ -771,6 +903,45 @@ function EmailLinkPanel({
       {label}
     </Button>
   );
+  if (availability === "unavailable") {
+    return (
+      <div className="space-y-4">
+        <p className="text-muted-foreground text-sm leading-6">
+          メールでのログインは現在利用できないため、このリンクでは続けられません。
+        </p>
+        {closeButton("閉じる")}
+      </div>
+    );
+  }
+  if (availability === "checking") {
+    return (
+      <div className="space-y-4 text-center">
+        <LoaderCircle className="mx-auto size-6 animate-spin" />
+        <p className="text-muted-foreground text-sm leading-6">
+          メールでのログインが利用できるか確認しています…
+        </p>
+        {closeButton("閉じる")}
+      </div>
+    );
+  }
+  if (availability === "unknown") {
+    return (
+      <div className="space-y-4">
+        <p className="text-muted-foreground text-sm leading-6">
+          メールでのログインが利用できるか確認できなかったため、このリンクを処理できません。
+        </p>
+        <Button
+          type="button"
+          onClick={onRetry}
+          disabled={busy}
+          className="h-11 w-full rounded-lg"
+        >
+          再試行
+        </Button>
+        {closeButton("閉じる")}
+      </div>
+    );
+  }
   if (sessionUnavailable) {
     return (
       <div className="space-y-4">

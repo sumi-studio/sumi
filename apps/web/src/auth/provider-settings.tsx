@@ -962,10 +962,13 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         if (!alternate) {
           throw new Error(
             // The server's verdict, not local providerData: email is a reauth
-            // path only while the deployment offers it.
-            serverMethods?.email === false
-              ? "別のログイン方法で再認証できません。メールでのログインは現在利用できないため、この方法は解除できません。"
-              : "別のログイン方法で再認証できません。ログアウトし、メールの確認コードで再ログインしてから5分以内にもう一度お試しください。",
+            // path only while the deployment offers it. An unanswered read is
+            // unknown too — never advise a fallback that may not exist.
+            serverMethods === null
+              ? "別のログイン方法で再認証できません。利用できるログイン方法を確認できなかったため、この方法は現在解除できません。時間をおいて再度お試しください。"
+              : serverMethods.email === false
+                ? "別のログイン方法で再認証できません。メールでのログインは現在利用できないため、この方法は解除できません。"
+                : "別のログイン方法で再認証できません。ログアウトし、メールの確認コードで再ログインしてから5分以内にもう一度お試しください。",
           );
         }
         await sendProviderRedirect(
