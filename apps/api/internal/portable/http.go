@@ -215,7 +215,18 @@ func (s *Server) importBundle(w http.ResponseWriter, r *http.Request) {
 	// decided the bundle's approvals at the source; without it,
 	// approved-but-unconsumed grants are re-pended for the destination.
 	sameHuman := r.URL.Query().Get("same_human") == "true"
-	rec, created, err := s.svc.Import(r.Context(), http.MaxBytesReader(w, r.Body, s.maxBundle), humanID, sameHuman)
+	// supersedes=<export transfer id> chooses the explicit return/reclaim
+	// operation: an absent persona slot imports exactly as before, and a
+	// slot holding this persona's surrendered copy is replaced only when
+	// the named export is the completed transfer that surrendered it.
+	var rec Receipt
+	var created bool
+	var err error
+	if supersedes := r.URL.Query().Get("supersedes"); supersedes != "" {
+		rec, created, err = s.svc.ImportReturning(r.Context(), http.MaxBytesReader(w, r.Body, s.maxBundle), humanID, sameHuman, supersedes)
+	} else {
+		rec, created, err = s.svc.Import(r.Context(), http.MaxBytesReader(w, r.Body, s.maxBundle), humanID, sameHuman)
+	}
 	if err != nil {
 		writeErr(w, err)
 		return

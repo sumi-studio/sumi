@@ -119,6 +119,34 @@ func (c *CoreDirectChat) AppendWithIdempotencyStatus(
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
+	if existing {
+		// A replayed command that already holds a committed terminal receipt
+		// must keep that result exactly: re-dispatching would resubmit a
+		// rejected command's input as fresh work the moment the persona
+		// accepts inputs again — e.g. after a return transfer reactivates it
+		// here. The first committed command_disposition is the durable truth;
+		// the reconciler already refuses a second one, and admission must not
+		// manufacture the work the receipt says never ran.
+		disposition, found, derr := c.Gateway.CommandDispositionFor(ctx, env)
+		if derr != nil {
+			return env, true, derr
+		}
+		if found {
+			var d struct {
+				Status       string `json:"status"`
+				RejectReason string `json:"reject_reason"`
+			}
+			if err := json.Unmarshal(disposition, &d); err == nil &&
+				d.Status == "rejected" && d.RejectReason == string(RejectSecretaryMoved) {
+				// The first answer was the moved rejection; the replay
+				// returns the same terminal answer rather than a bare
+				// receipt of a command that never ran.
+				return env, true, fmt.Errorf("%w: %w",
+					agentstate.ErrPersonaInactive, agentstate.ErrPersonaTransferred)
+			}
+			return env, true, nil
+		}
+	}
 	if err := c.dispatch(ctx, provenance, env); err != nil {
 		return env, existing, err
 	}
