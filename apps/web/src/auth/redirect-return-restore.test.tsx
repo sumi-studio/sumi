@@ -21,6 +21,7 @@ import { AuthProvider, useAuth } from "./auth-context";
 import { AuthGate } from "./auth-gate";
 
 const mocks = vi.hoisted(() => ({
+  getAuthJSON: vi.fn(),
   getSumiSession: vi.fn(),
   verifyCommittedSumiSession: vi.fn(),
   logoutSumiSession: vi.fn(),
@@ -45,6 +46,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./session-client", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./session-client")>()),
+  getAuthJSON: mocks.getAuthJSON,
   getSumiSession: mocks.getSumiSession,
   verifyCommittedSumiSession: mocks.verifyCommittedSumiSession,
   logoutSumiSession: mocks.logoutSumiSession,
@@ -183,6 +185,12 @@ beforeEach(() => {
   identityStore.workspace.current = null;
   identityStore.workspaceScope.current = null;
   mocks.getFirebaseAuth.mockReturnValue({});
+  mocks.getAuthJSON.mockImplementation(async (path: string) => {
+    if (path === "/auth/methods") {
+      return { methods: ["email_code", "google.com", "github.com"] };
+    }
+    throw new Error(`Unexpected auth read: ${path}`);
+  });
   mocks.getSumiSession.mockResolvedValue({ authenticated: false });
   mocks.startAuthFlow.mockResolvedValue({
     flowId: "flow-1",
@@ -225,7 +233,7 @@ describe("redirect restore UX", () => {
         "unauthenticated",
       ),
     );
-    fireEvent.change(emailInput(), {
+    fireEvent.change(await screen.findByLabelText("メールアドレス"), {
       target: { value: "person@example.com" },
     });
 
@@ -299,7 +307,7 @@ describe("redirect restore UX", () => {
         "unauthenticated",
       ),
     );
-    fireEvent.change(emailInput(), {
+    fireEvent.change(await screen.findByLabelText("メールアドレス"), {
       target: { value: "person@example.com" },
     });
 

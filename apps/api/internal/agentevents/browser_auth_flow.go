@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -385,6 +386,25 @@ func (s *BrowserAuthServer) serveProviderOperationStatus(w http.ResponseWriter, 
 		return
 	}
 	writeBrowserAuthJSON(w, http.StatusOK, result)
+}
+
+// serveSignInMethods reports the flow providers this deployment can start,
+// anonymously: the same set Start accepts, minus a provider whose backing
+// surface is not mounted. Sign-in screens read this instead of duplicating
+// deployment truth, so a disabled channel is never offered dead.
+func (s *BrowserAuthServer) serveSignInMethods(w http.ResponseWriter, r *http.Request) {
+	if !s.allowSafeReadOrigin(w, r) {
+		return
+	}
+	methods := []string{"github.com", "google.com"}
+	if s.EmailFlows != nil {
+		methods = append(methods, "email_code")
+	}
+	sort.Strings(methods)
+	w.Header().Set("Cache-Control", "no-store")
+	writeBrowserAuthJSON(w, http.StatusOK, struct {
+		Methods []string `json:"methods"`
+	}{Methods: methods})
 }
 
 func (s *BrowserAuthServer) serveProviderMethods(w http.ResponseWriter, r *http.Request) {

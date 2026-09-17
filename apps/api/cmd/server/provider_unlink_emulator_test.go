@@ -97,7 +97,7 @@ func completeEmailLinkProof(t *testing.T, ctx context.Context, store *koseki.Sto
 	}
 }
 
-func TestFirebaseEmulatorUnlinkGuardRequiresLiveEmailFamilyAndSumiProof(t *testing.T) {
+func TestFirebaseEmulatorUnlinkGuardRequiresVerifiedEmailAndSumiProof(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	client := firebaseProviderEmulatorClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -122,6 +122,8 @@ func TestFirebaseEmulatorUnlinkGuardRequiresLiveEmailFamilyAndSumiProof(t *testi
 		t.Fatal(err)
 	}
 	controller := newKosekiAuthFlowController(store, "local", lifecycle)
+	// Email counts as a usable method only while the channel is enabled.
+	controller.email = &emailCodeController{}
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
 	claims := agentevents.UserSessionClaims{TenantID: "local", UserID: registered.HumanID, PersonalityAgentID: registered.AgentID}
@@ -136,24 +138,16 @@ func TestFirebaseEmulatorUnlinkGuardRequiresLiveEmailFamilyAndSumiProof(t *testi
 		t.Fatalf("profile email, Firebase UID, or unsupported provider counted: %v", err)
 	}
 
+	// The verified address plus Sumi's own proof is the usable email method —
+	// email-code sign-in resolves that address to this UID, so no Firebase
+	// password family is required.
 	completeEmailLinkProof(t, ctx, store, uid, email)
-	request.Nonce = controllerNonce(t)
-	if _, err := controller.StartProviderOperation(ctx, claims, request, identity); !errors.Is(err, agentevents.ErrBrowserAuthLastMethod) {
-		t.Fatalf("Sumi proof counted without live Firebase email family: %v", err)
-	}
-	if _, err := client.UpdateUser(ctx, uid, (&firebaseauth.UserToUpdate{}).Password("emulator-password-123")); err != nil {
-		t.Fatalf("add Firebase email/password family: %v", err)
-	}
-	account, err := lifecycle.ProviderAccount(ctx, uid)
-	if err != nil || !account.EmailProvider {
-		t.Fatalf("live Firebase email family: %+v %v", account, err)
-	}
 	request.Nonce = controllerNonce(t)
 	result, err := controller.StartProviderOperation(ctx, claims, request, identity)
 	if err != nil || result.Outcome != "provider_unlinked" || result.ClientOperation != "" {
-		t.Fatalf("backend-owned unlink with both proofs: %+v %v", result, err)
+		t.Fatalf("backend-owned unlink with verified email and proof: %+v %v", result, err)
 	}
-	account, err = lifecycle.ProviderAccount(ctx, uid)
+	account, err := lifecycle.ProviderAccount(ctx, uid)
 	if err != nil || account.ProviderSubjects["github.com"] != "" {
 		t.Fatalf("Firebase provider remained after terminal result: %+v %v", account, err)
 	}

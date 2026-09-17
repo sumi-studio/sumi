@@ -34,7 +34,6 @@ type kosekiAuthFlowController struct {
 type firebaseProviderAccount struct {
 	UID              string
 	ProviderSubjects map[string]string
-	EmailProvider    bool
 	// EmailVerified means Firebase resolves the verified address to this UID,
 	// so a Sumi email-code proof can sign in again without a password provider.
 	EmailVerified bool
@@ -329,12 +328,13 @@ func (c *kosekiAuthFlowController) runProviderUnlink(ctx context.Context, claims
 	return c.finishProviderUnlink(ctx, claims, request.Nonce, operation, providerSubject)
 }
 
-// usableEmailMethod reports whether this account can sign in by email. A
-// verified Firebase address is a sign-in method only while Sumi email-code
-// sign-in is enabled; it then resolves that address to this UID. Either family
-// also needs Sumi's own completed email proof for the same principal.
+// usableEmailMethod reports whether this account can sign in by email. Email
+// is a sign-in method only while Sumi email-code sign-in is enabled — without
+// a sender no flow can start. While enabled, email-code sign-in resolves a
+// verified Firebase address to this UID, so a verified address plus Sumi's own
+// completed email proof for the same principal is a usable method.
 func (c *kosekiAuthFlowController) usableEmailMethod(ctx context.Context, humanID string, account firebaseProviderAccount) (bool, error) {
-	if !account.EmailProvider && !(account.EmailVerified && c.email != nil) {
+	if c.email == nil || !account.EmailVerified {
 		return false, nil
 	}
 	return c.store.HasCompletedEmailLinkProof(ctx, humanID, account.UID)

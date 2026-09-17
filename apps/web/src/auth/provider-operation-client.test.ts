@@ -2,18 +2,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   completeProviderOperation,
   failProviderOperation,
+  getSignInMethods,
   startProviderOperation,
   statusProviderOperation,
 } from "./provider-operation-client";
 
-const clientMocks = vi.hoisted(() => ({ postAuthJSON: vi.fn() }));
+const clientMocks = vi.hoisted(() => ({
+  postAuthJSON: vi.fn(),
+  getAuthJSON: vi.fn(),
+}));
 
 vi.mock("./session-client", () => ({
   postAuthJSON: clientMocks.postAuthJSON,
+  getAuthJSON: clientMocks.getAuthJSON,
 }));
 
 beforeEach(() => {
   clientMocks.postAuthJSON.mockReset();
+  clientMocks.getAuthJSON.mockReset();
 });
 
 describe("provider operation client", () => {
@@ -161,5 +167,31 @@ describe("provider operation client", () => {
     await expect(
       statusProviderOperation({ operationId: "operation-1", nonce: "nonce" }),
     ).rejects.toThrow("Invalid provider operation response.");
+  });
+});
+
+describe("sign-in methods client", () => {
+  it("reads the deployment's email capability from the anonymous endpoint", async () => {
+    clientMocks.getAuthJSON.mockResolvedValue({
+      methods: ["github.com", "google.com"],
+    });
+    await expect(getSignInMethods()).resolves.toEqual({ emailCode: false });
+    expect(clientMocks.getAuthJSON).toHaveBeenCalledWith("/auth/methods");
+
+    clientMocks.getAuthJSON.mockResolvedValue({
+      methods: ["email_code", "github.com", "google.com"],
+    });
+    await expect(getSignInMethods()).resolves.toEqual({ emailCode: true });
+  });
+
+  it("rejects a malformed answer so callers fail open", async () => {
+    clientMocks.getAuthJSON.mockResolvedValue({ methods: "email_code" });
+    await expect(getSignInMethods()).rejects.toThrow(
+      "Invalid sign-in methods response.",
+    );
+    clientMocks.getAuthJSON.mockResolvedValue({ methods: [7] });
+    await expect(getSignInMethods()).rejects.toThrow(
+      "Invalid sign-in methods response.",
+    );
   });
 });
