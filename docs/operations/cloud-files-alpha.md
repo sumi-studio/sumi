@@ -66,6 +66,8 @@ person/secretary ─ (caller with a scope token) ─ filesvc :8780 (WSL origin, 
 | `deploy/files/systemd/sumi-files-executor@.service` | Runs one secretary's runtime through the supervisor lifecycle with `/workspace` bound to scope `%i` (the compact PAID); stops and restarts with the volume client. |
 | `deploy/files/compose.executor-workspace.yaml` | Compose override the supervisor adds to the full agent graph in files scope mode: `prepare` and `executor` bind the scope as `/workspace`. |
 | `deploy/files/compose.prepare-workspace.yaml` | Compose override the supervisor adds to the prepare-only graph in files scope mode: `prepare` binds the scope as `/workspace`. |
+| `deploy/files/compose.provisioner-files.yaml` | Compose overlay enabling files scope mode on the runtime provisioner (co-located executor client): supplies the `SUMI_FILES_*` environment and an `rslave` bind of `/var/lib/sumi-files` so the supervisor's scope gate sees the host mount. |
+| `deploy/files/sumi-files-resolve-url` | Resolves a `{docker:CONTAINER}` host token in a URL to the container's current bridge IP (container addresses are runtime evidence, not durable configuration). |
 | `scripts/operations/files-cloud-probe.mjs` | Post-deploy probe: API round trip, refusals, and (with `--mount-dir`) cross-client visibility. |
 
 `sumi-files-check` refusal codes: `not_mounted`, `wrong_fstype`,
@@ -128,13 +130,23 @@ databases with their own roles: `sumi_files_meta` (JuiceFS metadata) and
 both databases with the normal PostgreSQL backup; the mount units disable
 JuiceFS's own metadata dump (`--backup-meta 0`).
 
+When the metadata database is a container on the same host's Docker daemon
+(the `sumi-dev` PostgreSQL publishes no port), write the host part of
+`SUMI_FILES_META_URL` — and `FILESV_DB_URL` — as a `{docker:CONTAINER}` (or
+`{docker:CONTAINER@NETWORK}`) token, e.g.
+`postgres://sumi_files_meta@{docker:sumi-dev-postgres-1}:5432/sumi_files_meta?sslmode=disable`.
+`sumi-files-mount`, `sumi-files-format` and the `filesvc` unit resolve the
+named container's current bridge IP at every start; a container's address is
+runtime evidence, not durable configuration, and a recreated database
+container gets a new one.
+
 ### 3. Install on the origin (user units)
 
 ```sh
 install -d ~/.local/lib/sumi-files ~/.config/sumi-files ~/.cache/sumi-files
 install -d -m 0700 ~/.local/state/sumi-files ~/.local/state/sumi-files/mnt
 (cd apps/files && go build -buildvcs=false -o ~/.local/lib/sumi-files/filesvc ./cmd/filesvc)
-install -m 0755 deploy/files/sumi-files-{format,mount,check} ~/.local/lib/sumi-files/
+install -m 0755 deploy/files/sumi-files-{format,mount,check,resolve-url} ~/.local/lib/sumi-files/
 install -m 0755 <pinned juicefs 1.4.1 binary> ~/.local/lib/sumi-files/juicefs
 install -m 0644 deploy/files/systemd/sumi-files-mount@.service deploy/files/systemd/sumi-filesvc.service ~/.config/systemd/user/
 ```
@@ -206,7 +218,7 @@ node scripts/operations/files-cloud-probe.mjs --api http://127.0.0.1:8780 \
 ```sh
 install -d /root/.local/lib/sumi-files /etc/sumi-files /var/cache/sumi-files
 install -d -m 0700 /var/lib/sumi-files /var/lib/sumi-files/mnt
-install -m 0755 deploy/files/sumi-files-{mount,check,executor-launch,executor-stop} \
+install -m 0755 deploy/files/sumi-files-{mount,check,resolve-url,executor-launch,executor-stop} \
   <juicefs 1.4.1> /root/.local/lib/sumi-files/
 install -m 0644 deploy/files/systemd/sumi-files-mount@.service \
   deploy/files/systemd/sumi-files-executor@.service /etc/systemd/system/
@@ -266,6 +278,87 @@ The root volume client adds `allow_other`, which Docker and uid 10002 need.
 Running the probe with `--mount-dir` from the executor host is the check that
 an API write and a Linux write cross between two JuiceFS clients.
 
+### 6. Co-located executor on the origin (provisioner topology)
+
+On a host whose executors are launched by the runtime provisioner — the sole
+Docker authority in the `sumi-dev` topology — do **not** enable
+`sumi-files-executor@` units. The provisioner container runs the same
+supervisor actions (`prepare`/`activate`/`stop`) the units wrap; enabling both
+paths would create two launch authorities for one project name. Instead:
+
+1. Make `/var/lib/sumi-files` a shared mount so later remounts propagate
+   into containers (WSL mounts `/` private; do this once, persist via fstab
+   or a oneshot unit). This step must run **before** the JuiceFS client is
+   started: binding the directory onto itself while a FUSE mount is active
+   underneath shadows that mount — the client keeps serving an orphaned
+   mountpoint while the visible path shows a bare directory, and the bind
+   must be unmounted again to recover. If a client is already running, stop
+   it first rather than mounting over an active canonical client:
+
+   ```sh
+   install -d -m 0700 /var/lib/sumi-files /var/lib/sumi-files/mnt
+   mount --bind /var/lib/sumi-files /var/lib/sumi-files
+   mount --make-rshared /var/lib/sumi-files
+   ```
+
+2. Then install and start the executor volume client exactly as above (root
+   system unit, `/var/lib/sumi-files/mnt`). A containerized volume client was
+   considered and rejected for alpha: the systemd unit already implements the
+   verified lifecycle (corpse removal, `ExecStartPost` verification,
+   dependent restart), while a container client would duplicate mount
+   supervision without systemd and need `SYS_ADMIN` plus host-mount
+   propagation in the outward direction.
+
+3. Merge `deploy/files/compose.provisioner-files.yaml` into the deployed
+   composition with `SUMI_FILES_VOLUME_UUID` set. It gives the provisioner
+   the four allowlisted `SUMI_FILES_*` variables and an `rslave` bind of
+   `/var/lib/sumi-files` at the identical path — so the supervisor's scope
+   gate (`sumi-files-check`, already in the provisioner image at
+   `/opt/sumi/deploy/files/`) sees the same mount the daemon binds into
+   executors. A partial `SUMI_FILES_*` set fails the launch closed.
+4. Recreate the provisioner service with an image built from the accepted
+   tree (`scripts/operations/build-dogfood-images`,
+   `ghcr.io/sumi-studio/sumi-provisioner:<sha>`); older images lack the
+   files-scope code. Verify `docker exec <provisioner> grep fuse.juicefs
+   /proc/self/mountinfo` and that prepare/activate for a secretary now binds
+   `/var/lib/sumi-files/mnt/<compact PAID>` at `/workspace`.
+
+Recovery semantics here differ from a dedicated executor host in one way:
+there is no `sumi-files-executor@` unit to `BindsTo` the mount, so after a
+client crash + remount the *running* executor's stale `/workspace` bind keeps
+answering ENOTCONN (a bind captures the dead FUSE connection; a remount does
+not propagate into an existing child-directory bind). **Verified:** 60+
+seconds after the client was killed and the mount auto-recovered, the
+runtime/executor/broker containers were all still `Up`, the runtime still
+answered, `/v1/inspect` still reported `phase: active`, and no local-control
+state change was published — nothing in the current topology detects the
+stale workspace bind. Recovery is therefore an explicit lifecycle action, not
+automatic:
+
+```sh
+# bounded operator recovery for one secretary (provisioner control socket):
+curl --unix-socket /run/sumi/runtime-provisioner/control.sock \
+  -d '{"version":1,"personality_agent_id":"<paid>"}' http://local/v1/inspect
+# -> note epoch.generation / rpc_boot_nonce / opaque_prepared_handle
+curl -X POST --unix-socket /run/sumi/runtime-provisioner/control.sock \
+  -d '{"version":1,"personality_agent_id":"<paid>","generation":<gen>,
+       "rpc_boot_nonce":"<nonce>","opaque_prepared_handle":"<handle>"}' \
+  http://local/v1/stop
+curl -X POST --unix-socket /run/sumi/runtime-provisioner/control.sock \
+  -d '{"version":1,"personality_agent_id":"<paid>","idempotency_key":"<new key>"}' \
+  http://local/v1/prepare      # -> new generation, nonce, handle
+curl -X POST --unix-socket /run/sumi/runtime-provisioner/control.sock \
+  --data @activate.json        # ActivationConfig for the new epoch
+```
+
+The new activate creates a fresh executor whose bind sees the remounted
+volume — the same files, a new generation (verified: gens 7→8→9→10 across
+two kill cycles, all data intact, `ready`+receipt republished each time).
+The provisioner's own view does update on remount via the `rslave` bind, so
+the scope gate passes again without restarting the provisioner. Detecting a
+stale `/workspace` bind automatically (e.g. executor health wiring or a
+supervisor watch) is a separate product gap — nothing here performs it.
+
 ## Verify with real use
 
 1. With the executor stopped (`systemctl stop sumi-files-executor@<scope>`
@@ -290,11 +383,26 @@ an API write and a Linux write cross between two JuiceFS clients.
 
 ## Rollback
 
-- Executors: `systemctl disable --now sumi-files-executor@<scope>`; its
-  ExecStop runs the supervisor `stop` action, which brings the project down
-  and removes the materialized secret tree. To run the same secretary on a
-  host-local workspace, launch it through the supervisor without the
-  `SUMI_FILES_*` environment. Files already in the volume stay there.
+- Executors: `systemctl disable --now sumi-files-executor@<scope>` (dedicated
+  host) or stop the runtime through the provisioner/API (co-located); the
+  supervisor `stop` action brings the project down and removes the
+  materialized secret tree. Once a secretary runs on the canonical volume,
+  its files live only there — a broken mount must be restored, not worked
+  around: relaunching without `SUMI_FILES_*` would substitute an unrelated
+  host-local workspace that does not contain the secretary's files. Removing
+  the files environment is only valid before first use or when intentionally
+  retiring the volume binding; until then, affected launches must keep
+  failing closed (the scope gate already refuses a missing or dead mount).
+  Files already in the volume stay there; the volume UUID and data are never
+  re-formatted for rollback or credential rotation.
+- Provisioner (co-located topology): stopping affected runtimes through
+  `/v1/stop` is the safe rollback. **Do not** recreate the provisioner with
+  the `compose.provisioner-files.yaml` overlay removed while any secretary is
+  bound to the canonical volume — with `SUMI_FILES_*` absent the scope gate
+  is inert and a subsequent launch silently binds the host-local workspace,
+  which does not contain the secretary's files. To take files mode off,
+  either keep affected runtimes stopped/refused until canonical support is
+  restored, or restore the files-capable image and the same binding/UUID.
 - Files API: `systemctl --user disable --now sumi-filesvc sumi-files-mount@service`.
   Callers get connection refused, not wrong files.
 - The Worker, the volume data (DO storage) and both databases are kept.
@@ -303,6 +411,14 @@ an API write and a Linux write cross between two JuiceFS clients.
   `sumi_files_meta` and `sumi_files`.
 - Re-enable by starting the units again with the same UUID; nothing is
   re-formatted.
+- Credential rotation: `META_PASSWORD` rotates by editing the mount env file
+  and restarting the mount units. The object-store pair is different —
+  `ACCESS_KEY`/`SECRET_KEY` are consumed only by `sumi-files-format`, which
+  stores them in the volume's metadata settings; editing a mount env file
+  does not update them. Rotation means a `wrangler secret put` on the Worker
+  plus updating the stored keys via `juicefs config` against a live mount
+  (the upstream-supported mechanism; not yet exercised end-to-end in the
+  fixture), never a re-format.
 
 ## Operating bounds
 
