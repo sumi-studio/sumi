@@ -235,6 +235,76 @@ func TestPGReceiptMkdirReplay(t *testing.T) {
 	}
 }
 
+// A keyed remove refused as dir_not_empty is a deterministic rejection,
+// not an accepted operation: no receipt row, no pending intent, the key
+// stays free. After the member is removed, the same key+request retries
+// for real and commits its own receipt.
+func TestPGReceiptDirNotEmptyIsNotAccepted(t *testing.T) {
+	svc, st, dir := pgReceiptSvc(t)
+	ctx := context.Background()
+
+	w := req(t, svc, "POST", "/v1/files/ws/mkdir", "svc", `{"path":"ne"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("mkdir: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "PUT", "/v1/files/ws/write?path=ne/f.txt", "svc", "child",
+		map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("member write: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws/remove?path=ne", "svc", "",
+		withIfV(keyHdr("op:ne"), "any"))
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "dir_not_empty") {
+		t.Fatalf("keyed non-empty dir remove: want 409 dir_not_empty, got %d %s",
+			w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "external_change") {
+		t.Fatalf("refusal claims a false external change: %s", w.Body)
+	}
+	// No receipt and no lingering intent: the refusal is not an accepted
+	// operation and must not pin the key.
+	var n int
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_receipt WHERE scope='ws' AND op_key='op:ne'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("refused op left a receipt: rows=%d err=%v", n, err)
+	}
+	if err := st.pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_op WHERE scope='ws' AND op_key='op:ne'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("refused op left a pending intent: rows=%d err=%v", n, err)
+	}
+	// The dir and member are intact on disk.
+	if got, ok := authReadOpt(dir, "ws/ne/f.txt"); !ok || got != "child" {
+		t.Fatalf("member after refusal: %q present=%v", got, ok)
+	}
+	// Same key + same request after emptying retries for real — the
+	// refusal did not borrow or create a receipt.
+	w = req(t, svc, "DELETE", "/v1/files/ws/remove?path=ne/f.txt", "svc", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("member remove: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws/remove?path=ne", "svc", "",
+		withIfV(keyHdr("op:ne"), "any"))
+	if w.Code != 200 || strings.Contains(w.Body.String(), `"replayed"`) {
+		t.Fatalf("retry after refusal must run for real: %d %s", w.Code, w.Body)
+	}
+	if durExists(t, dir, "ws/ne") {
+		t.Fatal("dir survived a real keyed remove")
+	}
+	// And now the key is consumed: a replay receipts, a different request
+	// conflicts.
+	w = req(t, svc, "DELETE", "/v1/files/ws/remove?path=ne", "svc", "",
+		withIfV(keyHdr("op:ne"), "any"))
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"replayed":true`) {
+		t.Fatalf("accepted remove must receipt: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws/remove?path=other", "svc", "",
+		withIfV(keyHdr("op:ne"), "any"))
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "idempotency_conflict") {
+		t.Fatalf("different request on consumed key must conflict: %d %s", w.Code, w.Body)
+	}
+}
+
 // Receipts are durable across store instances: a new Store on the same
 // DB+root answers the replay from the committed row.
 func TestPGReceiptSurvivesStoreRestart(t *testing.T) {

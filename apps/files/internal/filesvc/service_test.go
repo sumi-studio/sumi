@@ -381,6 +381,46 @@ func TestRenameAtomicAndRemove(t *testing.T) {
 	}
 }
 
+// Removing a non-empty directory is a truthful dir_not_empty refusal —
+// not a false external_change — and every member is preserved. Empty
+// directories remove normally (F-A: ENOTEMPTY was misclassified).
+func TestRemoveNonEmptyDirRefused(t *testing.T) {
+	svc, _ := testSvc(t)
+	w := req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"d"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("mkdir: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=d/f.txt", "tok-a", "child",
+		map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("member write: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "dir_not_empty") {
+		t.Fatalf("non-empty dir remove: want 409 dir_not_empty, got %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "external_change") {
+		t.Fatalf("refusal claims a false external change: %s", w.Body)
+	}
+	// The dir and its member are intact and readable.
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=d/f.txt", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "child" {
+		t.Fatalf("member after refusal: %d %q", w.Code, w.Body)
+	}
+	// Once emptied, the same remove succeeds.
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d/f.txt", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("member remove: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("empty dir remove: %d %s", w.Code, w.Body)
+	}
+}
+
 func TestExternalChangeFlag(t *testing.T) {
 	svc, dir := testSvc(t)
 	req(t, svc, "PUT", "/v1/files/ws1/write?path=x.txt", "tok-a", "v1", map[string]string{"If-Version": "none"})

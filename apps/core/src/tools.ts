@@ -728,7 +728,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "file.remove",
     description:
-      "Remove a file or directory in your private workspace. Without expect_version the remove is unconditional; pass a version integer to remove only if unchanged since you saw it.",
+      "Remove a file or an empty directory in your private workspace; a non-empty directory is refused (dir_not_empty) and kept intact — remove its members first. Without expect_version the remove is unconditional; pass a version integer to remove only if unchanged since you saw it.",
     parameters: {
       type: "object",
       properties: {
