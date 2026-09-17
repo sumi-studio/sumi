@@ -19,12 +19,12 @@ Sumi は、個人秘書を誰もが持てるものにし、個人秘書のあり
 
 ## 現在の状況
 
-Sumi はアルファ段階です。上の Description は目指す姿です。現在、Sumi に触れる方法は3つに分かれており、それぞれがまだ同じ秘書の仕組みで動いているわけではありません。
+Sumi はアルファ段階です。上の Description は目指す姿です。現在、Sumi を試す方法は3つあり、それぞれ利用する画面と導入に必要なものが異なります。
 
 | Sumi に触れる方法 | 現在の内容 | 使える人 |
 |---|---|---|
-| **ホスト版アルファ Web アプリ** | 招待制のサインイン、Workspace、Messaging を備えた既存の Web アプリ。 | 招待された開発者とテスターのみ。一般公開のサインアップはありません。新しい秘書コアと組み合わせた利用は、現在検証中です。 |
-| **[Local host](#local-host-を試す)** | 新しい秘書コアを、Sumi Cloud アカウントなしで Linux または WSL のマシン1台で動かすもの。 | ソースのチェックアウトからインストールすれば誰でも使えます。ブラウザページと `say` コマンドは開発・検証用の画面であり、プロダクト UI ではありません。 |
+| **ホスト版アルファ Web アプリ** | 招待制のサインイン、Workspace、Messaging を備えた既存の Web アプリ。現在のアルファビルドでは、新しい秘書コアと一緒にデプロイされています。 | 招待された開発者とテスターのみ。一般公開のサインアップはありません。ホスト版アプリで新しいコアを日常利用する検証は、まだ受け入れ作業として残っています。 |
+| **[Local host](#local-host-を試す)** | 新しい秘書コアを、Sumi Cloud アカウントなしで Linux または WSL のマシン1台で動かすもの。 | ソースのチェックアウト、または `sumi-local pack` で作ったバンドル（linux/amd64。バンドルのインストールに Go は不要）から、誰でもインストールできます。ブラウザページと `say` コマンドは開発・検証用の画面であり、プロダクト UI ではありません。 |
 | **[ソースから Web アプリを動かす](#ソースから-web-アプリを動かす)** | サインイン、Workspace、Messaging、設定を含む Web アプリ全体と、TypeScript の秘書コアで動く秘書。 | 自分の Firebase プロジェクトを持つ開発者。標準の決定的なモデルプロバイダには認証情報は不要です。 |
 
 ### 新しい秘書コア
@@ -37,10 +37,10 @@ Sumi はアルファ段階です。上の Description は目指す姿です。�
 - **許可が必要な操作は人の判断を待ちます。** その依頼は本人の承認 inbox で待機します。承認フローのテストでは、承認すると待機していた依頼が再開して操作が一度だけ実行されること、拒否すると実行されないこと、ほかの人からは見えず判断もできないことを確認しています。
 - **秘書のモデルは一人ひとりが選びます。** OpenAI 互換の chat completions エンドポイント、OpenAI Responses、Anthropic Messages、OpenCode Go などの対応プリセットで自分の API キーを接続します。コアは選ばれた接続だけを使い、その接続が使えないときは、別のモデルで答えるのではなく依頼が失敗します。モデルの利用量は記録されます。
 
-### まだ使えないもの
+### 現在の制限
 
-- **ホスト版の Web アプリで、新しいコアをプロダクトとして使うこと。** 開発用の `make dev` は、ソースから Web アプリ全体を新しいコアで動かします。Direct Chat に加え、秘書による共有 Messaging の履歴・検索・送信・編集や Workspace の招待の一覧・受諾も、永続コアを通して動きます。ホスト版アルファへの統合は現在進めています。
-- **秘書を Local から Cloud へ移すこと。** 同じ一個人として続けるための状態移行の基盤はソースにあります（[portable state](docs/agent/portable-state.md)）が、秘書を実際に移す一連の手順はまだありません。
+- **ホスト版の Web アプリで、新しいコアをプロダクトとして使うこと。** 開発用の `make dev` は、ソースから Web アプリ全体を新しいコアで動かします。Direct Chat に加え、秘書による共有 Messaging の履歴・検索・送信・編集や Workspace の招待の一覧・受諾も、永続コアを通して動きます。ホスト版アルファには受理済みの API・Web・秘書コアが一緒にデプロイされていますが、実際の人がサインインして日常的に秘書を使うプロダクトとしての利用は、まだ受け入れ済みではありません。
+- **Local→Cloud への移動を端から端まで検証した実績。** プロダクト側の画面は存在します（サインイン画面に秘書の移動パネルがあります）。状態の移行そのものも、公開中の Cloud アルファに対して一度実際に実行されています。同じ秘書が未処理の入力を引き継いだまま Cloud 上で有効化され、Local 側は `secretary_moved` を返し、段階的なキャンセルで Local の秘書に戻せることを確認しました。ただし、その実行は状態のみの移行で（ファイルは移りません）、招待の発行は保護された CLI から行い、外部サインインの証明はテスト用の代替でした。移行・確認・移行後のリクエスト自体は実際の公開エンドポイントに対して実行されています。この UI の流れそのものを端から端まで動かした検証はまだありません。
 - **Description にあるほかのアプリ。** 現在の Workspace アプリは Messaging だけです。タスク、カレンダー、メモ、メール、ブラウジング、会議、学習は、まだ人と秘書が共有するアプリになっていません。
 - **通話の中で秘書が話すこと。** ソース中の通話機能は opt-in で、LiveKit を使います。秘書の通話参加には、まだ実際の音声認識エンジンがありません。
 - **デスクトップアプリとネイティブモバイルアプリ。** `apps/web` は、Web アプリ、モバイル WebApp、将来の Electron デスクトップアプリで共通の唯一の renderer として設計されています（[ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md)）。デスクトップアプリとネイティブモバイルアプリはまだありません。
@@ -50,7 +50,7 @@ Sumi はアルファ段階です。上の Description は目指す姿です。�
 
 `deploy/local-host/sumi-local` は、新しい秘書コアをマシン1台にインストールして動かします。動くプロセスは、PostgreSQL を使う Go の state service と、秘書本体の2つです。モデルを設定しない場合、秘書はメッセージをそのまま返す `mock` モデルを使うため、実際のモデルを接続する前に再起動や回復の動きを試せます。
 
-必要なもの: Linux（Windows では WSL）、bash 5 以上、Node.js 22.18 以上（または 23.6 以上）、Go、`curl`、`openssl`、`flock`、`tar`、そして Docker か自分で用意した PostgreSQL データベース。
+必要なもの: Linux（Windows では WSL）、bash 5 以上、Node.js 22.18 以上（または 23.6 以上）、`curl`、`openssl`、`flock`、`tar`、そして Docker か自分で用意した PostgreSQL データベース。Go が必要なのはソースのチェックアウトからインストールする場合とバンドルを作る場合だけです。`sumi-local pack` のバンドルをインストールするのに Go もリポジトリも不要です。
 
 ```sh
 deploy/local-host/sumi-local install --managed-pg   # または: --db-url postgres://…
@@ -61,7 +61,7 @@ sumi-local status
 sumi-local stop
 ```
 
-`install` は `~/.local/bin` に `sumi-local` コマンドを追加します。`sumi-local url` はブラウザで開くアドレスを表示します。このアドレスにはページのアクセストークンが含まれるので、パスワードと同じように扱ってください。`sumi-local uninstall` は秘書のデータを残し、`sumi-local uninstall --purge` はデータも削除します。`sumi-local pack` を使うと、Go のない別の Linux（amd64）マシンにインストールできるバンドルを作れます。ビルド済みのバンドルは公開していません。
+`install` は、インストールが完了した時点で `~/.local/bin` に `sumi-local` コマンドを追加します。データベース設定などで導入に失敗した場合、既存のコマンドのリンク先は変わりません。`sumi-local url` はブラウザで開くアドレスを表示します。このアドレスにはページのアクセストークンが含まれるので、パスワードと同じように扱ってください。`sumi-local uninstall` は秘書のデータを残し、`sumi-local uninstall --purge` はデータも削除します。`sumi-local pack` を使うと、Go のない別の Linux（amd64）マシンにインストールできるバンドルを作れます。ビルド済みのバンドルは公開していません。
 
 実際のモデルを接続するには、インストール先の `config.env` に `SUMI_MODEL_PROVIDER=openai` と、OpenAI 互換エンドポイント用の `SUMI_MODEL_*` の値を設定します。Local host は1インストールにつき秘書1体です。設定、回復の挙動、現在の制限は [Local host](docs/local-host.md)（英語）を参照してください。
 
@@ -150,4 +150,5 @@ make migrate   # API のスキーマ migration を適用（SUMI_DB_URL が必要
 - [Real local stack](docs/local-development.md) — ソースから Web アプリ全体を動かす（英語）
 - [Portable secretary state](docs/agent/portable-state.md) — 秘書を Local と Cloud の間で移すための基盤（英語）
 - [Secretary core on Cloudflare](docs/operations/cloud-core-alpha.md) — Cloud の秘書コアのデプロイと検証（運用者向け、英語）
+- [Alpha acceptance status](docs/operations/alpha-acceptance.md) — 検証済み、モックで確認済み、未検証の一覧（英語）
 - [ロードマップ](docs/roadmap.md)（英語）

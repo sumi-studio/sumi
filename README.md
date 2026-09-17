@@ -17,12 +17,12 @@ Sumi aims to democratize access to personal secretaries and extend what a person
 
 ## Where Sumi is today
 
-Sumi is in alpha. The Description above is the goal. Today there are three separate ways to see Sumi, and they do not yet run the same secretary system.
+Sumi is in alpha. The Description above is the goal. Today there are three ways to try Sumi, with different interfaces and setup requirements.
 
 | Way to see Sumi | What it is today | Who can use it |
 |---|---|---|
-| **Hosted alpha Web app** | The existing Web app, with invite-only sign-in, Workspaces and Messaging. | Invited developers and testers only; there is no public sign-up. Integration with the new secretary core is still being verified. |
-| **[Local host](#try-the-local-host)** | The new secretary core on one Linux or WSL machine, without a Sumi Cloud account. | Anyone who installs it from a source checkout. Its browser page and `say` command are engineering surfaces, not the product UI. |
+| **Hosted alpha Web app** | The existing Web app, with invite-only sign-in, Workspaces and Messaging, deployed together with the new secretary core at the current alpha build. | Invited developers and testers only; there is no public sign-up. Everyday sign-in-to-secretary use of the hosted app on the new core remains open acceptance work. |
+| **[Local host](#try-the-local-host)** | The new secretary core on one Linux or WSL machine, without a Sumi Cloud account. | Anyone who installs it — from a source checkout or a `sumi-local pack` bundle (linux/amd64; no Go needed for a bundle). Its browser page and `say` command are engineering surfaces, not the product UI. |
 | **[Web app from source](#run-the-web-app-from-source)** | The full Web app — sign-in, Workspaces, Messaging and settings — with secretaries on the TypeScript secretary core. | Developers with their own Firebase project; no model credential is needed for the default deterministic provider. |
 
 ### The new secretary core
@@ -35,10 +35,10 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 - **Operations that need permission wait for a person.** The request waits in that person's approval inbox. Tests of the approval flow check that an approved operation resumes the waiting request and runs once, that a denied operation does not run, and that another person cannot see or decide it.
 - **Each person chooses their secretary's model.** A person connects their own API key through a supported preset, such as an OpenAI-compatible chat completions endpoint, OpenAI Responses, Anthropic Messages or OpenCode Go. The core uses exactly that connection; if it cannot be used, the request fails rather than being answered by a different model. Model usage is recorded.
 
-### Not available yet
+### Current limits
 
-- **Using the hosted Web app on the new core as a product.** `make dev` runs the Web app from source on the new core for development — Direct Chat, shared Messaging history/search/post/edit, and workspace invitations all run through the durable core. The hosted alpha Web app is still integrating it.
-- **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
+- **Using the hosted Web app on the new core as a product.** `make dev` runs the Web app from source on the new core for development — Direct Chat, shared Messaging history/search/post/edit, and workspace invitations all run through the durable core. The hosted alpha deployment already serves the accepted API, Web and secretary core together, but product-level use of it (a real person's sign-in driving a secretary day to day) is not yet accepted.
+- **Verified end-to-end use of the Local→Cloud move.** The product surface exists — the sign-in screen carries a secretary-move panel — and the state transfer itself has been exercised once against the live Cloud alpha: the same secretary activated on Cloud with its pending input carried over, the Local install then answered `secretary_moved`, and a staged cancellation restored the Local secretary. That run covered state only — files do not move. Its invitation was seeded through a guarded CLI and the external sign-in proof was substituted for the test, while the transfer, confirmation and post-move requests themselves ran against the real public endpoints. The UI flow has not been exercised end to end.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
 - **Desktop and native mobile apps.** `apps/web` is designed to be the single renderer for the Web app, a mobile WebApp and a future Electron desktop app ([ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md)). No desktop or native mobile app exists yet.
@@ -48,7 +48,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 `deploy/local-host/sumi-local` installs and runs the new secretary core on one machine. It runs two processes: a Go state service backed by PostgreSQL, and the secretary. With no model configured, the secretary uses a `mock` model that echoes your message, so you can try restarts and recovery before connecting a real model.
 
-Requirements: Linux (use WSL on Windows), bash 5 or newer, Node.js 22.18 or newer (or 23.6 or newer), Go, `curl`, `openssl`, `flock` and `tar`, and either Docker or a PostgreSQL database you provide.
+Requirements: Linux (use WSL on Windows), bash 5 or newer, Node.js 22.18 or newer (or 23.6 or newer), `curl`, `openssl`, `flock` and `tar`, and either Docker or a PostgreSQL database you provide. Go is needed only to install from a source checkout or to build a bundle — installing a `sumi-local pack` bundle needs no Go and no repository.
 
 ```sh
 deploy/local-host/sumi-local install --managed-pg   # or: --db-url postgres://…
@@ -59,7 +59,7 @@ sumi-local status
 sumi-local stop
 ```
 
-`install` adds a `sumi-local` command to `~/.local/bin`. `sumi-local url` prints the browser address; it contains the page's access token, so treat it like a password. `sumi-local uninstall` keeps your secretary's data, and `sumi-local uninstall --purge` deletes it. `sumi-local pack` builds a bundle you can install on another Linux (amd64) machine without Go; no prebuilt bundle is published.
+`install` adds a `sumi-local` command to `~/.local/bin` once the install completes — a failed install leaves an existing shim pointing at the previous install. `sumi-local url` prints the browser address; it contains the page's access token, so treat it like a password. `sumi-local uninstall` keeps your secretary's data, and `sumi-local uninstall --purge` deletes it. `sumi-local pack` builds a bundle you can install on another Linux (amd64) machine without Go; no prebuilt bundle is published.
 
 To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*` values for an OpenAI-compatible endpoint in the install's `config.env`. The Local host runs one secretary per install. See [Local host](docs/local-host.md) for configuration, recovery behavior and current limits.
 
@@ -148,4 +148,5 @@ The workflows in `.github/workflows/` are configured to run on every pull reques
 - [Real local stack](docs/local-development.md) — running the full Web app from source
 - [Portable secretary state](docs/agent/portable-state.md) — the foundation for moving a secretary between Local and Cloud
 - [Secretary core on Cloudflare](docs/operations/cloud-core-alpha.md) — how the Cloud secretary core is deployed and verified (operators)
+- [Alpha acceptance status](docs/operations/alpha-acceptance.md) — what is verified, exercised with mocks, and still untested
 - [Roadmap](docs/roadmap.md)

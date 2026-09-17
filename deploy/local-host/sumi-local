@@ -770,14 +770,6 @@ cmd_install() {
     cp "$SCRIPT_PATH" "$prefix/bin/sumi-local"
     chmod +x "$prefix/bin/sumi-local"
   fi
-  mkdir -p "$HOME/.local/bin"
-  local shim_dst="$HOME/.local/bin/sumi-local"
-  if [[ -e $shim_dst || -L $shim_dst ]] \
-     && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/sumi-local" ]]; then
-    info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
-  fi
-  ln -sf "$prefix/bin/sumi-local" "$shim_dst"
-
   # --- config ---------------------------------------------------------------
   local cfg="$home/config.env"
   if [[ -f $cfg ]]; then
@@ -872,6 +864,18 @@ cmd_install() {
   local eff_id; eff_id="$(marker_id "$cfg")"
   { printf 'SUMI_LOCAL_ID=%s\n' "$(shq "${eff_id:-$claim_id}")"
     printf 'SUMI_LOCAL_PREFIX=%s\n' "$(shq "$prefix")"; } >"$home/.sumi-local-home"
+
+  # Publish the CLI shim only once the install is known-good: everything
+  # above can still die (payload copy, db-mode resolution), and a symlink
+  # repoint earlier would hand the user's command entry to an install
+  # that never completed — possibly over a still-working one.
+  mkdir -p "$HOME/.local/bin"
+  local shim_dst="$HOME/.local/bin/sumi-local"
+  if [[ -e $shim_dst || -L $shim_dst ]] \
+     && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/sumi-local" ]]; then
+    info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
+  fi
+  ln -sf "$prefix/bin/sumi-local" "$shim_dst"
 
   cat <<EOF
 [$PROG] installed.

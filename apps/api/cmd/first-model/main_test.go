@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -84,5 +86,31 @@ func TestScopeRejectsMalformedPersona(t *testing.T) {
 	}
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400", w.Code)
+	}
+}
+
+// A replayed input_id carrying a different request is a caller conflict
+// (409), matching how the agentstate server maps ErrTurnConflict — not a
+// 500, which would look like an internal failure. Bad input stays 400 and
+// unrelated store failures stay 500.
+func TestSubmitErrorStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"bad request", agentstate.ErrBadRequest, http.StatusBadRequest},
+		{"turn conflict", agentstate.ErrTurnConflict, http.StatusConflict},
+		{"wrapped turn conflict",
+			fmt.Errorf("%w: input_id replay carries a different request", agentstate.ErrTurnConflict),
+			http.StatusConflict},
+		{"internal failure", errors.New("database connection lost"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := submitErrorStatus(tc.err); got != tc.want {
+				t.Fatalf("submitErrorStatus=%d want %d", got, tc.want)
+			}
+		})
 	}
 }
