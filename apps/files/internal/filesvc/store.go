@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -510,8 +511,43 @@ func (s *Store) migrate(ctx context.Context) error {
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS dst_oid text NOT NULL DEFAULT '';
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS dst_sha text NOT NULL DEFAULT '';
 		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS names jsonb NOT NULL DEFAULT '[]'::jsonb;
+		-- Client operation identity: callers that supply an idempotency key
+		-- get a durable receipt in file_receipt, committed atomically with
+		-- the settled effect. op_key/req_hash ride on the intent so a settle
+		-- that happens after the declaring process died still emits it.
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS op_key text NOT NULL DEFAULT '';
+		ALTER TABLE file_op ADD COLUMN IF NOT EXISTS req_hash text NOT NULL DEFAULT '';
+		CREATE TABLE IF NOT EXISTS file_receipt (
+			scope     text   NOT NULL,
+			op_key    text   NOT NULL,
+			req_hash  text   NOT NULL,
+			op        text   NOT NULL,
+			path      text   NOT NULL,
+			to_path   text   NOT NULL DEFAULT '',
+			version   bigint NOT NULL DEFAULT 0,
+			verdict   text   NOT NULL DEFAULT 'applied',
+			created_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (scope, op_key)
+		);
+		-- verdict: the settled outcome the receipt answers. 'applied' =
+		-- the op's declared effect was confirmed (live commit or a
+		-- reconcile observation proving the end-state holds). 'diverged' =
+		-- the op was accepted once and is permanently settled, but its
+		-- effect could not be confirmed — foreign content occupied the
+		-- path, or landing was never proven. A diverged receipt answers a
+		-- replay with a deterministic conflict, never a silent success.
+		ALTER TABLE file_receipt ADD COLUMN IF NOT EXISTS verdict text NOT NULL DEFAULT 'applied';
 		ALTER TABLE file_version ADD COLUMN IF NOT EXISTS oid text NOT NULL DEFAULT '';
 		CREATE INDEX IF NOT EXISTS file_op_scope ON file_op(scope, path);
+		-- At most one PENDING intent per (scope, op_key): a second declare
+		-- under the same key while the first is still in flight fails
+		-- deterministically (ErrIdemInFlight) instead of mutating twice.
+		-- Resolved or dropped intents free the key, so a retry after the
+		-- first intent's verdict reaches the receipt check or declares a
+		-- fresh legitimate attempt.
+		CREATE UNIQUE INDEX IF NOT EXISTS file_op_pending_op_key
+			ON file_op(scope, op_key)
+			WHERE op_key <> '' AND resolved_at IS NULL;
 		SELECT setval('file_version_seq',
 			GREATEST(COALESCE((SELECT MAX(version) FROM file_version), 0),
 			         COALESCE((SELECT MAX(version) FROM file_op), 0),
@@ -531,7 +567,62 @@ var (
 	// a conflicting mutation now could produce rows the pending
 	// settlement would strand (f104). Retry once the intent settles.
 	ErrUnsettled = errors.New("a mutation touching this path is still settling")
+	// ErrIdemConflict: the idempotency key already has a committed receipt
+	// for a DIFFERENT request. Reusing a key across requests can never
+	// borrow the earlier operation's receipt.
+	ErrIdemConflict = errors.New("idempotency key was already used for a different request")
+	// ErrIdemInFlight: another intent under the same idempotency key is
+	// still pending — its verdict (applied, dropped, or reconciled) is
+	// not yet recorded. Truthful refusal: the caller retries once the
+	// in-flight operation settles and is then answered by the receipt
+	// check or declares a fresh attempt.
+	ErrIdemInFlight = errors.New("an operation with this idempotency key is still in flight")
 )
+
+// OpIdentity is the caller's stable operation identity. When Key is set the
+// mutation is journaled under it: the committed effect carries a durable
+// receipt, and a later request with the same key is answered from that
+// receipt instead of mutating again. ReqHash is the service-computed
+// fingerprint of the canonical request — the receipt answers only an
+// identical request; a same-key different-request claim conflicts.
+type OpIdentity struct {
+	Key     string
+	ReqHash string
+}
+
+// Replayed is returned (as an error) when op_key already has a committed
+// receipt: the operation was accepted once and its recorded result is the
+// answer, regardless of what later operations did to the path. It is not
+// a failure — handlers map it to the replayed success response.
+type Replayed struct {
+	Op      string
+	Path    string
+	ToPath  string
+	Version int64
+}
+
+func (e *Replayed) Error() string {
+	return fmt.Sprintf("operation already applied: %s %s (version %d)", e.Op, e.Path, e.Version)
+}
+
+// ReplayedDiverged is returned (as an error) when op_key has a committed
+// receipt whose settled verdict is diverged: the operation was accepted
+// once and is permanently settled — it will never re-run — but its
+// declared effect could not be confirmed applied (the path held foreign
+// content when the intent settled, or the landing could not be proven).
+// It is a deterministic conflict, not a transient failure: the key is
+// spent and handlers answer a truthful "outcome unconfirmed" instead of
+// either a silent success or an endless retry.
+type ReplayedDiverged struct {
+	Op      string
+	Path    string
+	ToPath  string
+	Version int64
+}
+
+func (e *ReplayedDiverged) Error() string {
+	return fmt.Sprintf("operation outcome could not be confirmed: %s %s (accepted once, settled diverged; the path's content is not provably this operation's effect)", e.Op, e.Path)
+}
 
 // IfVersion is the caller's declared expectation for the target path.
 type IfVersion struct {
@@ -562,6 +653,8 @@ type intent struct {
 	srcKind   string       // rename: kind of the source at declare ("" = unknown → unprovable)
 	names     []nameRec    // the op's private-name journal; names[0] is the op's own slot
 	journal   *nameJournal // bound while this process owns the intent
+	opKey     string       // caller idempotency key — non-empty when the client asked for a durable receipt
+	reqHash   string       // canonical-request fingerprint the receipt answers
 	at        time.Time
 }
 
@@ -782,14 +875,25 @@ func (s *Store) runFs(it intent, fn func(intent) (FileInfo, bool, error)) <-chan
 		case it.op == "remove" && errors.Is(ferr, ErrNotFound):
 			// Desired absence already holds — the rows are dead state.
 			// Clean them WITHOUT an event: we observed absence, we did
-			// not cause it (observed-absence vs performed-removal).
-			s.dropIntentGhosts(context.Background(), it, true)
+			// not cause it (observed-absence vs performed-removal). The
+			// keyed caller's operation still settles here: receipt the
+			// outcome ("applied" — the declared postcondition, absence,
+			// holds) so a lost-ledger replay is answered from the receipt
+			// instead of re-executing a remove against a file created
+			// after this op was answered (F338).
+			s.dropIntentGhosts(context.Background(), it, true, "applied")
 		case errors.Is(ferr, errUndoParked):
 			if !committed {
 				// A verified effect displaced foreign bytes and could not
 				// fully restore the pre-effect shape — the parked object is
-				// live evidence; retain the intent for the reconciler.
-				s.tombstoneIntent(context.Background(), it)
+				// live evidence; retain the intent for the reconciler. A
+				// keyed intent also settles its receipt NOW, diverged:
+				// the outcome is genuinely unconfirmable this op already
+				// consumed its one execution, so a replay must never
+				// re-run (the restored occupant could be foreign). The
+				// tombstone still stands for the reconciler, which can
+				// upgrade the verdict to applied on a confirmed landing.
+				s.tombstoneIntentVerdict(context.Background(), it, "diverged")
 			} else {
 				// The effect committed but a foreign object stayed parked
 				// at the intent's staging slot: journal the commit AND keep
@@ -842,7 +946,7 @@ func intentSHA(it intent) string {
 func (s *Store) applyUntilSettled(it intent, info FileInfo, sha string) error {
 	backoff := 200 * time.Millisecond
 	for attempt := 0; ; attempt++ {
-		err := s.apply(context.Background(), it, info, sha, false)
+		err := s.apply(context.Background(), it, info, sha, false, "applied")
 		if err == nil || errors.Is(err, errIntentSettled) {
 			return nil
 		}
@@ -889,7 +993,7 @@ func (s *Store) applyRetained(it intent, info FileInfo, sha string) error {
 	}
 	backoff := 200 * time.Millisecond
 	for attempt := 0; ; attempt++ {
-		err := s.apply(context.Background(), it, info, sha, true)
+		err := s.apply(context.Background(), it, info, sha, true, "applied")
 		if err == nil || errors.Is(err, errIntentSettled) || errors.Is(err, errNotJournaled) {
 			return nil
 		}
@@ -1021,7 +1125,7 @@ func checkVersion(ctx context.Context, tx pgx.Tx, scope, path string, iv IfVersi
 // post-state evidence (sha256 of the write body; "dir" for mkdir) — the
 // reconciler compares it against what actually landed so foreign bytes
 // are never attributed to this op (f83).
-func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv IfVersion, expectSHA string, casProbe, preProbe FPProbe) (intent, error) {
+func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv IfVersion, expectSHA string, idem OpIdentity, casProbe, preProbe FPProbe) (intent, error) {
 	if s.deposed.Load() {
 		return intent{}, ErrUnavailable
 	}
@@ -1032,6 +1136,30 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 		return intent{}, err
 	}
 	defer tx.Rollback(ctx)
+
+	// A committed receipt is the accepted operation's durable identity: the
+	// same key replaying the same request is answered from it without a
+	// second mutation — even if later operations deleted or replaced the
+	// path. A different request under the same key never borrows it.
+	if idem.Key != "" {
+		var recHash, recOp, recPath, recTo, recVerdict string
+		var recVer int64
+		rerr := tx.QueryRow(ctx,
+			`SELECT req_hash, op, path, to_path, version, verdict FROM file_receipt WHERE scope=$1 AND op_key=$2`,
+			scope, idem.Key).Scan(&recHash, &recOp, &recPath, &recTo, &recVer, &recVerdict)
+		if rerr == nil {
+			if recHash != idem.ReqHash {
+				return intent{}, ErrIdemConflict
+			}
+			if recVerdict == "diverged" {
+				return intent{}, &ReplayedDiverged{Op: recOp, Path: recPath, ToPath: recTo, Version: recVer}
+			}
+			return intent{}, &Replayed{Op: recOp, Path: recPath, ToPath: recTo, Version: recVer}
+		}
+		if !errors.Is(rerr, pgx.ErrNoRows) {
+			return intent{}, rerr
+		}
+	}
 
 	casPath := path
 	if op == "rename" {
@@ -1071,7 +1199,7 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 	if err := checkVersion(ctx, tx, scope, casPath, iv, casProbe, op == "remove"); err != nil {
 		return intent{}, err
 	}
-	it := intent{owner: s.owner, scope: scope, op: op, path: path, toPath: toPath, expectSHA: expectSHA}
+	it := intent{owner: s.owner, scope: scope, op: op, path: path, toPath: toPath, expectSHA: expectSHA, opKey: idem.Key, reqHash: idem.ReqHash}
 	if preProbe != nil {
 		pre, exists, perr := preProbe()
 		if perr != nil {
@@ -1148,11 +1276,18 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 		return intent{}, err
 	}
 	err = tx.QueryRow(ctx,
-		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+		`INSERT INTO file_op (root, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, op_key, req_hash)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
 		s.rootID, s.owner, scope, op, path, toPath, it.version, it.preFP, it.dstFP, it.expectSHA, it.srcKind,
-		it.preOid, it.dstOid, it.dstSHA).Scan(&it.id)
+		it.preOid, it.dstOid, it.dstSHA, it.opKey, it.reqHash).Scan(&it.id)
 	if err != nil {
+		// A second keyed declare blocked by file_op_pending_op_key waits
+		// out the first declare's tx, then surfaces here — the in-flight
+		// intent owns the key until it settles.
+		var pgerr *pgconn.PgError
+		if it.opKey != "" && errors.As(err, &pgerr) && pgerr.Code == "23505" {
+			return intent{}, ErrIdemInFlight
+		}
 		return intent{}, err
 	}
 	// Journal the op's private name BEFORE commit — and therefore before
@@ -1239,7 +1374,11 @@ var errNotJournaled = errors.New("diverged observation already recorded or super
 // and errNotJournaled is returned after resolving the intent), and a
 // tombstone keeps its original resolved_at so re-judgment never re-arms
 // the path's pending_settlement window.
-func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, keepIntent bool) error {
+// verdict is the receipt outcome this settle records ("applied" |
+// "diverged"): a keyed intent that settles commits its receipt with the
+// truth of this judgment — a diverged receipt exists precisely so a
+// replay never has to re-run to learn the effect could not be confirmed.
+func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA string, keepIntent bool, verdict string) error {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1298,6 +1437,17 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 			`DELETE FROM file_op WHERE id=$1`, it.id); derr != nil {
 			return derr
 		}
+	}
+
+	// The accepted operation's durable receipt commits with the verdict
+	// this settle reached: a replay is answered from here without a second
+	// mutation, whether settle ran on the live path or through the
+	// reconciler. An intent that is dropped (provably never committed —
+	// a definitive pre-commit rejection) leaves no receipt, so its key
+	// retries the operation for real; an intent resolved by the
+	// reconciler without landing proof receipts "diverged" instead.
+	if err := s.recordReceiptTx(ctx, tx, it, verdict); err != nil {
+		return err
 	}
 
 	rowWrites := int64(1)
@@ -1372,6 +1522,22 @@ func (s *Store) apply(ctx context.Context, it intent, info FileInfo, contentSHA 
 		// the same bytes, or a repeated diverged observation). An event
 		// now would announce a version the row does not hold and forge
 		// commit evidence for intentApplied — resolve without one.
+		// One exception to repair before commit: this settle CONFIRMED
+		// the declared effect (verdict applied — e.g. late-landed bytes
+		// re-judged) while the row still carries the diverged marker an
+		// earlier unconfirmed settle recorded. Refresh the recorded
+		// fingerprint to the live one so stat/CAS stop reporting an
+		// external change that has resolved; no event — the version
+		// itself is unchanged.
+		if verdict == "applied" && (it.op == "write" || it.op == "mkdir") &&
+			info.Fingerprint != "" && !strings.HasPrefix(info.Fingerprint, "diverged:") {
+			if _, err := tx.Exec(ctx,
+				`UPDATE file_version SET fp=$4, content_sha=$5, updated=now()
+				 WHERE scope=$1 AND path=$2 AND version=$3 AND starts_with(fp, 'diverged:')`,
+				it.scope, it.path, it.version, info.Fingerprint, contentSHA); err != nil {
+				return err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
@@ -1440,8 +1606,11 @@ func (s *Store) dropIntent(ctx context.Context, it intent) bool {
 // dead state: rows under path (subtree when subtree=true) minted before
 // this intent's declare-time version. The version guard preserves rows
 // committed by later ops for recreated paths — a stale settlement can
-// never steal them (f81). Owner-fenced like dropIntent (f103).
-func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) bool {
+// never steal them (f81). Owner-fenced like dropIntent (f103). A non-empty
+// verdict also commits the keyed caller's receipt in the same tx — used
+// when the resolved outcome is the op's declared postcondition holding
+// (a remove that observed absence), so a replay cannot re-execute.
+func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool, verdict string) bool {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1465,6 +1634,11 @@ func (s *Store) dropIntentGhosts(ctx context.Context, it intent, subtree bool) b
 	}
 	if derr != nil {
 		return false
+	}
+	if verdict != "" {
+		if err := s.recordReceiptTx(ctx, tx, it, verdict); err != nil {
+			return false
+		}
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM file_op WHERE id=$1`, it.id); err != nil {
 		return false
@@ -1496,10 +1670,39 @@ func (s *Store) tombstoneIntent(ctx context.Context, it intent) bool {
 	return tx.Commit(ctx) == nil
 }
 
+// recordReceiptTx writes the caller's durable operation receipt inside the
+// settling transaction, carrying the verdict this settle reached. An
+// intent dropped before its fs effect could commit (a definitive
+// pre-commit rejection) leaves no receipt, so its key retries the
+// operation for real; an intent settled by the reconciler without landing
+// proof receipts "diverged" — the key is spent and the replay reports an
+// unconfirmed outcome rather than re-mutating or claiming success. A
+// diverged verdict upgrades to "applied" if a later judgment confirms the
+// declared effect (the tombstoned re-judgment of a late-landed write);
+// applied is never downgraded.
+func (s *Store) recordReceiptTx(ctx context.Context, tx pgx.Tx, it intent, verdict string) error {
+	if it.opKey == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO file_receipt (scope, op_key, req_hash, op, path, to_path, version, verdict)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 ON CONFLICT (scope, op_key) DO UPDATE SET verdict='applied'
+		   WHERE file_receipt.verdict='diverged' AND EXCLUDED.verdict='applied'`,
+		it.scope, it.opKey, it.reqHash, it.op, it.path, it.toPath, it.version, verdict)
+	return err
+}
+
 // tombstoneIntentGhosts: tombstone + dead-row cleanup in one tx — the
 // intent's evidence is retained while rows the disk proves absent are
 // deleted (no event: observed absence is not a performed operation).
-func (s *Store) tombstoneIntentGhosts(ctx context.Context, it intent, subtree bool) bool {
+// verdict is the receipt outcome committed with the resolution
+// ("applied" | "diverged"; "" = no receipt). "applied" means the op's
+// declared end-state is confirmed (a remove whose path is absent, or a
+// write whose commit act the journal proves landed before the path
+// vanished); "diverged" spends the key on an unconfirmed outcome so a
+// replay cannot silently re-run or claim success.
+func (s *Store) tombstoneIntentGhosts(ctx context.Context, it intent, subtree bool, verdict string) bool {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -1524,12 +1727,70 @@ func (s *Store) tombstoneIntentGhosts(ctx context.Context, it intent, subtree bo
 	if derr != nil {
 		return false
 	}
+	if verdict != "" {
+		if err := s.recordReceiptTx(ctx, tx, it, verdict); err != nil {
+			return false
+		}
+	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error=''
 		 WHERE id=$1 AND resolved_at IS NULL`, it.id); err != nil {
 		return false
 	}
 	return tx.Commit(ctx) == nil
+}
+
+// tombstoneIntentVerdict is tombstoneIntent plus a durable receipt for a
+// keyed intent resolved without touching version rows — used when the
+// reconcile judgment settles an operation whose on-disk outcome is
+// unconfirmed ("diverged") or whose declared end-state is proven by the
+// intent's own journal ("applied"). The tombstone keeps the evidence for
+// late-effect re-judgment; the receipt spends the key so a replay is
+// answered, never re-run.
+func (s *Store) tombstoneIntentVerdict(ctx context.Context, it intent, verdict string) bool {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false
+	}
+	defer tx.Rollback(ctx)
+	if err := s.checkOwnerTx(ctx, tx); err != nil {
+		return false
+	}
+	if verdict != "" {
+		if err := s.recordReceiptTx(ctx, tx, it, verdict); err != nil {
+			return false
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE file_op SET resolved_at=now(), stalled_at=NULL, last_error=''
+		 WHERE id=$1 AND resolved_at IS NULL`, it.id); err != nil {
+		return false
+	}
+	return tx.Commit(ctx) == nil
+}
+
+// intentLanded reports whether the intent's own name journal proves the
+// fs commit act completed: a write's publish act ("pub"/"xch"), a
+// remove's capture ("cap"). Acts are journaled BEFORE the syscall that
+// can land them, so a recorded res=ok is durable proof the effect
+// committed — and anything else (unresulted, undone, or unjournaled) is
+// unproven, never "never ran". Journal patches are best-effort, so the
+// absence of a landed record can only degrade a judgment toward
+// "unconfirmed", never toward "applied".
+func intentLanded(it intent) bool {
+	if len(it.names) == 0 {
+		return false
+	}
+	rec := it.names[0]
+	switch it.op {
+	case "write":
+		return (rec.Act == "pub" || rec.Act == "xch") && rec.Res == "ok"
+	case "remove":
+		return rec.Act == "cap" && rec.Res == "ok"
+	}
+	return false
 }
 
 // markStalled records that an intent cannot be judged right now: the
@@ -3056,11 +3317,18 @@ func (s *Store) kickReconcile() {
 // expectSHA is the sha256 hex of the intended content (or "dir" for
 // mkdir); the reconciler uses it to detect external bytes.
 func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+	return s.WithWriteKeyed(ctx, scope, path, op, iv, expectSHA, OpIdentity{}, probe, fn)
+}
+
+// WithWriteKeyed is WithWrite with a caller operation identity: a committed
+// effect leaves a durable receipt under idem.Key, and a replay of the same
+// request is answered from it instead of re-mutating.
+func (s *Store) WithWriteKeyed(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, idem OpIdentity, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
 
-	it, err := s.declare(ctx, scope, op, path, "", iv, expectSHA, probe, probe)
+	it, err := s.declare(ctx, scope, op, path, "", iv, expectSHA, idem, probe, probe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
@@ -3080,11 +3348,16 @@ func (s *Store) WithWrite(ctx context.Context, scope, path, op string, iv IfVers
 // rename — renameat2(RENAME_NOREPLACE) for create-only modes), then moves
 // the source subtree's rows to the destination in the apply tx.
 func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+	return s.RenameKeyed(ctx, scope, from, to, iv, OpIdentity{}, casProbe, fromProbe, fn)
+}
+
+// RenameKeyed is Rename with a caller operation identity (see WithWriteKeyed).
+func (s *Store) RenameKeyed(ctx context.Context, scope, from, to string, iv IfVersion, idem OpIdentity, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
 
-	it, err := s.declare(ctx, scope, "rename", from, to, iv, "", casProbe, fromProbe)
+	it, err := s.declare(ctx, scope, "rename", from, to, iv, "", idem, casProbe, fromProbe)
 	if err != nil {
 		return 0, FileInfo{}, err
 	}
@@ -3101,11 +3374,16 @@ func (s *Store) Rename(ctx context.Context, scope, from, to string, iv IfVersion
 // Remove drops the version rows for the removed path and any descendants
 // after the fs removal, under the same intent journal.
 func (s *Store) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error {
+	return s.RemoveKeyed(ctx, scope, path, iv, OpIdentity{}, probe, fn)
+}
+
+// RemoveKeyed is Remove with a caller operation identity (see WithWriteKeyed).
+func (s *Store) RemoveKeyed(ctx context.Context, scope, path string, iv IfVersion, idem OpIdentity, probe FPProbe, fn func(intent) (bool, error)) error {
 	mu := s.lockScope(scope)
 	mu.Lock()
 	defer mu.Unlock()
 
-	it, err := s.declare(ctx, scope, "remove", path, "", iv, "", probe, probe)
+	it, err := s.declare(ctx, scope, "remove", path, "", iv, "", idem, probe, probe)
 	if err != nil {
 		return err
 	}
@@ -3257,7 +3535,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 
 	dctx, cancel := s.dbCtx(ctx)
 	defer cancel()
-	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, names, at`
+	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, names, at, op_key, req_hash`
 	load := func(where string, args ...any) []intent {
 		rows, err := s.pool.Query(dctx,
 			`SELECT `+cols+` FROM file_op WHERE root=$1 AND `+where+` ORDER BY id`, args...)
@@ -3271,7 +3549,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 			var names []byte
 			if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
 				&it.version, &it.preFP, &it.dstFP, &it.expectSHA, &it.srcKind,
-				&it.preOid, &it.dstOid, &it.dstSHA, &names, &it.at); err != nil {
+				&it.preOid, &it.dstOid, &it.dstSHA, &names, &it.at, &it.opKey, &it.reqHash); err != nil {
 				return out
 			}
 			if len(names) > 0 {
@@ -3487,7 +3765,7 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 			if tombstoned {
 				return false
 			}
-			return s.tombstoneIntentGhosts(ctx, it, true)
+			return s.tombstoneIntentGhosts(ctx, it, true, "")
 		default:
 			// Source present but changed, destination absent: nothing is
 			// observed anywhere else; rows stay, stat reports the change.
@@ -3506,12 +3784,28 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 			if it.op == "remove" {
 				// Desired absence holds — clean dead rows, journal no
 				// event: observed absence is not a performed removal.
-				return s.tombstoneIntentGhosts(ctx, it, true)
+				// The keyed caller's operation IS complete though: its
+				// receipt commits here so a replay cannot delete a
+				// later recreation.
+				return s.tombstoneIntentGhosts(ctx, it, true, "applied")
 			}
-			// Absent + settled owner: the write/mkdir never landed. Any
-			// row for the path is a ghost — clean it; keep the intent's
+			// Absent write/mkdir. Absence alone can never prove the op
+			// "never landed" — it is indistinguishable from landed-then-
+			// deleted — so the keyed intent must not be left receiptless
+			// for a retry to silently re-run. If the intent's own journal
+			// proves the commit act completed, the op DID apply (the path
+			// was removed afterward — ordinary post-success divergence)
+			// and receipts "applied". Otherwise the settle is unconfirmed
+			// and receipts "diverged": the key is spent and a replay
+			// answers a deterministic conflict instead of recreating a
+			// file a later delete may have removed. Either way any row
+			// for the path is a ghost — clean it; keep the intent's
 			// evidence for late-landing re-judgment.
-			return s.tombstoneIntentGhosts(ctx, it, false)
+			verdict := "diverged"
+			if intentLanded(it) {
+				verdict = "applied"
+			}
+			return s.tombstoneIntentGhosts(ctx, it, false, verdict)
 		case serr != nil:
 			// Unverifiable — could not observe. Never resolved by timer.
 			if !tombstoned {
@@ -3520,11 +3814,26 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 			return false
 		}
 		if it.op == "remove" {
-			// Path still exists — the removal never committed.
+			// Path still exists — the removal's end-state does not hold.
+			// A keyed intent settles here once, receipted: if the journal
+			// proves the capture landed AND the object now at the path is
+			// not the declared one (oid differs), the op applied and a
+			// later object replaced it ("applied"). Otherwise the outcome
+			// is unconfirmable — never-ran, landed-then-recreated, and
+			// captured-then-restored are indistinguishable without an
+			// oid proof (a restore round-trip bumps ctime, so fp cannot
+			// carry this comparison) — and the receipt answers
+			// "diverged": a replay may NOT re-execute the remove, because
+			// the present object could be a replacement created by a
+			// later independent operation.
 			if tombstoned {
 				return false
 			}
-			return s.tombstoneIntent(ctx, it)
+			verdict := "diverged"
+			if intentLanded(it) && it.preOid != "" && info.Oid != "" && info.Oid != it.preOid {
+				verdict = "applied"
+			}
+			return s.tombstoneIntentVerdict(ctx, it, verdict)
 		}
 		if it.preFP != "" && info.Fingerprint == it.preFP {
 			// Byte-identical fingerprint since declare — the mutation
@@ -3563,11 +3872,23 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 				// intent tombstoned: this op's bytes may still land late
 				// and overwrite the foreign content, and the intent is
 				// the only evidence that can re-attribute them.
+				// The receipt's verdict mirrors the proof: if the
+				// journal confirms the publish act committed, the op
+				// applied (the current bytes are a later external
+				// overwrite — ordinary post-success divergence); if
+				// landing is unproven the settle is "diverged" and a
+				// keyed replay reports an unconfirmed outcome rather
+				// than claiming a write whose bytes were never
+				// observed (F338).
 				info.Fingerprint = divergedFP(it.expectSHA)
-				return s.applyKeep(ctx, it, info, contentSHA, tombstoned)
+				verdict := "diverged"
+				if intentLanded(it) {
+					verdict = "applied"
+				}
+				return s.applyKeep(ctx, it, info, contentSHA, tombstoned, verdict)
 			}
 		}
-		if err := s.apply(ctx, it, info, contentSHA, false); err != nil {
+		if err := s.apply(ctx, it, info, contentSHA, false, "applied"); err != nil {
 			log.Printf("reconcile: apply %s %s/%s: %v", it.op, it.scope, it.path, err)
 			return false
 		}
@@ -3587,8 +3908,8 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 // path a newer version superseded, writes nothing (apply's in-tx row
 // guard): no stale event, no resolved_at refresh. Returns whether this
 // call settled anything.
-func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, contentSHA string, tombstoned bool) bool {
-	err := s.apply(ctx, it, info, contentSHA, true)
+func (s *Store) applyKeep(ctx context.Context, it intent, info FileInfo, contentSHA string, tombstoned bool, verdict string) bool {
+	err := s.apply(ctx, it, info, contentSHA, true, verdict)
 	switch {
 	case err == nil:
 		log.Printf("reconcile: %s %s/%s landed divergent content — marking external", it.op, it.scope, it.path)

@@ -2072,13 +2072,16 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 			// the reconciler settles them.
 			return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 		case errors.Is(uerr, ErrNotEmpty):
-			// A dir gained members after capture — it diverged from the
-			// declared object; restore it instead of deleting.
+			// The captured object is a directory with members — remove is
+			// not recursive and refuses it outright. Its identity was
+			// already verified (st3 == dstFP), so this is the declared
+			// object itself, not a divergence: restore it whole and
+			// report dir_not_empty rather than external_change.
 			rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 			switch {
 			case rerr == nil:
 				syncDir(pfd)
-				return false, ErrExternalChange
+				return false, ErrNotEmpty
 			case errors.Is(rerr, unix.EEXIST):
 				return false, fmt.Errorf("%w: %w", ErrExternalChange, errUndoParked)
 			default:

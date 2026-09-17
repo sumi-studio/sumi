@@ -483,7 +483,7 @@ func TestLateRepairRelocateKeepsCommittedRow(t *testing.T) {
 			// timed-out settler shape — runFs goroutines never hold the
 			// scope mutex the pass holds).
 			wit, derr := s.declare(ctx, "ws", "write", "B", "", IfVersion{Mode: "any"},
-				sha("new-W"), authProbe(root, "B"), authProbe(root, "B"))
+				sha("new-W"), OpIdentity{}, authProbe(root, "B"), authProbe(root, "B"))
 			if derr != nil {
 				t.Errorf("W declare: %v", derr)
 				return
@@ -494,7 +494,7 @@ func TestLateRepairRelocateKeepsCommittedRow(t *testing.T) {
 				t.Errorf("W fs: committed=%v err=%v", wcommitted, werr)
 				return
 			}
-			if aerr := s.apply(ctx, wit, winfo, wit.expectSHA, false); aerr != nil {
+			if aerr := s.apply(ctx, wit, winfo, wit.expectSHA, false, "applied"); aerr != nil {
 				t.Errorf("W apply: %v", aerr)
 				return
 			}
@@ -588,7 +588,7 @@ func TestLateRepairRelocateStaleRowDoesNotRevert(t *testing.T) {
 			}
 			pv.Close()
 			wit, derr := s.declare(ctx, "ws", "write", "B", "", IfVersion{Mode: "any"},
-				sha("new-W"), authProbe(root, "B"), authProbe(root, "B"))
+				sha("new-W"), OpIdentity{}, authProbe(root, "B"), authProbe(root, "B"))
 			if derr != nil {
 				t.Errorf("W declare: %v", derr)
 				return
@@ -599,7 +599,7 @@ func TestLateRepairRelocateStaleRowDoesNotRevert(t *testing.T) {
 				t.Errorf("W fs: committed=%v err=%v", wcommitted, werr)
 				return
 			}
-			if aerr := s.apply(ctx, wit, winfo, wit.expectSHA, false); aerr != nil {
+			if aerr := s.apply(ctx, wit, winfo, wit.expectSHA, false, "applied"); aerr != nil {
 				t.Errorf("W apply: %v", aerr)
 			}
 		}}

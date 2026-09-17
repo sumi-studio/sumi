@@ -22,10 +22,49 @@ type fakeStore struct {
 	evs    []Event
 	seq    int64 // global monotonic version mint — mirrors file_version_seq
 	obsErr error // injected ObservedVersion failure (f33)
+	// receipts models file_receipt: (scope, op_key) → committed request
+	// identity + result. Consulted before CAS, written after the effect
+	// commits — same ordering as the real store.
+	receipts map[string]fakeReceipt
+}
+
+type fakeReceipt struct {
+	reqHash string
+	op      string
+	path    string
+	toPath  string
+	version int64
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{vers: map[string]int64{}, fps: map[string]string{}}
+	return &fakeStore{vers: map[string]int64{}, fps: map[string]string{}, receipts: map[string]fakeReceipt{}}
+}
+
+// checkReceipt mirrors declare's receipt gate: same key+same request →
+// Replayed; same key+different request → ErrIdemConflict; no receipt →
+// proceed. It runs before the CAS probe exactly like the real store.
+func (f *fakeStore) checkReceipt(scope, op, path, toPath string, idem OpIdentity) error {
+	if idem.Key == "" {
+		return nil
+	}
+	rec, ok := f.receipts[scope+"\x00"+idem.Key]
+	if !ok {
+		return nil
+	}
+	if rec.reqHash != idem.ReqHash {
+		return ErrIdemConflict
+	}
+	return &Replayed{Op: rec.op, Path: rec.path, ToPath: rec.toPath, Version: rec.version}
+}
+
+func (f *fakeStore) recordReceipt(scope, op, path, toPath string, version int64, idem OpIdentity) {
+	if idem.Key == "" {
+		return
+	}
+	k := scope + "\x00" + idem.Key
+	if _, ok := f.receipts[k]; !ok {
+		f.receipts[k] = fakeReceipt{reqHash: idem.ReqHash, op: op, path: path, toPath: toPath, version: version}
+	}
 }
 
 // bump mirrors the real store's CAS rules, including the fingerprint gate:
@@ -71,7 +110,10 @@ func (f *fakeStore) bump(scope, path string, iv IfVersion, probe FPProbe) (int64
 	return f.seq, nil
 }
 
-func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, _ string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (f *fakeStore) WithWriteKeyed(ctx context.Context, scope, path, op string, iv IfVersion, _ string, idem OpIdentity, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+	if rerr := f.checkReceipt(scope, op, path, "", idem); rerr != nil {
+		return 0, FileInfo{}, rerr
+	}
 	k := scope + "/" + path
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, path, iv, probe)
@@ -95,10 +137,14 @@ func (f *fakeStore) WithWrite(ctx context.Context, scope, path, op string, iv If
 	}
 	f.fps[scope+"/"+path] = info.Fingerprint
 	f.evs = append(f.evs, Event{Seq: int64(len(f.evs) + 1), Path: path, Op: op, Version: ver})
+	f.recordReceipt(scope, op, path, "", ver, idem)
 	return ver, info, nil
 }
 
-func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+func (f *fakeStore) RenameKeyed(ctx context.Context, scope, from, to string, iv IfVersion, idem OpIdentity, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error) {
+	if rerr := f.checkReceipt(scope, "rename", from, to, idem); rerr != nil {
+		return 0, FileInfo{}, rerr
+	}
 	k := scope + "/" + to
 	prev, had := f.vers[k]
 	ver, err := f.bump(scope, to, iv, casProbe)
@@ -139,10 +185,14 @@ func (f *fakeStore) Rename(ctx context.Context, scope, from, to string, iv IfVer
 	delete(f.vers, scope+"/"+from)
 	delete(f.fps, scope+"/"+from)
 	f.evs = append(f.evs, Event{Seq: int64(len(f.evs) + 1), Path: to, From: from, Op: "rename", Version: ver})
+	f.recordReceipt(scope, "rename", from, to, ver, idem)
 	return ver, info, nil
 }
 
-func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error {
+func (f *fakeStore) RemoveKeyed(ctx context.Context, scope, path string, iv IfVersion, idem OpIdentity, probe FPProbe, fn func(intent) (bool, error)) error {
+	if rerr := f.checkReceipt(scope, "remove", path, "", idem); rerr != nil {
+		return rerr
+	}
 	k := scope + "/" + path
 	cur := f.vers[k]
 	if cur == 0 && (iv.Mode == "eq" || iv.Mode == "none") {
@@ -177,6 +227,7 @@ func (f *fakeStore) Remove(ctx context.Context, scope, path string, iv IfVersion
 	}
 	f.seq++
 	f.evs = append(f.evs, Event{Seq: int64(len(f.evs) + 1), Path: path, Op: "remove", Version: f.seq})
+	f.recordReceipt(scope, "remove", path, "", f.seq, idem)
 	return nil
 }
 
@@ -327,6 +378,46 @@ func TestRenameAtomicAndRemove(t *testing.T) {
 	w = req(t, svc, "GET", "/v1/files/ws1/read?path=r2.txt", "tok-a", "", nil)
 	if w.Code != 404 {
 		t.Fatalf("removed file readable: %d", w.Code)
+	}
+}
+
+// Removing a non-empty directory is a truthful dir_not_empty refusal —
+// not a false external_change — and every member is preserved. Empty
+// directories remove normally (F-A: ENOTEMPTY was misclassified).
+func TestRemoveNonEmptyDirRefused(t *testing.T) {
+	svc, _ := testSvc(t)
+	w := req(t, svc, "POST", "/v1/files/ws1/mkdir", "tok-a", `{"path":"d"}`, nil)
+	if w.Code != 200 {
+		t.Fatalf("mkdir: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "PUT", "/v1/files/ws1/write?path=d/f.txt", "tok-a", "child",
+		map[string]string{"If-Version": "none"})
+	if w.Code != 200 {
+		t.Fatalf("member write: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 409 || !strings.Contains(w.Body.String(), "dir_not_empty") {
+		t.Fatalf("non-empty dir remove: want 409 dir_not_empty, got %d %s", w.Code, w.Body)
+	}
+	if strings.Contains(w.Body.String(), "external_change") {
+		t.Fatalf("refusal claims a false external change: %s", w.Body)
+	}
+	// The dir and its member are intact and readable.
+	w = req(t, svc, "GET", "/v1/files/ws1/read?path=d/f.txt", "tok-a", "", nil)
+	if w.Code != 200 || w.Body.String() != "child" {
+		t.Fatalf("member after refusal: %d %q", w.Code, w.Body)
+	}
+	// Once emptied, the same remove succeeds.
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d/f.txt", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("member remove: %d %s", w.Code, w.Body)
+	}
+	w = req(t, svc, "DELETE", "/v1/files/ws1/remove?path=d", "tok-a", "",
+		map[string]string{"If-Version": "any"})
+	if w.Code != 200 {
+		t.Fatalf("empty dir remove: %d %s", w.Code, w.Body)
 	}
 }
 

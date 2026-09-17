@@ -642,7 +642,7 @@ test("every production API registration has an explicit edge disposition", async
     );
   }
 
-  for (const prefix of ["/auth/", "/direct-chat/", "/messaging/"]) {
+  for (const prefix of ["/auth/", "/direct-chat/", "/messaging/", "/files/"]) {
     assert.ok(
       discovery.routes.some((route) => route.pattern.includes(` ${prefix}`)),
       `policy prefix ${prefix} has no production registrar`,
@@ -962,6 +962,116 @@ test("secretary transfer calls reach the bound API origin, never the SPA", async
   // The origin's own answer — a 404 while the registrar is unmounted — is
   // returned by identity rather than replaced by the SPA document.
   assert.equal(actual, unmounted);
+});
+
+test("file workspace calls reach the bound API origin with contract intact", async () => {
+  // Every production /files op is API traffic: the API derives the filesvc
+  // scope from the session and proxies to the private service. None of these
+  // paths may render the SPA shell, and the public edge never talks to
+  // filesvc itself.
+  for (const path of [
+    "/files/list",
+    "/files/stat",
+    "/files/read",
+    "/files/write",
+    "/files/mkdir",
+    "/files/remove",
+  ]) {
+    assert.equal(classifyPath(path), "origin", path);
+  }
+  // The bare namespace is not an application page, and lookalikes outside
+  // the prefix are not API traffic.
+  assert.equal(classifyPath("/files"), "deny");
+  assert.notEqual(classifyPath("/files-lookalike/x"), "origin");
+  assert.notEqual(classifyPath("/files2/list"), "origin");
+  // Encoded or traversal variants still resolve inside the namespace or
+  // fail closed; they never become SPA navigations.
+  assert.equal(classifyPath("/files%2Flist"), "origin");
+  assert.equal(classifyPath("/files%252Flist"), "origin");
+  assert.equal(classifyPath("/files/../src/main.ts"), "deny");
+
+  // A write carries the session cookie, the CAS precondition, the
+  // idempotency key, the authorization-fence query parameters, and the raw
+  // body. The bound origin must receive all of it verbatim, and its typed
+  // conflict answer returns by identity rather than an SPA document.
+  const conflict = Response.json(
+    { error: "version_conflict" },
+    { status: 409, headers: { "Cache-Control": "no-store" } },
+  );
+  let forwarded: Request | undefined;
+  const actual = await handleRequest(
+    new Request(
+      "https://sumi.example/files/write?path=%2Fnotes%2Fa.txt&installation_id=inst-1&authority_epoch=7",
+      {
+        method: "PUT",
+        headers: {
+          Cookie: "session=fixture",
+          "Content-Type": "application/octet-stream",
+          "If-Version": "none",
+          "X-Idempotency-Key": "brw-1",
+        },
+        body: "file-bytes",
+      },
+    ),
+    {
+      ASSETS: { fetch: () => assert.fail("file API reached static assets") },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          forwarded = request;
+          return conflict;
+        },
+      },
+    },
+    async () => assert.fail("file API bypassed the bound API origin"),
+  );
+  assert.equal(
+    forwarded?.url,
+    "http://sumi.example/files/write?path=%2Fnotes%2Fa.txt&installation_id=inst-1&authority_epoch=7",
+  );
+  assert.equal(forwarded?.method, "PUT");
+  assert.equal(forwarded?.headers.get("Cookie"), "session=fixture");
+  assert.equal(forwarded?.headers.get("If-Version"), "none");
+  assert.equal(forwarded?.headers.get("X-Idempotency-Key"), "brw-1");
+  assert.equal(await forwarded?.text(), "file-bytes");
+  assert.equal(actual, conflict);
+
+  // Reads forward the same way: session auth and the bounded range/list
+  // query reach the origin unchanged.
+  let listForwarded: Request | undefined;
+  await handleRequest(
+    new Request(
+      "https://sumi.example/files/list?path=%2F&limit=50&cursor=abc&installation_id=inst-1&authority_epoch=7",
+      { headers: { Cookie: "session=fixture" } },
+    ),
+    {
+      ASSETS: { fetch: () => assert.fail("file API reached static assets") },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          listForwarded = request;
+          return Response.json({ entries: [] });
+        },
+      },
+    },
+    async () => assert.fail("file API bypassed the bound API origin"),
+  );
+  assert.equal(
+    listForwarded?.url,
+    "http://sumi.example/files/list?path=%2F&limit=50&cursor=abc&installation_id=inst-1&authority_epoch=7",
+  );
+  assert.equal(listForwarded?.headers.get("Cookie"), "session=fixture");
+
+  // With no files registrar mounted the API answers 404 itself; the edge
+  // returns that answer by identity instead of the SPA fallback.
+  const unmounted = new Response("404 page not found\n", { status: 404 });
+  const unmountedResponse = await handleRequest(
+    new Request("https://sumi.example/files/list"),
+    {
+      ASSETS: { fetch: () => assert.fail("file API reached static assets") },
+      SUMI_ORIGIN: { fetch: async () => unmounted },
+    },
+    async () => assert.fail("file API bypassed the bound API origin"),
+  );
+  assert.equal(unmountedResponse, unmounted);
 });
 
 test("model connection status and login route to the authenticated API", () => {
