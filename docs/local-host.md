@@ -49,7 +49,10 @@ sumi-local uninstall            # removes executables, keeps your data
 sumi-local uninstall --purge    # also deletes the state home (+ managed PG data)
 ```
 
-Installing drops a `sumi-local` shim in `~/.local/bin`.
+Installing drops a `sumi-local` shim in `~/.local/bin` once the install
+completes. A failed install (for example, no database configured) leaves
+an existing shim pointing at the previous install and its half-written
+payload removable by `uninstall`.
 
 ## Layout
 
