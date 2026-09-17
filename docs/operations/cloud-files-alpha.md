@@ -332,10 +332,16 @@ carries a bounded healthcheck (`test -d /workspace`, no fork required under
 the agent's seccomp profile), so the stale bind is reported — not silently
 ignored: the container shows `(unhealthy)` and `/v1/inspect` reports
 `executor_workspace: "unhealthy"` while `phase` stays `active`. Live-phase
-inspection also reports `files_scope: "bound"` when the supervisor has
-verified the workspace bind source is the configured canonical scope on the
-configured volume — the provisioner uses that signal, not its environment
-alone, to heal a binding record lost to state-directory repair. Workspace
+inspection also reports `files_scope` — `"bound"` when the supervisor has
+verified the workspace bind is on the configured canonical volume (the
+configured scope directory, or the same scope remounted at another path),
+`"foreign"` when a host-path workspace bind exists that this configuration
+cannot verify, and nothing when the workspace is the ordinary named-volume
+local one. The provisioner reconciles both against the durable record: a
+missing record is re-created only on `bound`, and a `foreign` workspace with
+no record refuses `prepare`/`activate` outright — a prepared epoch cannot be
+retargeted to the configured volume merely because its binding record was
+lost. Workspace
 usability and runtime liveness are deliberately separate facts — the runtime
 keeps serving what does not need the workspace — and repair is still an
 explicit lifecycle action (no in-place rebind exists):
@@ -417,10 +423,25 @@ background restart.
   report the still-running epoch also refuses, so changed configuration can
   never overwrite the recorded volume. A binding record lost with the state
   directory is only re-created on verified physical evidence
-  (`files_scope: "bound"` from inspection), never on environment alone. To
-  take a bound secretary back to a local workspace deliberately, stop it and
-  remove its entry from `files-bindings.json` while the provisioner is down;
-  until then the binding is enforced. Files already in the volume stay
+  (`files_scope: "bound"` from inspection), never on environment alone; if
+  inspection instead reports `files_scope: "foreign"` — a live workspace bind
+  the current configuration cannot verify — `prepare`/`activate` refuse until
+  the epoch is stopped and relaunched deliberately.
+  Binding-state repair rules: remove or repair a `files-bindings.json` entry
+  only while the provisioner is **stopped**; editing it live races the
+  daemon's atomic republish. A corrupt or wrongly-permissioned authority file
+  prevents the provisioner from starting at all — `stop`/`inspect` included —
+  by design (fail closed, never guess the binding). And if the record **and**
+  every old-generation container are gone, the prior volume is unknowable:
+  the next launch under the current configuration is accepted and records
+  that volume. Keep the state directory durable.
+  Observation limit worth knowing: `inspect` holds the per-secretary lock for
+  the duration of its filesystem checks. A mount that is wedged-but-alive
+  (not ENOTCONN — answering nothing) can stall `stat` past `timeout`'s
+  SIGTERM in uninterruptible sleep, delaying `stop` for that one secretary
+  until the caller cancels or the 15-minute operation cap fires. Other
+  secretaries are unaffected; this is an accepted limit, not a silent retry.
+  Files already in the volume stay
   there; the volume UUID and data are never re-formatted for rollback or
   credential rotation.
 - Files API: `systemctl --user disable --now sumi-filesvc sumi-files-mount@service`.

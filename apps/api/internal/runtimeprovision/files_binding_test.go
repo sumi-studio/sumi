@@ -424,6 +424,131 @@ func TestFilesBindingAdoptHealsOnlyOnVerifiedScope(t *testing.T) {
 	}
 }
 
+// TestFilesBindingLostRecordActivateRefusesForeignBind is the discriminating
+// regression for RB-1: a prepared epoch launched under volume A loses its
+// binding record while the daemon is stopped; the provisioner restarts under
+// volume B. The physical workspace bind is still A, so inspection reports
+// files_scope "foreign" — neither prepare-adopt nor activate may dispatch to
+// the backend under B, because doing so would silently retarget the
+// secretary's workspace.
+func TestFilesBindingLostRecordActivateRefusesForeignBind(t *testing.T) {
+	for _, envB := range []bool{true, false} {
+		t.Run(fmt.Sprintf("filesConfigured=%t", envB), func(t *testing.T) {
+			stateDirectory := filepath.Join(t.TempDir(), "state")
+			backend := newFakeBackend()
+			first, err := NewService(backend, filesTestConfig(stateDirectory))
+			if err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := first.Prepare(context.Background(), filesTestPrepare(testPAID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The epoch stays prepared. Lose the binding record and restart
+			// under different (or absent) files configuration; the live bind
+			// cannot verify against it, so inspection reports foreign.
+			if err := os.Remove(filepath.Join(stateDirectory, filesBindingsFileName)); err != nil {
+				t.Fatal(err)
+			}
+			config := ServiceConfig{StateDirectory: stateDirectory}
+			if envB {
+				config = filesTestConfig(stateDirectory)
+				config.Files.VolumeUUID = "ffffffff-0000-0000-0000-000000000000"
+			}
+			backend.filesScope = FilesScopeForeign
+			restarted, err := NewService(backend, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inspection, err := restarted.Inspect(context.Background(), InspectRequest{
+				Version:            ProtocolVersion,
+				PersonalityAgentID: testPAID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspection.Phase != PhasePrepared || inspection.FilesScope != FilesScopeForeign {
+				t.Fatalf("inspection = %#v, want prepared+foreign", inspection)
+			}
+			if _, err := restarted.Prepare(context.Background(), filesTestPrepare(testPAID)); err == nil || !errors.Is(err, ErrConflict) {
+				t.Fatalf("adopt of a foreign-bound epoch err = %v, want conflict", err)
+			}
+			activatesBefore := backend.activateCalls[testPAID]
+			if _, err := restarted.Activate(context.Background(), filesTestActivate(epoch)); err == nil || !errors.Is(err, ErrConflict) {
+				t.Fatalf("activate of a foreign-bound epoch err = %v, want conflict", err)
+			}
+			if backend.activateCalls[testPAID] != activatesBefore {
+				t.Fatal("refused activate still dispatched to the backend")
+			}
+			if _, err := os.Stat(filepath.Join(stateDirectory, filesBindingsFileName)); err == nil {
+				if document := bindingFileContent(t, stateDirectory); len(document.Bindings) != 0 {
+					t.Fatalf("refused transitions recorded a binding: %+v", document.Bindings)
+				}
+			}
+			// Fenced recovery stays open: stop is ungated, and relaunching
+			// under the original volume works once the torn-down epoch's
+			// containers are gone.
+			configA := filesTestConfig(stateDirectory)
+			recovered, err := NewService(backend, configA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.filesScope = FilesScopeBound
+			if _, err := recovered.Stop(context.Background(), StopRequest{
+				Version:       ProtocolVersion,
+				PreparedEpoch: epoch,
+			}); err == nil {
+				// Stop requires an active epoch; a prepared-only epoch is
+				// removed through abort instead.
+				if _, err := recovered.Abort(context.Background(), AbortRequest{
+					Version:       ProtocolVersion,
+					PreparedEpoch: epoch,
+				}); err != nil {
+					t.Fatalf("tearing down the prepared epoch failed: %v", err)
+				}
+			}
+			if _, err := recovered.Prepare(context.Background(), filesTestPrepare(testPAID)); err != nil {
+				t.Fatalf("relaunch under the original volume refused: %v", err)
+			}
+		})
+	}
+}
+
+// A matching durable record stays authoritative when the physical bind is
+// stale or unverifiable (files_scope foreign): the epoch was launched under
+// this volume's configuration, and refusing adopt would strand a recoverable
+// runtime whose stale bind is repaired by the fenced lifecycle.
+func TestFilesBindingRecordSurvivesForeignPhysicalEvidence(t *testing.T) {
+	stateDirectory := filepath.Join(t.TempDir(), "state")
+	backend := newFakeBackend()
+	first, err := NewService(backend, filesTestConfig(stateDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := first.Prepare(context.Background(), filesTestPrepare(testPAID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record exists and matches; the physical bind does not verify (e.g. the
+	// mount it was bound through is dead). Adopt and activate still proceed
+	// under the established authority.
+	backend.filesScope = FilesScopeForeign
+	restarted, err := NewService(backend, filesTestConfig(stateDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := restarted.Prepare(context.Background(), filesTestPrepare(testPAID))
+	if err != nil {
+		t.Fatalf("adopt with matching record refused: %v", err)
+	}
+	if adopted != epoch {
+		t.Fatalf("adopted epoch %+v, want %+v", adopted, epoch)
+	}
+	if _, err := restarted.Activate(context.Background(), filesTestActivate(epoch)); err != nil {
+		t.Fatalf("activate with matching record refused: %v", err)
+	}
+}
+
 // The durable store itself refuses overwrite: a record call carrying a
 // different volume than the established binding fails instead of replacing
 // it, so no caller can accidentally retarget canonical authority.

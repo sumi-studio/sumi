@@ -1213,34 +1213,62 @@ executor_workspace_state() {
   esac
 }
 
-# files_scope_bound verifies that the live project's /workspace bind is the
-# configured canonical scope — the container mount source equals
-# SUMI_FILES_SCOPE_DIR and sumi-files-check confirms that scope on the
-# configured volume. inspect-epoch emits files_scope="bound" only when both
-# hold, so a restarted provisioner can heal a missing durable binding from
-# verified physical state instead of trusting environment that may have
-# changed since the project was launched. A single bounded check: no --wait,
-# so a dead mount fails fast instead of stalling inspection.
-files_scope_bound() {
-  (( FILES_WORKSPACE_MODE )) || return 1
-  local container source
+# files_scope_state classifies the live project's /workspace mount so the
+# provisioner can reconcile durable binding records with physical evidence:
+#
+#   bound    the workspace is a host-path bind verified on the configured
+#            canonical volume — either the configured scope directory itself,
+#            or the same scope under a different mountpoint of the same
+#            volume (a legitimate remount).
+#   foreign  the workspace is a host-path bind this configuration cannot
+#            verify — a scope on a different volume, a dead mount, or a bind
+#            from configuration this process never had. A foreign bind means
+#            the epoch's workspace came from a canonical-style launch; it is
+#            not a never-bound local workspace.
+#   (empty)  no host-path workspace bind — the ordinary named-volume local
+#            workspace — or no container to inspect.
+#
+# A single bounded check per attempt: no --wait, so a dead mount fails fast
+# instead of stalling inspection.
+files_scope_state() {
+  local container mount type source
   container="$(lifecycle_compose ps --all --quiet executor 2>/dev/null)" || true
   if [[ ! "${container}" =~ ^[0-9a-f]{12,64}$ ]]; then
     container="$(prepare_compose ps --all --quiet prepare 2>/dev/null)" || true
   fi
-  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
-  source="$(run_external docker inspect --format \
-    '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' \
-    "${container}" 2>/dev/null)" || return 1
-  [[ "${source}" == "${SUMI_FILES_SCOPE_DIR}" ]] || return 1
-  "${SUMI_FILES_CHECK}" "${SUMI_FILES_MOUNTPOINT}" "${SUMI_FILES_VOLUME_UUID}" \
-    "${PAID_COMPACT}" >/dev/null 2>&1
+  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 0
+  mount="$(run_external docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Type}} {{.Source}}{{"\n"}}{{end}}{{end}}' \
+    "${container}" 2>/dev/null)" || return 0
+  mount="${mount%%$'\n'*}"
+  type="${mount%% *}"
+  source="${mount#* }"
+  [[ "${type}" == "bind" && "${source}" == /* ]] || return 0
+  if (( FILES_WORKSPACE_MODE )); then
+    if [[ "${source}" == "${SUMI_FILES_SCOPE_DIR}" ]] &&
+      "${SUMI_FILES_CHECK}" "${SUMI_FILES_MOUNTPOINT}" \
+        "${SUMI_FILES_VOLUME_UUID}" "${PAID_COMPACT}" >/dev/null 2>&1; then
+      printf 'bound'
+      return 0
+    fi
+    # Same volume remounted at a different path: the bind keeps the old
+    # scope spelling, but its parent mount still verifies as the configured
+    # volume. Scope binds are always <mountpoint>/<compact PAID>.
+    if [[ "${source}" == */"${PAID_COMPACT}" &&
+      "${source%/*}" != "${SUMI_FILES_MOUNTPOINT}" ]] &&
+      "${SUMI_FILES_CHECK}" "${source%/*}" \
+        "${SUMI_FILES_VOLUME_UUID}" "${PAID_COMPACT}" >/dev/null 2>&1; then
+      printf 'bound'
+      return 0
+    fi
+  fi
+  printf 'foreign'
 }
 
 inspect_epoch() {
-  local workspace_state scope_state=""
+  local workspace_state scope_state
   workspace_state="$(executor_workspace_state)"
-  files_scope_bound && scope_state="bound"
+  scope_state="$(files_scope_state)"
   if long_lived_roles_match_expected_state running; then
     epoch_identity || fail "active project has no coherent prepared epoch"
     print_epoch_json active "${workspace_state}" "${scope_state}"

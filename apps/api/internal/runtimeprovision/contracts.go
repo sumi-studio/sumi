@@ -154,18 +154,25 @@ func (health ExecutorWorkspaceHealth) valid() bool {
 	return false
 }
 
-// FilesScopeState reports whether the supervisor verified that a live
-// project's /workspace bind is the configured canonical scope: the container
-// mount source equals SUMI_FILES_SCOPE_DIR and sumi-files-check passes for
-// the configured mountpoint/volume. It is emitted only on verification —
-// absent means "not verified" (files mode off, dead mount, wrong volume, or
-// a workspace that was never canonically bound), never "bound elsewhere".
+// FilesScopeState classifies a live project's /workspace mount as the
+// supervisor observes it. FilesScopeBound means verified: the workspace is a
+// host-path bind on the configured canonical volume (the configured scope
+// directory, or the same scope remounted at another path). FilesScopeForeign
+// means the workspace is a host-path bind this configuration cannot verify —
+// a scope on another volume, a dead mount, or a bind from configuration this
+// process never had; it is physical evidence the epoch's workspace came from
+// a canonical-style launch, not a never-bound local workspace. Absent means
+// no host-path workspace bind exists (the ordinary named-volume local
+// workspace) or there is no container to inspect.
 type FilesScopeState string
 
-const FilesScopeBound FilesScopeState = "bound"
+const (
+	FilesScopeBound   FilesScopeState = "bound"
+	FilesScopeForeign FilesScopeState = "foreign"
+)
 
 func (scope FilesScopeState) valid() bool {
-	return scope == FilesScopeBound
+	return scope == FilesScopeBound || scope == FilesScopeForeign
 }
 
 type Inspection struct {

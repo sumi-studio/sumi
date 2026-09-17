@@ -223,6 +223,25 @@ func TestParseSupervisorInspectionExecutorWorkspace(t *testing.T) {
 	}
 }
 
+func TestParseSupervisorInspectionFilesScope(t *testing.T) {
+	inspection, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"prepared","generation":9,"rpc_boot_nonce":"nonce","files_scope":"foreign"}`), testPAID)
+	if err != nil {
+		t.Fatalf("prepared inspection with foreign files scope rejected: %v", err)
+	}
+	if inspection.FilesScope != FilesScopeForeign {
+		t.Fatalf("files_scope = %q, want foreign", inspection.FilesScope)
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","files_scope":"bogus"}`), testPAID); err == nil {
+		t.Fatal("invalid files scope state was accepted")
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"unknown","files_scope":"bound"}`), testPAID); err == nil {
+		t.Fatal("files scope on an unknown inspection was accepted")
+	}
+}
+
 func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
 	// The runner signals the whole process group, so anything this script waits
 	// on in that same group receives SIGTERM at the same moment the shell does.
