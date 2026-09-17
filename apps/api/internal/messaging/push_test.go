@@ -433,6 +433,9 @@ func TestPushDevicePurgeDrainRetainsPendingAcrossDeadline(t *testing.T) {
 	store := w.store.Store
 	store.pushDevicePurge.Lock()
 	store.pushDevicePurge.pending = map[string]struct{}{w.humanB.ID: {}}
+	// Mirror the production scheduler's entry state so the post-drain
+	// running==false check actually exercises the deferred clear.
+	store.pushDevicePurge.running = true
 	store.pushDevicePurge.Unlock()
 	deadCtx, stop := context.WithCancel(ctx)
 	stop() // already expired: every pass fails before touching the rows
