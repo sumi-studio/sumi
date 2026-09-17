@@ -2,9 +2,11 @@
 
 This is the supported developer entrypoint for using the browser chat with a
 real secretary. It runs the Go API, the secretary runtime, and Vite as native
-processes, with PostgreSQL in Docker. `make dev` uses the Rust runtime while
-the new TypeScript core (`apps/core`) is opt-in via `make dev-core`. The
-Playwright stack remains a test fixture and is not the product entrypoint.
+processes, with PostgreSQL in Docker. `make dev` runs each secretary on the
+accepted TypeScript core (`apps/core`); the Rust tool executor +
+`PersonalityAgent` remains available as an explicit diagnostic path via
+`make dev-rust`. The Playwright stack remains a test fixture and is not the
+product entrypoint.
 
 ## Prerequisites
 
@@ -13,11 +15,11 @@ Playwright stack remains a test fixture and is not the product entrypoint.
 - `pnpm install` (`make setup`) completed
 - a Firebase project with Authentication enabled
 - Google and/or GitHub enabled under Firebase Authentication → Sign-in method
-- for the default `--runtime rust` launch: Rust stable and a real
-  model-provider credential for a preset supported by `apps/agent`
-- for `--runtime core` (`make dev-core`) only: no model credential is
-  required for the deterministic `mock` provider; set `SUMI_MODEL_PROVIDER`
-  for a real endpoint
+- for the default `--runtime core` launch (`make dev`): no model credential
+  is required for the deterministic `mock` provider; set
+  `SUMI_MODEL_PROVIDER` for a real endpoint
+- for `make dev-rust` only: Rust stable and a real model-provider credential
+  for a preset supported by `apps/agent`
 
 The Vite development build has a public `sumi-studio` Firebase web
 configuration fallback. It is an identifier, not a server credential, and is
@@ -98,7 +100,7 @@ the exact `SUMI_AUTH_FIREBASE_TENANT_ID`; leave it blank for ordinary Firebase
 Auth. `SUMI_AUTH_TENANT_ID` and `SUMI_AUTH_USER_ID` are server-owned Sumi
 identifiers, not claims accepted from the browser.
 
-On the Rust runtime (`--runtime rust`, the `make dev` default), the following
+On the Rust runtime (`make dev-rust`), the following
 identity must be equal everywhere:
 
 ```text
@@ -110,7 +112,7 @@ SUMI_PERSONALITY_AGENT_ID
 
 The launcher derives the local-control and executor/runtime values from
 `SUMI_PERSONALITY_AGENT_ID` and rejects an unequal auth binding. The ID must be
-a canonical lowercase UUIDv7. The opt-in core runtime needs none of this:
+a canonical lowercase UUIDv7. The default core runtime needs none of this:
 each secretary's persona comes from the signed-in human's 戸籍 registration,
 and the dev pool derives the persona id from each wake.
 
@@ -126,7 +128,7 @@ OPENCODE_GO_API_KEY=<real credential>
 The launcher never prints Firebase or provider credentials.
 
 Production AutoReview has no conversation-model fallback. Before spawning a
-PersonalityAgent on `--runtime rust`, configure both
+PersonalityAgent under `make dev-rust`, configure both
 `SUMI_EXECUTION_REVIEWER_MODEL_*` and
 `SUMI_ESCALATION_REVIEWER_MODEL_*`, and provide
 `SUMI_EXECUTION_REVIEWER_API_KEY` and `SUMI_ESCALATION_REVIEWER_API_KEY` from
@@ -138,7 +140,7 @@ does not prove that two credentials belong to separate provider accounts.
 
 ### Codex OAuth bridge provider
 
-This bridge serves the Rust runtime (the `make dev` default); the core
+This bridge serves the Rust runtime (`make dev-rust`); the core
 runtime's `openai` provider can point at any OpenAI-compatible endpoint
 directly.
 
@@ -163,7 +165,7 @@ SUMI_MODEL_BASE_URL=http://127.0.0.1:8765/v1
 SUMI_MODEL_API_KEY_ENV=SUMI_CODEX_RESPONSES_PROXY_SECRET
 ```
 
-Then run `make dev` from a shell that retains
+Then run `make dev-rust` from a shell that retains
 `SUMI_CODEX_RESPONSES_PROXY_SECRET`. The production runtime permits this
 literal-loopback HTTP provider override; it still rejects non-loopback HTTP.
 This bridge is a development path to the ChatGPT Codex subscription endpoint,
@@ -231,23 +233,16 @@ make dev
 
 ### Runtime mode
 
-`make dev` keeps the working launch on the Rust tool executor +
-`PersonalityAgent` while Direct Chat adoption of the new core is being
-proven; it requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
-`SUMI_MODEL_PRESET` and the provider/reviewer credentials in `.env.local`.
-
-`make dev-core` (`scripts/dev/real-stack --runtime core`, or
+`make dev` (`scripts/dev/real-stack --runtime core`, or
 `SUMI_DEV_RUNTIME=core` in `.env.local`) runs each secretary on the accepted
 TypeScript core (`apps/core`): the API mounts the persona-scoped state
 service at `/internal/core`, Messaging attention is admitted as durable core
 inputs with secretary replies delivered back through the messaging effect,
 and Direct Chat commands are served through the same core state
-(`SUMI_DIRECT_CHAT_BACKEND=core`). Workspace-invitation list/accept run as
-delegated core tools (`workspace_invitation.list` /
-`workspace_invitation.accept`): acceptance commits atomically with the
-operation record under the secretary's own identity, the same guarantee the
-runtime's local-control calls gave. Shared Messaging history/search still
-run on their existing surfaces and are not part of this mode. A local
+(`SUMI_DIRECT_CHAT_BACKEND=core`). Workspace-invitation list/accept and
+shared Messaging history/search/post/edit run as delegated core tools under
+the secretary's own identity; each effect commits atomically with its
+durable operation record. A local
 dev pool
 (`apps/core/src/host/dev-pool.ts`, loopback `127.0.0.1:8083`) runs one
 `host/local.ts` Node process per persona, started by the API's wake sweep —
@@ -255,13 +250,17 @@ the same wake contract Cloud uses. The writer lease in Postgres keeps one
 operative execution owner per secretary, so restarting the pool or a host
 preserves saved work and does not duplicate committed effects.
 
-Under `--runtime core` the `mock` model provider is deterministic and
+Under the core runtime the `mock` model provider is deterministic and
 network-free — enough to develop against the real application without a paid
 account. `SUMI_MODEL_PROVIDER` selects `fixture` (scripted rules),
 `openai` (an OpenAI-compatible endpoint), or `none` instead; a model
 connection selected in the app overrides the environment.
 
-`make dev-rust` is the same launch as `make dev`, spelled out.
+`make dev-rust` (`scripts/dev/real-stack --runtime rust`, or
+`SUMI_DEV_RUNTIME=rust` in `.env.local`) keeps the working launch on the
+Rust tool executor + `PersonalityAgent` as an explicit diagnostic and
+comparison path. It requires Rust stable, `SUMI_PERSONALITY_AGENT_ID`,
+`SUMI_MODEL_PRESET` and the provider/reviewer credentials in `.env.local`.
 
 Open exactly <http://127.0.0.1:5173>. The fixed Vite server proxies HTTP
 `/auth` and WebSocket `/direct-chat` to <http://127.0.0.1:8080>, so the browser
@@ -315,13 +314,16 @@ the Firebase project's authorized domains and the Admin ADC above must have
 access to the same project. A localhost-only Firebase domain configuration or
 an ADC identity without project permission will not pass the human smoke.
 
-The production Rust connector deliberately accepts plaintext WebSockets only
-to a literal loopback address. When the API is bound to the Tailnet address,
+The Rust runtime connector deliberately accepts plaintext WebSockets only
+to a literal loopback address. Under `make dev-rust`, when the API is bound
+to the Tailnet address,
 the launcher therefore adds a loopback-only TCP relay at `127.0.0.1:8082` for
 the runtime-to-API gateway connection. The relay does not listen on the
 Tailnet, does not change the browser path, and is stopped with the stack.
 
-Startup order and gates are:
+Under `make dev` (core) the startup order is
+`API /health → dev core pool /health → Vite`. Under `make dev-rust` the
+order and gates are:
 
 ```text
 API /health → loopback gateway relay → executor Unix socket
@@ -332,14 +334,15 @@ The Ready gate observes the integrity-protected local-control state produced
 after the runtime authenticates to the control plane and completes the
 executor Health exchange. Vite is not started if any earlier gate fails.
 
-The launcher also generates one ephemeral Ed25519 call-authority pair for the
+Under `make dev-rust` the launcher also generates one ephemeral Ed25519
+call-authority pair for the
 disposable generation. Only the private seed is passed to the runtime; only
 the corresponding public key is passed to the executor. Neither key is read
 from the developer env file, and the broker receives neither half. The
 production supervisor follows the same role split with allocator-owned,
 per-generation identities.
 
-The real-browser agent fixture goes beyond the Health gate. Its first provider
+The `make dev-rust` real-browser agent fixture goes beyond the Health gate. Its first provider
 request returns a Normal `list_dir` call, the built-in Normal policy
 deterministically allows that bounded read without invoking the external
 Execution AutoReviewer, and the post-COMMIT runtime permit is signed and
@@ -352,11 +355,11 @@ Human credential-gated smoke:
 
 1. Sign in with the enabled Google or GitHub provider.
 2. Confirm the chat reports `エージェント利用可能`.
-3. Send a message and confirm a real provider response streams into the chat.
-4. Press Ctrl-C and confirm the API, relay, executor, runtime, and Vite stop.
+3. Send a message and confirm a provider response streams into the chat.
+4. Press Ctrl-C and confirm the API, runtime processes, and Vite stop.
 
 The automated checks validate configuration, proxying, identity equality,
-workspace propagation, startup gates, and the local exact-call executor path.
+workspace propagation, and startup gates.
 They do not perform the final third-party Firebase/provider login and
 billing-bearing model request.
 
@@ -385,11 +388,16 @@ bind host, which the other device reaches over the Tailnet.
 ## Disposable generation boundary
 
 `make dev` creates state directories and non-production secrets in one
-mode-0700 temporary directory. It acquires one host lock, starts exactly one
-generation (`0`), never restarts or replaces that generation, and deletes that
-directory on shutdown. Because there is no surviving ledger or replacement
-generation to allocate, the persistent supervisor allocator is not part of
-this deliberately disposable single-agent direct path.
+mode-0700 temporary directory, acquires one host lock, and deletes that
+directory on shutdown. The core runtime's secretary state is durable in
+Postgres through the state service rather than in this directory, so
+restarting the launcher does not lose the conversation.
+
+Under `make dev-rust` the launcher additionally starts exactly one
+generation (`0`), never restarts or replaces that generation, and — because
+there is no surviving ledger or replacement generation to allocate — the
+persistent supervisor allocator is not part of this deliberately disposable
+single-agent direct path.
 
 Two stores are deliberately outside that boundary, because the identity
 registry rows and the attachment bytes they name have to be discarded together
