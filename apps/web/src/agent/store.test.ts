@@ -1331,7 +1331,10 @@ function disposition(
   commandId: string,
   commandSeq: number,
   status: "applied" | "superseded" | "rejected",
-  rejectReason?: "not_allowed",
+  rejectReason?: Extract<
+    CommandDispositionEvent,
+    { status: "rejected" }
+  >["reject_reason"],
 ): DirectChatServerFrame {
   return {
     type: "event",
