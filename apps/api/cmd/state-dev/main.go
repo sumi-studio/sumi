@@ -35,6 +35,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 )
@@ -96,6 +97,22 @@ func main() {
 	if waker != nil {
 		log.Printf("core wake: sweeping for personas awaiting a runtime; waking %s", waker.Target())
 		go waker.Run(context.Background())
+	}
+	// Canonical workspace files: when a filesvc endpoint is configured the
+	// file.* effects are claimable, scoped to the claiming persona — the
+	// same wiring cmd/server applies on the public mux. Unset config leaves
+	// the tools unregistered (discovery and execution agree).
+	filesClient, err := fileaccess.FromEnv(os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if filesClient != nil {
+		for tool, effect := range fileaccess.FileEffects(filesClient) {
+			if err := coreState.RegisterToolEffect(tool, effect); err != nil {
+				log.Fatalf("register core file effect %s: %v", tool, err)
+			}
+		}
+		log.Print("core file tools ready (file.* effects scoped to the claiming persona)")
 	}
 	coreState.RegisterRoutes(mux)
 	portable.NewServer(pool.Pool, token).RegisterRoutes(mux)

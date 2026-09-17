@@ -3,6 +3,7 @@ package fileaccess
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -98,7 +99,7 @@ func TestE2ELedgerFileWriteReplay(t *testing.T) {
 	scope, _ := ScopeForPersona(pa)
 	_ = c.Remove(ctx, scope, "ledger/file.txt", "any") // prior-run residue
 	req := map[string]any{"path": "ledger/file.txt", "content_text": "ledger content"}
-	turn := planTurn(t, s, pa, "t-1", "in-1",
+	turn := planTurn(t, s, pa, "t-1-"+fmt.Sprint(time.Now().UnixNano()), "in-1-"+fmt.Sprint(time.Now().UnixNano()),
 		agentstate.PlanCall{Tool: ToolWrite, Route: "normal", Request: req})
 
 	// Happy path: claim executes the write inside the operation transaction
@@ -131,47 +132,108 @@ func TestE2ELedgerFileWriteReplay(t *testing.T) {
 }
 
 // The interruption case the whole slice hinges on: the filesvc write
-// commits, then the process dies before the operation record does — so the
-// row never existed, and the retried claim runs the effect again. The
-// effect's 409 -> content-compare reconcile is what preserves accepted-write
-// identity: same request lands once, receipt carries the landed version.
+// commits under the operation's durable identity, then the process dies
+// before the operation record does — so the row never existed, and the
+// retried claim runs the effect again. The service receipt — not file
+// bytes — is what preserves accepted-write identity. The lost-ledger state
+// is modeled by landing the identical keyed request out-of-band (the
+// filesvc commit the dead process made); the API ledger genuinely has no
+// operation row. An intervening independent actor then mutates the path:
+// the replay must still be answered by the receipt without re-mutating.
 func TestE2ELedgerWriteCrashWindow(t *testing.T) {
 	s, c, pa := e2eLedgerSetup(t)
 	ctx := context.Background()
 	scope, _ := ScopeForPersona(pa)
+	// Receipts and operation rows are durable: input IDs (and therefore
+	// effect keys) must be unique per run, and crashed-run file residue
+	// must not wedge create-only writes.
+	runID := fmt.Sprintf("r%d", time.Now().UnixNano())
+	for _, p := range []string{"ledger/crash.txt", "ledger/rm.txt"} {
+		_ = c.Remove(ctx, scope, p, "any")
+	}
 	req := map[string]any{"path": "ledger/crash.txt", "content_text": "landed before ledger"}
+	// The ledger derives the effect key as inputID:tool:callIndex; the
+	// effect forwards effectOpKey(idemKey). Landing the keyed request
+	// directly models "filesvc committed, API ledger rolled back".
+	crashInput := "in-crash-" + runID
+	opKey := effectOpKey(crashInput + ":tool:0")
 
-	// Simulate the committed-external/lost-ledger state: the write lands
-	// out-of-band, the operation record never committed.
-	if _, err := c.Write(ctx, scope, "ledger/crash.txt", "none", []byte("landed before ledger")); err != nil {
-		var se *ServiceError
-		if !errors.As(err, &se) || se.Status != 409 {
-			t.Fatalf("land: %v", err)
-		}
-	}
-	landed, err := c.Stat(ctx, scope, "ledger/crash.txt")
+	// Committed-external/lost-ledger state: the keyed write lands out of
+	// band — version AND receipt are recorded upstream; no operation row.
+	landedVer, _, err := c.WriteKeyed(ctx, scope, "ledger/crash.txt", "none", opKey, []byte("landed before ledger"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("land keyed write: %v", err)
+	}
+	// An intervening independent actor deletes the file before the retry.
+	if err := c.Remove(ctx, scope, "ledger/crash.txt", "any"); err != nil {
+		t.Fatalf("intervening delete: %v", err)
 	}
 
-	turn := planTurn(t, s, pa, "t-crash", "in-crash",
+	turn := planTurn(t, s, pa, "t-crash-"+runID, crashInput,
 		agentstate.PlanCall{Tool: ToolWrite, Route: "normal", Request: req})
 	op, fresh, err := claim(t, s, turn, ToolWrite, 0, req)
 	if err != nil || !fresh || op.Status != "done" {
-		t.Fatalf("reconciled claim: %+v fresh=%v err=%v", op, fresh, err)
+		t.Fatalf("receipt claim: %+v fresh=%v err=%v", op, fresh, err)
 	}
 	if op.Response["replayed"] != true {
-		t.Fatalf("reconcile must mark replayed: %+v", op.Response)
+		t.Fatalf("claim must be answered by the receipt: %+v", op.Response)
 	}
-	if op.Response["version"].(float64) != float64(landed.Version) {
-		t.Fatalf("receipt version %v != landed version %d", op.Response["version"], landed.Version)
+	if op.Response["version"].(float64) != float64(landedVer) {
+		t.Fatalf("receipt version %v != landed version %d", op.Response["version"], landedVer)
 	}
-	// The file still holds exactly the call's bytes — one logical write.
-	got, _ := c.Read(ctx, scope, "ledger/crash.txt", 0, -1)
-	if string(got.Body) != "landed before ledger" {
-		t.Fatalf("content: %q", got.Body)
+	// The replay must not recreate what the intervening op deleted.
+	if _, err := c.Stat(ctx, scope, "ledger/crash.txt"); err == nil {
+		t.Fatal("replayed write recreated a file another operation deleted")
 	}
-	finishTurn(t, s, turn, "in-crash")
+	finishTurn(t, s, turn, crashInput)
+
+	// Same window for remove: land the keyed remove, another operation
+	// recreates the path, the retried claim must not delete it again.
+	rmReq := map[string]any{"path": "ledger/rm.txt"}
+	rmInput := "in-rm-" + runID
+	rmOpKey := effectOpKey(rmInput + ":tool:0")
+	if _, err := c.Write(ctx, scope, "ledger/rm.txt", "none", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.RemoveKeyed(ctx, scope, "ledger/rm.txt", "any", rmOpKey); err != nil {
+		t.Fatalf("land keyed remove: %v", err)
+	}
+	if _, err := c.Write(ctx, scope, "ledger/rm.txt", "none", []byte("replacement")); err != nil {
+		t.Fatalf("intervening replacement: %v", err)
+	}
+	rmTurn := planTurn(t, s, pa, "t-rm-"+runID, rmInput,
+		agentstate.PlanCall{Tool: ToolRemove, Route: "normal", Request: rmReq})
+	rmOp, fresh, err := claim(t, s, rmTurn, ToolRemove, 0, rmReq)
+	if err != nil || !fresh || rmOp.Status != "done" {
+		t.Fatalf("remove receipt claim: %+v fresh=%v err=%v", rmOp, fresh, err)
+	}
+	if rmOp.Response["replayed"] != true || rmOp.Response["removed"] != true {
+		t.Fatalf("replayed remove must report the receipt: %+v", rmOp.Response)
+	}
+	got, err := c.Read(ctx, scope, "ledger/rm.txt", 0, -1)
+	if err != nil || string(got.Body) != "replacement" {
+		t.Fatalf("replayed remove deleted a later replacement: %q %v", got.Body, err)
+	}
+	finishTurn(t, s, rmTurn, rmInput)
+
+	// A brand-new operation requesting bytes identical to another writer's
+	// is a genuine conflict — identical content is not identity.
+	if _, err := c.Write(ctx, scope, "ledger/dup.txt", "none", []byte("same")); err != nil {
+		var se *ServiceError
+		if !errors.As(err, &se) || se.Status != 409 {
+			t.Fatalf("seed dup: %v", err)
+		}
+	}
+	dupReq := map[string]any{"path": "ledger/dup.txt", "content_text": "same"}
+	dupInput := "in-dup-" + runID
+	dupTurn := planTurn(t, s, pa, "t-dup-"+runID, "in-dup-"+runID,
+		agentstate.PlanCall{Tool: ToolWrite, Route: "normal", Request: dupReq})
+	_, _, err = claim(t, s, dupTurn, ToolWrite, 0, dupReq)
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("new create over identical foreign bytes must conflict, got %v", err)
+	}
+	finishTurn(t, s, dupTurn, dupInput)
+
 	// deterministically — the claim reports the honest conflict and rolls
 	// back, so every re-claim reports the same refusal.
 	pa2 := "019a0000-0000-7000-8000-0000000000d4"
@@ -179,13 +241,14 @@ func TestE2ELedgerWriteCrashWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope2, _ := ScopeForPersona(pa2)
+	c2Input := "in-c2-" + runID
 	if _, err := c.Write(ctx, scope2, "conflict.txt", "none", []byte("theirs")); err != nil {
 		var se *ServiceError
 		if !errors.As(err, &se) || se.Status != 409 {
 			t.Fatal(err)
 		}
 	}
-	turn2 := planTurn(t, s, pa2, "t-c2", "in-c2",
+	turn2 := planTurn(t, s, pa2, "t-c2-"+runID, c2Input,
 		agentstate.PlanCall{Tool: ToolWrite, Route: "normal", Request: map[string]any{
 			"path": "conflict.txt", "content_text": "ours"}})
 	_, _, err = claim(t, s, turn2, ToolWrite, 0, map[string]any{
@@ -196,11 +259,11 @@ func TestE2ELedgerWriteCrashWindow(t *testing.T) {
 	if got2, _ := c.Read(ctx, scope2, "conflict.txt", 0, -1); string(got2.Body) != "theirs" {
 		t.Fatal("conflict clobbered content")
 	}
-	finishTurn(t, s, turn2, "in-c2")
+	finishTurn(t, s, turn2, c2Input)
 
 	// Persona isolation through the ledger: pa2's read of pa's file is a
 	// deterministic refusal — the scope never leaks.
-	turn3 := planTurn(t, s, pa2, "t-c3", "in-c3",
+	turn3 := planTurn(t, s, pa2, "t-c3-"+runID, "in-c3-"+runID,
 		agentstate.PlanCall{Tool: ToolRead, Route: "normal", Request: map[string]any{"path": "ledger/crash.txt"}})
 	_, _, err = claim(t, s, turn3, ToolRead, 0, map[string]any{"path": "ledger/crash.txt"})
 	if !errors.Is(err, agentstate.ErrBadRequest) {
@@ -208,6 +271,8 @@ func TestE2ELedgerWriteCrashWindow(t *testing.T) {
 	}
 
 	_ = c.Remove(ctx, scope, "ledger/crash.txt", "any")
+	_ = c.Remove(ctx, scope, "ledger/rm.txt", "any")
+	_ = c.Remove(ctx, scope, "ledger/dup.txt", "any")
 	_ = c.Remove(ctx, scope, "ledger", "any")
 	_ = c.Remove(ctx, scope2, "conflict.txt", "any")
 }

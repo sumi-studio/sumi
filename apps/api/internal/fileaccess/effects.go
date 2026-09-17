@@ -1,9 +1,10 @@
 package fileaccess
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"unicode/utf8"
@@ -83,18 +84,32 @@ func pathArg(request map[string]any) (string, error) {
 // oversize) is recorded as a failed operation so the turn sees the honest
 // answer instead of retrying forever; transport errors and service-side
 // 5xx/503 stay transient so a claim replay re-runs the effect.
+// op_in_flight is transient too: a duplicate keyed operation is still
+// settling upstream and a later replay is answered by the receipt.
 func effectErr(err error) error {
 	var se *ServiceError
-	if errors.As(err, &se) && se.Status >= 400 && se.Status < 500 {
+	if errors.As(err, &se) && se.Status >= 400 && se.Status < 500 && se.Code != "op_in_flight" {
 		return fmt.Errorf("%w: %s", agentstate.ErrBadRequest, se.Error())
 	}
 	return err
 }
 
+// effectOpKey derives the filesvc idempotency key from the operation
+// ledger's server-owned identity (inputID:tool:callIndex). The key rides
+// into filesvc namespaced under the persona's scope, so it can never
+// select another scope — but input_id is caller-supplied text, so the
+// raw key is hashed into the service's bounded key charset rather than
+// forwarded verbatim.
+func effectOpKey(idemKey string) string {
+	sum := sha256.Sum256([]byte(idemKey))
+	return "core:" + hex.EncodeToString(sum[:])
+}
+
 // expectVersion maps the tool's expect_version field to filesvc's
-// If-Version token. "any" is refused: an unconditional overwrite cannot be
-// replay-verified after a crash (the retry cannot tell its own landed write
-// from an interloper's), so mutating tools always carry an exact predicate.
+// If-Version token. "any" is refused for writes as deliberate CAS
+// discipline: a mutating tool call always carries an exact predicate so a
+// blind overwrite can never clobber content the model never saw. Replay
+// safety itself comes from the durable operation receipt, not this check.
 func expectVersion(request map[string]any, def string) (string, error) {
 	v, ok := request["expect_version"]
 	if !ok {
@@ -105,7 +120,7 @@ func expectVersion(request map[string]any, def string) (string, error) {
 		if t == "none" {
 			return "none", nil
 		}
-		return "", fmt.Errorf("%w: expect_version must be \"none\" or a file version integer; unconditional \"any\" writes cannot be replay-verified", agentstate.ErrBadRequest)
+		return "", fmt.Errorf("%w: expect_version must be \"none\" or a file version integer; unconditional \"any\" writes are not allowed", agentstate.ErrBadRequest)
 	case float64:
 		if t != float64(int64(t)) || t < 0 {
 			return "", fmt.Errorf("%w: expect_version must be a non-negative integer", agentstate.ErrBadRequest)
@@ -208,14 +223,13 @@ func (fx *fileEffects) read(ctx context.Context, _ pgx.Tx, personaID, _ string, 
 	return out, nil
 }
 
-// write applies the create/overwrite with an exact If-Version predicate and
-// then reconciles a conflict by content: after a crash between the filesvc
-// mutation and the operation-record commit, the retried call gets a 409 —
-// at which point bytes-at-path equality is the evidence that this call's
-// intended outcome already landed, and the live version becomes the
-// receipt. Divergent content means a genuine conflict and records a failed
-// operation rather than silently clobbering someone else's bytes.
-func (fx *fileEffects) write(ctx context.Context, _ pgx.Tx, personaID, _ string, request map[string]any) (map[string]any, error) {
+// write applies the create/overwrite with an exact If-Version predicate
+// under the operation's durable identity: the service receipt — not file
+// bytes — is the record that this operation was accepted. A replay of the
+// same claim answers from the receipt (replayed) without a second
+// mutation, whatever later operations did to the path; a genuinely new
+// operation that conflicts on content stays a real 409.
+func (fx *fileEffects) write(ctx context.Context, _ pgx.Tx, personaID, idemKey string, request map[string]any) (map[string]any, error) {
 	scope, err := fx.scope(personaID)
 	if err != nil {
 		return nil, err
@@ -241,33 +255,18 @@ func (fx *fileEffects) write(ctx context.Context, _ pgx.Tx, personaID, _ string,
 	if err != nil {
 		return nil, err
 	}
-	ver, err := fx.c.Write(ctx, scope, p, ifv, body)
-	if err == nil {
-		return map[string]any{"version": ver, "written": true}, nil
-	}
-	var se *ServiceError
-	if !errors.As(err, &se) || se.Status != 409 {
+	ver, replayed, err := fx.c.WriteKeyed(ctx, scope, p, ifv, effectOpKey(idemKey), body)
+	if err != nil {
 		return nil, effectErr(err)
 	}
-	// Conflict: decide whether this is a replay of an already-landed write.
-	st, serr := fx.c.Stat(ctx, scope, p)
-	if serr != nil {
-		return nil, effectErr(fmt.Errorf("version_conflict and could not verify replay state: %v", serr))
+	out := map[string]any{"version": ver, "written": true}
+	if replayed {
+		out["replayed"] = true
 	}
-	if st.Kind != "file" || st.Size != int64(len(body)) {
-		return nil, fmt.Errorf("%w: version_conflict at %s: path holds different content (kind=%s size=%d)", agentstate.ErrBadRequest, p, st.Kind, st.Size)
-	}
-	cur, rerr := fx.c.Read(ctx, scope, p, 0, int64(len(body)))
-	if rerr != nil {
-		return nil, fmt.Errorf("version_conflict and could not verify replay state: %v", rerr)
-	}
-	if !bytes.Equal(cur.Body, body) {
-		return nil, fmt.Errorf("%w: version_conflict at %s: path holds different content", agentstate.ErrBadRequest, p)
-	}
-	return map[string]any{"version": cur.Version, "written": true, "replayed": true}, nil
+	return out, nil
 }
 
-func (fx *fileEffects) mkdir(ctx context.Context, _ pgx.Tx, personaID, _ string, request map[string]any) (map[string]any, error) {
+func (fx *fileEffects) mkdir(ctx context.Context, _ pgx.Tx, personaID, idemKey string, request map[string]any) (map[string]any, error) {
 	scope, err := fx.scope(personaID)
 	if err != nil {
 		return nil, err
@@ -276,14 +275,18 @@ func (fx *fileEffects) mkdir(ctx context.Context, _ pgx.Tx, personaID, _ string,
 	if err != nil {
 		return nil, err
 	}
-	ver, err := fx.c.Mkdir(ctx, scope, p)
+	ver, replayed, err := fx.c.MkdirKeyed(ctx, scope, p, effectOpKey(idemKey))
 	if err != nil {
 		return nil, effectErr(err)
 	}
-	return map[string]any{"version": ver}, nil
+	out := map[string]any{"version": ver}
+	if replayed {
+		out["replayed"] = true
+	}
+	return out, nil
 }
 
-func (fx *fileEffects) remove(ctx context.Context, _ pgx.Tx, personaID, _ string, request map[string]any) (map[string]any, error) {
+func (fx *fileEffects) remove(ctx context.Context, _ pgx.Tx, personaID, idemKey string, request map[string]any) (map[string]any, error) {
 	scope, err := fx.scope(personaID)
 	if err != nil {
 		return nil, err
@@ -292,9 +295,10 @@ func (fx *fileEffects) remove(ctx context.Context, _ pgx.Tx, personaID, _ string
 	if err != nil {
 		return nil, err
 	}
-	// For removal the idempotent default is "any": the desired end-state is
-	// absence, so a replay that finds the file already gone reports
-	// already_absent instead of failing.
+	// "any" stays the remove default: the operation's receipt — not current
+	// absence — is the replay record, so an accepted remove that later saw
+	// a replacement created cannot delete it, and a fresh remove of an
+	// absent path still reports already_absent truthfully.
 	ifv, err := expectVersion(request, "any")
 	if err != nil {
 		return nil, err
@@ -302,9 +306,13 @@ func (fx *fileEffects) remove(ctx context.Context, _ pgx.Tx, personaID, _ string
 	if ifv == "none" {
 		return nil, fmt.Errorf("%w: expect_version \"none\" cannot remove a file; use a version integer for CAS or omit for unconditional remove", agentstate.ErrBadRequest)
 	}
-	err = fx.c.Remove(ctx, scope, p, ifv)
+	replayed, err := fx.c.RemoveKeyed(ctx, scope, p, ifv, effectOpKey(idemKey))
 	if err == nil {
-		return map[string]any{"removed": true}, nil
+		out := map[string]any{"removed": true}
+		if replayed {
+			out["replayed"] = true
+		}
+		return out, nil
 	}
 	var se *ServiceError
 	if errors.As(err, &se) && se.Status == 404 {

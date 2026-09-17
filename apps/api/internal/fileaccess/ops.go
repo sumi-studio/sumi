@@ -101,30 +101,66 @@ func (c *Client) Read(ctx context.Context, scope, path string, offset, length in
 // Write stores body under ifVersion semantics ("none"|<n>; "any" is never
 // sent by the effect layer — see effects.go for why).
 func (c *Client) Write(ctx context.Context, scope, path, ifVersion string, body []byte) (int64, error) {
+	ver, _, err := c.WriteKeyed(ctx, scope, path, ifVersion, "", body)
+	return ver, err
+}
+
+// WriteKeyed is Write carrying the caller's durable operation identity as
+// X-Idempotency-Key. When the service already committed this exact
+// operation, the response is the recorded receipt — replayed=true — and no
+// second mutation ran. The receipt answers regardless of what later
+// operations did to the path; only a same-key DIFFERENT request is refused
+// (409 idempotency_conflict).
+func (c *Client) WriteKeyed(ctx context.Context, scope, path, ifVersion, opKey string, body []byte) (int64, bool, error) {
 	h := http.Header{"If-Version": {ifVersion}}
+	if opKey != "" {
+		h.Set("X-Idempotency-Key", opKey)
+	}
 	out, _, err := c.doJSON(ctx, scope, "write", http.MethodPut,
 		url.Values{"path": {path}}, h, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return jsonInt(out["version"]), nil
+	replayed, _ := out["replayed"].(bool)
+	return jsonInt(out["version"]), replayed, nil
 }
 
 func (c *Client) Mkdir(ctx context.Context, scope, path string) (int64, error) {
+	ver, _, err := c.MkdirKeyed(ctx, scope, path, "")
+	return ver, err
+}
+
+func (c *Client) MkdirKeyed(ctx context.Context, scope, path, opKey string) (int64, bool, error) {
 	payload, _ := json.Marshal(map[string]string{"path": path})
-	out, _, err := c.doJSON(ctx, scope, "mkdir", http.MethodPost, nil,
-		http.Header{"Content-Type": {"application/json"}}, bytes.NewReader(payload))
-	if err != nil {
-		return 0, err
+	h := http.Header{"Content-Type": {"application/json"}}
+	if opKey != "" {
+		h.Set("X-Idempotency-Key", opKey)
 	}
-	return jsonInt(out["version"]), nil
+	out, _, err := c.doJSON(ctx, scope, "mkdir", http.MethodPost, nil, h, bytes.NewReader(payload))
+	if err != nil {
+		return 0, false, err
+	}
+	replayed, _ := out["replayed"].(bool)
+	return jsonInt(out["version"]), replayed, nil
 }
 
 func (c *Client) Remove(ctx context.Context, scope, path, ifVersion string) error {
-	h := http.Header{"If-Version": {ifVersion}}
-	_, _, err := c.doJSON(ctx, scope, "remove", http.MethodDelete,
-		url.Values{"path": {path}}, h, nil)
+	_, err := c.RemoveKeyed(ctx, scope, path, ifVersion, "")
 	return err
+}
+
+func (c *Client) RemoveKeyed(ctx context.Context, scope, path, ifVersion, opKey string) (bool, error) {
+	h := http.Header{"If-Version": {ifVersion}}
+	if opKey != "" {
+		h.Set("X-Idempotency-Key", opKey)
+	}
+	out, _, err := c.doJSON(ctx, scope, "remove", http.MethodDelete,
+		url.Values{"path": {path}}, h, nil)
+	if err != nil {
+		return false, err
+	}
+	replayed, _ := out["replayed"].(bool)
+	return replayed, nil
 }
 
 func jsonInt(v any) int64 {

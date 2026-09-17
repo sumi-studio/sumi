@@ -1,6 +1,8 @@
 package fileaccess
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -23,11 +25,22 @@ type fakeFilesvc struct {
 	next  int64
 	files map[string]map[string]fakeEntry // scope -> path -> entry
 	token string
+	// receipts models file_receipt: (scope, op_key) -> the committed
+	// request hash + recorded result. Consulted before CAS, written after
+	// the mutation commits — the durable identity the real service stores
+	// in Postgres.
+	receipts map[string]fakeReceipt
 	// dropResponse, when set, hijacks the connection after the handler ran —
 	// simulating a transport failure after a committed upstream mutation.
 	dropResponse bool
 
 	seen []seenReq
+}
+
+type fakeReceipt struct {
+	reqHash string
+	op      string
+	version int64
 }
 
 type fakeEntry struct {
@@ -46,9 +59,71 @@ type seenReq struct {
 
 func newFakeFilesvc(t *testing.T) *fakeFilesvc {
 	return &fakeFilesvc{
-		t:     t,
-		files: map[string]map[string]fakeEntry{},
-		token: "svc-token",
+		t:        t,
+		files:    map[string]map[string]fakeEntry{},
+		token:    "svc-token",
+		receipts: map[string]fakeReceipt{},
+	}
+}
+
+// fakeReqHash mirrors filesvc's service.go reqHash: sha256 over
+// length-prefixed canonical request parts.
+func fakeReqHash(parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write([]byte(strconv.Itoa(len(p))))
+		h.Write([]byte{0})
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// fakeIVCanon mirrors filesvc's ivCanon.
+func fakeIVCanon(iv string) string {
+	switch iv {
+	case "any":
+		return "any:0"
+	case "none":
+		return "none:0"
+	default:
+		return "eq:" + iv
+	}
+}
+
+// fakeReceiptCheck is the declare-time receipt gate: same key + same
+// canonical request answers from the recorded receipt; same key +
+// different request is an idempotency_conflict. Returns true when a
+// response was written (the caller must return).
+func (f *fakeFilesvc) fakeReceiptCheck(w http.ResponseWriter, scope, opKey, reqH string) bool {
+	if opKey == "" {
+		return false
+	}
+	rec, ok := f.receipts[scope+"\x00"+opKey]
+	if !ok {
+		return false
+	}
+	if rec.reqHash != reqH {
+		writeErrJSON(w, 409, "idempotency_conflict", "idempotency key was already used for a different request")
+		return true
+	}
+	w.Header().Set("content-type", "application/json")
+	out := map[string]any{"version": rec.version, "replayed": true}
+	if rec.op == "remove" {
+		out["removed"] = true
+	}
+	json.NewEncoder(w).Encode(out)
+	return true
+}
+
+// fakeReceiptRecord commits the operation's receipt after the mutation —
+// the same ordering the real apply transaction guarantees.
+func (f *fakeFilesvc) fakeReceiptRecord(scope, opKey, reqH, op string, version int64) {
+	if opKey == "" {
+		return
+	}
+	k := scope + "\x00" + opKey
+	if _, ok := f.receipts[k]; !ok {
+		f.receipts[k] = fakeReceipt{reqHash: reqH, op: op, version: version}
 	}
 }
 
@@ -128,16 +203,23 @@ func (f *fakeFilesvc) dispatch(w http.ResponseWriter, r *http.Request, scope, op
 		writeErrJSON(w, 400, "bad_path", "escapes scope")
 		return
 	}
+	opKey := r.Header.Get("X-Idempotency-Key")
 	switch op {
 	case "write":
 		body, _ := io.ReadAll(r.Body)
 		iv := r.Header.Get("If-Version")
+		if iv == "" {
+			writeErrJSON(w, 400, "bad_if_version", "missing")
+			return
+		}
+		sum := sha256.Sum256(body)
+		reqH := fakeReqHash("write", path, fakeIVCanon(iv), hex.EncodeToString(sum[:]))
+		if f.fakeReceiptCheck(w, scope, opKey, reqH) {
+			return
+		}
 		ent, exists := tree[path]
 		exists = exists && !ent.dir
 		switch {
-		case iv == "":
-			writeErrJSON(w, 400, "bad_if_version", "missing")
-			return
 		case iv == "none":
 			if exists {
 				writeErrJSON(w, 409, "version_conflict", "exists")
@@ -161,6 +243,7 @@ func (f *fakeFilesvc) dispatch(w http.ResponseWriter, r *http.Request, scope, op
 		}
 		v := f.mint()
 		tree[path] = fakeEntry{body: body, version: v}
+		f.fakeReceiptRecord(scope, opKey, reqH, "write", v)
 		w.Header().Set("content-type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"version": v})
 	case "mkdir":
@@ -176,8 +259,13 @@ func (f *fakeFilesvc) dispatch(w http.ResponseWriter, r *http.Request, scope, op
 			writeErrJSON(w, 400, "bad_path", "escapes scope")
 			return
 		}
+		reqH := fakeReqHash("mkdir", b.Path)
+		if f.fakeReceiptCheck(w, scope, opKey, reqH) {
+			return
+		}
 		v := f.mint()
 		tree[b.Path] = fakeEntry{dir: true, version: v}
+		f.fakeReceiptRecord(scope, opKey, reqH, "mkdir", v)
 		json.NewEncoder(w).Encode(map[string]any{"version": v})
 	case "read":
 		ent, ok := tree[path]
@@ -238,6 +326,10 @@ func (f *fakeFilesvc) dispatch(w http.ResponseWriter, r *http.Request, scope, op
 		json.NewEncoder(w).Encode(map[string]any{"entries": entries, "next_cursor": ""})
 	case "remove":
 		iv := r.Header.Get("If-Version")
+		reqH := fakeReqHash("remove", path, fakeIVCanon(iv))
+		if f.fakeReceiptCheck(w, scope, opKey, reqH) {
+			return
+		}
 		ent, exists := tree[path]
 		if !exists {
 			writeErrJSON(w, 404, "not_found", "missing")
@@ -258,6 +350,7 @@ func (f *fakeFilesvc) dispatch(w http.ResponseWriter, r *http.Request, scope, op
 			return
 		}
 		delete(tree, path)
+		f.fakeReceiptRecord(scope, opKey, reqH, "remove", f.mint())
 		json.NewEncoder(w).Encode(map[string]any{"removed": true})
 	default:
 		writeErrJSON(w, 404, "not_found", "unknown op")

@@ -37,7 +37,7 @@ func resetTables(t *testing.T, dsn string) {
 	}
 	defer conn.Close(context.Background())
 	_, err = conn.Exec(context.Background(),
-		`TRUNCATE file_version, file_event, file_op;
+		`TRUNCATE file_version, file_event, file_op, file_receipt;
 		 DELETE FROM store_meta;
 		 SELECT setval('file_version_seq', 1, false)`)
 	// Tables may not exist before first migrate — that's fine, the
@@ -55,7 +55,7 @@ func resetTables(t *testing.T, dsn string) {
 		}
 		defer conn.Close(context.Background())
 		if _, err := conn.Exec(context.Background(),
-			`TRUNCATE file_version, file_event, file_op;
+			`TRUNCATE file_version, file_event, file_op, file_receipt;
 			 DELETE FROM store_meta;
 			 SELECT setval('file_version_seq', 1, false)`); err != nil {
 			t.Fatalf("reset: %v", err)
@@ -1567,7 +1567,7 @@ func TestPGStaleWritePreservesSuccessor(t *testing.T) {
 	// The stale op declares while "old" is current — then its actor is
 	// paused (its fs effect stays queued).
 	stale, err := s1.declare(ctx, "ws", "write", "a.txt", "",
-		IfVersion{Mode: "any"}, sha("stale"), probeOf(root, "ws", "a.txt"),
+		IfVersion{Mode: "any"}, sha("stale"), OpIdentity{}, probeOf(root, "ws", "a.txt"),
 		probeOf(root, "ws", "a.txt"))
 	if err != nil {
 		t.Fatalf("stale declare: %v", err)

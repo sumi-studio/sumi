@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -13,13 +15,23 @@ import (
 const testPersona = "018f47a2-9b3c-7def-8abc-0123456789ab"
 const testScope = "018f47a29b3c7def8abc0123456789ab"
 
+// Every Apply carries the operation ledger's stable identity. Distinct
+// operations get distinct keys — the same key is only ever retried with
+// the identical request, which is what the durable receipt answers.
+var testOpSeq atomic.Int64
+
 func applyTool(t *testing.T, fx map[string]agentstate.ToolEffect, tool string, req map[string]any) (map[string]any, error) {
+	t.Helper()
+	return applyToolKey(t, fx, tool, fmt.Sprintf("in:tool:%d", testOpSeq.Add(1)), req)
+}
+
+func applyToolKey(t *testing.T, fx map[string]agentstate.ToolEffect, tool, opKey string, req map[string]any) (map[string]any, error) {
 	t.Helper()
 	e, ok := fx[tool]
 	if !ok {
 		t.Fatalf("tool %s not registered", tool)
 	}
-	return e.Apply(context.Background(), nil, testPersona, "in:tool:0", req)
+	return e.Apply(context.Background(), nil, testPersona, opKey, req)
 }
 
 func TestFileEffectsScopePinnedToPersona(t *testing.T) {
@@ -89,9 +101,9 @@ func TestFileWriteCreateThenCASOverwrite(t *testing.T) {
 
 // The crash-window case: the filesvc write commits, the response never
 // arrives (process died before the ledger commit). The retried claim runs
-// the effect again; the write 409s; the effect must prove the landed bytes
-// are this call's and record the true version — not re-write or report a
-// false conflict.
+// the effect again under the same operation key; filesvc's durable receipt
+// answers with the recorded version — no second mutation, and nothing
+// depends on the file's current bytes.
 func TestFileWriteReplayAfterLandedWrite(t *testing.T) {
 	f := newFakeFilesvc(t)
 	c, _ := f.client(t)
@@ -101,8 +113,9 @@ func TestFileWriteReplayAfterLandedWrite(t *testing.T) {
 	f.dropResponse = true
 	f.mu.Unlock()
 
+	opKey := "lost-commit:write:0"
 	req := map[string]any{"path": "crash.txt", "content_text": "committed bytes"}
-	_, err := applyTool(t, fx, ToolWrite, req)
+	_, err := applyToolKey(t, fx, ToolWrite, opKey, req)
 	if err == nil || errors.Is(err, agentstate.ErrBadRequest) {
 		t.Fatalf("first attempt must fail transiently, got %v", err)
 	}
@@ -113,7 +126,7 @@ func TestFileWriteReplayAfterLandedWrite(t *testing.T) {
 
 	landedVersion := f.files[testScope]["crash.txt"].version
 
-	out, err := applyTool(t, fx, ToolWrite, req)
+	out, err := applyToolKey(t, fx, ToolWrite, opKey, req)
 	if err != nil {
 		t.Fatalf("replay must reconcile, got %v", err)
 	}
@@ -123,10 +136,190 @@ func TestFileWriteReplayAfterLandedWrite(t *testing.T) {
 	if out["version"] != landedVersion {
 		t.Fatalf("receipt must carry the landed version, got %v want %d", out["version"], landedVersion)
 	}
-	// The retried PUT reached filesvc and 409'd — no second mutation was
+	// The retry was answered from the receipt — no second mutation was
 	// minted, so the file's recorded version is unchanged.
 	if f.files[testScope]["crash.txt"].version != landedVersion {
 		t.Fatal("replay minted a second version")
+	}
+}
+
+// Accepted-operation identity: a brand-new create-only operation must NOT
+// treat another writer's identical bytes as its own receipt. Content
+// equality is not operation identity — the conflict stays a real conflict.
+func TestFileWriteNewOpNeverBorrowsIdenticalBytes(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+
+	// An unrelated writer (no operation key) creates the file first.
+	if _, err := c.Write(context.Background(), testScope, "same.txt", "none", []byte("same")); err != nil {
+		t.Fatal(err)
+	}
+	out, err := applyToolKey(t, fx, ToolWrite, "brand-new-op", map[string]any{
+		"path": "same.txt", "content_text": "same"})
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("new create borrowed foreign bytes as its receipt: out=%v err=%v", out, err)
+	}
+}
+
+// Lost-ledger + intervening actor: the keyed write commits upstream and
+// its ledger commit is lost, then another operation deletes the file.
+// Replaying the same operation must report the receipt, never recreate.
+func TestFileWriteLostLedgerRetryDoesNotRecreateDeleted(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+	ctx := context.Background()
+
+	key := "lost-ledger-write"
+	req := map[string]any{"path": "gone.txt", "content_text": "old"}
+	out, err := applyToolKey(t, fx, ToolWrite, key, req)
+	if err != nil || out["written"] != true {
+		t.Fatalf("first apply: %v %v", out, err)
+	}
+	landed := f.files[testScope]["gone.txt"].version
+
+	// Intervening independent operation deletes the file.
+	if err := c.Remove(ctx, testScope, "gone.txt", "any"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err = applyToolKey(t, fx, ToolWrite, key, req)
+	if err != nil || out["replayed"] != true {
+		t.Fatalf("replay must be answered by the receipt: %v %v", out, err)
+	}
+	if out["version"] != landed {
+		t.Fatalf("receipt version %v != landed %d", out["version"], landed)
+	}
+	if _, err := c.Stat(ctx, testScope, "gone.txt"); err == nil {
+		t.Fatal("replayed write recreated a file another operation deleted")
+	}
+}
+
+// Lost-ledger remove + intervening replacement: replay must not delete a
+// file another operation created after the remove committed.
+func TestFileRemoveLostLedgerRetryPreservesReplacement(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+	ctx := context.Background()
+
+	if _, err := c.Write(ctx, testScope, "replace.txt", "none", []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	key := "lost-ledger-remove"
+	req := map[string]any{"path": "replace.txt"}
+	if _, err := applyToolKey(t, fx, ToolRemove, key, req); err != nil {
+		t.Fatal(err)
+	}
+	// Intervening independent operation creates the replacement.
+	if _, err := c.Write(ctx, testScope, "replace.txt", "none", []byte("replacement")); err != nil {
+		t.Fatal(err)
+	}
+	out, err := applyToolKey(t, fx, ToolRemove, key, req)
+	if err != nil || out["removed"] != true || out["replayed"] != true {
+		t.Fatalf("replayed remove must report the receipt: %v %v", out, err)
+	}
+	got, err := c.Read(ctx, testScope, "replace.txt", 0, -1)
+	if err != nil || string(got.Body) != "replacement" {
+		t.Fatalf("replayed remove deleted a later replacement: %q %v", got.Body, err)
+	}
+}
+
+// The receipt binds the canonical request, not just the key: reusing a
+// committed key for a different request is a deterministic refusal.
+func TestFileWriteKeyReuseDifferentRequestConflicts(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+
+	key := "reused-key"
+	req := map[string]any{"path": "k.txt", "content_text": "original"}
+	if _, err := applyToolKey(t, fx, ToolWrite, key, req); err != nil {
+		t.Fatal(err)
+	}
+	// Same key, different bytes.
+	_, err := applyToolKey(t, fx, ToolWrite, key, map[string]any{
+		"path": "k.txt", "content_text": "changed", "expect_version": "none"})
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("key reuse with different request must conflict, got %v", err)
+	}
+	// Same key, different path.
+	_, err = applyToolKey(t, fx, ToolWrite, key, map[string]any{
+		"path": "other.txt", "content_text": "original"})
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("key reuse with different path must conflict, got %v", err)
+	}
+	// Same key, different op.
+	_, err = applyToolKey(t, fx, ToolRemove, key, map[string]any{"path": "k.txt"})
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("key reuse across ops must conflict, got %v", err)
+	}
+}
+
+// mkdir is a mutation with the same identity contract: a committed keyed
+// mkdir replays from its receipt even after the dir was removed.
+func TestFileMkdirReplayFromReceipt(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+	ctx := context.Background()
+
+	key := "mkdir-op"
+	req := map[string]any{"path": "made/dir"}
+	out, err := applyToolKey(t, fx, ToolMkdir, key, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	landed := out["version"].(int64)
+	if err := c.Remove(ctx, testScope, "made/dir", "any"); err != nil {
+		t.Fatal(err)
+	}
+	out, err = applyToolKey(t, fx, ToolMkdir, key, req)
+	if err != nil || out["replayed"] != true || out["version"] != landed {
+		t.Fatalf("mkdir replay must receipt: %v %v", out, err)
+	}
+	// The dir was NOT recreated by the replay.
+	if _, err := c.Stat(ctx, testScope, "made/dir"); err == nil {
+		t.Fatal("replayed mkdir recreated a deleted directory")
+	}
+	// A fresh mkdir of a recreated path is a different operation — it
+	// lands its own version.
+	if _, err := c.Mkdir(ctx, testScope, "made/dir"); err != nil {
+		t.Fatal(err)
+	}
+	out, err = applyTool(t, fx, ToolMkdir, req)
+	if err != nil || out["replayed"] == true {
+		t.Fatalf("fresh mkdir must run for real: %v %v", out, err)
+	}
+}
+
+// A committed keyed write followed by another operation's overwrite still
+// answers its own recorded version — never the later file's state.
+func TestFileWriteReplayAfterInterveningOverwrite(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+	ctx := context.Background()
+
+	key := "write-then-overwritten"
+	req := map[string]any{"path": "ov.txt", "content_text": "mine"}
+	out, err := applyToolKey(t, fx, ToolWrite, key, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := out["version"].(int64)
+	// Another operation overwrites with different bytes.
+	if _, err := c.Write(ctx, testScope, "ov.txt", "any", []byte("theirs")); err != nil {
+		t.Fatal(err)
+	}
+	out, err = applyToolKey(t, fx, ToolWrite, key, req)
+	if err != nil || out["replayed"] != true || out["version"] != mine {
+		t.Fatalf("replay must report the recorded version: %v %v", out, err)
+	}
+	got, _ := c.Read(ctx, testScope, "ov.txt", 0, -1)
+	if string(got.Body) != "theirs" {
+		t.Fatalf("replay touched the later writer's bytes: %q", got.Body)
 	}
 }
 

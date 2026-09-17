@@ -25,9 +25,13 @@ type VersionStore interface {
 	// reached — an error with committed=true means "landed but
 	// unobserved" and the intent must be kept for reconciliation, not
 	// dropped as a rejection (F-RA-5/f120).
-	WithWrite(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
-	Rename(ctx context.Context, scope, from, to string, iv IfVersion, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
-	Remove(ctx context.Context, scope, path string, iv IfVersion, probe FPProbe, fn func(intent) (bool, error)) error
+	// The Keyed variants carry the caller's durable operation identity:
+	// a committed effect leaves a receipt under idem.Key and a replay of
+	// the identical request is answered as *Replayed instead of
+	// mutating again. An empty idem.Key is the unkeyed path.
+	WithWriteKeyed(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, idem OpIdentity, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
+	RenameKeyed(ctx context.Context, scope, from, to string, iv IfVersion, idem OpIdentity, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
+	RemoveKeyed(ctx context.Context, scope, path string, iv IfVersion, idem OpIdentity, probe FPProbe, fn func(intent) (bool, error)) error
 	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
 }
@@ -208,6 +212,78 @@ func parseIfVersion(h string) (IfVersion, error) {
 	}
 }
 
+// ivCanon renders an IfVersion in the canonical form request hashes use —
+// two encodings of the same condition ("none" vs "eq:0" are intentionally
+// distinct: they differ in the wire contract) hash identically.
+func ivCanon(iv IfVersion) string {
+	return iv.Mode + ":" + strconv.FormatInt(iv.Version, 10)
+}
+
+// maxOpKeyLen bounds caller-supplied idempotency keys: they index durable
+// receipt rows, so unconstrained length would be an unbounded storage
+// vector. The charset keeps keys printable and delimiter-safe.
+const maxOpKeyLen = 200
+
+func validOpKey(key string) bool {
+	if key == "" || len(key) > maxOpKeyLen {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '.' || c == '_' || c == ':' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// reqHash fingerprints the canonical request an idempotency key binds to:
+// every field that changes the mutation's meaning — op, paths, version
+// condition, and body digest — so a same-key request that differs in any
+// of them conflicts instead of borrowing the receipt.
+func reqHash(parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write([]byte(strconv.Itoa(len(p))))
+		h.Write([]byte{0})
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// opIdentity reads X-Idempotency-Key and binds it to the canonical request.
+// No header means the unkeyed path — internal callers keep the pre-receipt
+// behavior.
+func opIdentity(r *http.Request, parts ...string) (OpIdentity, error) {
+	key := r.Header.Get("X-Idempotency-Key")
+	if key == "" {
+		return OpIdentity{}, nil
+	}
+	if !validOpKey(key) {
+		return OpIdentity{}, errors.New("bad X-Idempotency-Key (1-200 chars, [A-Za-z0-9._:-])")
+	}
+	return OpIdentity{Key: key, ReqHash: reqHash(parts...)}, nil
+}
+
+// mutationResult answers a mutation handler: a *Replayed error is the
+// operation's committed receipt — success, with the recorded version —
+// everything else goes through mapErr.
+func (s *Service) mutationResult(w http.ResponseWriter, err error, ok map[string]any) {
+	if err == nil {
+		writeJSON(w, ok)
+		return
+	}
+	var rep *Replayed
+	if errors.As(err, &rep) {
+		ok["version"] = rep.Version
+		ok["replayed"] = true
+		writeJSON(w, ok)
+		return
+	}
+	s.mapErr(w, err)
+}
+
 func (s *Service) handleStat(w http.ResponseWriter, r *http.Request, scope, path string) {
 	info, err := s.root.stat(scope, path)
 	if err != nil {
@@ -348,17 +424,19 @@ func (s *Service) handleWrite(w http.ResponseWriter, r *http.Request, scope, pat
 	}
 	exclusive := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
 	sum := sha256.Sum256(body)
-	ver, _, err := s.store.WithWrite(r.Context(), scope, path, "write", iv,
-		hex.EncodeToString(sum[:]),
+	bodySHA := hex.EncodeToString(sum[:])
+	idem, err := opIdentity(r, "write", path, ivCanon(iv), bodySHA)
+	if err != nil {
+		writeErr(w, 400, "bad_idempotency_key", err.Error())
+		return
+	}
+	ver, _, err := s.store.WithWriteKeyed(r.Context(), scope, path, "write", iv,
+		bodySHA, idem,
 		s.probe(scope, path),
 		func(it intent) (FileInfo, bool, error) {
 			return s.root.atomicWrite(scope, path, body, exclusive, it)
 		})
-	if err != nil {
-		s.mapErr(w, err)
-		return
-	}
-	writeJSON(w, map[string]any{"version": ver})
+	s.mutationResult(w, err, map[string]any{"version": ver})
 }
 
 type renameReq struct {
@@ -409,16 +487,17 @@ func (s *Service) handleRename(w http.ResponseWriter, r *http.Request, scope str
 	// none / eq 0 = "destination must not exist" — enforced atomically by
 	// renameat2(RENAME_NOREPLACE), not just by the version row.
 	noReplace := iv.Mode == "none" || (iv.Mode == "eq" && iv.Version == 0)
-	ver, _, err := s.store.Rename(r.Context(), scope, from, to, iv,
+	idem, err := opIdentity(r, "rename", from, to, ivCanon(iv))
+	if err != nil {
+		writeErr(w, 400, "bad_idempotency_key", err.Error())
+		return
+	}
+	ver, _, err := s.store.RenameKeyed(r.Context(), scope, from, to, iv, idem,
 		s.probe(scope, to), s.probe(scope, from),
 		func(it intent) (FileInfo, bool, error) {
 			return s.root.rename(scope, from, to, noReplace, it)
 		})
-	if err != nil {
-		s.mapErr(w, err)
-		return
-	}
-	writeJSON(w, map[string]any{"version": ver})
+	s.mutationResult(w, err, map[string]any{"version": ver})
 }
 
 func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope string) {
@@ -434,17 +513,18 @@ func (s *Service) handleMkdir(w http.ResponseWriter, r *http.Request, scope stri
 		s.mapErr(w, merr)
 		return
 	}
-	ver, _, err := s.store.WithWrite(r.Context(), scope, mpath, "mkdir",
-		IfVersion{Mode: "any"}, "dir",
+	idem, err := opIdentity(r, "mkdir", mpath)
+	if err != nil {
+		writeErr(w, 400, "bad_idempotency_key", err.Error())
+		return
+	}
+	ver, _, err := s.store.WithWriteKeyed(r.Context(), scope, mpath, "mkdir",
+		IfVersion{Mode: "any"}, "dir", idem,
 		s.probe(scope, mpath),
 		func(it intent) (FileInfo, bool, error) {
 			return s.root.mkdir(scope, mpath)
 		})
-	if err != nil {
-		s.mapErr(w, err)
-		return
-	}
-	writeJSON(w, map[string]any{"version": ver})
+	s.mutationResult(w, err, map[string]any{"version": ver})
 }
 
 func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, path string, q url.Values) {
@@ -453,15 +533,16 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request, scope, pa
 		writeErr(w, 400, "bad_if_version", err.Error())
 		return
 	}
-	err = s.store.Remove(r.Context(), scope, path, iv, s.probe(scope, path),
+	idem, err := opIdentity(r, "remove", path, ivCanon(iv))
+	if err != nil {
+		writeErr(w, 400, "bad_idempotency_key", err.Error())
+		return
+	}
+	err = s.store.RemoveKeyed(r.Context(), scope, path, iv, idem, s.probe(scope, path),
 		func(it intent) (bool, error) {
 			return s.root.remove(scope, path, it)
 		})
-	if err != nil {
-		s.mapErr(w, err)
-		return
-	}
-	writeJSON(w, map[string]any{"removed": true})
+	s.mutationResult(w, err, map[string]any{"removed": true})
 }
 
 func (s *Service) handleChanges(w http.ResponseWriter, r *http.Request, scope string, q url.Values) {
@@ -563,6 +644,10 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "permission_denied", "filesystem denied the operation")
 	case errors.Is(err, ErrNotEmpty):
 		writeErr(w, 409, "dir_not_empty", err.Error())
+	case errors.Is(err, ErrIdemConflict):
+		writeErr(w, 409, "idempotency_conflict", err.Error())
+	case errors.Is(err, ErrIdemInFlight):
+		writeErr(w, 409, "op_in_flight", err.Error())
 	case errors.Is(err, ErrUnsettled):
 		// The error message carries the unsettled path and, when the
 		// filesystem could not be observed at all, the recorded stall

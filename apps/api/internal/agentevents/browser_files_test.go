@@ -24,6 +24,7 @@ type fakeFileBackend struct {
 	method   string
 	query    url.Values
 	ifVer    string
+	opKey    string
 	body     []byte
 	fail     bool
 	response *http.Response
@@ -33,6 +34,7 @@ func (f *fakeFileBackend) ProxyOp(_ context.Context, scope, op, method string, q
 	f.scope, f.op, f.method = scope, op, method
 	f.query = query
 	f.ifVer = headers.Get("If-Version")
+	f.opKey = headers.Get("X-Idempotency-Key")
 	if body != nil {
 		f.body, _ = io.ReadAll(body)
 	}
@@ -238,5 +240,42 @@ func TestBrowserFilesRemoveForwardsIfVersion(t *testing.T) {
 		map[string]string{"If-Version": "7"}, nil)
 	if w.Code != 200 || backend.op != "remove" || backend.method != http.MethodDelete || backend.ifVer != "7" {
 		t.Fatalf("remove forward: %d %v", w.Code, backend)
+	}
+}
+
+// A browser-chosen operation key is namespaced under "br:" upstream so it
+// can never collide with the Core ledger's derived identity, and malformed
+// or oversized keys are refused at the route rather than forwarded.
+func TestBrowserFilesIdempotencyKeyNamespaced(t *testing.T) {
+	backend := &fakeFileBackend{response: cannedFileResponse(200, nil, `{"version":1}`)}
+	s := newFileBrowserServer(t, backend)
+	w := fileRequest(t, s, http.MethodPut, "/files/write?"+fileScopeQuery+"&path=k.txt",
+		map[string]string{"If-Version": "none", "X-Idempotency-Key": "my-key"},
+		strings.NewReader("data"))
+	if w.Code != 200 || backend.opKey != "br:my-key" {
+		t.Fatalf("namespaced key forward: %d key=%q", w.Code, backend.opKey)
+	}
+	// No key → no upstream header.
+	backend.opKey = "unset"
+	w = fileRequest(t, s, http.MethodPut, "/files/write?"+fileScopeQuery+"&path=k.txt",
+		map[string]string{"If-Version": "none"}, strings.NewReader("data"))
+	if w.Code != 200 || backend.opKey != "" {
+		t.Fatalf("unkeyed write must not forward a key: %d key=%q", w.Code, backend.opKey)
+	}
+	// Bad keys are refused without touching the backend.
+	backend.opKey = "unset"
+	backend.scope = "unset"
+	w = fileRequest(t, s, http.MethodPut, "/files/write?"+fileScopeQuery+"&path=k.txt",
+		map[string]string{"If-Version": "none", "X-Idempotency-Key": "bad key with spaces"},
+		strings.NewReader("data"))
+	if w.Code != http.StatusBadRequest || backend.scope == filesScope {
+		t.Fatalf("malformed key must be refused at the route: %d", w.Code)
+	}
+	// Reads never carry a key even if the client sends one.
+	backend.opKey = "unset"
+	w = fileRequest(t, s, http.MethodGet, "/files/read?"+fileScopeQuery+"&path=k.txt",
+		map[string]string{"X-Idempotency-Key": "sneaky"}, nil)
+	if backend.opKey != "" {
+		t.Fatalf("read must not forward a key, got %q", backend.opKey)
 	}
 }

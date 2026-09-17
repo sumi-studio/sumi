@@ -152,7 +152,8 @@ func TestE2EBrowserFilesRealFilesvc(t *testing.T) {
 	// file the person just wrote, writes its own reply, and the person's
 	// session reads that reply — one canonical scope, both faces.
 	fx := fileaccess.FileEffects(mustE2EClient(t))
-	out, err := fx[fileaccess.ToolRead].Apply(context.Background(), nil, e2eFilesPA, "e2e:tool:0",
+	runID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	out, err := fx[fileaccess.ToolRead].Apply(context.Background(), nil, e2eFilesPA, runID+":tool:0",
 		map[string]any{"path": "e2e-web/hello.txt"})
 	if err != nil {
 		t.Fatalf("secretary read of person write: %v", err)
@@ -160,7 +161,7 @@ func TestE2EBrowserFilesRealFilesvc(t *testing.T) {
 	if out["content_text"] != "v2" {
 		t.Fatalf("secretary saw %v", out)
 	}
-	if _, err = fx[fileaccess.ToolWrite].Apply(context.Background(), nil, e2eFilesPA, "e2e:tool:1",
+	if _, err = fx[fileaccess.ToolWrite].Apply(context.Background(), nil, e2eFilesPA, runID+":tool:1",
 		map[string]any{"path": "e2e-web/reply.txt", "content_text": "from secretary"}); err != nil {
 		t.Fatalf("secretary write: %v", err)
 	}

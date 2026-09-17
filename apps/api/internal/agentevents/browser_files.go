@@ -155,7 +155,39 @@ func (s *BrowserServer) fileRequestParts(w http.ResponseWriter, r *http.Request,
 		body = http.MaxBytesReader(w, r.Body, 4096)
 		headers = http.Header{"Content-Type": {"application/json"}}
 	}
+	// An optional client idempotency key gives a browser mutation the same
+	// durable-receipt identity Core operations get. It is namespaced "br:"
+	// so a client-chosen value can never collide with a ledger-derived
+	// "core:" key, and the same charset/length bound filesvc applies is
+	// enforced here so the request fails before the upstream call.
+	if op == "write" || op == "remove" || op == "mkdir" {
+		if key := r.Header.Get("X-Idempotency-Key"); key != "" {
+			if !validBrowserOpKey(key) {
+				return nil, nil, nil, errors.New("bad X-Idempotency-Key (1-190 chars, [A-Za-z0-9._:-])")
+			}
+			if headers == nil {
+				headers = http.Header{}
+			}
+			headers.Set("X-Idempotency-Key", "br:"+key)
+		}
+	}
 	return out, headers, body, nil
+}
+
+// validBrowserOpKey mirrors filesvc's key bound, with room for the "br:"
+// prefix the route adds.
+func validBrowserOpKey(key string) bool {
+	if key == "" || len(key) > 190 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '.' || c == '_' || c == ':' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // checkBrowserFilePath is a cheap outer bound; filesvc's openat2-beneath
