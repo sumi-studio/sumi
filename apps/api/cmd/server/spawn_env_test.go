@@ -143,3 +143,64 @@ func TestRunIdleReaperExitsOnContextDone(t *testing.T) {
 		t.Fatal("runIdleReaper did not exit after context cancellation")
 	}
 }
+
+// The legacy lazy-runtime controller must not be wired into the browser
+// Direct Chat surface under the core backend: admitted commands are durable
+// core inputs and a spawned legacy runtime would hold the persona's event-log
+// lease, blocking the core projection.
+func TestBrowserDirectChatSpawnerSkipsLegacySpawnUnderCoreBackend(t *testing.T) {
+	mgr, err := spawn.New(spawn.Config{
+		Spawner:       &fakeSpawner{},
+		Resolver:      fakeAgentResolver{},
+		SharedBearer:  "b",
+		SharedNonce:   "n",
+		StateRoot:     t.TempDir(),
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "core")
+	if got := browserDirectChatSpawner(mgr); got != nil {
+		t.Fatal("core backend must not receive the legacy lazy spawner")
+	}
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "")
+	if got := browserDirectChatSpawner(mgr); got == nil {
+		t.Fatal("legacy backend keeps the lazy spawner")
+	}
+	if got := browserDirectChatSpawner(nil); got != nil {
+		t.Fatal("nil manager must stay a nil interface, not a typed nil")
+	}
+}
+
+// Under the core backend the API must not construct the legacy
+// conversation-runtime control plane at all: every lazy-spawn consumer is
+// wired behind the manager, so returning nil makes the whole surface inert
+// even while the provisioner socket env is present for executor
+// capabilities such as process operations.
+func TestSpawnManagerFromEnvSkipsConversationRuntimeUnderCoreBackend(t *testing.T) {
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "core")
+	t.Setenv("SUMI_RUNTIME_PROVISIONER_SOCKET", "/tmp/sumi-test-provisioner.sock")
+	mgr, err := spawnManagerFromEnv(nil, nil, nil, nil, nil, nil)
+	if err != nil || mgr != nil {
+		t.Fatalf("core backend must not build the legacy spawn manager: mgr=%v err=%v", mgr, err)
+	}
+}
+
+// Runtime-activation nudges (selection or connection changes) must not reach
+// the activation worker's queue when no Rust conversation runtime can run.
+func TestActivationEnqueueDisabledUnderCoreBackend(t *testing.T) {
+	worker := newChatGPTActivationWorker(&activationTestEmployer{})
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "core")
+	if activationEnqueue(worker) != nil {
+		t.Fatal("core backend must not wire runtime-activation nudges")
+	}
+	if activationEnqueue(nil) != nil {
+		t.Fatal("nil worker must yield a nil nudge")
+	}
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "")
+	if activationEnqueue(worker) == nil {
+		t.Fatal("legacy backend keeps the activation nudge")
+	}
+}
