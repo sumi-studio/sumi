@@ -980,6 +980,16 @@ export interface components {
             /** @enum {string} */
             reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
         };
+        DirectChatCommandMovedResponse: {
+            /** @constant */
+            error: "secretary_moved";
+            idempotency_key?: string;
+            /** Format: uuid */
+            command_id?: string;
+            seq?: components["schemas"]["JsonSafeInteger"];
+            /** @constant */
+            reject_reason: "secretary_moved";
+        };
         DirectChatCommandIdempotencyConflictResponse: {
             /** @constant */
             error: "idempotency_conflict";
@@ -1600,7 +1610,7 @@ export interface components {
             error_message: string;
         };
         /** @enum {string} */
-        CommandRejectReason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+        CommandRejectReason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "secretary_moved";
         CommandDispositionEvent: {
             /** @constant */
             type: "command_disposition";
@@ -1744,7 +1754,7 @@ export interface components {
             type: "command_rejected";
             idempotency_key: string;
             /** @enum {string} */
-            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable";
+            reject_reason: "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "idempotency_conflict" | "unavailable" | "secretary_moved";
         };
         DirectChatStatusFrame: {
             /** @constant */
@@ -3271,6 +3281,19 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DirectChatCommandIdempotencyConflictResponse"];
+                };
+            };
+            /**
+             * @description The secretary transferred to another placement. The command was
+             *     durably recorded and is terminally rejected; it will not be
+             *     answered here and must not be retried on this surface.
+             */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectChatCommandMovedResponse"];
                 };
             };
             /** @description App or Employer authority store unavailable */

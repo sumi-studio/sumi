@@ -7,6 +7,7 @@ import {
   type DirectChatIndexEntry,
 } from "../lib/direct-chat-history";
 import {
+  describeCommandRejectReason,
   type DirectChatConnectionState,
   type DirectChatInstallationBinding,
   type DirectChatReadyState,
@@ -798,7 +799,7 @@ export function createConversationStore({
         }
         const entry = outbox.findByIdempotencyKey(frame.idempotency_key);
         if (!entry) {
-          publish(`Command rejected: ${frame.reject_reason}`);
+          publish(describeCommandRejectReason(frame.reject_reason));
           return;
         }
         const recovered = outbox.recoverByIdempotencyKey(
@@ -810,7 +811,7 @@ export function createConversationStore({
         }
         publish(
           recovered
-            ? `Command rejected: ${frame.reject_reason}`
+            ? describeCommandRejectReason(frame.reject_reason)
             : "Command rejection could not be saved for local recovery",
         );
       }

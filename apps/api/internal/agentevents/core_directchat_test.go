@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
@@ -29,6 +30,7 @@ type coreDirectChatFixture struct {
 	t       *testing.T
 	ctx     context.Context
 	core    *agentstate.Store
+	pool    *pgxpool.Pool
 	adapter *CoreDirectChat
 	gateway *DurableGateway
 	dir     string
@@ -68,6 +70,7 @@ func newCoreDirectChatFixture(t *testing.T) *coreDirectChatFixture {
 		t:       t,
 		ctx:     context.Background(),
 		core:    core,
+		pool:    pool,
 		adapter: adapter,
 		gateway: gateway,
 		dir:     dir,
@@ -1741,5 +1744,96 @@ func TestCoreDirectChatGuardPathRejectsReplayRefusedRecords(t *testing.T) {
 				t.Fatal("corrupt tail was rewritten or appended after")
 			}
 		})
+	}
+}
+
+// A command sent after the secretary transferred is durable, synchronously
+// refused with ErrPersonaTransferred, and closed by the reconciler with a
+// terminal rejected/secretary_moved disposition — not retried forever, not
+// silently lost, and not labelled with a generic reason that hides the move.
+func TestCoreDirectChatTransferredPersonaRejectsMoved(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+
+	env := f.sendMessage(t, "key-before", "sent before the move")
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`,
+		f.pa); err != nil {
+		t.Fatalf("transfer persona: %v", err)
+	}
+
+	movedEnv, err := f.adapter.Append(f.ctx, f.provenance(), "key-after",
+		json.RawMessage(`{"type":"user_message","text":"after the move","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaTransferred) ||
+		!errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("append after transfer: %v", err)
+	}
+	if movedEnv.CommandID == "" || movedEnv.Seq != 2 {
+		t.Fatalf("moved command lost its durable identity: %+v", movedEnv)
+	}
+	// No core input may be admitted for the transferred persona.
+	if _, _, err := f.core.GetInput(f.ctx, f.pa, "direct-chat:"+movedEnv.CommandID); !errors.Is(err, agentstate.ErrInputNotFound) {
+		t.Fatalf("transferred persona queued an input: %v", err)
+	}
+
+	f.sweep(t)
+	events := durableEvents(t, f.gateway, f.pa)
+	var dispositions []map[string]any
+	for _, e := range events {
+		var ev map[string]any
+		if err := json.Unmarshal(e.Event, &ev); err != nil {
+			continue
+		}
+		if ev["type"] == "command_disposition" {
+			dispositions = append(dispositions, ev)
+		}
+	}
+	if len(dispositions) != 2 {
+		t.Fatalf("dispositions: %v", dispositions)
+	}
+	// The pre-move command's input was admitted while active — applied.
+	if dispositions[0]["command_id"] != env.CommandID || dispositions[0]["status"] != "applied" {
+		t.Fatalf("pre-move disposition: %v", dispositions[0])
+	}
+	if dispositions[1]["command_id"] != movedEnv.CommandID ||
+		dispositions[1]["status"] != "rejected" ||
+		dispositions[1]["reject_reason"] != string(RejectSecretaryMoved) {
+		t.Fatalf("post-move disposition: %v", dispositions[1])
+	}
+
+	// Re-sweeping after restart must not append duplicates or retry.
+	restarted := &CoreDirectChat{Core: f.core, Gateway: f.gateway}
+	if err := restarted.syncPersona(f.ctx, f.pa); err != nil {
+		t.Fatalf("resync after restart: %v", err)
+	}
+	if after := durableEvents(t, f.gateway, f.pa); len(after) != len(events) {
+		t.Fatalf("resync appended %d duplicate events", len(after)-len(events))
+	}
+}
+
+// A sealed persona mid-move is inactive but NOT moved: its rejected
+// disposition must stay not_allowed, never claim the secretary is gone.
+func TestCoreDirectChatSealedPersonaStaysNotAllowed(t *testing.T) {
+	f := newCoreDirectChatFixture(t)
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`,
+		f.pa); err != nil {
+		t.Fatalf("seal persona: %v", err)
+	}
+	_, err := f.adapter.Append(f.ctx, f.provenance(), "key-sealed",
+		json.RawMessage(`{"type":"user_message","text":"mid move","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) ||
+		errors.Is(err, agentstate.ErrPersonaTransferred) {
+		t.Fatalf("sealed append: %v", err)
+	}
+	f.sweep(t)
+	var rejected map[string]any
+	for _, e := range durableEvents(t, f.gateway, f.pa) {
+		var ev map[string]any
+		if json.Unmarshal(e.Event, &ev) == nil && ev["type"] == "command_disposition" {
+			rejected = ev
+		}
+	}
+	if rejected["status"] != "rejected" || rejected["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("sealed disposition: %v", rejected)
 	}
 }

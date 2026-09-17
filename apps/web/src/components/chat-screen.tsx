@@ -679,6 +679,8 @@ function previewRecoverableText(text: string): string {
 
 function describeRecoveryReason(reason: string): string {
   switch (reason) {
+    case "secretary_moved":
+      return "この秘書は Sumi Cloud に移動しました。移動先で会話を続けてください";
     case "superseded":
       return "別の操作に置き換えられました";
     case "unavailable":

@@ -79,6 +79,7 @@ const RejectReasons = new Set([
   "not_allowed",
   "idempotency_conflict",
   "unavailable",
+  "secretary_moved",
 ]);
 const DurableCommandRejectReasons = new Set([
   "unknown_command",
@@ -86,7 +87,18 @@ const DurableCommandRejectReasons = new Set([
   "attachments_not_empty",
   "oversized",
   "not_allowed",
+  "secretary_moved",
 ]);
+
+// describeCommandRejectReason turns a wire reject_reason into a
+// sender-facing sentence. A moved secretary gets an explicit destination
+// instead of raw protocol vocabulary.
+export function describeCommandRejectReason(reason: string): string {
+  if (reason === "secretary_moved") {
+    return "This secretary moved to Sumi Cloud. Continue the conversation there.";
+  }
+  return `Command rejected: ${reason}`;
+}
 const UUIDPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DurableEventTypes = new Set([

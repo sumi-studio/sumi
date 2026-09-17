@@ -45,11 +45,28 @@ var (
 	// moved by a transfer (internal/portable), so this placement may not run
 	// it or accept new inputs for it.
 	ErrPersonaInactive = errors.New("persona is not active in this placement")
+	// ErrPersonaTransferred marks the terminal 'transferred' authority among
+	// the inactive ones: it is always wrapped together with
+	// ErrPersonaInactive so existing inactive handling keeps matching, while
+	// callers that must tell the person their secretary moved away for good
+	// can test for it with errors.Is.
+	ErrPersonaTransferred = errors.New("persona transferred to another placement")
 	// ErrPersonaBound: a binding request named a human, but the persona is
 	// already bound to a different one — an identity change is a transfer
 	// or a new persona, never a silent rebind.
 	ErrPersonaBound = errors.New("persona is already bound to a different human")
 )
+
+// inactiveAuthorityError reports an inactive persona authority. The terminal
+// 'transferred' authority wraps ErrPersonaTransferred alongside
+// ErrPersonaInactive; the in-flight sealed/staged authorities are reported
+// as plainly inactive.
+func inactiveAuthorityError(authority string) error {
+	if authority == "transferred" {
+		return fmt.Errorf("%w: %w", ErrPersonaInactive, ErrPersonaTransferred)
+	}
+	return fmt.Errorf("%w: persona authority is %s", ErrPersonaInactive, authority)
+}
 
 // dataErr maps deterministic PostgreSQL data errors — class 22 data
 // exceptions (e.g. 22P05 unsupported Unicode escape) and 23514 check
@@ -569,7 +586,7 @@ func bindHuman(ctx context.Context, db queryRower, personaID, humanID string) (P
 			}
 			return Persona{}, fmt.Errorf("%w: bound to %s", ErrPersonaBound, *existing.HumanID)
 		}
-		return Persona{}, fmt.Errorf("%w: persona authority is %s", ErrPersonaInactive, existing.Authority)
+		return Persona{}, inactiveAuthorityError(existing.Authority)
 	}
 	if err != nil {
 		return Persona{}, err
@@ -604,8 +621,25 @@ func (s *Store) ClearModelIntent(ctx context.Context, personaID string) error {
 	case err != nil:
 		return err
 	default:
-		return fmt.Errorf("%w: persona authority is %s", ErrPersonaInactive, authority)
+		return inactiveAuthorityError(authority)
 	}
+}
+
+// PersonaAuthority reports the persona's current placement authority
+// (active, sealed, staged or transferred). It is a read-only lookup for
+// callers that need to distinguish the terminal moved state without
+// mutating anything.
+func (s *Store) PersonaAuthority(ctx context.Context, personaID string) (string, error) {
+	var authority string
+	err := s.pool.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1`, personaID).Scan(&authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrPersonaNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return authority, nil
 }
 
 func (s *Store) persona(ctx context.Context, personaID string) (Persona, error) {
@@ -704,7 +738,7 @@ func (s *Store) AcquireWriter(ctx context.Context, personaID, holderID string, t
 			return lease, err
 		}
 		if authority != "active" {
-			return lease, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
+			return lease, inactiveAuthorityError(authority)
 		}
 		return lease, ErrWriterHeld
 	}
@@ -845,7 +879,7 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 			in.PersonaID, in.InputID, in.Kind, in.Payload, in.ActorKind, in.ActorID,
 			in.SourceSurface, in.ThreadID, in.OccurredAt, in.Attention).Scan(&same)
 		if errors.Is(err, pgx.ErrNoRows) && authority != "active" {
-			return Input{}, false, fmt.Errorf("%w: authority is %s", ErrPersonaInactive, authority)
+			return Input{}, false, inactiveAuthorityError(authority)
 		}
 		if err != nil {
 			return Input{}, false, err

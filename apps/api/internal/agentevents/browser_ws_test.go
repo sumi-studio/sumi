@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
@@ -2955,5 +2956,87 @@ func TestBrowserWebSocketRejectsUnauthorizedSessionsBeforeAnyCloseCode(t *testin
 				t.Fatal("unauthorized dial completed a handshake")
 			}
 		})
+	}
+}
+
+// movedCommandAppender durably allocates the command then reports the
+// transferred persona — the same contract CoreDirectChat.Append has when
+// the durable append commits but the core refuses the input.
+type movedCommandAppender struct{ inner fakeCommandAppender }
+
+func (a *movedCommandAppender) Append(
+	ctx context.Context,
+	provenance DirectChatProvenance,
+	idempotencyKey string,
+	command json.RawMessage,
+) (CommandEnvelope, error) {
+	env, _ := a.inner.Append(ctx, provenance, idempotencyKey, command)
+	return env, fmt.Errorf("%w: %w", agentstate.ErrPersonaInactive, agentstate.ErrPersonaTransferred)
+}
+
+// A command sent to a transferred secretary over the live socket is a
+// terminal moved rejection — the socket stays open and the durable command
+// was recorded for the reconciler's secretary_moved disposition.
+func TestBrowserWebSocketTransferredPersonaRejectsWithMoved(t *testing.T) {
+	gateway := openRuntimeGateway(t)
+	const personalityAgentID = "018f47a2-9b3c-7def-8abc-0123456789ab"
+	sessions, err := NewHMACUserSessionVerifier(testSecret, "", newTestBrowserSessionRevocationStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newAuthorizedBrowserServer(sessions, &movedCommandAppender{}, gateway)
+	server.AllowedOrigins = []string{"https://web.example"}
+	mux := http.NewServeMux()
+	mux.Handle("GET /direct-chat/ws", server)
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+
+	claims := userSessionWireClaims{
+		TenantID:           "tenant-1",
+		UserID:             "user-1",
+		PersonalityAgentID: personalityAgentID,
+		Exp:                time.Now().Add(time.Hour).Unix(),
+		Aud:                defaultBrowserAudience,
+	}
+	conn := dialBrowserWS(t, httpServer, signBrowserSession(t, testSecret, claims), personalityAgentID)
+	defer conn.Close()
+	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
+		t.Fatal(err)
+	}
+	assertDirectChatStatus(t, conn, "unavailable")
+
+	command := browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "moved-command",
+		Command:        json.RawMessage(`{"type":"user_message","text":"are you there","attachments":[]}`),
+	}
+	if err := conn.WriteJSON(command); err != nil {
+		t.Fatal(err)
+	}
+	var rejected browserCommandRejectedFrame
+	if err := conn.ReadJSON(&rejected); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Type != "command_rejected" ||
+		rejected.IdempotencyKey != command.IdempotencyKey ||
+		rejected.RejectReason != RejectSecretaryMoved {
+		t.Fatalf("unexpected moved rejection: %+v", rejected)
+	}
+
+	// The socket stays usable for the terminal answer and the command is
+	// durable — the fake appended before reporting the move.
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "moved-command-2",
+		Command:        json.RawMessage(`{"type":"user_message","text":"still moved","attachments":[]}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second browserCommandRejectedFrame
+	if err := conn.ReadJSON(&second); err != nil {
+		t.Fatal(err)
+	}
+	if second.RejectReason != RejectSecretaryMoved {
+		t.Fatalf("second rejection: %+v", second)
 	}
 }

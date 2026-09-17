@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
@@ -332,7 +333,8 @@ func validBrowserRejectReason(reason RejectReason) bool {
 		RejectOversized,
 		RejectNotAllowed,
 		RejectIdempotencyConflict,
-		RejectUnavailable:
+		RejectUnavailable,
+		RejectSecretaryMoved:
 		return true
 	default:
 		return false
@@ -1168,6 +1170,19 @@ func (s *BrowserServer) browserReadPump(
 					Type:           "command_rejected",
 					IdempotencyKey: frame.IdempotencyKey,
 					RejectReason:   RejectIdempotencyConflict,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
+			if errors.Is(err, agentstate.ErrPersonaTransferred) {
+				// The command is durable in the log; the secretary moved to
+				// another placement for good, so the rejection is terminal
+				// and says where the conversation went.
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   RejectSecretaryMoved,
 				}); writeErr != nil {
 					return writeErr
 				}

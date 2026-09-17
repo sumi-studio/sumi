@@ -333,7 +333,7 @@ export type CommandDispositionEvent =
  * via the `definition` "CommandRejectReason".
  */
 export type CommandRejectReason =
-  "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed";
+  "unknown_command" | "schema_violation" | "attachments_not_empty" | "oversized" | "not_allowed" | "secretary_moved";
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "VolatileAgentEvent".
@@ -1097,7 +1097,8 @@ export interface BrowserCommandRejectedFrame {
     | "oversized"
     | "not_allowed"
     | "idempotency_conflict"
-    | "unavailable";
+    | "unavailable"
+    | "secretary_moved";
 }
 /**
  * placeholder for v1; no attachments are accepted yet

@@ -1113,6 +1113,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DirectChatCommandIdempotencyConflictResponse"
+        "410":
+          description: |
+            The secretary transferred to another placement. The command was
+            durably recorded and is terminally rejected; it will not be
+            answered here and must not be retried on this surface.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectChatCommandMovedResponse"
         "401":
           description: Missing or invalid browser session cookie
         "403":
@@ -2017,6 +2026,25 @@ components:
         reject_reason:
           type: string
           enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+    DirectChatCommandMovedResponse:
+      type: object
+      required: [error, reject_reason]
+      additionalProperties: false
+      properties:
+        error:
+          const: secretary_moved
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        command_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        seq:
+          $ref: "#/components/schemas/JsonSafeInteger"
+        reject_reason:
+          const: secretary_moved
     DirectChatCommandIdempotencyConflictResponse:
       type: object
       required: [error, idempotency_key, reject_reason]

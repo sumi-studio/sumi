@@ -1079,7 +1079,9 @@ $defs:
 
   CommandRejectReason:
     type: string
-    enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed]
+    # secretary_moved: the secretary transferred to another placement; the
+    # rejection is terminal and tells the person where to continue.
+    enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, secretary_moved]
 
   CommandAck:
     type: object
@@ -1204,7 +1206,7 @@ $defs:
         maxLength: 1024
       reject_reason:
         type: string
-        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable]
+        enum: [unknown_command, schema_violation, attachments_not_empty, oversized, not_allowed, idempotency_conflict, unavailable, secretary_moved]
 
   DirectChatStatusFrame:
     oneOf:

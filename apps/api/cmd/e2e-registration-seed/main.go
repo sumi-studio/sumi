@@ -10,10 +10,24 @@
 //	                                 bound to exactly one Human on the Cloud DB
 //	e2e-registration-seed verify-local <persona>  assert Local authority is
 //	                                 transferred (not active) on the Local DB
+//	e2e-registration-seed resolve-synthetic <flow_id>
+//	                                 mark an owned pending sign-up flow as
+//	                                 confirmation_required/create_account with a
+//	                                 synthetic credential. ONLY the external-IdP
+//	                                 verification step is synthesized: the flow's
+//	                                 nonce, enrollment invite binding, and browser
+//	                                 epoch were created by the real POST /auth/flows,
+//	                                 and invite consumption still runs for real at
+//	                                 confirm. The synthetic firebase uid is prefixed
+//	                                 "synthetic-" and can never collide with a real
+//	                                 account credential.
 //
 //	SUMI_E2E_REG_SEED_DATABASE_URL  postgres://... (already migrated)
-//	SUMI_E2E_REG_SEED_EMAIL         invite recipient (invite mode)
-//	SUMI_E2E_REG_SEED_DISPLAY_NAME  optional persona label (secretary mode)
+//	SUMI_E2E_REG_SEED_EMAIL         invite recipient (invite mode); for
+//	                              resolve-synthetic, the verified email when the
+//	                              bound invite carries none
+//	SUMI_E2E_REG_SEED_DISPLAY_NAME  optional persona label (secretary mode) /
+//	                              verified display name (resolve-synthetic)
 package main
 
 import (
@@ -92,6 +106,12 @@ func run(ctx context.Context, args []string) error {
 		fmt.Println(personaID)
 		return nil
 
+	case "resolve-synthetic":
+		if len(args) != 2 {
+			return errors.New("resolve-synthetic requires a flow id")
+		}
+		return resolveSynthetic(ctx, pool, args[1], env("SUMI_E2E_REG_SEED_EMAIL"), env("SUMI_E2E_REG_SEED_DISPLAY_NAME"))
+
 	case "verify":
 		if len(args) != 2 {
 			return errors.New("verify requires a persona id")
@@ -105,8 +125,70 @@ func run(ctx context.Context, args []string) error {
 		return verifyLocal(ctx, pool, args[1])
 
 	default:
-		return errors.New("usage: e2e-registration-seed <invite|secretary|verify|verify-local> [persona]")
+		return errors.New("usage: e2e-registration-seed <invite|secretary|resolve-synthetic|verify|verify-local> [id]")
 	}
+}
+
+// resolveSynthetic turns an owned pending sign-up flow into the state a real
+// POST /auth/flows/resolve produces after a verified OAuth token:
+// confirmation_required + create_account + a verified credential identity.
+// It synthesizes ONLY the external-IdP proof — the flow must already exist,
+// be pending, be a provider sign-up, and carry a live enrollment invite whose
+// email (when set) becomes the verified identity's email so invite
+// consumption at confirm still exercises its real check. Everything else —
+// nonce authority, browser epoch binding, confirm, invite consumption,
+// transfer claim — runs on the unmodified production path.
+func resolveSynthetic(ctx context.Context, pool *pgxpool.Pool, flowID, email, displayName string) error {
+	var inviteID string
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(enrollment_invite_id::text,'')
+		FROM auth_flows
+		WHERE flow_id = $1 AND status = 'pending' AND intent = 'sign_up'
+		  AND channel = 'provider' AND expires_at > now()`,
+		flowID).Scan(&inviteID); err != nil {
+		return fmt.Errorf("flow lookup (must be a live pending provider sign-up): %w", err)
+	}
+	if inviteID == "" {
+		return errors.New("flow carries no enrollment invite — refusing to synthesize an uninvited registration")
+	}
+	var inviteEmail string
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(email,'') FROM enrollment_invites
+		WHERE invite_id = $1 AND revoked_at IS NULL AND consumed_at IS NULL`,
+		inviteID).Scan(&inviteEmail)
+	if err != nil {
+		return fmt.Errorf("invite lookup: %w", err)
+	}
+	verifiedEmail := inviteEmail
+	if verifiedEmail == "" {
+		verifiedEmail = email
+	}
+	if verifiedEmail == "" {
+		return errors.New("invite carries no email; pass SUMI_E2E_REG_SEED_EMAIL for the verified address")
+	}
+	if email != "" && inviteEmail != "" && email != inviteEmail {
+		return fmt.Errorf("given email %q does not match the bound invite email %q", email, inviteEmail)
+	}
+	if displayName == "" {
+		displayName = "Synthetic Registrant"
+	}
+	firebaseUID := "synthetic-" + uuid.Must(uuid.NewV7()).String()
+	tag, err := pool.Exec(ctx, `
+		UPDATE auth_flows SET status='confirmation_required',
+			confirmation_action='create_account', firebase_uid=$2,
+			provider_subject=$3, verified_display_name=$4,
+			verified_email=$5, email_verified=true, proved_at=now()
+		WHERE flow_id=$1 AND status='pending'`,
+		flowID, firebaseUID, "synthetic-"+uuid.Must(uuid.NewV7()).String(),
+		displayName, verifiedEmail)
+	if err != nil {
+		return fmt.Errorf("resolve synthetic: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("flow changed underfoot — not pending anymore")
+	}
+	fmt.Println(firebaseUID)
+	return nil
 }
 
 // verifyCloud asserts the transfer claimed the carried persona: exactly one

@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 )
 
@@ -37,6 +38,11 @@ const (
 	RejectNotAllowed          RejectReason = "not_allowed"
 	RejectIdempotencyConflict RejectReason = "idempotency_conflict"
 	RejectUnavailable         RejectReason = "unavailable"
+	// RejectSecretaryMoved is the terminal rejection for a secretary that
+	// transferred to another placement: the command is durable and recorded
+	// rejected, and the reason tells the person where the conversation went
+	// instead of reading as a generic failure.
+	RejectSecretaryMoved RejectReason = "secretary_moved"
 )
 
 // CommandAppender is the durable command log entry point owned by the T28 API
@@ -276,6 +282,28 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Error:          "idempotency_conflict",
 				IdempotencyKey: idempotencyKey,
 				RejectReason:   RejectIdempotencyConflict,
+			})
+			return
+		}
+		if errors.Is(err, agentstate.ErrPersonaTransferred) {
+			// The command is already durable (env carries its allocated
+			// identity) and the reconciler records it terminally rejected.
+			// The synchronous answer is the same truth: the secretary moved
+			// to another placement for good — 410, not a retryable failure.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error          string       `json:"error"`
+				IdempotencyKey string       `json:"idempotency_key"`
+				CommandID      string       `json:"command_id,omitempty"`
+				Seq            uint64       `json:"seq,omitempty"`
+				RejectReason   RejectReason `json:"reject_reason"`
+			}{
+				Error:          "secretary_moved",
+				IdempotencyKey: idempotencyKey,
+				CommandID:      env.CommandID,
+				Seq:            env.Seq,
+				RejectReason:   RejectSecretaryMoved,
 			})
 			return
 		}

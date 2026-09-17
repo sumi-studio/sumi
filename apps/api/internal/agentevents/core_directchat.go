@@ -611,6 +611,13 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 	if err != nil {
 		return err
 	}
+	// A transferred secretary's commands are all rejected for the same
+	// reason — it moved — regardless of which command shape failed. One
+	// read per sweep keeps the reason honest for every command kind.
+	moved := false
+	if authority, aerr := c.Core.PersonaAuthority(ctx, personaID); aerr == nil {
+		moved = authority == "transferred"
+	}
 	for _, env := range commands {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -632,7 +639,7 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 			case errors.Is(lookupErr, agentstate.ErrInputNotFound):
 				if err := c.ensureMessageInput(ctx, env.Provenance, env); err != nil {
 					if isPermanentCoreSubmitError(err) {
-						if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); aerr != nil {
+						if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", commandRejectReason(err, moved)); aerr != nil {
 							return aerr
 						}
 					} else {
@@ -660,8 +667,12 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 						return aerr
 					}
 				case errors.Is(err, agentstate.ErrApprovalNotFound),
-					errors.Is(err, agentstate.ErrApprovalForbidden):
-					if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); aerr != nil {
+					errors.Is(err, agentstate.ErrApprovalForbidden),
+					errors.Is(err, agentstate.ErrPersonaInactive):
+					// An inactive persona takes no decisions; transferred is
+					// terminal. Close it rejected rather than letting the
+					// command wedge every sweep.
+					if aerr := c.appendDisposition(ctx, personaID, st, env, "rejected", commandRejectReason(err, moved)); aerr != nil {
 						return aerr
 					}
 				default:
@@ -669,7 +680,11 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 				}
 			}
 		} else if !c.hasDisposition(env, st) {
-			if err := c.appendDisposition(ctx, personaID, st, env, "rejected", string(RejectNotAllowed)); err != nil {
+			reason := string(RejectNotAllowed)
+			if moved {
+				reason = string(RejectSecretaryMoved)
+			}
+			if err := c.appendDisposition(ctx, personaID, st, env, "rejected", reason); err != nil {
 				return err
 			}
 		}
@@ -718,6 +733,18 @@ func isPermanentCoreSubmitError(err error) bool {
 		errors.Is(err, agentstate.ErrTurnConflict) ||
 		errors.Is(err, agentstate.ErrBadRequest) ||
 		errors.Is(err, agentstate.ErrPersonaBound)
+}
+
+// commandRejectReason picks the reject_reason for a command's terminal
+// disposition. A secretary transferred to another placement reports
+// secretary_moved — durable history and reconnected browsers then tell the
+// person where the conversation went — while every other permanent refusal
+// stays not_allowed.
+func commandRejectReason(err error, moved bool) string {
+	if moved || errors.Is(err, agentstate.ErrPersonaTransferred) {
+		return string(RejectSecretaryMoved)
+	}
+	return string(RejectNotAllowed)
 }
 
 // ---------------------------------------------------------------------------
