@@ -251,6 +251,7 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
       }
 
       await verifyOriginCancellation(origin, cancellationOrigin);
+      await verifyFilesForwarding(origin, cancellationOrigin);
       await verifyThemeBootstrapInBrowser(origin);
     } finally {
       await stopWrangler(server);
@@ -261,10 +262,18 @@ test("pinned Wrangler dry-run and local workerd enforce the production artifact"
   }
 });
 
+interface FilesRequestObservation {
+  method: string;
+  url: string;
+  headers: { [name: string]: string | string[] | undefined };
+  body: string;
+}
+
 interface CancellationOrigin {
   authority: string;
   requestReceived: Promise<void>;
   subrequestCancelled: Promise<void>;
+  filesRequests: FilesRequestObservation[];
   close(): Promise<void>;
 }
 
@@ -294,7 +303,28 @@ async function startCancellationOrigin(): Promise<CancellationOrigin> {
     resolveSubrequestCancelled = resolvePromise;
   });
   let observed = false;
+  const filesRequests: FilesRequestObservation[] = [];
   const server = createHttpServer((request, response) => {
+    // /files/* answers like the API's file registrar: record the exact
+    // request the edge forwarded and return a typed file-domain response.
+    if (request.url?.startsWith("/files/")) {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        filesRequests.push({
+          method: request.method ?? "",
+          url: request.url ?? "",
+          headers: request.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+        response.writeHead(409, {
+          "Cache-Control": "no-store",
+          "Content-Type": "application/json; charset=utf-8",
+        });
+        response.end(JSON.stringify({ error: "version_conflict" }));
+      });
+      return;
+    }
     if (request.url !== "/auth/cancellation") {
       response.writeHead(404).end();
       return;
@@ -331,6 +361,7 @@ async function startCancellationOrigin(): Promise<CancellationOrigin> {
     authority: `127.0.0.1:${address.port}`,
     requestReceived,
     subrequestCancelled,
+    filesRequests,
     async close() {
       if (!server.listening) return;
       const closed = new Promise<void>((resolveClose) =>
@@ -394,6 +425,61 @@ async function verifyOriginCancellation(
     5_000,
     "workerd did not cancel the private-origin subrequest",
   );
+}
+
+// The file workspace routes are API traffic end to end: real workerd must
+// forward them to the bound origin with the session cookie, the CAS
+// precondition, the idempotency key, and the raw body intact, and return the
+// API's typed answer by identity instead of the SPA document.
+async function verifyFilesForwarding(
+  workerOrigin: string,
+  origin: CancellationOrigin,
+): Promise<void> {
+  const write = await fetch(
+    `${workerOrigin}/files/write?path=%2Fnotes%2Fa.txt&installation_id=inst-1&authority_epoch=7`,
+    {
+      method: "PUT",
+      headers: {
+        Cookie: "session=edge-fixture",
+        "Content-Type": "application/octet-stream",
+        "If-Version": "none",
+        "X-Idempotency-Key": "edge-1",
+      },
+      body: "file-bytes",
+    },
+  );
+  assert.equal(write.status, 409);
+  assert.equal(write.headers.get("Cache-Control"), "no-store");
+  assert.deepEqual(await write.json(), { error: "version_conflict" });
+
+  const list = await fetch(
+    `${workerOrigin}/files/list?path=%2F&limit=50&installation_id=inst-1&authority_epoch=7`,
+    { headers: { Cookie: "session=edge-fixture" } },
+  );
+  assert.equal(list.status, 409);
+
+  assert.equal(origin.filesRequests.length, 2);
+  const [writeSeen, listSeen] = origin.filesRequests;
+  assert.equal(writeSeen.method, "PUT");
+  assert.equal(
+    writeSeen.url,
+    "/files/write?path=%2Fnotes%2Fa.txt&installation_id=inst-1&authority_epoch=7",
+  );
+  assert.equal(writeSeen.headers.cookie, "session=edge-fixture");
+  assert.equal(writeSeen.headers["if-version"], "none");
+  assert.equal(writeSeen.headers["x-idempotency-key"], "edge-1");
+  assert.equal(writeSeen.body, "file-bytes");
+  assert.equal(listSeen.method, "GET");
+  assert.equal(
+    listSeen.url,
+    "/files/list?path=%2F&limit=50&installation_id=inst-1&authority_epoch=7",
+  );
+
+  // The bare namespace is the worker's canonical denial, never an SPA
+  // document and never an origin request.
+  const bare = await manualFetch(workerOrigin, "/files");
+  assert.ok(isCanonicalWorkerDenial(bare));
+  assert.equal(origin.filesRequests.length, 2);
 }
 
 async function within<T>(
