@@ -30,6 +30,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/feedback"
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -758,6 +759,30 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		browser.SetAppender(coreDirectChat)
 		log.Print("direct chat commands and replies run through the core state service (SUMI_DIRECT_CHAT_BACKEND=core)")
+	}
+	// Canonical workspace files: one internal filesvc credential held
+	// server-side. The person-facing /files/* routes derive their scope from
+	// the verified session's PAID; the secretary's file.* effects scope to
+	// the persona the core operation ledger claims. Neither face accepts a
+	// caller-supplied scope. Unset config disables both faces cleanly.
+	filesClient, err := fileaccess.FromEnv(os.Getenv)
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
+	if filesClient != nil {
+		browser.Files = filesClient
+		browser.RegisterFileRoutes(mux)
+		log.Print("person file routes ready (/files/*, session-scoped to canonical filesvc)")
+		if coreServer != nil {
+			for tool, effect := range fileaccess.FileEffects(filesClient) {
+				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
+					closeOnError()
+					return nil, fmt.Errorf("register core file effect %s: %w", tool, err)
+				}
+			}
+			log.Print("core file tools ready (file.* effects scoped to the claiming persona)")
+		}
 	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())

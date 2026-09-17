@@ -622,6 +622,126 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       },
     },
   },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.stat",
+    description:
+      "Stat one path in your private workspace. Returns kind, size, mtime_ns, the service version used for file.write's expect_version, and external_change. A read, not a side effect.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "workspace-relative path" },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.list",
+    description:
+      "List one directory in your private workspace. Returns a bounded page of entries; when next_cursor is present, call again with that cursor for the rest. Omit path or pass \"/\" for the workspace root. A read, not a side effect.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "workspace-relative directory (default root)",
+        },
+        limit: {
+          type: "integer",
+          description: "optional page size (at most 200)",
+        },
+        cursor: {
+          type: "string",
+          description: "opaque next_cursor from a previous page",
+        },
+      },
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.read",
+    description:
+      "Read a page of one file in your private workspace. Text comes back as content_text, binary as content_base64. Page large files with offset (next offset = offset + bytes returned; has_more says whether more remains). Returns the file's version for use with file.write's expect_version.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "workspace-relative path" },
+        offset: {
+          type: "integer",
+          description: "byte offset to read from (default 0)",
+        },
+        len: {
+          type: "integer",
+          description: "page size in bytes (at most 1048576)",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.write",
+    description:
+      "Create or replace a file in your private workspace. Content is at most 2 MiB: pass it as content_text (UTF-8) or content_base64. Writes carry an explicit version predicate — expect_version \"none\" creates only (the default), or pass the version from file.stat/file.read to overwrite exactly that version. A stale version fails rather than silently clobbering; unconditional overwrites are refused because a retried write could not tell its own landed bytes from someone else's.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "workspace-relative path" },
+        content_text: {
+          type: "string",
+          description: "UTF-8 file content",
+        },
+        content_base64: {
+          type: "string",
+          description: "file content, base64-encoded (for binary)",
+        },
+        expect_version: {
+          type: ["string", "integer"],
+          description:
+            "\"none\" to create-only (default), or the version integer this write must replace",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.mkdir",
+    description:
+      "Create a directory (and any missing parents) in your private workspace. Returns the directory's version.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "workspace-relative directory" },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    internal: true,
+    delegated: true,
+    name: "file.remove",
+    description:
+      "Remove a file or directory in your private workspace. Without expect_version the remove is unconditional; pass a version integer to remove only if unchanged since you saw it.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "workspace-relative path" },
+        expect_version: {
+          type: "integer",
+          description:
+            "optional version integer the path must still be at to remove",
+        },
+      },
+      required: ["path"],
+    },
+  },
 ];
 
 /**
