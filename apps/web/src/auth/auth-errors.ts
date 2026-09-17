@@ -72,6 +72,8 @@ const emailErrorMessages: Record<string, string> = {
   continued_in_other_browser:
     "このログインは別のブラウザで続行されました。こちらで続ける場合は、もう一度メールアドレスを入力してください。",
   email_unavailable: "メールでのログインは現在利用できません。",
+  email_recovery_unavailable:
+    "このメールアドレスは別のログイン方法で登録されています。メールでの確認は現在利用できないため、以前に使った方法でログインしてください。",
   session_active:
     "別のアカウントでログインしています。切り替える場合は、現在のセッションを終了してください。",
   flow_consumed: "このログインはすでに完了しています。",

@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
 type fakeFirebaseProviderLifecycle struct {
@@ -70,11 +72,13 @@ func TestProviderUnlinkIsBackendOwnedAndCountsOnlyProvedMethods(t *testing.T) {
 	}
 	providers := &fakeFirebaseProviderLifecycle{accounts: map[string]firebaseProviderAccount{
 		"unlink-uid": {
-			UID: "unlink-uid", EmailProvider: true,
+			UID: "unlink-uid", EmailVerified: true,
 			ProviderSubjects: map[string]string{"github.com": "github-subject", "facebook.com": "unsupported"},
 		},
 	}}
 	controller := newKosekiAuthFlowController(store, "local", providers)
+	// Proved email counts as a method only while the email channel is enabled.
+	controller.email = &emailCodeController{}
 	now := time.Now().UTC()
 	controller.clock = func() time.Time { return now }
 	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
@@ -756,4 +760,105 @@ func controllerNonce(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// Without a configured sender the OAuth providers and the registration choice
+// keep working; only the email channel itself is off.
+func TestProviderRegistrationAndMethodsWithoutEmailSender(t *testing.T) {
+	pool := kosekiResolverTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	// The transfer choice gate is independent of the sender: wire the service
+	// so the sign-up below must still park at create-account confirmation.
+	store.Transfers = transfersession.New(pool, transfersession.Config{})
+	providers := &fakeFirebaseProviderLifecycle{accounts: map[string]firebaseProviderAccount{}}
+	controller := newKosekiAuthFlowController(store, "local", providers)
+	// controller.email stays nil — the sender is not configured.
+
+	// email_code refuses honestly instead of starting a flow that can never
+	// deliver.
+	if _, err := controller.Start(ctx, agentevents.StartBrowserAuthFlowRequest{
+		Intent: "sign_in", Provider: "email_code", Email: "nobody@example.com",
+		Continuation: "/direct-chat", Nonce: controllerNonce(t),
+	}); !errors.Is(err, agentevents.ErrBrowserEmailUnavailable) {
+		t.Fatalf("email start without sender: %v", err)
+	}
+
+	// An invited OAuth sign-up reaches the same create-account choice and
+	// provisions on confirm — nothing consults the email surface.
+	issuer := uuid.Must(uuid.NewV7()).String()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO humans(human_id,display_name) VALUES($1,'no-sender issuer')`, issuer); err != nil {
+		t.Fatalf("issuer: %v", err)
+	}
+	normalized, err := koseki.NormalizeEmail("oauth-signup@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, inviteToken, err := store.IssueEnrollmentInvite(ctx, issuer, normalized, time.Hour)
+	if err != nil {
+		t.Fatalf("issue invite: %v", err)
+	}
+	nonce := controllerNonce(t)
+	started, err := controller.Start(ctx, agentevents.StartBrowserAuthFlowRequest{
+		InviteToken: inviteToken, Intent: "sign_up", Provider: "google.com",
+		Continuation: "/direct-chat", Nonce: nonce,
+	})
+	if err != nil || started.Outcome != "proof_required" || started.FlowID == "" {
+		t.Fatalf("provider start without sender: %+v %v", started, err)
+	}
+	resolved, err := controller.Resolve(ctx, agentevents.ResolveBrowserAuthFlowRequest{
+		FlowID: started.FlowID, Nonce: nonce,
+	}, agentevents.FirebaseIdentity{
+		UID: "oauth-signup-uid", SignInProvider: "google.com",
+		Email: "oauth-signup@example.com", EmailVerified: true,
+		ProviderSubjects: map[string][]string{"google.com": {"google-subject"}},
+		IssuedAt:         time.Now(),
+	})
+	if err != nil || resolved.Outcome != "confirmation_required" || resolved.NextAction != "create_account" {
+		t.Fatalf("provider resolve without sender: %+v %v", resolved, err)
+	}
+	confirmed, err := controller.Confirm(ctx, agentevents.ConfirmBrowserAuthFlowRequest{
+		FlowID: started.FlowID, Nonce: nonce, Action: "create_account",
+	})
+	if err != nil || confirmed.Outcome != "account_created" {
+		t.Fatalf("provider confirm without sender: %+v %v", confirmed, err)
+	}
+
+	// An account whose live Firebase profile carries a verified address — with
+	// a completed email proof — reports no usable email method while the
+	// channel is off, so neither settings nor the unlink guard count a method
+	// that cannot sign in.
+	const uid = "verified-email-uid"
+	registered, err := store.AutoRegister(ctx, "firebase", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	providers.accounts[uid] = firebaseProviderAccount{
+		UID: uid, EmailVerified: true, ProviderSubjects: map[string]string{},
+	}
+	proofNonce := controllerNonce(t)
+	proofNormalized, err := koseki.NormalizeEmail("password-provider@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := store.StartAuthFlow(ctx, koseki.StartAuthFlowRequest{
+		Intent: koseki.IntentSignIn, Channel: koseki.ChannelEmailLink,
+		ExpectedProvider: "password", NormalizedEmail: proofNormalized,
+		Continuation: "/direct-chat", Nonce: proofNonce, TTL: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveAuthProof(ctx, proof.FlowID, proofNonce, koseki.VerifiedIdentity{
+		FirebaseUID: uid, NormalizedEmail: proofNormalized, EmailVerified: true, SignInProvider: "password",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claims := agentevents.UserSessionClaims{UserID: registered.HumanID, PersonalityAgentID: registered.AgentID, TenantID: "local"}
+	methods, err := controller.ProviderMethods(ctx, claims)
+	if err != nil || methods.Email || len(methods.Providers) != 0 {
+		t.Fatalf("proved email counted while sender absent: %+v %v", methods, err)
+	}
 }

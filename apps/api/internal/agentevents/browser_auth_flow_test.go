@@ -471,3 +471,37 @@ func TestProviderOperationSagaErrorsExposeRetryableSemanticCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestSignInMethodsReportMountedProvidersAnonymously(t *testing.T) {
+	server, _ := newTestBrowserAuthServer(t, &fakeFirebaseVerifier{}, &fakeBindingResolver{})
+	server.Flows = &fakeAuthFlowController{}
+
+	read := func(mux *http.ServeMux, origin string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, "/auth/methods", nil)
+		if origin != "" {
+			request.Header.Set("Origin", origin)
+		}
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, request)
+		return recorder
+	}
+	mux := http.NewServeMux()
+	server.RegisterRoutes(mux)
+	if got := read(mux, "https://evil.example"); got.Code != http.StatusForbidden {
+		t.Fatalf("foreign origin: %d %s", got.Code, got.Body.String())
+	}
+	// Anonymous callers learn the deployment's providers: OAuth always mounts
+	// with the flow surface; email_code only while its controller does.
+	if got := read(mux, browserAuthTestOrigin); got.Code != http.StatusOK ||
+		got.Body.String() != "{\"methods\":[\"github.com\",\"google.com\"]}\n" ||
+		got.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("email disabled: %d %q", got.Code, got.Body.String())
+	}
+	server.EmailFlows = &fakeEmailAuthController{}
+	enabled := http.NewServeMux()
+	server.RegisterRoutes(enabled)
+	if got := read(enabled, browserAuthTestOrigin); got.Code != http.StatusOK ||
+		got.Body.String() != "{\"methods\":[\"email_code\",\"github.com\",\"google.com\"]}\n" {
+		t.Fatalf("email enabled: %d %q", got.Code, got.Body.String())
+	}
+}

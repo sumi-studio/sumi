@@ -223,10 +223,7 @@ describe("provider settings", () => {
     // browser already removed remotely.
     settingsMocks.currentUser = {
       uid: "firebase-user-a",
-      providerData: [
-        { providerId: "password" },
-        { providerId: "github.com" },
-      ],
+      providerData: [{ providerId: "password" }, { providerId: "github.com" }],
     };
     settingsMocks.getProviderMethods.mockResolvedValue({
       providers: [],
@@ -1183,6 +1180,83 @@ describe("provider settings", () => {
       { timeout: 2_500 },
     );
     expect(screen.getByRole("alert")).not.toHaveTextContent("Failed to fetch");
+  });
+
+  it("never advises the email fallback while the methods read is unanswered", async () => {
+    // The password entry keeps the unlink enabled, but it is not a managed
+    // reauth path — and with the server read failed, email availability is
+    // unknown too, so no fallback may be promised.
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    setSignInClaims("google.com", 3_600);
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "再認証して解除" }),
+    );
+
+    await waitFor(() =>
+      // The confirm dialog stays open on failure; the alert renders behind it.
+      expect(
+        screen.getByText(/利用できるログイン方法を確認できなかったため/),
+      ).toBeInTheDocument(),
+    );
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
+  });
+
+  it("still advises the email-code fallback when the server confirms it usable", async () => {
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "password" }, { providerId: "google.com" }],
+    };
+    settingsMocks.getProviderMethods.mockResolvedValue({
+      providers: ["google.com"],
+      email: true,
+    });
+    setSignInClaims("google.com", 3_600);
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "再認証して解除" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/メールの確認コードで再ログインしてから5分以内/),
+      ).toBeInTheDocument(),
+    );
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
+  });
+
+  it("explains email is not a usable fallback when the server reports it off", async () => {
+    // An unmanaged provider entry keeps this unlink allowed, but the only
+    // managed alternate is GitHub — not linked — and email is off.
+    settingsMocks.currentUser = {
+      uid: "firebase-user-a",
+      providerData: [{ providerId: "apple.com" }, { providerId: "google.com" }],
+    };
+    settingsMocks.getProviderMethods.mockResolvedValue({
+      providers: ["google.com"],
+      email: false,
+    });
+    setSignInClaims("google.com", 3_600);
+    render(<ProviderSettings humanId="human-a" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Googleの解除を開始" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "再認証して解除" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/メールでのログインは現在利用できないため/),
+      ).toBeInTheDocument(),
+    );
+    expect(settingsMocks.reauthenticateWithRedirect).not.toHaveBeenCalled();
   });
 
   it("explains and disables removal of the final Firebase login method", () => {
