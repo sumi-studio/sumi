@@ -12,7 +12,7 @@ readonly POSTGRES_COMPOSE_FILE="${REPOSITORY_ROOT}/deploy/local/compose.yaml"
 readonly COMPOSE_POSTGRES_DB_URL="postgres://sumi:sumi-dev@127.0.0.1:5432/sumi?sslmode=disable"
 
 ENV_FILE="${SUMI_LOCAL_ENV_FILE:-${DEFAULT_ENV_FILE}}"
-RUNTIME_MODE="${SUMI_DEV_RUNTIME:-rust}"
+RUNTIME_MODE="${SUMI_DEV_RUNTIME:-core}"
 CHECK_ONLY=0
 RUNTIME_ROOT=
 PUBLIC_HOST=
@@ -33,14 +33,15 @@ fail() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev/real-stack [--check] [--env-file PATH] [--runtime rust|core]
+Usage: scripts/dev/real-stack [--check] [--env-file PATH] [--runtime core|rust]
 
 Starts the real local Sumi API, the secretary runtime, and the Vite frontend.
-The default `rust` runtime keeps the working tool-executor + PersonalityAgent
-launch. `--runtime core` (SUMI_DEV_RUNTIME=core, `make dev-core`) runs each
-secretary on the accepted TypeScript core (apps/core) driven by the API's
-wake sweep, with Messaging and Direct Chat served through the durable core
-state service. --check validates credentials and identity configuration
+The default `core` runtime (make dev) runs each secretary on the accepted
+TypeScript core (apps/core) driven by the API's wake sweep, with Messaging
+and Direct Chat served through the durable core state service.
+`--runtime rust` (SUMI_DEV_RUNTIME=rust, `make dev-rust`) keeps the
+tool-executor + PersonalityAgent launch as an explicit diagnostic and
+comparison path. --check validates credentials and identity configuration
 without building or starting processes.
 EOF
 }

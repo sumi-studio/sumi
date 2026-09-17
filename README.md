@@ -23,7 +23,7 @@ Sumi is in alpha. The Description above is the goal. Today there are three separ
 |---|---|---|
 | **Hosted alpha Web app** | The existing Web app, with invite-only sign-in, Workspaces and Messaging. | Invited developers and testers only; there is no public sign-up. Integration with the new secretary core is still being verified. |
 | **[Local host](#try-the-local-host)** | The new secretary core on one Linux or WSL machine, without a Sumi Cloud account. | Anyone who installs it from a source checkout. Its browser page and `say` command are engineering surfaces, not the product UI. |
-| **[Web app from source](#run-the-web-app-from-source)** | The full Web app — sign-in, Workspaces, Messaging and settings — with one secretary on the Rust agent runtime. | Developers with their own Firebase project and model-provider credentials. |
+| **[Web app from source](#run-the-web-app-from-source)** | The full Web app — sign-in, Workspaces, Messaging and settings — with secretaries on the TypeScript secretary core. | Developers with their own Firebase project; no model credential is needed for the default deterministic provider. |
 
 ### The new secretary core
 
@@ -37,7 +37,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 ### Not available yet
 
-- **Using the full Web app on the new core as a product.** `make dev-core` runs the Web app on the new core for development. Direct Chat runs on the core; Messaging's core path currently covers attention intake and secretary replies only — shared Messaging history/search and accepting workspace invitations are still served by the existing surfaces, not the core. Connecting it for everyday use is still being verified.
+- **Using the hosted Web app on the new core as a product.** `make dev` runs the Web app from source on the new core for development — Direct Chat, shared Messaging history/search/post/edit, and workspace invitations all run through the durable core. The hosted alpha Web app is still integrating it.
 - **Moving a secretary from Local to Cloud.** The state-transfer foundation for continuing as the same individual is in the source ([portable state](docs/agent/portable-state.md)), but there is no end-to-end way to move a secretary yet.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
@@ -65,9 +65,9 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 ## Run the Web app from source
 
-`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the Rust agent runtime and tool executor (`apps/agent`), and Vite. `make dev-core` runs the same app on the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — while its Direct Chat adoption is being proven.
+`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — and Vite. `make dev-rust` keeps the Rust agent runtime and tool executor (`apps/agent`) as an explicit diagnostic path.
 
-Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials; Rust stable and model-provider credentials for the conversation model and two separate review models. `make dev-core` needs no model credential for the default deterministic provider.
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. The default core runtime needs no model credential (deterministic `mock` provider); `make dev-rust` additionally requires Rust stable and model-provider credentials for the conversation model and two separate review models.
 
 ```sh
 make setup

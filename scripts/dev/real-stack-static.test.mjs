@@ -392,22 +392,21 @@ test("the supported launcher gates API, executor, runtime Ready, then Vite", asy
   );
 });
 
-test("the explicit core runtime wires the dev pool to the wake sweep", async () => {
+test("the default core runtime wires the dev pool to the wake sweep", async () => {
   const launcher = await source("scripts/dev/real-stack");
 
-  // The documented entrypoint keeps the working Rust runtime as the default;
-  // the new core is deliberately opt-in until ordinary Direct Chat adoption
-  // is accepted.
-  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-rust\}"/);
-  assert.match(launcher, /--runtime rust\|core/);
+  // The documented entrypoint runs the accepted TypeScript core by default;
+  // the Rust runtime is the explicit diagnostic path.
+  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-core\}"/);
+  assert.match(launcher, /--runtime core\|rust/);
   assert.match(
     launcher,
     /fail "--runtime must be core or rust \(got \$\{RUNTIME_MODE\}\)"/,
   );
 
-  // Validation is split: the Rust branch still requires the single-agent
-  // identity and provider key contract, while the core branch validates the
-  // provider-env contract apps/core actually consumes.
+  // Validation is split: the Rust diagnostic branch still requires the
+  // single-agent identity and provider key contract, while the default core
+  // branch validates the provider-env contract apps/core actually consumes.
   const rustValidator = launcherFunction(
     launcher,
     "validate_rust_runtime_configuration",
@@ -548,11 +547,11 @@ test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async
   ]);
   assert.match(
     makefile,
-    /dev: ## Start the supported authenticated local Sumi stack \(Rust runtime for now\)/,
+    /dev: ## Start the supported authenticated local Sumi stack \(TypeScript core\)/,
   );
   assert.match(
     makefile,
-    /dev-core: ## Start the stack on the accepted TypeScript secretary core\n\tpnpm dev:core/,
+    /dev-rust: ## Start the stack on the Rust PersonalityAgent runtime \(diagnostic path\)/,
   );
   const scripts = JSON.parse(packageJSON).scripts;
   assert.equal(scripts.dev, "bash scripts/dev/real-stack");
