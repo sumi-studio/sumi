@@ -174,6 +174,11 @@ type Receipt struct {
 	// asserting differently conflicts rather than silently changing what
 	// was staged.
 	SameHuman bool `json:"same_human,omitempty"`
+	// Supersedes records the completed export transfer whose surrendered
+	// copy this import replaced — the lineage evidence that this staging
+	// was a same-secretary reclaim, not a first arrival. Empty on an
+	// ordinary import into an absent persona slot.
+	Supersedes string `json:"supersedes,omitempty"`
 	// PriorModelIntent is export-side bookkeeping: the intent the seal's
 	// snapshot replaced, so Abort can restore the source's pre-transfer
 	// semantics — NULL for a persona that never arrived by transfer, the

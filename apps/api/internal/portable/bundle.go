@@ -263,6 +263,23 @@ const personaInsertSQL = `
 		NULLIF(d->>'model_intent', 'null')::jsonb, 'staged', $3
 	FROM (SELECT $1::jsonb AS d) r`
 
+// personaReclaimSQL is the reclaim counterpart of personaInsertSQL: the
+// surrendered copy's row is updated in place so placement-local records
+// that reference it — finished jobs, usage facts, call state, none of
+// which travel — stay attached to the same persona id while the carried
+// rowset is replaced by the bundle's. The precondition under the persona
+// lock already proved authority='transferred'; asserting it again in the
+// WHERE clause means a slot that stopped qualifying mid-transaction fails
+// loudly rather than importing into it.
+const personaReclaimSQL = `
+	UPDATE core_personas p
+	SET human_id = $2, display_name = d->>'display_name',
+		created_at = (d->>'created_at')::timestamptz,
+		model_intent = NULLIF(d->>'model_intent', 'null')::jsonb,
+		authority = 'staged', transfer_id = $3
+	FROM (SELECT $1::jsonb AS d) r
+	WHERE p.persona_id = (d->>'persona_id')::uuidv7 AND p.authority = 'transferred'`
+
 // Import stages a bundle addressed to this placement. Everything happens in
 // one transaction: rows are inserted as they stream, then the trailer's
 // counts and digest, the cut positions and reference integrity are verified,
@@ -286,6 +303,51 @@ const personaInsertSQL = `
 // Decided-and-consumed and denied approvals are receipts/history and keep
 // their state; pending approvals stay pending either way.
 func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, sameHuman bool) (Receipt, bool, error) {
+	return s.importBundle(ctx, r, humanID, sameHuman, "")
+}
+
+// ImportReturning stages a bundle addressed to this placement for a persona
+// that may already live here as a surrendered copy — the return journey, in
+// which the destination of an earlier transfer sends the same individual
+// back to the placement it left.
+//
+// supersedes is the caller's lineage assertion: the export transfer under
+// which this placement gave the persona up. When the persona slot is absent
+// the call is exactly Import — the fresh-target case needs no lineage, the
+// assertion is vacuous, and the recorded receipt carries Supersedes="".
+// When the slot holds a row it must be this persona in 'transferred'
+// authority, held by the named export whose ledger row is 'completed': the
+// provably surrendered frozen copy. Anything else — an active, sealed or
+// staged persona, a different transfer's hold, or a surrender this
+// placement never completed — is refused, so a return never overwrites a
+// live or unrelated secretary and never replaces a copy whose outbound
+// transfer is still in flight.
+//
+// On replay the recorded lineage is asserted like the other admission
+// parameters: a staging that was an actual reclaim answers a different
+// non-empty supersedes with a conflict, while an absent-slot staging
+// recorded no lineage and accepts any assertion, and an ordinary Import
+// retry asserts nothing and returns the truthful recorded receipt.
+//
+// Reclaim replaces the carried rowset inside the import transaction: every
+// carried table's rows of the frozen copy are deleted and the bundle's rows
+// take the slot, in bundle order exactly as a fresh import lays them down.
+// The persona row itself is updated in place, so placement-local records
+// that reference it but never travel — finished jobs, usage facts, call
+// state — stay attached to the same persona id; the surrendered copy's
+// parked writer lease is deleted and re-minted at the new cut's epoch
+// floor. core_transfers has no persona FK, so the completed export receipt
+// and every earlier transfer's lineage survive untouched. Any bundle
+// failure — truncation, a changed byte, a dangling reference — rolls the
+// whole replacement back to the untouched frozen copy.
+func (s *Service) ImportReturning(ctx context.Context, r io.Reader, humanID *string, sameHuman bool, supersedes string) (Receipt, bool, error) {
+	if supersedes != "" && !transferIDRe.MatchString(supersedes) {
+		return Receipt{}, false, fmt.Errorf("%w: supersedes must be an export transfer id", ErrBadRequest)
+	}
+	return s.importBundle(ctx, r, humanID, sameHuman, supersedes)
+}
+
+func (s *Service) importBundle(ctx context.Context, r io.Reader, humanID *string, sameHuman bool, supersedes string) (Receipt, bool, error) {
 	if humanID != nil && !uuidv7Re.MatchString(*humanID) {
 		return Receipt{}, false, fmt.Errorf("%w: human_id must be a uuidv7", ErrBadRequest)
 	}
@@ -344,17 +406,40 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported with a different human_id",
 				ErrTransferConflict, hdr.TransferID)
 		}
+		// Lineage replays like the other admission parameters: when the
+		// staging was an actual reclaim, its recorded supersedes is what
+		// the slot decision was made under, and a different non-empty
+		// assertion conflicts rather than silently answering with the
+		// original lineage. An absent-slot staging recorded no lineage —
+		// supersedes was vacuous then, so any assertion on replay is
+		// consistent with what ran. An empty assertion (an ordinary
+		// Import call replaying a reclaim) asserts nothing and returns
+		// the truthful recorded receipt.
+		if prior.Supersedes != "" && supersedes != "" && supersedes != prior.Supersedes {
+			return Receipt{}, false, fmt.Errorf("%w: transfer %s was imported as the return of export %s",
+				ErrTransferConflict, hdr.TransferID, prior.Supersedes)
+		}
 	}
+	reclaim := false
 	if !replay {
-		var authority string
-		err := tx.QueryRow(ctx,
-			`SELECT authority FROM core_personas WHERE persona_id = $1`, hdr.PersonaID).Scan(&authority)
-		if err == nil {
+		// The persona row lock serializes the slot decision with seal,
+		// complete and any concurrent import: a copy that qualifies as
+		// surrendered stays surrendered until this transaction commits or
+		// rolls back.
+		authority, held, err := lockPersona(ctx, tx, hdr.PersonaID)
+		switch {
+		case errors.Is(err, ErrPersonaNotFound):
+			// Absent slot — the ordinary fresh-destination case.
+		case err != nil:
+			return Receipt{}, false, err
+		case supersedes == "":
 			return Receipt{}, false, fmt.Errorf("%w (authority %s); a transfer never overwrites or duplicates a secretary",
 				ErrPersonaExists, authority)
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return Receipt{}, false, err
+		default:
+			if err := prepareReclaim(ctx, tx, hdr.PersonaID, supersedes, authority, held); err != nil {
+				return Receipt{}, false, err
+			}
+			reclaim = true
 		}
 		if err := checkDestinationSchema(ctx, tx); err != nil {
 			return Receipt{}, false, err
@@ -417,8 +502,23 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 		}
 		if !replay {
 			if idx == 0 {
-				_, err = tx.Exec(ctx, personaInsertSQL, json.RawMessage(row.Data), humanID, hdr.TransferID)
-				err = personaInsertErr(err)
+				if reclaim {
+					var tag pgconn.CommandTag
+					tag, err = tx.Exec(ctx, personaReclaimSQL, json.RawMessage(row.Data), humanID, hdr.TransferID)
+					switch {
+					case err != nil:
+						err = insertErr(personaTable.name, err)
+					case tag.RowsAffected() != 1:
+						// The persona lock held since the precondition makes
+						// this unreachable; fail loudly rather than stage a
+						// slot that stopped qualifying mid-transaction.
+						err = fmt.Errorf("%w: surrendered copy of persona %s changed during reclaim",
+							ErrTransferConflict, hdr.PersonaID)
+					}
+				} else {
+					_, err = tx.Exec(ctx, personaInsertSQL, json.RawMessage(row.Data), humanID, hdr.TransferID)
+					err = personaInsertErr(err)
+				}
 			} else {
 				_, err = tx.Exec(ctx, t.insertSQL(), json.RawMessage(row.Data))
 				err = insertErr(t.name, err)
@@ -543,6 +643,12 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 		NotIncluded: NotIncluded,
 		UpdatedAt:   now.UTC(),
 	}
+	// Supersedes is the durable record that this staging was a same-
+	// secretary reclaim — it replaced the surrendered copy of the named
+	// completed export — rather than a first arrival into an absent slot.
+	if reclaim {
+		rec.Supersedes = supersedes
+	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		return Receipt{}, false, err
@@ -554,6 +660,57 @@ func (s *Service) Import(ctx context.Context, r io.Reader, humanID *string, same
 		return Receipt{}, false, fmt.Errorf("record transfer: %w", err)
 	}
 	return rec, true, tx.Commit(ctx)
+}
+
+// prepareReclaim verifies that the persona occupying this slot is the
+// surrendered copy of a completed export — the provably frozen state a
+// returning secretary may replace — and clears its carried rowset inside
+// the import transaction. The caller holds the persona row lock, so the
+// qualifying state cannot change before commit.
+//
+// The persona row itself is kept: placement-local records that reference
+// it — finished jobs, usage facts, call state — are this install's own
+// history, not the frozen copy's carried state, and stay attached to the
+// same persona id. core_transfers has no persona FK, so the completed
+// export receipt and every earlier transfer's evidence survive. The parked
+// writer lease is the surrendered copy's execution authority rather than
+// lineage, so it is deleted and the import re-mints the epoch floor at the
+// new bundle's cut.
+//
+// Refusals are the contract's guard rail: an active, sealed or staged copy
+// is not surrendered (a sealed persona is a live outbound transfer, a
+// staged one is an in-flight inbound transfer), a hold by any transfer
+// other than supersedes is the wrong lineage, and the named export must be
+// 'completed' for this persona — a merely-sealed export means the copy is
+// still owed activation evidence, and an aborted one already returned
+// authority to this placement.
+func prepareReclaim(ctx context.Context, tx pgx.Tx, personaID, supersedes, authority string, held *string) error {
+	if authority != "transferred" || !heldBy(held, supersedes) {
+		return fmt.Errorf("%w: persona %s is %s here, not the surrendered copy of export %s; "+
+			"a returning transfer never overwrites an active or unrelated secretary",
+			ErrTransferConflict, personaID, authority, supersedes)
+	}
+	exp, err := ledger(ctx, tx, "export", supersedes, false)
+	if err != nil {
+		return err
+	}
+	if exp.Status != "completed" || exp.PersonaID != personaID {
+		return fmt.Errorf("%w: export %s is %s; reclaim requires the completed surrender of persona %s",
+			ErrTransferConflict, supersedes, exp.Status, personaID)
+	}
+	// Delete in reverse contract order: turns, plans and approvals reference
+	// inputs, so dependents clear before the rows they point at.
+	for i := len(coreTables) - 1; i >= 0; i-- {
+		t := coreTables[i]
+		if _, err := tx.Exec(ctx, `DELETE FROM `+t.name+` WHERE persona_id = $1`, personaID); err != nil {
+			return fmt.Errorf("clear surrendered %s: %w", t.name, err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM core_writer_leases WHERE persona_id = $1`, personaID); err != nil {
+		return fmt.Errorf("clear surrendered writer lease: %w", err)
+	}
+	return nil
 }
 
 func checkHeader(h Header) error {
