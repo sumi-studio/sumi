@@ -182,7 +182,7 @@ const tombstoneColdScanInterval = time.Hour
 // be skipped or delayed by competing reconcile work or errors, so no
 // fixed convergence time is claimed. Per-scope cost is a full
 // recursive directory enumeration — every entry, not only staged
-// names — bounded by depth 32.
+// names — bounded by depth 256.
 const stageSweepInterval = 30 * time.Second
 
 func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {

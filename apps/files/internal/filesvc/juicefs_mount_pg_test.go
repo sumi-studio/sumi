@@ -8,10 +8,12 @@ package filesvc
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func jfsRoot(t *testing.T) string {
@@ -21,6 +23,32 @@ func jfsRoot(t *testing.T) string {
 		t.Skip("FILESV_TEST_JFSROOT not set — JuiceFS mount tests skipped")
 	}
 	return r
+}
+
+// jfsScope returns a scope name unique to this test invocation and
+// registers removal of only that scope's directory under the shared
+// mount root. resetTables clears the DB but not the filesystem, so
+// -count=N runs and back-to-back reruns must never reuse fixed paths or
+// require cleaning other runs' residue.
+func jfsScope(t *testing.T, root string) string {
+	t.Helper()
+	scope := fmt.Sprintf("jfs%x", time.Now().UnixNano())
+	t.Cleanup(func() { os.RemoveAll(filepath.Join(root, scope)) })
+	return scope
+}
+
+// jfsScopeRecoverIntents counts recover intents minted for this scope
+// only — the sweep walks every scope dir on a reused mount, so residue
+// elsewhere must not leak into the assertion.
+func jfsScopeRecoverIntents(t *testing.T, s *Store, scope string) int {
+	t.Helper()
+	var n int
+	if err := s.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM file_op WHERE root=$1 AND op='recover' AND scope=$2`,
+		s.rootID, scope).Scan(&n); err != nil {
+		t.Fatalf("count recover intents: %v", err)
+	}
+	return n
 }
 
 // A verified JuiceFS mount must yield a bound durable object identity
@@ -44,11 +72,12 @@ func TestJuiceFSMountBindsObjectIdentity(t *testing.T) {
 	st.SetReconcileView(func(context.Context) (ReconView, error) {
 		return proot.pin(true)
 	})
-	if err := os.MkdirAll(filepath.Join(root, "ws"), 0o755); err != nil {
+	scope := jfsScope(t, root)
+	if err := os.MkdirAll(filepath.Join(root, scope), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// The seed write forces the mount check on the service root.
-	if w := req(t, svc, "PUT", "/v1/files/ws/write?path=probe.txt", "svc", "x",
+	if w := req(t, svc, "PUT", "/v1/files/"+scope+"/write?path=probe.txt", "svc", "x",
 		map[string]string{"If-Version": "none"}); w.Code != 200 {
 		t.Fatalf("seed write on juicefs: %d %s", w.Code, w.Body)
 	}
@@ -60,7 +89,7 @@ func TestJuiceFSMountBindsObjectIdentity(t *testing.T) {
 	if mi.jfsUUID == "" {
 		t.Fatal("jfsUUID empty on a verified mount — objectID unbound on JuiceFS")
 	}
-	info, ok, err := svc.probe("ws", "probe.txt")()
+	info, ok, err := svc.probe(scope, "probe.txt")()
 	if err != nil || !ok {
 		t.Fatalf("probe probe.txt: ok=%v err=%v", ok, err)
 	}
@@ -92,37 +121,38 @@ func TestJuiceFSConfirmedRemoveReceiptsApplied(t *testing.T) {
 		return proot.pin(true)
 	})
 	ctx := context.Background()
+	scope := jfsScope(t, root)
 
-	if w := req(t, svc, "PUT", "/v1/files/ws/write?path=orig.txt", "svc", "original",
+	if w := req(t, svc, "PUT", "/v1/files/"+scope+"/write?path=orig.txt", "svc", "original",
 		map[string]string{"If-Version": "none"}); w.Code != 200 {
 		t.Fatalf("seed write on juicefs: %d %s", w.Code, w.Body)
 	}
 	rh := reqHash("remove", "orig.txt", ivCanon(IfVersion{Mode: "any"}))
-	it := declareKeyed(t, st, "ws", "remove", "orig.txt", IfVersion{Mode: "any"},
-		"", "op:jfs-rm", rh, svc.probe("ws", "orig.txt"))
+	it := declareKeyed(t, st, scope, "remove", "orig.txt", IfVersion{Mode: "any"},
+		"", "op:jfs-rm", rh, svc.probe(scope, "orig.txt"))
 	if it.preOid == "" {
 		t.Fatal("declare recorded no bound preOid on verified JuiceFS — identity still unbound")
 	}
 	it.journal.act(0, "cap", "orig.txt")
 	it.journal.res(0, "ok")
-	stage := filepath.Join(root, "ws", it.names[0].Name)
-	if err := os.Rename(filepath.Join(root, "ws", "orig.txt"), stage); err != nil {
+	stage := filepath.Join(root, scope, it.names[0].Name)
+	if err := os.Rename(filepath.Join(root, scope, "orig.txt"), stage); err != nil {
 		t.Fatalf("simulate capture on juicefs: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "ws", "orig.txt"), []byte("replacement"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, scope, "orig.txt"), []byte("replacement"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	st.lastTombScan.Store(0)
 	st.Reconcile(ctx)
 
-	w := req(t, svc, "DELETE", "/v1/files/ws/remove?path=orig.txt", "svc", "",
+	w := req(t, svc, "DELETE", "/v1/files/"+scope+"/remove?path=orig.txt", "svc", "",
 		withIfV(keyHdr("op:jfs-rm"), "any"))
 	t.Logf("replayed remove on juicefs: %d %s", w.Code, w.Body)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"replayed":true`) {
 		t.Fatalf("confirmed remove did not receipt applied on JuiceFS: %d %s", w.Code, w.Body)
 	}
-	got, _ := os.ReadFile(filepath.Join(root, "ws", "orig.txt"))
+	got, _ := os.ReadFile(filepath.Join(root, scope, "orig.txt"))
 	if string(got) != "replacement" {
 		t.Fatalf("applied-remove replay touched the replacement: %q", got)
 	}
@@ -145,8 +175,9 @@ func TestJuiceFSOrphanSweep(t *testing.T) {
 		return proot.pin(true)
 	})
 	ctx := context.Background()
+	scope := jfsScope(t, root)
 
-	scopeDir := filepath.Join(root, "jfsws", "sub")
+	scopeDir := filepath.Join(root, scope, "sub")
 	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -158,13 +189,13 @@ func TestJuiceFSOrphanSweep(t *testing.T) {
 	}
 	st.lastStageSweep.Store(0)
 	st.Reconcile(ctx)
-	if n := recoverIntents(t, st); n != 0 {
+	if n := jfsScopeRecoverIntents(t, st, scope); n != 0 {
 		t.Fatalf("first sighting on juicefs minted %d recover intents", n)
 	}
 	os.Remove(ghost)
 	st.lastStageSweep.Store(0)
 	st.Reconcile(ctx)
-	if n := recoverIntents(t, st); n != 0 {
+	if n := jfsScopeRecoverIntents(t, st, scope); n != 0 {
 		t.Fatalf("transient ghost on juicefs left %d recover intents", n)
 	}
 
@@ -177,12 +208,12 @@ func TestJuiceFSOrphanSweep(t *testing.T) {
 		st.lastStageSweep.Store(0)
 		st.Reconcile(ctx)
 	}
-	if n := recoverIntents(t, st); n != 1 {
+	if n := jfsScopeRecoverIntents(t, st, scope); n != 1 {
 		t.Fatalf("persistent orphan on juicefs not recovered (%d intents)", n)
 	}
 	// Content must be surfaced visibly, not parked or destroyed.
 	found := false
-	filepath.Walk(filepath.Join(root, "jfsws"), func(p string, fi os.FileInfo, err error) error {
+	filepath.Walk(filepath.Join(root, scope), func(p string, fi os.FileInfo, err error) error {
 		if err == nil && !fi.IsDir() && strings.Contains(fi.Name(), "recovered-o") {
 			if b, rerr := os.ReadFile(p); rerr == nil && string(b) == "real-orphan-on-jfs" {
 				found = true

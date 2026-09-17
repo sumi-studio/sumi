@@ -241,8 +241,12 @@ func TestPGReceiptConfirmedRemoveAppliedAtReconcile(t *testing.T) {
 	}
 	// The applied verdict needs a bound durable identity to prove the
 	// present occupant is not the declared object — unbound filesystems
-	// (overlayfs, unverified mounts) can only receipt diverged.
-	if info, ok, _ := svc.probe("ws", "orig.txt")(); !ok || info.oidCls != idBound {
+	// (overlayfs, unverified mounts) can only receipt diverged. A probe
+	// failure after the asserted 200 write is a test failure, not a
+	// capability skip — only genuinely unbound identity may skip.
+	if info, ok, err := svc.probe("ws", "orig.txt")(); err != nil || !ok {
+		t.Fatalf("probe after 200 write: ok=%v err=%v", ok, err)
+	} else if info.oidCls != idBound {
 		t.Skip("fixture filesystem cannot bind durable object identity — see TestJuiceFSConfirmedRemoveReceiptsApplied for the verified-mount path")
 	}
 	rh := reqHash("remove", "orig.txt", ivCanon(IfVersion{Mode: "any"}))
