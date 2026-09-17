@@ -1649,6 +1649,11 @@ func TestPGReconcileCompletesDeadUndo(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Reconcile(ctx)
+	// The dead op's row is gone by the time the sweep lists the parked
+	// name, so the first sighting only defers; a persistent unowned
+	// private name is adopted on the next sweep.
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
 	// The write's authored bytes are at the path: the effect landed and
 	// the intent commits. The private name must be drained.
 	if got := durRead(t, dir, "ws/a.txt"); got != "stale" {
@@ -2103,6 +2108,10 @@ func TestPGReconcileCommittedDstFPDiscard(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertEvent(t, s, "ws", "a.txt", "", "write", 72)
+	s.Reconcile(ctx)
+	// The settled op's row is gone, so the orphaned displaced object is
+	// adopted on the next sweep — one listing sighting only defers.
+	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
 	if got := durRead(t, dir, "ws/a.txt"); got != "v1" {
 		t.Fatalf("a.txt = %q, want committed v1", got)
