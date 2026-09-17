@@ -724,6 +724,7 @@ type supervisorInspection struct {
 	RPCBootNonce            string                  `json:"rpc_boot_nonce,omitempty"`
 	ReapedThroughGeneration *uint64                 `json:"reaped_through_generation,omitempty"`
 	ExecutorWorkspace       ExecutorWorkspaceHealth `json:"executor_workspace,omitempty"`
+	FilesScope              FilesScopeState         `json:"files_scope,omitempty"`
 }
 
 func (backend *DockerBackend) Prepare(ctx context.Context, request PrepareRequest) (PreparedEpoch, error) {
@@ -1015,6 +1016,7 @@ func parseSupervisorInspection(output []byte, expectedPersonalityAgentID string)
 		Phase:                   wire.Phase,
 		ReapedThroughGeneration: wire.ReapedThroughGeneration,
 		ExecutorWorkspace:       wire.ExecutorWorkspace,
+		FilesScope:              wire.FilesScope,
 	}
 	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive || wire.Phase == PhaseRecovery {
 		epoch := PreparedEpoch{

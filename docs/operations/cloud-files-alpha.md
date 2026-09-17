@@ -331,7 +331,11 @@ not propagate into an existing child-directory bind). The executor container
 carries a bounded healthcheck (`test -d /workspace`, no fork required under
 the agent's seccomp profile), so the stale bind is reported — not silently
 ignored: the container shows `(unhealthy)` and `/v1/inspect` reports
-`executor_workspace: "unhealthy"` while `phase` stays `active`. Workspace
+`executor_workspace: "unhealthy"` while `phase` stays `active`. Live-phase
+inspection also reports `files_scope: "bound"` when the supervisor has
+verified the workspace bind source is the configured canonical scope on the
+configured volume — the provisioner uses that signal, not its environment
+alone, to heal a binding record lost to state-directory repair. Workspace
 usability and runtime liveness are deliberately separate facts — the runtime
 keeps serving what does not need the workspace — and repair is still an
 explicit lifecycle action (no in-place rebind exists):
@@ -408,7 +412,12 @@ background restart.
   (the durable `provisioner-control` volume). A recreated provisioner whose
   `SUMI_FILES_*` configuration is absent or points at a different volume now
   **refuses** `prepare`/`activate` for that secretary with `conflict` — no
-  host-local workspace is substituted, and no launch reaches Compose. To
+  host-local workspace is substituted, and no launch reaches Compose. The
+  refusal covers adopt as well as launch: a `prepare` that would merely
+  report the still-running epoch also refuses, so changed configuration can
+  never overwrite the recorded volume. A binding record lost with the state
+  directory is only re-created on verified physical evidence
+  (`files_scope: "bound"` from inspection), never on environment alone. To
   take a bound secretary back to a local workspace deliberately, stop it and
   remove its entry from `files-bindings.json` while the provisioner is down;
   until then the binding is enforced. Files already in the volume stay

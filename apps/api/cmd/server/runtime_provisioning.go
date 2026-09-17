@@ -641,7 +641,12 @@ func (p *provisionedProcess) Wait() error {
 						p.epoch.PersonalityAgentID, p.epoch.Generation)
 					workspaceUnhealthy = true
 				}
-			} else if workspaceUnhealthy {
+			} else if workspaceUnhealthy &&
+				inspection.ExecutorWorkspace == runtimeprovision.ExecutorWorkspaceHealthy {
+				// Only explicit healthy evidence ends the unhealthy state:
+				// "starting" and a temporarily absent report are not proof
+				// the bind became usable, and announcing recovery on them
+				// would lie about the workspace and flap the transition log.
 				log.Printf("spawn: executor workspace bind healthy again: agent=%q", p.epoch.PersonalityAgentID)
 				workspaceUnhealthy = false
 			}

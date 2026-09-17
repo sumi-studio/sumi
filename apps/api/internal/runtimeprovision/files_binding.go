@@ -48,7 +48,7 @@ type durableFilesBindings struct {
 }
 
 type filesBindingsDocument struct {
-	Version  int                      `json:"version"`
+	Version  int                     `json:"version"`
 	Bindings map[string]filesBinding `json:"bindings"`
 }
 
@@ -145,8 +145,20 @@ func (state *durableFilesBindings) record(personalityAgentID string, binding fil
 	if err := state.confirmPending(); err != nil {
 		return err
 	}
-	if previous, existed := state.entries[personalityAgentID]; existed && previous == binding {
-		return nil
+	if previous, existed := state.entries[personalityAgentID]; existed {
+		if previous == binding {
+			return nil
+		}
+		// A recorded binding is the established canonical authority: process
+		// configuration may not overwrite it. Adopt paths that hold matching
+		// configuration converge on the identical record; a differing record
+		// here means a launch would have bound a different volume than the
+		// workspace already established, which callers must surface rather
+		// than persist.
+		return fmt.Errorf(
+			"%w: canonical files binding already records volume %s; refusing overwrite with %s",
+			ErrConflict, previous.VolumeUUID, binding.VolumeUUID,
+		)
 	}
 	candidate := make(map[string]filesBinding, len(state.entries)+1)
 	for id, entry := range state.entries {

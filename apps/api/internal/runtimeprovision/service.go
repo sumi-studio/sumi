@@ -44,13 +44,14 @@ func (environment FilesEnvironment) configured() bool {
 }
 
 type serviceEntry struct {
-	mu             sync.Mutex
-	known          bool
-	phase          Phase
-	epoch          PreparedEpoch
-	idempotencyKey string
-	stopped        bool
-	reapedThrough  *uint64
+	mu              sync.Mutex
+	known           bool
+	phase           Phase
+	epoch           PreparedEpoch
+	idempotencyKey  string
+	stopped         bool
+	reapedThrough   *uint64
+	filesScopeBound bool
 }
 
 func NewService(backend Backend, config ServiceConfig) (*Service, error) {
@@ -104,8 +105,8 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 		if entry.idempotencyKey != "" && entry.idempotencyKey != request.IdempotencyKey {
 			return PreparedEpoch{}, fmt.Errorf("%w: personality agent already has a live prepared epoch", ErrConflict)
 		}
-		if err := service.recordFilesBinding(request.PersonalityAgentID); err != nil {
-			return PreparedEpoch{}, fmt.Errorf("persist canonical files binding: %w", err)
+		if err := service.adoptFilesBinding(request.PersonalityAgentID, entry.filesScopeBound); err != nil {
+			return PreparedEpoch{}, err
 		}
 		return entry.epoch, nil
 	}
@@ -147,8 +148,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 		entry.epoch = *inspection.Epoch
 		entry.idempotencyKey = request.IdempotencyKey
 		entry.stopped = false
-		if err := service.recordFilesBinding(request.PersonalityAgentID); err != nil {
-			return PreparedEpoch{}, fmt.Errorf("persist canonical files binding: %w", err)
+		entry.filesScopeBound = inspection.FilesScope == FilesScopeBound
+		if err := service.adoptFilesBinding(request.PersonalityAgentID, entry.filesScopeBound); err != nil {
+			return PreparedEpoch{}, err
 		}
 		return entry.epoch, nil
 	}
@@ -174,6 +176,7 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	entry.epoch = epoch
 	entry.idempotencyKey = request.IdempotencyKey
 	entry.stopped = false
+	entry.filesScopeBound = service.filesEnv.configured()
 	return epoch, nil
 }
 
@@ -432,6 +435,28 @@ func (service *Service) recordFilesBinding(personalityAgentID string) error {
 	})
 }
 
+// adoptFilesBinding guards a prepare that returns an already-prepared or
+// already-active project — whether hydrated into memory by Inspect or
+// reported by the backend. The recorded binding still constrains the adopt:
+// differing or absent SUMI_FILES_* configuration is a refused
+// retarget/substitution, not a successful prepare, and a failed adopt records
+// nothing. Healing a missing record additionally requires verified physical
+// evidence that the live workspace bind is the configured canonical scope;
+// trusting current environment alone would let a provisioner recreated with
+// different configuration overwrite the true binding (or claim a local
+// workspace as canonical) merely because containers still exist.
+func (service *Service) adoptFilesBinding(personalityAgentID string, scopeVerified bool) error {
+	if err := service.checkFilesBinding(personalityAgentID); err != nil {
+		return err
+	}
+	if !scopeVerified || !service.filesEnv.configured() {
+		return nil
+	}
+	return service.files.record(personalityAgentID, filesBinding{
+		VolumeUUID: service.filesEnv.VolumeUUID,
+	})
+}
+
 // verifyReapAttestation recomputes a caller's claimed reap receipt against the
 // durable record this daemon wrote when it observed the empty project. ADR 0007
 // assigns kill/reap and its physical proof to the control plane, so the control
@@ -474,6 +499,7 @@ func (entry *serviceEntry) setInspection(inspection Inspection) {
 	entry.known = true
 	entry.phase = inspection.Phase
 	entry.stopped = inspection.Phase == PhaseUnknown
+	entry.filesScopeBound = inspection.FilesScope == FilesScopeBound
 	if inspection.Epoch != nil {
 		entry.epoch = *inspection.Epoch
 	}

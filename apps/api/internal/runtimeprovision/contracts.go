@@ -154,6 +154,20 @@ func (health ExecutorWorkspaceHealth) valid() bool {
 	return false
 }
 
+// FilesScopeState reports whether the supervisor verified that a live
+// project's /workspace bind is the configured canonical scope: the container
+// mount source equals SUMI_FILES_SCOPE_DIR and sumi-files-check passes for
+// the configured mountpoint/volume. It is emitted only on verification —
+// absent means "not verified" (files mode off, dead mount, wrong volume, or
+// a workspace that was never canonically bound), never "bound elsewhere".
+type FilesScopeState string
+
+const FilesScopeBound FilesScopeState = "bound"
+
+func (scope FilesScopeState) valid() bool {
+	return scope == FilesScopeBound
+}
+
 type Inspection struct {
 	PersonalityAgentID      string         `json:"personality_agent_id"`
 	Phase                   Phase          `json:"phase"`
@@ -163,6 +177,12 @@ type Inspection struct {
 	// scope mode and an executor container exists; empty means the signal is
 	// unavailable, not that the workspace is fine.
 	ExecutorWorkspace ExecutorWorkspaceHealth `json:"executor_workspace,omitempty"`
+	// FilesScope is "bound" only when the supervisor verified the live
+	// project's workspace bind is the configured canonical scope on the
+	// configured volume. The provisioner uses it to heal a missing durable
+	// binding without trusting environment that may have changed since the
+	// project was launched.
+	FilesScope FilesScopeState `json:"files_scope,omitempty"`
 }
 
 type OperationResponse struct {
@@ -453,6 +473,9 @@ func (inspection Inspection) Validate() error {
 	if inspection.ExecutorWorkspace != "" && !inspection.ExecutorWorkspace.valid() {
 		return fmt.Errorf("unknown executor workspace health %q", inspection.ExecutorWorkspace)
 	}
+	if inspection.FilesScope != "" && !inspection.FilesScope.valid() {
+		return fmt.Errorf("unknown files scope state %q", inspection.FilesScope)
+	}
 	switch inspection.Phase {
 	case PhaseUnknown:
 		if inspection.Epoch != nil {
@@ -460,6 +483,9 @@ func (inspection Inspection) Validate() error {
 		}
 		if inspection.ExecutorWorkspace != "" {
 			return errors.New("unknown inspection must not carry executor workspace health")
+		}
+		if inspection.FilesScope != "" {
+			return errors.New("unknown inspection must not carry files scope state")
 		}
 	case PhasePrepared, PhaseActive, PhaseRecovery:
 		if inspection.Epoch == nil {

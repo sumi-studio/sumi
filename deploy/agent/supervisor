@@ -1173,14 +1173,14 @@ prepared_containers_exist() {
 print_epoch_json() {
   local phase="$1"
   local executor_workspace="${2:-}"
-  if [[ -n "${executor_workspace}" ]]; then
-    printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s","executor_workspace":"%s"}\n' \
-      "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}" \
-      "${executor_workspace}"
-  else
-    printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
-      "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
-  fi
+  local files_scope="${3:-}"
+  local extra=""
+  [[ -n "${executor_workspace}" ]] &&
+    extra="${extra},\"executor_workspace\":\"${executor_workspace}\""
+  [[ -n "${files_scope}" ]] &&
+    extra="${extra},\"files_scope\":\"${files_scope}\""
+  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"%s}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}" "${extra}"
 }
 
 print_unknown_json() {
@@ -1213,25 +1213,50 @@ executor_workspace_state() {
   esac
 }
 
+# files_scope_bound verifies that the live project's /workspace bind is the
+# configured canonical scope — the container mount source equals
+# SUMI_FILES_SCOPE_DIR and sumi-files-check confirms that scope on the
+# configured volume. inspect-epoch emits files_scope="bound" only when both
+# hold, so a restarted provisioner can heal a missing durable binding from
+# verified physical state instead of trusting environment that may have
+# changed since the project was launched. A single bounded check: no --wait,
+# so a dead mount fails fast instead of stalling inspection.
+files_scope_bound() {
+  (( FILES_WORKSPACE_MODE )) || return 1
+  local container source
+  container="$(lifecycle_compose ps --all --quiet executor 2>/dev/null)" || true
+  if [[ ! "${container}" =~ ^[0-9a-f]{12,64}$ ]]; then
+    container="$(prepare_compose ps --all --quiet prepare 2>/dev/null)" || true
+  fi
+  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+  source="$(run_external docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' \
+    "${container}" 2>/dev/null)" || return 1
+  [[ "${source}" == "${SUMI_FILES_SCOPE_DIR}" ]] || return 1
+  "${SUMI_FILES_CHECK}" "${SUMI_FILES_MOUNTPOINT}" "${SUMI_FILES_VOLUME_UUID}" \
+    "${PAID_COMPACT}" >/dev/null 2>&1
+}
+
 inspect_epoch() {
-  local workspace_state
+  local workspace_state scope_state=""
   workspace_state="$(executor_workspace_state)"
+  files_scope_bound && scope_state="bound"
   if long_lived_roles_match_expected_state running; then
     epoch_identity || fail "active project has no coherent prepared epoch"
-    print_epoch_json active "${workspace_state}"
+    print_epoch_json active "${workspace_state}" "${scope_state}"
     return
   fi
   if ! long_lived_containers_exist && prepared_containers_exist &&
     prepared_project_containers_match_expected_roles; then
     epoch_identity || fail "prepared project has no coherent epoch"
-    print_epoch_json prepared
+    print_epoch_json prepared "" "${scope_state}"
     return
   fi
   # A partial, failed, or orphaned project is not reusable, but allocator
   # identity remains the authority needed by the API to fence local control
   # before its subsequent destructive reconcile.
   if epoch_identity; then
-    print_epoch_json recovery "${workspace_state}"
+    print_epoch_json recovery "${workspace_state}" "${scope_state}"
   else
     print_unknown_json
   fi

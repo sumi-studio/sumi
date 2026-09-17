@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1137,5 +1140,119 @@ func TestProvisionedExplicitStopRetriesAfterPhysicalTeardownFailure(t *testing.T
 	}
 	if err := process.Wait(); err != nil {
 		t.Fatalf("recovered wait=%v", err)
+	}
+}
+
+type lockedLogSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (sink *lockedLogSink) Write(p []byte) (int, error) {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buf.Write(p)
+}
+
+func (sink *lockedLogSink) String() string {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return sink.buf.String()
+}
+
+// Workspace recovery must be announced only on positive healthy evidence: a
+// workspace still "starting" or one that stopped reporting has not been
+// observed usable, and neither may emit the recovery line or flap the
+// transition.
+func TestProvisionedProcessMonitorWorkspaceHealthTransitions(t *testing.T) {
+	spawner, provisioner, _, _, _ := newProvisioningTestSpawner(t)
+	paid := provisionedTestPAIDs[1]
+	process, err := spawner.Spawn(context.Background(), spawn.AgentRuntimeConfig{
+		AgentID: paid, WrappingKey: provisionedTestWrappingMaterial, GatewayURL: "ws://gateway.invalid/agent/ws",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := process.(*provisionedProcess)
+	p.monitorInterval = time.Millisecond
+	p.timeout = time.Minute
+
+	sink := &lockedLogSink{}
+	previous := log.Writer()
+	log.SetOutput(sink)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	states := []runtimeprovision.ExecutorWorkspaceHealth{
+		runtimeprovision.ExecutorWorkspaceUnhealthy,
+		runtimeprovision.ExecutorWorkspaceUnhealthy,
+		runtimeprovision.ExecutorWorkspaceStarting,
+		"",
+		runtimeprovision.ExecutorWorkspaceHealthy,
+	}
+	var stage atomic.Int32
+	seen := make(chan int, 1<<10)
+	waitErr := make(chan error, 1)
+	p.provisioner = &monitoringTestProvisioner{fakeRuntimeProvisioner: provisioner,
+		inspect: func(ctx context.Context, request runtimeprovision.InspectRequest) (runtimeprovision.Inspection, error) {
+			inspection, err := provisioner.Inspect(ctx, request)
+			if err != nil {
+				return inspection, err
+			}
+			current := int(stage.Load())
+			inspection.ExecutorWorkspace = states[current]
+			seen <- current
+			return inspection, nil
+		}}
+	waitObserved := func(want int) {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case <-seen:
+				if want--; want <= 0 {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("monitor stopped observing workspace health at stage %d", stage.Load())
+			}
+		}
+	}
+	go func() { waitErr <- p.Wait() }()
+	t.Cleanup(func() {
+		if p.monitorCancel != nil {
+			p.monitorCancel()
+		}
+		_ = p.Stop()
+		<-waitErr
+	})
+
+	waitObserved(3)
+	if count := strings.Count(sink.String(), "workspace bind unhealthy:"); count != 1 {
+		t.Fatalf("unhealthy transition logged %d times, want exactly one", count)
+	}
+	if strings.Contains(sink.String(), "workspace bind healthy again:") {
+		t.Fatal("recovery announced while workspace is still unhealthy")
+	}
+	stage.Store(2) // starting: not recovery evidence
+	waitObserved(3)
+	stage.Store(3) // field absent: not recovery evidence
+	waitObserved(3)
+	if strings.Contains(sink.String(), "workspace bind healthy again:") {
+		t.Fatal("recovery announced on starting or absent workspace health")
+	}
+	if count := strings.Count(sink.String(), "workspace bind unhealthy:"); count != 1 {
+		t.Fatalf("unhealthy transition reflogged %d times", count)
+	}
+	stage.Store(4) // explicit healthy
+	waitObserved(3)
+	if count := strings.Count(sink.String(), "workspace bind healthy again:"); count != 1 {
+		t.Fatalf("healthy transition logged %d times, want exactly one", count)
+	}
+	provisioner.mu.Lock()
+	stopped := provisioner.stops[paid]
+	_, stillActive := provisioner.epochs[paid]
+	provisioner.mu.Unlock()
+	if stopped != 0 || !stillActive {
+		t.Fatalf("workspace health churn retired the runtime: stops=%d active=%t", stopped, stillActive)
 	}
 }
