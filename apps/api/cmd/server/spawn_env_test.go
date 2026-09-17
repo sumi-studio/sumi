@@ -143,3 +143,33 @@ func TestRunIdleReaperExitsOnContextDone(t *testing.T) {
 		t.Fatal("runIdleReaper did not exit after context cancellation")
 	}
 }
+
+// The legacy lazy-runtime controller must not be wired into the browser
+// Direct Chat surface under the core backend: admitted commands are durable
+// core inputs and a spawned legacy runtime would hold the persona's event-log
+// lease, blocking the core projection.
+func TestBrowserDirectChatSpawnerSkipsLegacySpawnUnderCoreBackend(t *testing.T) {
+	mgr, err := spawn.New(spawn.Config{
+		Spawner:       &fakeSpawner{},
+		Resolver:      fakeAgentResolver{},
+		SharedBearer:  "b",
+		SharedNonce:   "n",
+		StateRoot:     t.TempDir(),
+		WorkspaceRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "core")
+	if got := browserDirectChatSpawner(mgr); got != nil {
+		t.Fatal("core backend must not receive the legacy lazy spawner")
+	}
+	t.Setenv("SUMI_DIRECT_CHAT_BACKEND", "")
+	if got := browserDirectChatSpawner(mgr); got == nil {
+		t.Fatal("legacy backend keeps the lazy spawner")
+	}
+	if got := browserDirectChatSpawner(nil); got != nil {
+		t.Fatal("nil manager must stay a nil interface, not a typed nil")
+	}
+}

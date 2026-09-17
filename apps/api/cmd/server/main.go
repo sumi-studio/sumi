@@ -673,7 +673,9 @@ func newApplicationFromEnv() (*application, error) {
 			chatGPTActivation.manager = spawnManager
 			chatGPTActivation.configurationCurrent = spawnManager.ConfigurationCurrent
 		}
-		browser.SetSpawner(spawnManager)
+		if spawner := browserDirectChatSpawner(spawnManager); spawner != nil {
+			browser.SetSpawner(spawner)
+		}
 		if processOperations != nil {
 			processOperations.Delivery = &processoperations.GatewayDelivery{
 				Gateway: runtime, Spawner: spawnManager,
@@ -2732,6 +2734,19 @@ func spawnManagerFromEnv(
 		return nil, err
 	}
 	return mgr, nil
+}
+
+// browserDirectChatSpawner hands the browser Direct Chat surface the legacy
+// lazy-runtime controller only when the legacy backend serves commands. Under
+// the core backend an admitted command is a durable core input and the wake
+// sweep starts the core host: no Rust process is involved, and a spawned
+// legacy runtime would additionally take the persona's event-log lease and
+// block the core projection (errProjectedWriteBlocked).
+func browserDirectChatSpawner(manager *spawn.Manager) agentevents.DirectChatSpawner {
+	if manager == nil || directChatCoreBackendEnabled() {
+		return nil
+	}
+	return manager
 }
 
 // spawnGatewayURLFromEnv resolves the gateway URL passed to spawned agents.
