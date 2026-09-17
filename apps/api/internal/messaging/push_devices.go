@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -57,17 +58,121 @@ func (s *Store) RefreshBrowserPushDevice(ctx context.Context, existingID, newID,
 	}
 	// Housekeeping runs after the refresh transaction releases its locks. It
 	// must not turn a successful login into a failure or hold locks that another
-	// concurrent refresh needs. A later login can retry any skipped cleanup.
+	// concurrent refresh needs. A contended database can still leave expired
+	// rows behind — the pass can exhaust its deadline or find every expired row
+	// locked — so an unfinished purge retries detached instead of waiting for
+	// the human's next login.
+	if err := s.purgeExpiredPushDevices(ctx, humanID); err != nil {
+		s.schedulePushDevicePurgeRetry(humanID)
+	}
+	return chosen, nil
+}
+
+// purgeExpiredPushDevices deletes expired device rows for one human inside a
+// short bounded pass. It returns an error whenever expired rows remain —
+// whether the pass failed or concurrent refreshes still hold their locks — so
+// the caller knows the purge is unfinished rather than silently skipped.
+func (s *Store) purgeExpiredPushDevices(ctx context.Context, humanID string) error {
 	cleanupCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
-	_, _ = s.pool.Exec(cleanupCtx, `
-		WITH expired AS (
-		  SELECT device_id FROM push_devices
-		  WHERE human_id=$1 AND expires_at <= clock_timestamp()
-		  ORDER BY device_id LIMIT 32 FOR UPDATE SKIP LOCKED
-		)
-		DELETE FROM push_devices WHERE device_id IN (SELECT device_id FROM expired)`, humanID)
-	return chosen, nil
+	for {
+		res, err := s.pool.Exec(cleanupCtx, `
+			WITH expired AS (
+			  SELECT device_id FROM push_devices
+			  WHERE human_id=$1 AND expires_at <= clock_timestamp()
+			  ORDER BY device_id LIMIT 32 FOR UPDATE SKIP LOCKED
+			)
+			DELETE FROM push_devices WHERE device_id IN (SELECT device_id FROM expired)`, humanID)
+		if err != nil {
+			return err
+		}
+		var remaining int
+		if err := s.pool.QueryRow(cleanupCtx, `
+			SELECT count(*) FROM push_devices
+			WHERE human_id=$1 AND expires_at <= clock_timestamp()`, humanID).Scan(&remaining); err != nil {
+			return err
+		}
+		if remaining == 0 {
+			return nil
+		}
+		if res.RowsAffected() == 0 || cleanupCtx.Err() != nil {
+			return fmt.Errorf("expired push devices remain: %d", remaining)
+		}
+	}
+}
+
+// schedulePushDevicePurgeRetry records a human whose bounded purge pass did
+// not finish and starts the shared drainer when none is running.
+func (s *Store) schedulePushDevicePurgeRetry(humanID string) {
+	s.pushDevicePurge.Lock()
+	if s.pushDevicePurge.pending == nil {
+		s.pushDevicePurge.pending = make(map[string]struct{})
+	}
+	s.pushDevicePurge.pending[humanID] = struct{}{}
+	if s.pushDevicePurge.running {
+		s.pushDevicePurge.Unlock()
+		return
+	}
+	s.pushDevicePurge.running = true
+	s.pushDevicePurge.Unlock()
+	go s.runPushDevicePurgeDrain()
+}
+
+func (s *Store) runPushDevicePurgeDrain() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s.drainExpiredPushDevicePurges(ctx)
+}
+
+// drainExpiredPushDevicePurges is the single retry loop for purge passes that
+// lost to contention: at most one runs per Store, it drains the pending set
+// within one bounded context, then exits. Anything still pending at the
+// deadline stays in the set for the next refresh to reschedule, so a busy or
+// closed database never turns logins into unbounded background work.
+func (s *Store) drainExpiredPushDevicePurges(ctx context.Context) {
+	defer func() {
+		s.pushDevicePurge.Lock()
+		defer s.pushDevicePurge.Unlock()
+		s.pushDevicePurge.running = false
+		// A pending entry can arrive between the empty check and this exit
+		// path; respawn once while the drain context is still alive.
+		if ctx.Err() == nil && len(s.pushDevicePurge.pending) > 0 {
+			s.pushDevicePurge.running = true
+			go s.runPushDevicePurgeDrain()
+		}
+	}()
+	for {
+		s.pushDevicePurge.Lock()
+		var humanID string
+		for h := range s.pushDevicePurge.pending {
+			humanID = h
+			break
+		}
+		if humanID == "" {
+			s.pushDevicePurge.Unlock()
+			return
+		}
+		delete(s.pushDevicePurge.pending, humanID)
+		s.pushDevicePurge.Unlock()
+		if err := s.purgeExpiredPushDevices(ctx, humanID); err != nil {
+			// Every unfinished pass — including one cut short by the drain
+			// deadline — returns the entry so it survives for the next
+			// refresh to reschedule.
+			s.pushDevicePurge.Lock()
+			s.pushDevicePurge.pending[humanID] = struct{}{}
+			s.pushDevicePurge.Unlock()
+			if ctx.Err() != nil {
+				log.Printf("push: expired device cleanup unfinished for human %s: %v", humanID, err)
+				return
+			}
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+	}
 }
 
 // Revocation waits for in-flight sends holding a shared device lease. Once it

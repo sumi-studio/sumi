@@ -80,6 +80,15 @@ type Store struct {
 	// admission bounds new durable mutations and live sockets for this
 	// process. Single-process and volatile: it resets on restart.
 	admission *operationAdmission
+	// pushDevicePurge coalesces expired-device housekeeping retries so a burst
+	// of contended refreshes adds pending entries, never extra goroutines.
+	pushDevicePurge pushDevicePurgeSet
+}
+
+type pushDevicePurgeSet struct {
+	sync.Mutex
+	pending map[string]struct{}
+	running bool
 }
 
 type attachmentMissingBlobScan struct {
