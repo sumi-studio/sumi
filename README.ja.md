@@ -25,7 +25,7 @@ Sumi はアルファ段階です。上の Description は目指す姿です。�
 |---|---|---|
 | **ホスト版アルファ Web アプリ** | 招待制のサインイン、Workspace、Messaging を備えた既存の Web アプリ。 | 招待された開発者とテスターのみ。一般公開のサインアップはありません。新しい秘書コアと組み合わせた利用は、現在検証中です。 |
 | **[Local host](#local-host-を試す)** | 新しい秘書コアを、Sumi Cloud アカウントなしで Linux または WSL のマシン1台で動かすもの。 | ソースのチェックアウトからインストールすれば誰でも使えます。ブラウザページと `say` コマンドは開発・検証用の画面であり、プロダクト UI ではありません。 |
-| **[ソースから Web アプリを動かす](#ソースから-web-アプリを動かす)** | サインイン、Workspace、Messaging、設定を含む Web アプリ全体と、Rust の agent runtime で動く秘書1体。 | 自分の Firebase プロジェクトとモデルプロバイダの認証情報を持つ開発者。 |
+| **[ソースから Web アプリを動かす](#ソースから-web-アプリを動かす)** | サインイン、Workspace、Messaging、設定を含む Web アプリ全体と、TypeScript の秘書コアで動く秘書。 | 自分の Firebase プロジェクトを持つ開発者。標準の決定的なモデルプロバイダには認証情報は不要です。 |
 
 ### 新しい秘書コア
 
@@ -39,7 +39,7 @@ Sumi はアルファ段階です。上の Description は目指す姿です。�
 
 ### まだ使えないもの
 
-- **新しいコアの上で Web アプリ全体をプロダクトとして使うこと。** 既存の Web アプリを新しいコアへつなぎ、日常的に使えることを検証しています。Web アプリ全体を新しいコアで動かす、文書化されたローカル手順もありません。
+- **ホスト版の Web アプリで、新しいコアをプロダクトとして使うこと。** 開発用の `make dev` は、ソースから Web アプリ全体を新しいコアで動かします。Direct Chat に加え、秘書による共有 Messaging の履歴・検索・送信・編集や Workspace の招待の一覧・受諾も、永続コアを通して動きます。ホスト版アルファへの統合は現在進めています。
 - **秘書を Local から Cloud へ移すこと。** 同じ一個人として続けるための状態移行の基盤はソースにあります（[portable state](docs/agent/portable-state.md)）が、秘書を実際に移す一連の手順はまだありません。
 - **Description にあるほかのアプリ。** 現在の Workspace アプリは Messaging だけです。タスク、カレンダー、メモ、メール、ブラウジング、会議、学習は、まだ人と秘書が共有するアプリになっていません。
 - **通話の中で秘書が話すこと。** ソース中の通話機能は opt-in で、LiveKit を使います。秘書の通話参加には、まだ実際の音声認識エンジンがありません。
@@ -67,9 +67,9 @@ sumi-local stop
 
 ## ソースから Web アプリを動かす
 
-`make dev` は、Web アプリ全体と実際に動く秘書1体を手元のマシンで起動します。起動するのは Go API、Docker 上の PostgreSQL、Rust の agent runtime と tool executor、Vite です。この開発用スタックの秘書は、Local host と Sumi Cloud が使う新しい TypeScript の秘書コアではなく、Rust の agent runtime（`apps/agent`）で動きます。
+`make dev` は、Web アプリ全体と秘書を手元のマシンで起動します。起動するのは Go API、Docker 上の PostgreSQL、ローカルの dev pool を通して動く TypeScript の秘書コア（`apps/core`）、Vite です。Local host と Sumi Cloud も同じ秘書コアを使います。Rust の agent runtime と tool executor（`apps/agent`）は、診断用の `make dev-rust` で明示的に起動できます。
 
-必要なもの: Node.js 20.19 以上、pnpm 11、Go、Rust stable、Docker、`curl`、`openssl`、`flock`。Google または GitHub のサインインを有効にした Firebase プロジェクトと、それに対応する Admin 認証情報。会話用モデルと、それとは別の2つのレビュー用モデルのためのモデルプロバイダ認証情報。
+必要なもの: Node.js 22.18 以上、pnpm 11、Go、Docker、`curl`、`openssl`、`flock`。Google または GitHub のサインインを有効にした Firebase プロジェクトと、それに対応する Admin 認証情報。標準のコアは決定的な `mock` プロバイダを使うため、モデルの認証情報は不要です。`make dev-rust` では追加で Rust stable と、会話用モデルおよび別の2つのレビュー用モデルの認証情報が必要です。
 
 ```sh
 make setup
@@ -91,7 +91,7 @@ apps/
   api/                Go の API。サインインセッション、identity、Workspace、Messaging、承認、
                       モデル接続、利用量、秘書コアが使う state service
   core/               TypeScript の秘書コア。Node.js 用ホストと Cloudflare Durable Object 用ホスト
-  agent/              `make dev` が使う Rust の agent runtime と分離された tool executor
+  agent/              `make dev-rust` が使う Rust の agent runtime と分離された tool executor
 packages/
   ui/                 @sumi/ui コンポーネントカタログ（shadcn/ui ベース）
   sdui/               @sumi/sdui 宣言的 UI スキーマ（zod）とレンダラー
@@ -113,7 +113,7 @@ CONTEXT.md            ドメイン用語集
 | サインイン | Firebase Authentication と、Go API が発行するセッション |
 | API と正本の状態 | Go、PostgreSQL |
 | 秘書コア | TypeScript。Node.js（Local）と Cloudflare Workers Durable Objects（Cloud） |
-| 開発用スタックの agent runtime | Rust |
+| 移行中の agent runtime（`make dev-rust`） | Rust |
 | 通話 | LiveKit |
 | 契約 | OpenAPI、JSON Schema |
 | モノレポとツール | pnpm workspaces、Turborepo、Biome |
