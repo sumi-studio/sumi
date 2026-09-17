@@ -41,6 +41,10 @@ type fakeReceipt struct {
 	reqHash string
 	op      string
 	version int64
+	// verdict mirrors file_receipt.verdict: "" is an applied receipt;
+	// "diverged" is a settle whose declared effect could not be confirmed —
+	// the replay answers outcome_uncertain, never a silent success.
+	verdict string
 }
 
 type fakeEntry struct {
@@ -104,6 +108,18 @@ func (f *fakeFilesvc) fakeReceiptCheck(w http.ResponseWriter, scope, opKey, reqH
 	}
 	if rec.reqHash != reqH {
 		writeErrJSON(w, 409, "idempotency_conflict", "idempotency key was already used for a different request")
+		return true
+	}
+	if rec.verdict == "diverged" {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":    "operation outcome could not be confirmed: " + rec.op,
+			"code":     "outcome_uncertain",
+			"replayed": true,
+			"op":       rec.op,
+			"version":  rec.version,
+		})
 		return true
 	}
 	w.Header().Set("content-type", "application/json")

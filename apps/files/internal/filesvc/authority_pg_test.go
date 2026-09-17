@@ -768,7 +768,7 @@ func TestAuthPGDivergedApplyAfterSupersede(t *testing.T) {
 	if err := s.pool.QueryRow(ctx, `SELECT resolved_at FROM file_op WHERE id=$1`, x.id).Scan(&r0); err != nil {
 		t.Fatal(err)
 	}
-	err := s.apply(ctx, x, FileInfo{Fingerprint: divergedFP(x.expectSHA)}, "", true)
+	err := s.apply(ctx, x, FileInfo{Fingerprint: divergedFP(x.expectSHA)}, "", true, "diverged")
 	t.Logf("diverged apply over a newer row: %v", err)
 	var n int
 	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM file_event WHERE version=$1`, x.version).Scan(&n); err != nil {

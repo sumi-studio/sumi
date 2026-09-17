@@ -497,10 +497,10 @@ func TestPGApplyIsIdempotent(t *testing.T) {
 	})
 	it := intent{id: id, owner: "dead-inst", scope: "ws", op: "write",
 		path: "f.txt", version: 46}
-	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false); err != nil {
+	if err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false, "applied"); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false)
+	err := s.apply(context.Background(), it, FileInfo{Fingerprint: "fp-f"}, "", false, "applied")
 	if !errors.Is(err, errIntentSettled) {
 		t.Fatalf("second apply = %v, want errIntentSettled", err)
 	}
@@ -617,10 +617,10 @@ func TestPGDropFencedForeignOwner(t *testing.T) {
 	if s.dropIntent(ctx, it) {
 		t.Fatal("dropIntent deleted under a foreign owner")
 	}
-	if s.dropIntentGhosts(ctx, it, true) {
+	if s.dropIntentGhosts(ctx, it, true, "") {
 		t.Fatal("dropIntentGhosts deleted under a foreign owner")
 	}
-	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", false); err == nil {
+	if err := s.apply(ctx, it, FileInfo{Fingerprint: "fp-x"}, "", false, "applied"); err == nil {
 		t.Fatal("apply ran under a foreign owner")
 	}
 	if n := intentCount(t, s); n != 1 {
