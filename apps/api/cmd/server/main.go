@@ -400,7 +400,7 @@ func newApplicationFromEnv() (*application, error) {
 		chatGPTRuntimeAccess = &chatGPTRuntime{connections: chatGPTConnections, employers: koseki.New(databasePool, directChatLifecycle), refresh: oauth.Refresh}
 		resolveModelActivation = chatGPTRuntimeAccess.activation
 		chatGPTActivation = newChatGPTActivationWorker(koseki.New(databasePool, directChatLifecycle))
-		chatGPTLogin = chatgpt.NewLoginService(chatGPTConnections, oauth, chatGPTBrowserIdentity(sv, browserOrigins), chatGPTActivation.enqueue)
+		chatGPTLogin = chatgpt.NewLoginService(chatGPTConnections, oauth, chatGPTBrowserIdentity(sv, browserOrigins), activationEnqueue(chatGPTActivation))
 	}
 
 	modelConnections, err := modelConnectionStoreFromEnv(databasePool)
@@ -422,8 +422,8 @@ func newApplicationFromEnv() (*application, error) {
 		resolveModelActivation = userModelActivation(modelConnections, koseki.New(databasePool, directChatLifecycle), chatGPTRuntimeAccess, resolveModelActivation)
 	}
 	modelConnectionService := &modelconnections.Service{Store: modelConnections, Authenticate: chatGPTBrowserIdentity(sv, browserOrigins)}
-	if chatGPTActivation != nil {
-		modelConnectionService.Changed = chatGPTActivation.enqueue
+	if enq := activationEnqueue(chatGPTActivation); enq != nil {
+		modelConnectionService.Changed = enq
 	}
 
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
@@ -673,7 +673,9 @@ func newApplicationFromEnv() (*application, error) {
 			chatGPTActivation.manager = spawnManager
 			chatGPTActivation.configurationCurrent = spawnManager.ConfigurationCurrent
 		}
-		browser.SetSpawner(spawnManager)
+		if spawner := browserDirectChatSpawner(spawnManager); spawner != nil {
+			browser.SetSpawner(spawner)
+		}
 		if processOperations != nil {
 			processOperations.Delivery = &processoperations.GatewayDelivery{
 				Gateway: runtime, Spawner: spawnManager,
@@ -856,7 +858,15 @@ func newApplicationFromEnv() (*application, error) {
 	if feedbackServer != nil {
 		cleanupFeedbackAttachments = feedbackServer.Store.CleanupAttachments
 	}
-	if feedbackServer != nil && spawnManager != nil {
+	switch {
+	case feedbackServer != nil && coreServer != nil:
+		// Feedback attention joins Messaging attention on the core intake:
+		// events become durable per-persona inputs the wake sweep delivers to
+		// the shared host — no legacy runtime is prepared or spawned for them.
+		delivery := &feedback.CoreAttentionDelivery{Core: coreServer.Store(), Pool: database.Pool}
+		deliverFeedbackAttention = func(ctx context.Context) error { return feedbackServer.Store.DeliverAttention(ctx, delivery, 25) }
+		log.Print("feedback attention delivers to core state inputs")
+	case feedbackServer != nil && spawnManager != nil:
 		delivery := &feedback.AttentionGateway{Gateway: runtime, Spawner: spawnManager, TenantID: strings.TrimSpace(os.Getenv("SUMI_LOCAL_CONTROL_TENANT_ID"))}
 		deliverFeedbackAttention = func(ctx context.Context) error { return feedbackServer.Store.DeliverAttention(ctx, delivery, 25) }
 	}
@@ -2565,6 +2575,21 @@ func spawnManagerFromEnv(
 		}
 		return nil, nil
 	}
+	if directChatCoreBackendEnabled() {
+		// Under the core backend no code path may create a Rust conversation
+		// runtime: admitted direct-chat commands are durable core inputs, and
+		// the wake sweep starts the shared TypeScript host. Returning no
+		// manager makes every lazy-spawn consumer inert by construction —
+		// the browser transports, model-selection activation, warm and
+		// pending-work reconciliation, runtime recovery, the idle reaper,
+		// feedback and process-completion preparation — so an un-ACKed core
+		// command can never hand a legacy runtime the event-log lease that
+		// blocks core projection (errProjectedWriteBlocked) or execute a turn
+		// the core also owns. The provisioner stays reachable for
+		// physical-executor capabilities such as process operations, which
+		// use their own client rather than this manager.
+		return nil, nil
+	}
 	if resolver == nil {
 		return nil, errors.New("runtime provisioning requires a 戸籍 database (SUMI_DB_URL)")
 	}
@@ -2732,6 +2757,32 @@ func spawnManagerFromEnv(
 		return nil, err
 	}
 	return mgr, nil
+}
+
+// browserDirectChatSpawner hands the browser Direct Chat surface the legacy
+// lazy-runtime controller only when the legacy backend serves commands. Under
+// the core backend an admitted command is a durable core input and the wake
+// sweep starts the core host: no Rust process is involved, and a spawned
+// legacy runtime would additionally take the persona's event-log lease and
+// block the core projection (errProjectedWriteBlocked).
+func browserDirectChatSpawner(manager *spawn.Manager) agentevents.DirectChatSpawner {
+	if manager == nil || directChatCoreBackendEnabled() {
+		return nil
+	}
+	return manager
+}
+
+// activationEnqueue returns the runtime-activation nudge for a selection or
+// connection change, or nil under the core backend where no Rust
+// conversation runtime exists to restart — the shared TypeScript host
+// re-resolves the persona's model selection through the core-state service
+// on every model call, so buffering an activation there would only queue
+// work for a runtime that can never start.
+func activationEnqueue(worker *chatGPTActivationWorker) func(string) {
+	if worker == nil || directChatCoreBackendEnabled() {
+		return nil
+	}
+	return worker.enqueue
 }
 
 // spawnGatewayURLFromEnv resolves the gateway URL passed to spawned agents.

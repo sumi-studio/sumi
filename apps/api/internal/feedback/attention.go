@@ -25,6 +25,14 @@ type AttentionDelivery interface {
 	Lookup(context.Context, string, AttentionEvent) (bool, error)
 	Admit(context.Context, string, AttentionEvent) error
 }
+
+// ErrDeliverySuppressed marks a permanent delivery failure: the event can
+// never be admitted on this placement, so the drain records outcome
+// 'suppressed' instead of retrying forever — e.g. the persona has
+// transferred off this placement and can accept no further input here, or
+// the durable input under this event id already carries different content.
+var ErrDeliverySuppressed = errors.New("feedback attention is permanently undeliverable")
+
 type AttentionGateway struct {
 	Gateway  *agentevents.DurableGateway
 	Spawner  agentevents.DirectChatSpawner
@@ -169,6 +177,14 @@ func (s *Store) deliverAttention(ctx context.Context, d AttentionDelivery, limit
 		}
 		cancel()
 		if err != nil {
+			if errors.Is(err, ErrDeliverySuppressed) {
+				// A permanent failure finishes the row suppressed, not
+				// pending: no retry can make this persona admit the event.
+				if _, finErr := s.pool.Exec(ctx, `UPDATE feedback_attention_outbox SET finished_at=now(),outcome='suppressed' WHERE event_id=$1 AND recipient_paid=$2 AND finished_at IS NULL`, e.EventID, e.PersonalityAgentID); finErr != nil {
+					failures = append(failures, finErr)
+				}
+				continue
+			}
 			failures = append(failures, err)
 			_, retryErr := s.pool.Exec(ctx, `UPDATE feedback_attention_outbox SET next_attempt_at=now()+interval '15 seconds' WHERE event_id=$1 AND recipient_paid=$2 AND finished_at IS NULL`, e.EventID, e.PersonalityAgentID)
 			if retryErr != nil {
