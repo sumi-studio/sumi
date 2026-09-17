@@ -1949,6 +1949,15 @@ func (g *DurableGateway) projectedKeySet(
 			}
 		}
 		if backfill.Len() > 0 {
+			// Truncations above do not move the file offset: a torn or
+			// phantom drop to zero leaves it at the old size, and the
+			// write would land mid-file leaving a garbage leading record
+			// and every preimage permanently misaligned. Reposition at
+			// the post-truncation end before writing.
+			if _, err := index.Seek(0, io.SeekEnd); err != nil {
+				index.Close()
+				return nil, nil, fmt.Errorf("seek dedup index end before backfill: %w", err)
+			}
 			if _, err := index.Write(backfill.Bytes()); err != nil {
 				index.Close()
 				return nil, nil, fmt.Errorf("backfill dedup index: %w", err)

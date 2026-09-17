@@ -716,9 +716,13 @@ func countEvent(types []string, want string) int {
 	return n
 }
 
-// Two projector instances over the same stores — a restarted API overlapping
-// its predecessor — must commit each fact once. The durable dedup index is
-// the guard; the per-process seen map alone cannot be.
+// Independent projector instances over the same durable files — restarted
+// API processes overlapping their predecessor — must commit each fact once.
+// The durable dedup index is the guard; the per-process seen map alone
+// cannot be. Production invokes syncPersona serially per adapter (one Run
+// goroutine sweeps personas in order), so each goroutine here is a fully
+// separate projector: its own command store, gateway, and adapter, sharing
+// only the on-disk logs — the contention a real overlapping process sees.
 func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 	f := newCoreDirectChatFixture(t)
 	env := f.sendMessage(t, "key-1", "once only")
@@ -731,23 +735,24 @@ func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 		{Kind: "assistant_message", Payload: map[string]any{"text": "reply", "round": 0}},
 	}, agentstate.CommitRequest{Outcome: "complete"})
 
-	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
-	if err != nil {
-		t.Fatalf("second gateway: %v", err)
-	}
-	adapter2 := &CoreDirectChat{Core: f.core, Gateway: gateway2}
-
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			a := f.adapter
-			g := f.gateway
-			if i%2 == 1 {
-				a, g = adapter2, gateway2
+			commands, err := OpenCommandStore(f.gateway.commands.dir)
+			if err != nil {
+				errs <- err
+				return
 			}
+			defer commands.Close()
+			g, err := OpenDurableGateway(f.dir, commands)
+			if err != nil {
+				errs <- err
+				return
+			}
+			a := &CoreDirectChat{Core: f.core, Gateway: g}
 			if err := a.syncPersona(f.ctx, f.pa); err != nil {
 				errs <- err
 				return
@@ -755,7 +760,7 @@ func TestCoreDirectChatConcurrentProjectorsCommitOnce(t *testing.T) {
 			if _, err := g.EventCatchUp(f.ctx, f.pa, 0); err != nil {
 				errs <- err
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 	close(errs)
