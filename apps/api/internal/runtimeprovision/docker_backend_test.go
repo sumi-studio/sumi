@@ -224,13 +224,17 @@ func TestParseSupervisorInspectionExecutorWorkspace(t *testing.T) {
 }
 
 func TestParseSupervisorInspectionFilesScope(t *testing.T) {
-	inspection, err := parseSupervisorInspection([]byte(
-		`{"personality_agent_id":"`+testPAID+`","phase":"prepared","generation":9,"rpc_boot_nonce":"nonce","files_scope":"foreign"}`), testPAID)
-	if err != nil {
-		t.Fatalf("prepared inspection with foreign files scope rejected: %v", err)
-	}
-	if inspection.FilesScope != FilesScopeForeign {
-		t.Fatalf("files_scope = %q, want foreign", inspection.FilesScope)
+	for _, scope := range []FilesScopeState{
+		FilesScopeBound, FilesScopeForeign, FilesScopeLocal, FilesScopeUnknown,
+	} {
+		inspection, err := parseSupervisorInspection([]byte(
+			`{"personality_agent_id":"`+testPAID+`","phase":"prepared","generation":9,"rpc_boot_nonce":"nonce","files_scope":"`+string(scope)+`"}`), testPAID)
+		if err != nil {
+			t.Fatalf("prepared inspection with %q files scope rejected: %v", scope, err)
+		}
+		if inspection.FilesScope != scope {
+			t.Fatalf("files_scope = %q, want %q", inspection.FilesScope, scope)
+		}
 	}
 	if _, err := parseSupervisorInspection([]byte(
 		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","files_scope":"bogus"}`), testPAID); err == nil {

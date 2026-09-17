@@ -250,6 +250,137 @@ exec /usr/bin/stat "$@"
 	}
 }
 
+// The real supervisor classifies a prepared epoch's workspace from the mount
+// shape plus the epoch's own canonical-volume label — never from a host path
+// alone. A failed mount inspection or a missing /workspace entry is explicit
+// "unknown" evidence, not silently local; a labeled bind matching the
+// configured volume is "bound" even when the path moved, and a labeled bind
+// naming another volume is "foreign" even when the path is unchanged — the
+// same-path volume-swap shape the host-side path check cannot detect.
+func TestSupervisorFilesScopeClassification(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is required to isolate the supervisor trust roots")
+	}
+	if output, err := exec.Command("unshare", "-Urnm", "/bin/true").CombinedOutput(); err != nil {
+		t.Skipf("user and mount namespaces are unavailable: %v: %s", err, output)
+	}
+
+	const configuredUUID = "aaaaaaaa-0000-0000-0000-000000000000"
+	for _, scenario := range []struct {
+		name      string
+		inspect   string // what the fake mount inspection emits
+		wantScope string
+	}{
+		{name: "mount-inspection-fails", inspect: "fail", wantScope: "unknown"},
+		{name: "no-workspace-mount", inspect: "nomount", wantScope: "unknown"},
+		{name: "named-volume-unlabeled", inspect: "volume:", wantScope: "local"},
+		{name: "bind-configured-volume", inspect: "bind:" + configuredUUID, wantScope: "bound"},
+		{name: "bind-other-volume-same-path", inspect: "bind:bbbbbbbb-1111-1111-1111-111111111111", wantScope: "foreign"},
+		{name: "bind-no-volume-label", inspect: "bind:", wantScope: "foreign"},
+		{name: "named-volume-with-epoch-claim", inspect: "volume:" + configuredUUID, wantScope: "foreign"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			testRoot := t.TempDir()
+			fakeDocker := filepath.Join(testRoot, "docker")
+			fakeStat := filepath.Join(testRoot, "stat")
+			fakeCheck := filepath.Join(testRoot, "sumi-files-check")
+			fakeDockerScript := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SUMI_FAKE_DOCKER_LOG"
+case "$*" in
+  "compose version")
+    ;;
+  *"ps --all --quiet executor")
+    ;;
+  *"ps --all --quiet allocator")
+    printf 'aaaaaaaaaaaa\n'
+    ;;
+  *"ps --all --quiet prepare")
+    printf 'bbbbbbbbbbbb\n'
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*"{{.State}}"*)
+    # No long-lived roles — the prepared shape.
+    ;;
+  "ps --all --filter label=com.docker.compose.project="*)
+    printf 'aaaaaaaaaaaa\tallocator\n'
+    printf 'bbbbbbbbbbbb\tprepare\n'
+    ;;
+  "inspect --format "*)
+    case "$SUMI_FAKE_INSPECT" in
+      fail)
+        exit 42
+        ;;
+      nomount)
+        printf '\n\n'
+        ;;
+      volume:*)
+        printf 'volume /var/lib/docker/volumes/sumi-ws/_data\n%s\n' "${SUMI_FAKE_INSPECT#volume:}"
+        ;;
+      bind:*)
+        printf 'bind %s\n%s\n' "$SUMI_FILES_SCOPE_DIR" "${SUMI_FAKE_INSPECT#bind:}"
+        ;;
+    esac
+    ;;
+  *"compose.prepare.yaml"*"run --rm --no-deps --pull never --entrypoint /bin/bash allocator"*)
+    printf 'SUMI_PERSONALITY_AGENT_ID=%s\nSUMI_RPC_GENERATION=7\nSUMI_RPC_NONCE=prepared-nonce\n' "$SUMI_PERSONALITY_AGENT_ID"
+    ;;
+  *)
+    exit 91
+    ;;
+esac
+`
+			if err := os.WriteFile(fakeDocker, []byte(fakeDockerScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			fakeStatScript := `#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = "-c" ] && [ "$3" = "--" ] && [ "$4" = "/" ]; then
+  case "$2" in
+    %u) printf '0\n'; exit 0 ;;
+    %a) printf '755\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`
+			if err := os.WriteFile(fakeStat, []byte(fakeStatScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fakeCheck, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			supervisor, err := filepath.Abs(repositoryFilePath("deploy", "agent", "supervisor"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(
+				"unshare", "-Urnm", "/bin/bash", "-eu", "-c",
+				`mount -t tmpfs -o mode=0755 tmpfs /run; exec "$1" inspect-epoch`,
+				"--", supervisor,
+			)
+			command.Env = []string{
+				"PATH=" + testRoot + ":/usr/bin:/bin",
+				"SUMI_CONFIG_FILE=/dev/null",
+				"SUMI_FAKE_DOCKER_LOG=" + filepath.Join(testRoot, "docker.log"),
+				"SUMI_FAKE_INSPECT=" + scenario.inspect,
+				"SUMI_PERSONALITY_AGENT_ID=" + testPAID,
+				"SUMI_FILES_MOUNTPOINT=/srv/canon",
+				"SUMI_FILES_VOLUME_UUID=" + configuredUUID,
+				"SUMI_FILES_CHECK=" + fakeCheck,
+			}
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("real supervisor prepared inspection failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), `"phase":"prepared"`) {
+				t.Fatalf("inspection did not report the prepared epoch: %s", output)
+			}
+			if !strings.Contains(string(output), `"files_scope":"`+scenario.wantScope+`"`) {
+				t.Fatalf("inspection scope = %s, want files_scope %q", output, scenario.wantScope)
+			}
+		})
+	}
+}
+
 func TestSupervisorPrepareDoesNotRequireActivationEnvironment(t *testing.T) {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare is required to isolate the supervisor trust roots")

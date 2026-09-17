@@ -28,7 +28,14 @@
 # separate — the runtime stays up; the documented operator recovery
 # (stop → prepare → activate) obtains a fresh bind at a new generation.
 services:
+  # The ai.sumi.files-volume-uuid label records the volume each container was
+  # created against. Docker path strings cannot prove which volume a running
+  # bind captured — a same-path volume swap would fool a host-side path check
+  # — so inspect-epoch classifies the workspace from this immutable label
+  # instead of re-verifying the path.
   prepare:
+    labels:
+      ai.sumi.files-volume-uuid: ${SUMI_FILES_VOLUME_UUID:?run sumi-files-check first}
     volumes:
       - type: bind
         source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}
@@ -36,6 +43,8 @@ services:
         bind:
           create_host_path: false
   executor:
+    labels:
+      ai.sumi.files-volume-uuid: ${SUMI_FILES_VOLUME_UUID:?run sumi-files-check first}
     volumes:
       - type: bind
         source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}

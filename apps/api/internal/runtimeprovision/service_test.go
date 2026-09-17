@@ -341,6 +341,8 @@ func TestPrepareRecoversCommittedBackendEpochWithoutAllocatingAgain(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The supervisor positively observes the ordinary named-volume workspace.
+	backend.filesScope = FilesScopeLocal
 	service := newTestService(t, backend)
 	recovered, err := service.Prepare(context.Background(), PrepareRequest{
 		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "retry-after-daemon-restart",

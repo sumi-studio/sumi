@@ -373,11 +373,16 @@ func TestFilesBindingAdoptRefusesWithoutConfiguration(t *testing.T) {
 }
 
 // A binding record lost to state-directory repair is healed only on verified
-// physical evidence — the supervisor confirming the live workspace bind is
-// the configured scope — never on environment alone.
+// physical evidence — the epoch's own recorded volume matching the configured
+// one (files_scope bound) — never on environment alone, and never from
+// ambiguous evidence. A positively local workspace keeps the never-bound
+// contract; foreign, unknown, and absent scope on a live epoch all refuse
+// launch-shaped transitions because none of them carry positive evidence.
 func TestFilesBindingAdoptHealsOnlyOnVerifiedScope(t *testing.T) {
-	for _, verified := range []bool{true, false} {
-		t.Run(fmt.Sprintf("verified=%t", verified), func(t *testing.T) {
+	for _, scope := range []FilesScopeState{
+		FilesScopeBound, FilesScopeLocal, FilesScopeForeign, FilesScopeUnknown, "",
+	} {
+		t.Run(fmt.Sprintf("scope=%q", scope), func(t *testing.T) {
 			stateDirectory := filepath.Join(t.TempDir(), "state")
 			backend := newFakeBackend()
 			first, err := NewService(backend, filesTestConfig(stateDirectory))
@@ -394,21 +399,26 @@ func TestFilesBindingAdoptHealsOnlyOnVerifiedScope(t *testing.T) {
 			if err := os.Remove(filepath.Join(stateDirectory, filesBindingsFileName)); err != nil {
 				t.Fatal(err)
 			}
-			if verified {
-				backend.filesScope = FilesScopeBound
-			}
+			backend.filesScope = scope
 			restarted, err := NewService(backend, filesTestConfig(stateDirectory))
 			if err != nil {
 				t.Fatal(err)
 			}
-			adopted, err := restarted.Prepare(context.Background(), filesTestPrepare(testPAID))
-			if err != nil {
-				t.Fatalf("adopting the live epoch failed: %v", err)
+			adopted, adoptErr := restarted.Prepare(context.Background(), filesTestPrepare(testPAID))
+			switch scope {
+			case FilesScopeBound, FilesScopeLocal:
+				if adoptErr != nil {
+					t.Fatalf("adopting the live epoch failed: %v", adoptErr)
+				}
+				if adopted != epoch {
+					t.Fatalf("adopted epoch %+v, want %+v", adopted, epoch)
+				}
+			default:
+				if adoptErr == nil || !errors.Is(adoptErr, ErrConflict) {
+					t.Fatalf("adopt under %q evidence err = %v, want conflict", scope, adoptErr)
+				}
 			}
-			if adopted != epoch {
-				t.Fatalf("adopted epoch %+v, want %+v", adopted, epoch)
-			}
-			if _, err := os.Stat(filepath.Join(stateDirectory, filesBindingsFileName)); verified {
+			if _, err := os.Stat(filepath.Join(stateDirectory, filesBindingsFileName)); scope == FilesScopeBound {
 				if err != nil {
 					t.Fatalf("verified adopt did not heal the binding record: %v", err)
 				}
@@ -418,6 +428,139 @@ func TestFilesBindingAdoptHealsOnlyOnVerifiedScope(t *testing.T) {
 			} else if err == nil {
 				if document := bindingFileContent(t, stateDirectory); len(document.Bindings) != 0 {
 					t.Fatalf("unverified adopt recorded a binding from environment alone: %+v", document.Bindings)
+				}
+			}
+		})
+	}
+}
+
+// TestFilesBindingUnknownEvidenceRefusesActivate is the discriminating
+// regression for RB-4: a prepared epoch launched under volume A loses its
+// binding record while the daemon is stopped; the provisioner restarts under
+// volume B, and the workspace mount inspection fails (or returns no
+// /workspace entry) even though the phase probes still see the containers.
+// The unknown observation carries no positive evidence — activate must be
+// refused before it reaches the backend, and nothing may be recorded.
+func TestFilesBindingUnknownEvidenceRefusesActivate(t *testing.T) {
+	for _, scope := range []FilesScopeState{FilesScopeUnknown, ""} {
+		t.Run(fmt.Sprintf("scope=%q", scope), func(t *testing.T) {
+			stateDirectory := filepath.Join(t.TempDir(), "state")
+			backend := newFakeBackend()
+			first, err := NewService(backend, filesTestConfig(stateDirectory))
+			if err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := first.Prepare(context.Background(), filesTestPrepare(testPAID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(stateDirectory, filesBindingsFileName)); err != nil {
+				t.Fatal(err)
+			}
+			backend.filesScope = scope
+			config := filesTestConfig(stateDirectory)
+			config.Files.VolumeUUID = "ffffffff-0000-0000-0000-000000000000"
+			restarted, err := NewService(backend, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restarted.Inspect(context.Background(), InspectRequest{
+				Version:            ProtocolVersion,
+				PersonalityAgentID: testPAID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restarted.Prepare(context.Background(), filesTestPrepare(testPAID)); err == nil || !errors.Is(err, ErrConflict) {
+				t.Fatalf("adopt under %q evidence err = %v, want conflict", scope, err)
+			}
+			activatesBefore := backend.activateCalls[testPAID]
+			if _, err := restarted.Activate(context.Background(), filesTestActivate(epoch)); err == nil || !errors.Is(err, ErrConflict) {
+				t.Fatalf("activate under %q evidence err = %v, want conflict", scope, err)
+			}
+			if backend.activateCalls[testPAID] != activatesBefore {
+				t.Fatal("refused activate still dispatched to the backend")
+			}
+			if _, err := os.Stat(filepath.Join(stateDirectory, filesBindingsFileName)); err == nil {
+				if document := bindingFileContent(t, stateDirectory); len(document.Bindings) != 0 {
+					t.Fatalf("refused transitions recorded a binding: %+v", document.Bindings)
+				}
+			}
+			// Stop/abort stay ungated so the epoch can be torn down and
+			// relaunched under the intended volume.
+			recovered, err := NewService(backend, filesTestConfig(stateDirectory))
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.filesScope = FilesScopeBound
+			if _, err := recovered.Abort(context.Background(), AbortRequest{
+				Version:       ProtocolVersion,
+				PreparedEpoch: epoch,
+			}); err != nil {
+				t.Fatalf("tearing down the prepared epoch failed: %v", err)
+			}
+			if _, err := recovered.Prepare(context.Background(), filesTestPrepare(testPAID)); err != nil {
+				t.Fatalf("relaunch under the original volume refused: %v", err)
+			}
+		})
+	}
+}
+
+// A same-path volume swap must not heal authority: the epoch records volume A
+// on its own container metadata while the host path now serves volume B, so
+// inspection reports foreign under the B configuration. The prepared epoch
+// may neither heal the record to B nor launch under B — and the same holds
+// when the executor is already active serving A.
+func TestFilesBindingSamePathSwapCannotHealOrLaunch(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprintf("active=%t", active), func(t *testing.T) {
+			stateDirectory := filepath.Join(t.TempDir(), "state")
+			backend := newFakeBackend()
+			first, err := NewService(backend, filesTestConfig(stateDirectory))
+			if err != nil {
+				t.Fatal(err)
+			}
+			epoch, err := first.Prepare(context.Background(), filesTestPrepare(testPAID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if active {
+				if _, err := first.Activate(context.Background(), filesTestActivate(epoch)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Remove(filepath.Join(stateDirectory, filesBindingsFileName)); err != nil {
+				t.Fatal(err)
+			}
+			// Host path now serves volume B; the epoch's own label still says
+			// A, so under the B configuration the workspace is foreign.
+			backend.filesScope = FilesScopeForeign
+			config := filesTestConfig(stateDirectory)
+			config.Files.VolumeUUID = "ffffffff-0000-0000-0000-000000000000"
+			restarted, err := NewService(backend, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := restarted.Prepare(context.Background(), filesTestPrepare(testPAID)); err == nil || !errors.Is(err, ErrConflict) {
+				t.Fatalf("prepare under swapped evidence err = %v, want conflict", err)
+			}
+			activatesBefore := backend.activateCalls[testPAID]
+			_, activateErr := restarted.Activate(context.Background(), filesTestActivate(epoch))
+			if active {
+				// An already-active epoch's activate is status-only: it must
+				// not dispatch to the backend and must not heal the record,
+				// but reporting the truthful active phase is allowed.
+				if activateErr != nil && !errors.Is(activateErr, ErrConflict) {
+					t.Fatalf("status-only activate err = %v", activateErr)
+				}
+			} else if activateErr == nil || !errors.Is(activateErr, ErrConflict) {
+				t.Fatalf("activate under swapped evidence err = %v, want conflict", activateErr)
+			}
+			if backend.activateCalls[testPAID] != activatesBefore {
+				t.Fatal("activate dispatched to the backend under swapped evidence")
+			}
+			if _, err := os.Stat(filepath.Join(stateDirectory, filesBindingsFileName)); err == nil {
+				if document := bindingFileContent(t, stateDirectory); len(document.Bindings) != 0 {
+					t.Fatalf("swapped evidence healed a binding to the wrong volume: %+v", document.Bindings)
 				}
 			}
 		})

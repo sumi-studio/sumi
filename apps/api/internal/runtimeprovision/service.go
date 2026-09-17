@@ -179,7 +179,7 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	if service.filesEnv.configured() {
 		entry.filesScope = FilesScopeBound
 	} else {
-		entry.filesScope = ""
+		entry.filesScope = FilesScopeLocal
 	}
 	return epoch, nil
 }
@@ -451,17 +451,18 @@ func (service *Service) recordFilesBinding(personalityAgentID string) error {
 // configuration is a refused retarget/substitution, and a failed transition
 // records nothing.
 //
-// With no durable record the physical evidence decides. A workspace the
-// supervisor verifies as the configured canonical scope heals the record —
-// the documented recovery for a binding lost to state-directory repair. A
-// foreign bind is proof the epoch was launched onto a canonical-style
-// workspace this configuration cannot verify; treating it as never-bound
-// would let activate retarget the secretary to the configured volume, so the
-// transition is refused. Only an absent bind — the ordinary named-volume
-// local workspace — is unconstrained, and a matching durable record plus
-// matching configuration stays authoritative even when the physical bind is
-// stale (the epoch can be stopped and relaunched through the fenced
-// lifecycle).
+// With no durable record the physical evidence decides, and only positive
+// evidence decides. A workspace whose epoch records the configured volume
+// (files_scope bound) heals the record — the documented recovery for a
+// binding lost to state-directory repair. A positively local workspace
+// (files_scope local) keeps the never-bound contract. A foreign bind is proof
+// the epoch was launched onto a canonical-style workspace this configuration
+// cannot verify, and unknown or absent evidence on a live epoch carries no
+// proof either way — both refuse, because a launch-shaped transition under
+// the wrong configuration would silently retarget the secretary. A matching
+// durable record stays authoritative over stale or unverifiable physical
+// evidence: the epoch can be stopped and relaunched through the fenced
+// lifecycle.
 func (service *Service) adoptFilesBinding(personalityAgentID string, scope FilesScopeState) error {
 	if err := service.checkFilesBinding(personalityAgentID); err != nil {
 		return err
@@ -477,13 +478,19 @@ func (service *Service) adoptFilesBinding(personalityAgentID string, scope Files
 		return service.files.record(personalityAgentID, filesBinding{
 			VolumeUUID: service.filesEnv.VolumeUUID,
 		})
+	case FilesScopeLocal:
+		return nil
 	case FilesScopeForeign:
 		return fmt.Errorf(
 			"%w: personality agent workspace is bound to a canonical files scope this configuration cannot verify; refusing retarget — stop the epoch and relaunch under the intended volume",
 			ErrConflict,
 		)
+	default:
+		return fmt.Errorf(
+			"%w: personality agent workspace scope could not be verified (files_scope %q); refusing launch until observation recovers or the epoch is stopped and relaunched",
+			ErrConflict, scope,
+		)
 	}
-	return nil
 }
 
 // verifyReapAttestation recomputes a caller's claimed reap receipt against the

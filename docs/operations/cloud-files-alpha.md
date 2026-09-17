@@ -332,16 +332,28 @@ carries a bounded healthcheck (`test -d /workspace`, no fork required under
 the agent's seccomp profile), so the stale bind is reported — not silently
 ignored: the container shows `(unhealthy)` and `/v1/inspect` reports
 `executor_workspace: "unhealthy"` while `phase` stays `active`. Live-phase
-inspection also reports `files_scope` — `"bound"` when the supervisor has
-verified the workspace bind is on the configured canonical volume (the
-configured scope directory, or the same scope remounted at another path),
-`"foreign"` when a host-path workspace bind exists that this configuration
-cannot verify, and nothing when the workspace is the ordinary named-volume
-local one. The provisioner reconciles both against the durable record: a
-missing record is re-created only on `bound`, and a `foreign` workspace with
-no record refuses `prepare`/`activate` outright — a prepared epoch cannot be
-retargeted to the configured volume merely because its binding record was
-lost. Workspace
+inspection also reports `files_scope`, which classifies the workspace from
+the mount shape plus the epoch's own canonical-volume label — the
+`ai.sumi.files-volume-uuid` label the compose overrides stamp on prepare and
+executor containers at create time. The label, not the mount path, carries
+the identity: a path string cannot prove which volume a running bind
+captured, because a same-path volume swap leaves the old bind serving the old
+volume while the host path verifies as the new one. The states are `"bound"`
+(the epoch's recorded volume is the configured one — a legitimate remount at
+a different path is covered, because the label names the volume, not the
+path), `"foreign"` (a host-path bind exists but the epoch's recorded volume
+differs or it never recorded one — including a pre-repair epoch with no
+label), `"local"` (a positively observed non-bind workspace — the ordinary
+named volume — with no canonical claim), and `"unknown"` (a container exists
+but the mount inspection failed or returned no `/workspace` entry). The
+provisioner reconciles the state against the durable record: a missing record
+is re-created only on `bound`, `local` keeps the never-bound contract, and
+without a durable record, `foreign`, `unknown`, or absent evidence on a live
+epoch refuse adoption through `prepare` and launch through `activate` from a
+prepared epoch. Repeating `activate` on an already active epoch remains a
+status read: it does not launch containers or heal a binding record. These
+checks prevent retargeting merely because a binding record was lost or the
+workspace could not be classified. Workspace
 usability and runtime liveness are deliberately separate facts — the runtime
 keeps serving what does not need the workspace — and repair is still an
 explicit lifecycle action (no in-place rebind exists):
@@ -422,11 +434,15 @@ background restart.
   refusal covers adopt as well as launch: a `prepare` that would merely
   report the still-running epoch also refuses, so changed configuration can
   never overwrite the recorded volume. A binding record lost with the state
-  directory is only re-created on verified physical evidence
-  (`files_scope: "bound"` from inspection), never on environment alone; if
-  inspection instead reports `files_scope: "foreign"` — a live workspace bind
-  the current configuration cannot verify — `prepare`/`activate` refuse until
-  the epoch is stopped and relaunched deliberately.
+  directory is only re-created on verified physical evidence — `files_scope:
+  "bound"`, meaning the epoch's own label records the configured volume —
+  never on environment alone and never on a reused host path. If inspection
+  reports `foreign`, `unknown`, or no scope on a live epoch without a durable
+  record, `prepare` adoption and prepared-epoch `activate` refuse until the
+  epoch is stopped and relaunched deliberately;
+  epochs created before the label existed have no recorded claim and report
+  `foreign`, so they recover through the same fenced teardown, not through
+  inference.
   Binding-state repair rules: remove or repair a `files-bindings.json` entry
   only while the provisioner is **stopped**; editing it live races the
   daemon's atomic republish. A corrupt or wrongly-permissioned authority file

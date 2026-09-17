@@ -155,24 +155,30 @@ func (health ExecutorWorkspaceHealth) valid() bool {
 }
 
 // FilesScopeState classifies a live project's /workspace mount as the
-// supervisor observes it. FilesScopeBound means verified: the workspace is a
-// host-path bind on the configured canonical volume (the configured scope
-// directory, or the same scope remounted at another path). FilesScopeForeign
-// means the workspace is a host-path bind this configuration cannot verify —
-// a scope on another volume, a dead mount, or a bind from configuration this
-// process never had; it is physical evidence the epoch's workspace came from
-// a canonical-style launch, not a never-bound local workspace. Absent means
-// no host-path workspace bind exists (the ordinary named-volume local
-// workspace) or there is no container to inspect.
+// supervisor observes it. FilesScopeBound means the epoch's own immutable
+// record (the container's canonical-volume label) names the configured
+// volume. FilesScopeForeign means a host-path workspace bind exists that this
+// configuration cannot verify — another volume, or a launch that never
+// recorded one. FilesScopeLocal means a positively observed non-bind
+// workspace (the ordinary named volume) with no canonical claim.
+// FilesScopeUnknown means a container exists but the workspace could not be
+// classified — the mount inspection failed or returned no /workspace entry;
+// it carries no positive evidence. Absent means no container to classify.
 type FilesScopeState string
 
 const (
 	FilesScopeBound   FilesScopeState = "bound"
 	FilesScopeForeign FilesScopeState = "foreign"
+	FilesScopeLocal   FilesScopeState = "local"
+	FilesScopeUnknown FilesScopeState = "unknown"
 )
 
 func (scope FilesScopeState) valid() bool {
-	return scope == FilesScopeBound || scope == FilesScopeForeign
+	switch scope {
+	case FilesScopeBound, FilesScopeForeign, FilesScopeLocal, FilesScopeUnknown:
+		return true
+	}
+	return false
 }
 
 type Inspection struct {
