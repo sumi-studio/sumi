@@ -12,6 +12,7 @@ import {
   inspectEnrollmentInvitation,
   isEnrollmentInvitationUnavailable,
 } from "./enrollment-invitations";
+import { getSignInMethods } from "./provider-operation-client";
 import { RegistrationSecretaryPanel } from "./registration-secretary-panel";
 import { AuthAPIError } from "./session-client";
 
@@ -84,6 +85,23 @@ export function LoginScreen() {
     useState<EmailLinkInspection | null>(null);
   const linkInspectionStarted = useRef(false);
   const codeInput = useRef<HTMLInputElement>(null);
+  // null = the deployment's answer has not landed (or failed): show the full
+  // set — the flow start still refuses an unavailable method honestly. false =
+  // the server says email sign-in is not offered: never render a dead submit.
+  const [emailAvailable, setEmailAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!configured) return;
+    let mounted = true;
+    void getSignInMethods().then(
+      (methods) => {
+        if (mounted) setEmailAvailable(methods.emailCode);
+      },
+      () => {},
+    );
+    return () => {
+      mounted = false;
+    };
+  }, [configured]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: invitationAttempt explicitly retries inspection.
   useEffect(() => {
@@ -116,6 +134,7 @@ export function LoginScreen() {
       linkInspectionStarted.current ||
       !configured ||
       !emailLinkPending ||
+      emailAvailable === false ||
       (sessionState !== "unauthenticated" && sessionState !== "authenticated")
     ) {
       return;
@@ -139,6 +158,7 @@ export function LoginScreen() {
   }, [
     configured,
     continueEmailLink,
+    emailAvailable,
     emailLinkPending,
     inspectEmailLink,
     sessionState,
@@ -146,7 +166,7 @@ export function LoginScreen() {
 
   // The code form follows proofs finished in another tab or browser.
   useEffect(() => {
-    if (!emailCode || emailLinkPending) return;
+    if (!emailCode || emailLinkPending || emailAvailable === false) return;
     const poll = globalThis.setInterval(() => {
       void refreshEmailCode().catch((nextError: unknown) => {
         if (
@@ -163,7 +183,7 @@ export function LoginScreen() {
       globalThis.clearInterval(poll);
       globalThis.clearInterval(tick);
     };
-  }, [emailCode, emailLinkPending, refreshEmailCode]);
+  }, [emailCode, emailAvailable, emailLinkPending, refreshEmailCode]);
 
   // A back/forward-cache restore revives this component with the spinner that
   // was showing when the tab left for the provider. The awaited navigation
@@ -461,6 +481,14 @@ export function LoginScreen() {
               )
             ) : emailCode ? (
               <div className="space-y-4">
+                {emailAvailable === false && (
+                  <p
+                    role="status"
+                    className="rounded-lg bg-amber-50 px-3 py-2.5 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+                  >
+                    メールでのログインは現在利用できません。このコードは確認できないため、キャンセルして別の方法でログインしてください。
+                  </p>
+                )}
                 {emailCode.recovery && (
                   <p
                     role="status"
@@ -623,39 +651,50 @@ export function LoginScreen() {
                     )}
                   </p>
                 )}
-                <form onSubmit={handleStartEmailCode} className="space-y-3">
-                  <label htmlFor="sumi-auth-email" className="sr-only">
-                    メールアドレス
-                  </label>
-                  <input
-                    id="sumi-auth-email"
-                    type="email"
-                    autoComplete="email"
-                    required
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
-                    disabled={busy !== null || !configured}
-                    placeholder="メールアドレス"
-                    className="h-11 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50"
-                  />
-                  <Button
-                    type="submit"
-                    disabled={busy !== null || !configured}
-                    className="h-11 w-full rounded-lg"
+                {emailAvailable !== false ? (
+                  <>
+                    <form onSubmit={handleStartEmailCode} className="space-y-3">
+                      <label htmlFor="sumi-auth-email" className="sr-only">
+                        メールアドレス
+                      </label>
+                      <input
+                        id="sumi-auth-email"
+                        type="email"
+                        autoComplete="email"
+                        required
+                        value={email}
+                        onChange={(event) => setEmail(event.target.value)}
+                        disabled={busy !== null || !configured}
+                        placeholder="メールアドレス"
+                        className="h-11 w-full rounded-lg border bg-background px-3 text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50"
+                      />
+                      <Button
+                        type="submit"
+                        disabled={busy !== null || !configured}
+                        className="h-11 w-full rounded-lg"
+                      >
+                        {busy === "email" && (
+                          <LoaderCircle className="size-5 animate-spin" />
+                        )}
+                        {intent === "sign_in"
+                          ? "メールでログイン"
+                          : "メールで新規登録"}
+                      </Button>
+                    </form>
+                    <div className="my-4 flex items-center gap-3 text-muted-foreground text-xs">
+                      <span className="h-px flex-1 bg-border" />
+                      または
+                      <span className="h-px flex-1 bg-border" />
+                    </div>
+                  </>
+                ) : (
+                  <p
+                    role="status"
+                    className="rounded-lg bg-muted px-3 py-2.5 text-muted-foreground text-sm"
                   >
-                    {busy === "email" && (
-                      <LoaderCircle className="size-5 animate-spin" />
-                    )}
-                    {intent === "sign_in"
-                      ? "メールでログイン"
-                      : "メールで新規登録"}
-                  </Button>
-                </form>
-                <div className="my-4 flex items-center gap-3 text-muted-foreground text-xs">
-                  <span className="h-px flex-1 bg-border" />
-                  または
-                  <span className="h-px flex-1 bg-border" />
-                </div>
+                    メールでのログイン・新規登録は現在利用できません。下の方法で続けてください。
+                  </p>
+                )}
                 <div className="space-y-3">
                   {providers.map((provider) => (
                     <Button

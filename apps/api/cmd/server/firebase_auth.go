@@ -108,11 +108,6 @@ func firebaseProviderAccountFromUser(user *firebaseauth.UserRecord, expectedUID 
 			continue
 		}
 		switch provider.ProviderID {
-		case "password", "email":
-			// This proves only that the live Firebase account still exposes the
-			// email/password provider family. Sumi's own completed email-link
-			// proof is also required before it counts as a usable method.
-			account.EmailProvider = true
 		case "google.com", "github.com":
 			if provider.UID == "" {
 				return firebaseProviderAccount{}, errors.New("firebase provider has no subject")

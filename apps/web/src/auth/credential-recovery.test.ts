@@ -6,6 +6,7 @@ import {
   beginSameEmailCredentialRecovery,
   completeSameEmailCredentialRecovery,
 } from "./credential-recovery";
+import { AuthAPIError } from "./session-client";
 
 const recoveryMocks = vi.hoisted(() => ({
   auth: {
@@ -370,3 +371,52 @@ function recovery(provider: "google.com" | "github.com") {
     },
   };
 }
+
+describe("same-email recovery without an email sender", () => {
+  it("reports the collision instead of the dead channel", async () => {
+    const error = new FirebaseError(
+      "auth/account-exists-with-different-credential",
+      "collision",
+      { email: "existing@example.com" },
+    );
+    recoveryMocks.credentialFromError.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+      toJSON: () => ({
+        providerId: "github.com",
+        signInMethod: "github.com",
+        pendingToken: "pending-oauth-token",
+      }),
+    });
+    recoveryMocks.beginEmailCodeAuth.mockRejectedValue(
+      new AuthAPIError("email_unavailable", 503),
+    );
+
+    await expect(
+      beginSameEmailCredentialRecovery(error, "github.com", "sign_in"),
+    ).rejects.toMatchObject({ message: "email_recovery_unavailable" });
+  });
+
+  it("keeps other start failures untouched", async () => {
+    const error = new FirebaseError(
+      "auth/account-exists-with-different-credential",
+      "collision",
+      { email: "existing@example.com" },
+    );
+    recoveryMocks.credentialFromError.mockReturnValue({
+      providerId: "github.com",
+      signInMethod: "github.com",
+      toJSON: () => ({
+        providerId: "github.com",
+        signInMethod: "github.com",
+        pendingToken: "pending-oauth-token",
+      }),
+    });
+    const network = new AuthAPIError("flow_expired", 410);
+    recoveryMocks.beginEmailCodeAuth.mockRejectedValue(network);
+
+    await expect(
+      beginSameEmailCredentialRecovery(error, "github.com", "sign_in"),
+    ).rejects.toBe(network);
+  });
+});

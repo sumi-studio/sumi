@@ -38,11 +38,25 @@ export async function beginSameEmailCredentialRecovery(
   }
   const email = collisionEmail(error);
   const credential = extractCredential(error, expectedProvider);
-  return beginEmailCodeAuth(email, "sign_in", {
-    provider: expectedProvider,
-    requestedIntent,
-    credential: serializeCredential(credential, expectedProvider),
-  });
+  try {
+    return await beginEmailCodeAuth(email, "sign_in", {
+      provider: expectedProvider,
+      requestedIntent,
+      credential: serializeCredential(credential, expectedProvider),
+    });
+  } catch (startError) {
+    // The only same-email recovery is an emailed proof; where no sender is
+    // configured that flow can never start. Report the collision itself so the
+    // person is sent back to the method that owns the address rather than
+    // being told only that email is down.
+    if (
+      startError instanceof AuthAPIError &&
+      startError.message === "email_unavailable"
+    ) {
+      throw new AuthAPIError("email_recovery_unavailable", 503);
+    }
+    throw startError;
+  }
 }
 
 export function isSameEmailCredentialCollision(error: unknown): boolean {

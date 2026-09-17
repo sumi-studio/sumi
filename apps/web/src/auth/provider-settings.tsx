@@ -961,7 +961,11 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
         );
         if (!alternate) {
           throw new Error(
-            "別のログイン方法で再認証できません。ログアウトし、メールの確認コードで再ログインしてから5分以内にもう一度お試しください。",
+            // The server's verdict, not local providerData: email is a reauth
+            // path only while the deployment offers it.
+            serverMethods?.email === false
+              ? "別のログイン方法で再認証できません。メールでのログインは現在利用できないため、この方法は解除できません。"
+              : "別のログイン方法で再認証できません。ログアウトし、メールの確認コードで再ログインしてから5分以内にもう一度お試しください。",
           );
         }
         await sendProviderRedirect(
@@ -997,6 +1001,7 @@ export function ProviderSettings({ humanId }: { humanId: string }) {
       linkedProviders,
       operationFor,
       sendProviderRedirect,
+      serverMethods,
     ],
   );
 

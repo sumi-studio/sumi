@@ -39,7 +39,7 @@ func TestFirebaseProviderAccountUsesOnlySupportedLiveProviderRecords(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !account.EmailProvider || account.UID != "firebase-user" || !reflect.DeepEqual(account.ProviderSubjects, map[string]string{
+	if account.UID != "firebase-user" || !reflect.DeepEqual(account.ProviderSubjects, map[string]string{
 		"google.com": "google-subject", "github.com": "github-subject",
 	}) {
 		t.Fatalf("provider account: %+v", account)
@@ -48,7 +48,7 @@ func TestFirebaseProviderAccountUsesOnlySupportedLiveProviderRecords(t *testing.
 	profileOnly, err := firebaseProviderAccountFromUser(&firebaseauth.UserRecord{
 		UserInfo: &firebaseauth.UserInfo{UID: "profile-only", ProviderID: "firebase", Email: "profile@example.com"},
 	}, "profile-only")
-	if err != nil || profileOnly.EmailProvider || len(profileOnly.ProviderSubjects) != 0 {
+	if err != nil || profileOnly.EmailVerified || len(profileOnly.ProviderSubjects) != 0 {
 		t.Fatalf("profile email counted as provider: %+v %v", profileOnly, err)
 	}
 }

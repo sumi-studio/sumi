@@ -33,6 +33,29 @@ function isManagedProvider(value: unknown): value is ManagedProvider {
   return value === "google.com" || value === "github.com";
 }
 
+export interface SignInMethods {
+  emailCode: boolean;
+}
+
+/**
+ * The sign-in methods this deployment can start, anonymously — the server's
+ * own capability, so a disabled channel (for example email while no sender is
+ * configured) is never offered as a dead control. The read fails open: a
+ * missing or malformed answer leaves the caller showing the full set, and the
+ * flow start still refuses an unavailable method honestly.
+ */
+export async function getSignInMethods(): Promise<SignInMethods> {
+  const body = await getAuthJSON("/auth/methods");
+  if (
+    !isObject(body) ||
+    !Array.isArray(body.methods) ||
+    !body.methods.every((method) => typeof method === "string")
+  ) {
+    throw new Error("Invalid sign-in methods response.");
+  }
+  return { emailCode: body.methods.includes("email_code") };
+}
+
 export interface ProviderOperationResult {
   operationId: string;
   outcome:

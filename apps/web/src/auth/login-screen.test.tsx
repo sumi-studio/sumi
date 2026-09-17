@@ -15,10 +15,15 @@ import { AuthAPIError } from "./session-client";
 
 const loginMocks = vi.hoisted(() => ({
   useAuth: vi.fn(),
+  getSignInMethods: vi.fn().mockResolvedValue({ emailCode: true }),
 }));
 
 vi.mock("./auth-context", () => ({
   useAuth: loginMocks.useAuth,
+}));
+
+vi.mock("./provider-operation-client", () => ({
+  getSignInMethods: loginMocks.getSignInMethods,
 }));
 
 afterEach(() => {
@@ -339,5 +344,78 @@ describe("LoginScreen confirmation", () => {
     expect(
       screen.getByText("対象アカウント: new@example.com"),
     ).toBeInTheDocument();
+  });
+});
+
+describe("LoginScreen without an email sender", () => {
+  it("offers OAuth sign-in instead of a dead email submit", async () => {
+    loginMocks.getSignInMethods.mockResolvedValue({ emailCode: false });
+    const state = authState();
+    loginMocks.useAuth.mockReturnValue(state);
+    render(<LoginScreen />);
+
+    expect(
+      await screen.findByText(
+        /メールでのログイン・新規登録は現在利用できません/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByPlaceholderText("メールアドレス"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "メールでログイン" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Googleで続ける" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "GitHubで続ける" }),
+    ).toBeInTheDocument();
+    expect(state.startEmailCode).not.toHaveBeenCalled();
+  });
+
+  it("keeps the full set when the capability read fails", async () => {
+    loginMocks.getSignInMethods.mockRejectedValue(new Error("offline"));
+    loginMocks.useAuth.mockReturnValue(authState());
+    render(<LoginScreen />);
+
+    await waitFor(() => expect(loginMocks.getSignInMethods).toHaveBeenCalled());
+    expect(screen.getByPlaceholderText("メールアドレス")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Googleで続ける" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not poll a pending code flow that can no longer verify", async () => {
+    loginMocks.getSignInMethods.mockResolvedValue({ emailCode: false });
+    const state = authState({ emailCode: codeFlow() });
+    loginMocks.useAuth.mockReturnValue(state);
+    render(<LoginScreen />);
+
+    expect(
+      await screen.findByText(/このコードは確認できないため/),
+    ).toBeInTheDocument();
+    expect(state.refreshEmailCode).not.toHaveBeenCalled();
+  });
+
+  it("inspects a pending link at most once and reports an unmounted surface honestly", async () => {
+    // The capability read is fail-open: while it is in flight the resume
+    // check proceeds — a disabled deployment answers it with an honest
+    // unavailable error. Once "email is off" is known, nothing repeats.
+    loginMocks.getSignInMethods.mockResolvedValue({ emailCode: false });
+    const state = authState({
+      emailLinkPending: true,
+      inspectEmailLink: vi
+        .fn()
+        .mockRejectedValue(new AuthAPIError("Not Found", 404)),
+    });
+    loginMocks.useAuth.mockReturnValue(state);
+    render(<LoginScreen />);
+
+    await waitFor(() => expect(state.inspectEmailLink).toHaveBeenCalled());
+    expect(
+      await screen.findByText(/ログイン機能は現在利用できません/),
+    ).toBeInTheDocument();
+    expect(state.inspectEmailLink).toHaveBeenCalledTimes(1);
   });
 });
