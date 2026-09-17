@@ -2034,6 +2034,10 @@ func TestLateRepairCorrFileCrossDevOccupant(t *testing.T) {
 	}))
 	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
+	// The unowned parked name defers one sweep boundary before it is
+	// adopted (transient listing ghosts never mint a fencing recover).
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
 	// The occupant is a live public object: identical fingerprints or
 	// not, recovery never evicts it — the recorded file surfaces at a
 	// visible sibling instead.

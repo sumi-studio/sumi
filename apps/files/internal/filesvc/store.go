@@ -84,6 +84,7 @@ type Store struct {
 	lastTombScan     atomic.Int64                                                          // unix nanos of the last hot tombstone re-judgment
 	lastTombScanCold atomic.Int64                                                          // unix nanos of the last cold tombstone re-judgment
 	lastStageSweep   atomic.Int64                                                          // unix nanos of the last orphan staged sweep
+	orphanSeen       sync.Map                                                              // scope\x00dir\x00name -> struct{} — unowned private names already sighted once
 }
 
 // StatFn stats a scope-relative path — injected by the service so the
@@ -181,7 +182,7 @@ const tombstoneColdScanInterval = time.Hour
 // be skipped or delayed by competing reconcile work or errors, so no
 // fixed convergence time is claimed. Per-scope cost is a full
 // recursive directory enumeration — every entry, not only staged
-// names — bounded by depth 32.
+// names — bounded by depth 256.
 const stageSweepInterval = 30 * time.Second
 
 func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
@@ -3112,6 +3113,19 @@ func (s *Store) sweepOrphanNames(ctx context.Context, view ReconView) []int64 {
 	for scope := range scopes {
 		reattach = append(reattach, s.sweepScopeNames(ctx, scope, view)...)
 	}
+	// Sightings recorded for scopes this pass did not enumerate are stale:
+	// a vanished scope offered no listing that could have confirmed the
+	// name persisted, so the deferral must restart if the scope returns —
+	// otherwise a transient same-named ghost would mint a fencing recover
+	// intent on first re-sighting.
+	s.orphanSeen.Range(func(k, _ any) bool {
+		key := k.(string)
+		sc, _, _ := strings.Cut(key, "\x00")
+		if !scopes[sc] {
+			s.orphanSeen.Delete(key)
+		}
+		return true
+	})
 	return reattach
 }
 
@@ -3152,6 +3166,7 @@ func (s *Store) knownScopes(ctx context.Context) []string {
 // structure cannot spin the walk.
 func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconView) []int64 {
 	seen := map[string]struct{}{}
+	present := map[string]struct{}{}
 	var reattach []int64
 	var walk func(dir string)
 	walk = func(dir string) {
@@ -3170,6 +3185,7 @@ func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconVie
 			if !strings.HasPrefix(name, opStagePrefix) {
 				continue // only private recovery names are owned names
 			}
+			present[scope+"\x00"+dir+"\x00"+name] = struct{}{}
 			if id := s.attachOrphanName(ctx, scope, view, dir, name); id > 0 {
 				reattach = append(reattach, id)
 			}
@@ -3190,6 +3206,22 @@ func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconVie
 		}
 	}
 	walk("")
+	// Drop first-sighting records for names this pass's listing no
+	// longer reports: a transient entry (stale listing, just-settled
+	// stage slot) must not stay one sighting away from a recover intent
+	// forever — if it ever reappears the deferral restarts — and the
+	// sighting set stays bounded by what the filesystem currently
+	// claims.
+	prefix := scope + "\x00"
+	s.orphanSeen.Range(func(k, _ any) bool {
+		key := k.(string)
+		if strings.HasPrefix(key, prefix) {
+			if _, ok := present[key]; !ok {
+				s.orphanSeen.Delete(key)
+			}
+		}
+		return true
+	})
 	return reattach
 }
 
@@ -3205,9 +3237,11 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	// the name alone (dir is omitempty, so a dir-less record cannot be
 	// matched by a dir key); the candidate rows' records are checked in
 	// Go so a same-named record in a different directory does not claim
-	// ownership.
+	// ownership. A record's empty Dir means "the intent's own parent dir"
+	// (nameDir), so the comparison resolves it against the intent's path —
+	// a stage slot discovered in a non-root directory still owns its name.
 	rows, qerr := s.pool.Query(dctx,
-		`SELECT id, names FROM file_op
+		`SELECT id, path, names FROM file_op
 		 WHERE scope=$1 AND names @> $2::jsonb`,
 		scope, mustJSON([]map[string]string{{"name": name}}))
 	if qerr != nil {
@@ -3216,8 +3250,9 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	owned := false
 	for rows.Next() {
 		var oid int64
+		var ipath string
 		var raw []byte
-		if rows.Scan(&oid, &raw) != nil {
+		if rows.Scan(&oid, &ipath, &raw) != nil {
 			continue
 		}
 		var recs []nameRec
@@ -3225,7 +3260,11 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 			continue
 		}
 		for _, r := range recs {
-			if r.Name == name && r.Dir == dir {
+			eff := r.Dir
+			if eff == "" {
+				eff, _ = splitRel(ipath)
+			}
+			if r.Name == name && eff == dir {
 				owned = true
 			}
 		}
@@ -3244,26 +3283,54 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 	// intent's record is re-judged by the tombstone scan.
 	if iid, ok := stageNameID(name); ok {
 		var exists, resolved bool
+		var ipath string
 		if err := s.pool.QueryRow(dctx,
-			`SELECT true, resolved_at IS NOT NULL FROM file_op
+			`SELECT true, resolved_at IS NOT NULL, path FROM file_op
 			  WHERE id=$1 AND scope=$2 AND root=$3`,
-			iid, scope, s.rootID).Scan(&exists, &resolved); err == nil && exists {
-			if _, err := s.pool.Exec(dctx,
-				`UPDATE file_op SET names =
-				    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
-				    || $2::jsonb
-				  WHERE id=$1`,
-				iid, mustJSON([]nameRec{{Name: name, Dir: dir}})); err == nil {
-				log.Printf("reconcile: private name %s/%s re-attached to intent %d", dir, name, iid)
-				if resolved {
-					// Its tombstone scan already ran (or just resolved)
-					// this pass — the caller re-judges it now so the
-					// record is not stranded until the next scan cadence.
-					return iid
+			iid, scope, s.rootID).Scan(&exists, &resolved, &ipath); err == nil && exists {
+			// The record's Dir encodes the discovered directory — but an
+			// empty Dir means "the intent's own parent dir" (nameDir), so
+			// a name found at scope root cannot be truthfully journaled
+			// for an intent whose path lives in a subdirectory: it would
+			// resolve to the parent dir, never own the name, and every
+			// later sweep would append another copy while the object
+			// stays parked at the root. That case falls through to the
+			// recover-intent path, whose own journal resolves Dir:"" to
+			// "" — the name's actual location.
+			pdir, _ := splitRel(ipath)
+			if dir != "" || pdir == "" {
+				if _, err := s.pool.Exec(dctx,
+					`UPDATE file_op SET names =
+					    CASE WHEN jsonb_typeof(names)='array' THEN names ELSE '[]'::jsonb END
+					    || $2::jsonb
+					  WHERE id=$1`,
+					iid, mustJSON([]nameRec{{Name: name, Dir: dir}})); err == nil {
+					log.Printf("reconcile: private name %s/%s re-attached to intent %d", dir, name, iid)
+					if resolved {
+						// Its tombstone scan already ran (or just resolved)
+						// this pass — the caller re-judges it now so the
+						// record is not stranded until the next scan cadence.
+						return iid
+					}
+					return 0
 				}
-				return 0
 			}
 		}
+	}
+	// No owner can be proven. A single listing sighting is not yet
+	// orphan evidence: on cached/slow filesystems (JuiceFS entry-cache
+	// lag) a directory listing can still report a private name whose
+	// owning intent settled moments ago — its file_op row is already
+	// gone on success, so neither check above can match it. Minting a
+	// recover intent from that one sighting fences the whole parent
+	// directory for the deadGrace hot window and 503s ordinary
+	// follow-on mutations (files-acc-20260918-root-02). Require the
+	// name to persist across one sweep boundary: genuinely orphaned
+	// objects are safe parked under their private name meanwhile, and
+	// a transient listing ghost never mints a fencing intent at all.
+	seenKey := scope + "\x00" + dir + "\x00" + name
+	if _, seen := s.orphanSeen.LoadOrStore(seenKey, struct{}{}); !seen {
+		return 0
 	}
 	// Orphan: create a recover intent. The journal records the inherited
 	// name BEFORE the intent is visible to the executor — the same
@@ -3288,20 +3355,26 @@ func (s *Store) attachOrphanName(ctx context.Context, scope string, view ReconVi
 }
 
 // stageNameID extracts the intent id embedded in a private stage name:
-// .filesv-op-<id> and its derived "-seg-suffix" forms all carry it.
+// the minted forms o<id>-a0-* (an op's stage slot) and c<id>-* (capture
+// names) tag the id with a role letter; bare <id>-* also parses so older
+// or foreign layouts still resolve. Segments carrying no id (adhoc-*)
+// return false — such names have no owning intent to re-attach to.
 func stageNameID(name string) (int64, bool) {
 	if !strings.HasPrefix(name, opStagePrefix) {
 		return 0, false
 	}
 	rest := name[len(opStagePrefix):]
-	digits := rest
+	seg := rest
 	if i := strings.IndexByte(rest, '-'); i >= 0 {
-		digits = rest[:i]
+		seg = rest[:i]
 	}
-	if digits == "" {
+	if len(seg) > 1 && (seg[0] == 'o' || seg[0] == 'c') {
+		seg = seg[1:]
+	}
+	if seg == "" {
 		return 0, false
 	}
-	id, err := strconv.ParseInt(digits, 10, 64)
+	id, err := strconv.ParseInt(seg, 10, 64)
 	return id, err == nil && id > 0
 }
 

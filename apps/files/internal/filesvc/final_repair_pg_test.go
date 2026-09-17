@@ -546,6 +546,11 @@ func TestFinalOrphanUnrecordedScopeSwept(t *testing.T) {
 	}
 	putFile(t, dir, "ghost/.filesv-op-7777-a0-beef", "unrecorded-scope-bytes")
 
+	// First sweep sights the name; it must persist across a sweep
+	// boundary before it is adopted (transient listing ghosts never
+	// mint a fencing recover intent).
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
 	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
 
@@ -654,6 +659,10 @@ func TestFinalOrphanNameSurfaces(t *testing.T) {
 
 	putFile(t, dir, "ws/.filesv-op-4242-a0-dead", "orphaned-bytes")
 
+	s.lastStageSweep.Store(0)
+	s.Reconcile(ctx)
+	// Second sweep: the name persisted past the sighting deferral, so
+	// it is adopted and surfaced now.
 	s.lastStageSweep.Store(0)
 	s.Reconcile(ctx)
 
