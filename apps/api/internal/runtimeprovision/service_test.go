@@ -92,6 +92,14 @@ type fakeBackend struct {
 	stopCalls      map[string]int
 	privateVolumes map[string]bool
 	reconcileReaps map[string]uint64
+	failPrepare    bool
+	// filesScope models the supervisor's verified-canonical-bind signal: what
+	// inspect reports for a live project whose /workspace bind provably is
+	// the calling process's configured scope. Tests leave it empty when the
+	// physical bind does not match the current environment — e.g. a
+	// provisioner recreated with different SUMI_FILES_* configuration while
+	// containers bound to the previous volume are still running.
+	filesScope FilesScopeState
 	// identitySurvivesReap reproduces the host shape that made every spawn after
 	// the first fail. A verified teardown runs `compose down` without removing
 	// the allocator's named volume, so the epoch identity written there outlives
@@ -131,6 +139,9 @@ func (backend *fakeBackend) Prepare(_ context.Context, request PrepareRequest) (
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.prepareCalls[request.PersonalityAgentID]++
+	if backend.failPrepare {
+		return PreparedEpoch{}, errors.New("backend prepare failed")
+	}
 	generation := backend.nextGeneration[request.PersonalityAgentID]
 	backend.nextGeneration[request.PersonalityAgentID] = generation + 1
 	epoch := PreparedEpoch{
@@ -179,7 +190,11 @@ func (backend *fakeBackend) Inspect(_ context.Context, personalityAgentID string
 	if !ok {
 		return unknownInspection(personalityAgentID), nil
 	}
-	return cloneInspection(inspection), nil
+	inspection = cloneInspection(inspection)
+	if inspection.Phase == PhasePrepared || inspection.Phase == PhaseActive {
+		inspection.FilesScope = backend.filesScope
+	}
+	return inspection, nil
 }
 
 func (backend *fakeBackend) Stop(_ context.Context, epoch PreparedEpoch) (Inspection, error) {
@@ -326,6 +341,8 @@ func TestPrepareRecoversCommittedBackendEpochWithoutAllocatingAgain(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The supervisor positively observes the ordinary named-volume workspace.
+	backend.filesScope = FilesScopeLocal
 	service := newTestService(t, backend)
 	recovered, err := service.Prepare(context.Background(), PrepareRequest{
 		Version: ProtocolVersion, PersonalityAgentID: testPAID, IdempotencyKey: "retry-after-daemon-restart",

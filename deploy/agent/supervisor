@@ -1172,8 +1172,15 @@ prepared_containers_exist() {
 
 print_epoch_json() {
   local phase="$1"
-  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
-    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
+  local executor_workspace="${2:-}"
+  local files_scope="${3:-}"
+  local extra=""
+  [[ -n "${executor_workspace}" ]] &&
+    extra="${extra},\"executor_workspace\":\"${executor_workspace}\""
+  [[ -n "${files_scope}" ]] &&
+    extra="${extra},\"files_scope\":\"${files_scope}\""
+  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"%s}\n' \
+    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}" "${extra}"
 }
 
 print_unknown_json() {
@@ -1186,23 +1193,117 @@ print_reaped_json() {
     "${SUMI_PERSONALITY_AGENT_ID}" "${generation}"
 }
 
+# executor_workspace_state reads the executor container's healthcheck status
+# in files scope mode. The overlay healthcheck runs a bounded stat of
+# /workspace, so a stale FUSE bind — ENOTCONN after the owned client died and
+# the parent mount remounted — reports "unhealthy" while the runtime process
+# stays alive. Workspace usability and runtime liveness are separate facts:
+# this surfaces the former through inspect without changing the phase, and
+# prints nothing when files mode is off or no executor container exists.
+executor_workspace_state() {
+  (( FILES_WORKSPACE_MODE )) || return 0
+  local container health
+  container="$(lifecycle_compose ps --all --quiet executor 2>/dev/null)" || return 0
+  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 0
+  health="$(run_external docker inspect \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "${container}" 2>/dev/null)" || return 0
+  case "${health}" in
+    healthy|unhealthy|starting) printf '%s' "${health}" ;;
+  esac
+}
+
+# files_scope_state classifies the live project's /workspace mount so the
+# provisioner can reconcile durable binding records with physical evidence.
+# The container's ai.sumi.files-volume-uuid label — written at create time
+# from the verified launch configuration — is the epoch's own claim of the
+# volume it was bound to; a mount-path string cannot prove that (a same-path
+# volume swap leaves a running bind serving the old volume), so the path is
+# never re-verified here.
+#
+#   bound    bind workspace + the epoch's recorded volume UUID matches the
+#            configured SUMI_FILES_VOLUME_UUID — a legitimate remount at a
+#            different path is covered, because the label names the volume,
+#            not the path.
+#   foreign  a host-path bind exists but the epoch's recorded volume differs
+#            from the configured one, or the epoch never recorded one —
+#            canonical-style workspace this configuration cannot verify. Also
+#            a non-bind workspace whose epoch still claims a canonical volume.
+#   local    positively observed non-bind workspace (the ordinary named
+#            volume) with no canonical-volume claim on the epoch.
+#   unknown  a container exists but its workspace could not be classified —
+#            the mount inspection failed or returned no /workspace entry.
+#   (empty)  no container to classify.
+#
+# Failing observation is never read as "local": unknown carries no positive
+# evidence and launch-shaped transitions refuse it when no durable record
+# governs.
+files_scope_state() {
+  local container observation mount_line mount_type label
+  container="$(lifecycle_compose ps --all --quiet executor 2>/dev/null)" || true
+  if [[ ! "${container}" =~ ^[0-9a-f]{12,64}$ ]]; then
+    container="$(prepare_compose ps --all --quiet prepare 2>/dev/null)" || true
+  fi
+  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 0
+  observation="$(run_external docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Type}} {{.Source}}{{"\n"}}{{end}}{{end}}{{"\n"}}{{with .Config.Labels}}{{index . "ai.sumi.files-volume-uuid"}}{{end}}' \
+    "${container}" 2>/dev/null)" || {
+    printf 'unknown'
+    return 0
+  }
+  mount_line="${observation%%$'\n'*}"
+  # Command substitution strips trailing newlines, so an empty label leaves no
+  # separator at all — only split the label off when one is actually present.
+  if [[ "${observation}" == *$'\n'* ]]; then
+    label="${observation##*$'\n'}"
+  else
+    label=""
+  fi
+  mount_type="${mount_line%% *}"
+  if [[ -z "${mount_line}" || "${mount_type}" == "${mount_line}" ]]; then
+    printf 'unknown'
+    return 0
+  fi
+  if [[ "${mount_type}" != "bind" ]]; then
+    if [[ -n "${label}" ]]; then
+      printf 'foreign'
+    else
+      printf 'local'
+    fi
+    return 0
+  fi
+  if [[ -z "${label}" ]]; then
+    printf 'foreign'
+    return 0
+  fi
+  if (( FILES_WORKSPACE_MODE )) &&
+    [[ "${label}" == "${SUMI_FILES_VOLUME_UUID}" ]]; then
+    printf 'bound'
+    return 0
+  fi
+  printf 'foreign'
+}
+
 inspect_epoch() {
+  local workspace_state scope_state
+  workspace_state="$(executor_workspace_state)"
+  scope_state="$(files_scope_state)"
   if long_lived_roles_match_expected_state running; then
     epoch_identity || fail "active project has no coherent prepared epoch"
-    print_epoch_json active
+    print_epoch_json active "${workspace_state}" "${scope_state}"
     return
   fi
   if ! long_lived_containers_exist && prepared_containers_exist &&
     prepared_project_containers_match_expected_roles; then
     epoch_identity || fail "prepared project has no coherent epoch"
-    print_epoch_json prepared
+    print_epoch_json prepared "" "${scope_state}"
     return
   fi
   # A partial, failed, or orphaned project is not reusable, but allocator
   # identity remains the authority needed by the API to fence local control
   # before its subsequent destructive reconcile.
   if epoch_identity; then
-    print_epoch_json recovery
+    print_epoch_json recovery "${workspace_state}" "${scope_state}"
   else
     print_unknown_json
   fi

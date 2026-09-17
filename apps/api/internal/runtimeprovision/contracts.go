@@ -131,11 +131,71 @@ type ReconcileRequest struct {
 	FencedEpoch *PreparedEpoch `json:"fenced_epoch,omitempty"`
 }
 
+// ExecutorWorkspaceHealth is the executor container's workspace-bind
+// usability as reported by its bounded healthcheck in canonical files scope
+// mode. It is deliberately independent of Phase: a secretary stays
+// phase-active while its workspace bind is unusable (the owned FUSE client
+// died and remounted; the executor's old bind still points at the dead
+// connection), and stopping the runtime just because one filesystem
+// operation is unavailable would discard unaffected capabilities.
+type ExecutorWorkspaceHealth string
+
+const (
+	ExecutorWorkspaceHealthy   ExecutorWorkspaceHealth = "healthy"
+	ExecutorWorkspaceUnhealthy ExecutorWorkspaceHealth = "unhealthy"
+	ExecutorWorkspaceStarting  ExecutorWorkspaceHealth = "starting"
+)
+
+func (health ExecutorWorkspaceHealth) valid() bool {
+	switch health {
+	case ExecutorWorkspaceHealthy, ExecutorWorkspaceUnhealthy, ExecutorWorkspaceStarting:
+		return true
+	}
+	return false
+}
+
+// FilesScopeState classifies a live project's /workspace mount as the
+// supervisor observes it. FilesScopeBound means the epoch's own immutable
+// record (the container's canonical-volume label) names the configured
+// volume. FilesScopeForeign means a host-path workspace bind exists that this
+// configuration cannot verify — another volume, or a launch that never
+// recorded one. FilesScopeLocal means a positively observed non-bind
+// workspace (the ordinary named volume) with no canonical claim.
+// FilesScopeUnknown means a container exists but the workspace could not be
+// classified — the mount inspection failed or returned no /workspace entry;
+// it carries no positive evidence. Absent means no container to classify.
+type FilesScopeState string
+
+const (
+	FilesScopeBound   FilesScopeState = "bound"
+	FilesScopeForeign FilesScopeState = "foreign"
+	FilesScopeLocal   FilesScopeState = "local"
+	FilesScopeUnknown FilesScopeState = "unknown"
+)
+
+func (scope FilesScopeState) valid() bool {
+	switch scope {
+	case FilesScopeBound, FilesScopeForeign, FilesScopeLocal, FilesScopeUnknown:
+		return true
+	}
+	return false
+}
+
 type Inspection struct {
 	PersonalityAgentID      string         `json:"personality_agent_id"`
 	Phase                   Phase          `json:"phase"`
 	Epoch                   *PreparedEpoch `json:"epoch,omitempty"`
 	ReapedThroughGeneration *uint64        `json:"reaped_through_generation,omitempty"`
+	// ExecutorWorkspace is present only when the supervisor runs in files
+	// scope mode and an executor container exists; empty means the signal is
+	// unavailable, not that the workspace is fine.
+	ExecutorWorkspace ExecutorWorkspaceHealth `json:"executor_workspace,omitempty"`
+	// FilesScope is "bound" only when the supervisor verified the live
+	// project's workspace bind is the configured canonical scope on the
+	// configured volume. The provisioner uses it to heal a missing durable
+	// binding without trusting environment that may have changed since the
+	// project was launched.
+	FilesScope FilesScopeState `json:"files_scope,omitempty"`
 }
 
 type OperationResponse struct {
@@ -423,10 +483,22 @@ func (inspection Inspection) Validate() error {
 	if err := ValidatePersonalityAgentID(inspection.PersonalityAgentID); err != nil {
 		return err
 	}
+	if inspection.ExecutorWorkspace != "" && !inspection.ExecutorWorkspace.valid() {
+		return fmt.Errorf("unknown executor workspace health %q", inspection.ExecutorWorkspace)
+	}
+	if inspection.FilesScope != "" && !inspection.FilesScope.valid() {
+		return fmt.Errorf("unknown files scope state %q", inspection.FilesScope)
+	}
 	switch inspection.Phase {
 	case PhaseUnknown:
 		if inspection.Epoch != nil {
 			return errors.New("unknown inspection must not carry an epoch")
+		}
+		if inspection.ExecutorWorkspace != "" {
+			return errors.New("unknown inspection must not carry executor workspace health")
+		}
+		if inspection.FilesScope != "" {
+			return errors.New("unknown inspection must not carry files scope state")
 		}
 	case PhasePrepared, PhaseActive, PhaseRecovery:
 		if inspection.Epoch == nil {

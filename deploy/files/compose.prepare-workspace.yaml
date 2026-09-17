@@ -13,6 +13,12 @@
 # instead of Docker silently creating a host-local workspace copy.
 services:
   prepare:
+    # The volume UUID the workspace bind was created under is immutable
+    # container metadata: inspect-epoch reads it to establish which volume
+    # this epoch was launched against. A later mount-path or configuration
+    # change cannot rewrite it — the label is the epoch's own claim.
+    labels:
+      ai.sumi.files-volume-uuid: ${SUMI_FILES_VOLUME_UUID:?run sumi-files-check first}
     volumes:
       - type: bind
         source: ${SUMI_FILES_SCOPE_DIR:?run sumi-files-check and set SUMI_FILES_SCOPE_DIR}

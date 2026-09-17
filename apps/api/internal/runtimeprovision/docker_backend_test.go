@@ -204,6 +204,48 @@ func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 	}
 }
 
+func TestParseSupervisorInspectionExecutorWorkspace(t *testing.T) {
+	inspection, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","executor_workspace":"unhealthy"}`), testPAID)
+	if err != nil {
+		t.Fatalf("active inspection with workspace health rejected: %v", err)
+	}
+	if inspection.ExecutorWorkspace != ExecutorWorkspaceUnhealthy {
+		t.Fatalf("executor_workspace = %q, want unhealthy", inspection.ExecutorWorkspace)
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","executor_workspace":"bogus"}`), testPAID); err == nil {
+		t.Fatal("invalid executor workspace health was accepted")
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"unknown","executor_workspace":"healthy"}`), testPAID); err == nil {
+		t.Fatal("executor workspace health on an unknown inspection was accepted")
+	}
+}
+
+func TestParseSupervisorInspectionFilesScope(t *testing.T) {
+	for _, scope := range []FilesScopeState{
+		FilesScopeBound, FilesScopeForeign, FilesScopeLocal, FilesScopeUnknown,
+	} {
+		inspection, err := parseSupervisorInspection([]byte(
+			`{"personality_agent_id":"`+testPAID+`","phase":"prepared","generation":9,"rpc_boot_nonce":"nonce","files_scope":"`+string(scope)+`"}`), testPAID)
+		if err != nil {
+			t.Fatalf("prepared inspection with %q files scope rejected: %v", scope, err)
+		}
+		if inspection.FilesScope != scope {
+			t.Fatalf("files_scope = %q, want %q", inspection.FilesScope, scope)
+		}
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","files_scope":"bogus"}`), testPAID); err == nil {
+		t.Fatal("invalid files scope state was accepted")
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"unknown","files_scope":"bound"}`), testPAID); err == nil {
+		t.Fatal("files scope on an unknown inspection was accepted")
+	}
+}
+
 func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
 	// The runner signals the whole process group, so anything this script waits
 	// on in that same group receives SIGTERM at the same moment the shell does.
