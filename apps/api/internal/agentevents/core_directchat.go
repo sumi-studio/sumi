@@ -732,6 +732,25 @@ func commandDispositionKey(commandID string) [sha256.Size]byte {
 	return key
 }
 
+// commandDispositionDedupKey returns the durable dedup identity of a
+// committed command_disposition event — the same command-scoped key
+// appendDisposition writes under — or false when the event is not a
+// disposition carrying a command_id. The gateway's dedup-index recovery
+// uses it so a rebuilt index reproduces the real key; hashing the stored
+// content can never match a key derived from the command_id, which would
+// leave a stale projector free to commit a second terminal receipt.
+func commandDispositionDedupKey(event json.RawMessage) ([sha256.Size]byte, bool) {
+	var head struct {
+		Type      string `json:"type"`
+		CommandID string `json:"command_id"`
+	}
+	if json.Unmarshal(event, &head) != nil ||
+		head.Type != "command_disposition" || head.CommandID == "" {
+		return [sha256.Size]byte{}, false
+	}
+	return commandDispositionKey(head.CommandID), true
+}
+
 func (c *CoreDirectChat) appendDisposition(
 	ctx context.Context,
 	personaID string,
