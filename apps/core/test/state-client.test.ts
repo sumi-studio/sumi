@@ -24,6 +24,20 @@ function stallingServer(): Promise<{ server: Server; url: string }> {
       res.write('{"partial"');
       return; // body never finishes
     }
+    if (url.includes("fast-error")) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "state unavailable" }));
+      return;
+    }
+    if (url.includes("bad-body")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("not JSON");
+      return;
+    }
+    if (url.includes("disconnect")) {
+      req.socket.destroy();
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ persona: { persona_id: "p" } }));
   });
@@ -95,6 +109,105 @@ test("an error-status body that stalls is still bounded by the deadline", async 
     assert.ok(Date.now() - at < 5_000, "error body read bounded");
   } finally {
     server.close();
+  }
+});
+
+test("settled calls retain no deadline activity; a pending call keeps its bound", async () => {
+  // Deadline bookkeeping: the call's own timer is the one created with the
+  // client's timeoutMs; other internals (undici etc.) use different delays
+  // and are ignored here. A timer counts as open until it fires or is
+  // cleared — this asserts the exchange releases its deadline on every
+  // exit while a still-pending call remains bounded.
+  const origSet = globalThis.setTimeout;
+  const origClear = globalThis.clearTimeout;
+  const openDeadlines = new Set<ReturnType<typeof setTimeout>>();
+  globalThis.setTimeout = ((
+    cb: (...a: unknown[]) => void,
+    ms?: number,
+    ...a: unknown[]
+  ) => {
+    if (ms !== TIMEOUT) return origSet(cb, ms, ...a);
+    const handle = origSet(() => {
+      openDeadlines.delete(handle);
+      cb();
+    }, ms);
+    openDeadlines.add(handle);
+    return handle;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((t: ReturnType<typeof setTimeout> | undefined) => {
+    if (t !== undefined) openDeadlines.delete(t);
+    return origClear(t);
+  }) as typeof clearTimeout;
+  try {
+    const { server, url } = await stallingServer();
+    try {
+      const client = new HttpStateClient(url, "tok", undefined, TIMEOUT);
+      const ok = await client.personaState("healthy");
+      assert.equal(ok.persona?.persona_id, "p");
+      // A finished exchange must not keep its deadline armed — a retained
+      // timer holds a Durable Object non-hibernateable until it fires.
+      await new Promise((r) => origSet(r, 30)); // let microtasks drain
+      assert.equal(
+        openDeadlines.size,
+        0,
+        "settled call retained a deadline timer",
+      );
+
+      // These fail before the deadline: cleanup must not depend on it firing.
+      await assert.rejects(client.personaState("fast-error"), (e: unknown) => {
+        assert.ok(e instanceof StateError && e.status === 500);
+        assert.equal(e.message, "state unavailable");
+        return true;
+      });
+      assert.equal(
+        openDeadlines.size,
+        0,
+        "HTTP error retained a deadline timer",
+      );
+      await assert.rejects(client.personaState("bad-body"), (e: unknown) => {
+        assert.ok(e instanceof StateError && e.status === 503);
+        assert.match(e.message, /unreadable 200 body/);
+        return true;
+      });
+      assert.equal(
+        openDeadlines.size,
+        0,
+        "JSON error retained a deadline timer",
+      );
+      await assert.rejects(client.personaState("disconnect"));
+      assert.equal(
+        openDeadlines.size,
+        0,
+        "fetch failure retained a deadline timer",
+      );
+
+      // While a call is still pending its deadline must remain armed.
+      const pending = client.personaState("stall-h");
+      await new Promise((r) => origSet(r, 30));
+      assert.equal(
+        openDeadlines.size,
+        1,
+        "pending call lost its deadline bound",
+      );
+      await assert.rejects(pending, (e: unknown) => {
+        assert.ok(e instanceof StateError && e.status === 503);
+        return true;
+      });
+      // The deadline fired — it no longer counts as retained activity.
+      assert.equal(openDeadlines.size, 0, "timed-out call retained a timer");
+
+      // Error-status exit releases its deadline too.
+      await assert.rejects(client.personaState("stall-e"), (e: unknown) => {
+        assert.ok(e instanceof StateError && e.status === 500);
+        return true;
+      });
+      assert.equal(openDeadlines.size, 0, "error exit retained a timer");
+    } finally {
+      server.close();
+    }
+  } finally {
+    globalThis.setTimeout = origSet;
+    globalThis.clearTimeout = origClear;
   }
 });
 

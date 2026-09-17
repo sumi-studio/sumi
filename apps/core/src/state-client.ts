@@ -436,51 +436,62 @@ export class HttpStateClient implements StateClient {
     // One signal bounds the whole request: a service that accepts but never
     // answers, or answers headers and stalls mid-body, fails here instead
     // of occupying a serialized start (or a drain) forever.
-    const signal = AbortSignal.timeout(this.timeoutMs);
-    let res: StateResponse;
+    // An owned controller — not AbortSignal.timeout — because the runtime's
+    // timeout signal leaves a pending timer until the deadline even after
+    // the exchange completes, which keeps a Durable Object
+    // non-hibernateable (and billed) for the remainder of the window.
+    // clearTimeout on every exit releases the deadline once the body has
+    // settled; a still-pending call keeps its bound.
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), this.timeoutMs);
     try {
-      res = await this.fetchImpl(this.baseUrl + path, {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal,
-      });
-    } catch (e) {
-      throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
-    }
-    if (res.ok) {
+      let res: StateResponse;
       try {
-        return (await res.json()) as T;
+        res = await this.fetchImpl(this.baseUrl + path, {
+          method,
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            "Content-Type": "application/json",
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: deadline.signal,
+        });
       } catch (e) {
-        const timeout = callDeadlineError(e, method, path, this.timeoutMs);
-        if (timeout) throw timeout;
-        // A 200 with an unreadable body is an infrastructure blip — a
-        // truncated proxy/middlebox response or a service bug — not a
-        // code defect. Surface it as a transient 5xx so callers back
-        // off instead of exiting (final-review NF2). The real status
-        // stays in the message.
-        throw new StateError(
-          503,
-          `state service returned an unreadable ${res.status} body: ${e instanceof Error ? e.message : String(e)}`,
-        );
+        throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
       }
+      if (res.ok) {
+        try {
+          return (await res.json()) as T;
+        } catch (e) {
+          const timeout = callDeadlineError(e, method, path, this.timeoutMs);
+          if (timeout) throw timeout;
+          // A 200 with an unreadable body is an infrastructure blip — a
+          // truncated proxy/middlebox response or a service bug — not a
+          // code defect. Surface it as a transient 5xx so callers back
+          // off instead of exiting (final-review NF2). The real status
+          // stays in the message.
+          throw new StateError(
+            503,
+            `state service returned an unreadable ${res.status} body: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      let message = `state service ${res.status}`;
+      let job: Job | undefined;
+      try {
+        const parsed = (await res.json()) as { error?: string; job?: Job };
+        if (parsed.error) message = parsed.error;
+        if (parsed.job) job = parsed.job;
+      } catch {
+        /* non-JSON error body */
+      }
+      if (res.status === 401) throw new UnauthorizedError(message);
+      if (res.status === 409 && message.includes("fenced"))
+        throw new FencedError(message);
+      throw new StateError(res.status, message, job);
+    } finally {
+      clearTimeout(timer);
     }
-    let message = `state service ${res.status}`;
-    let job: Job | undefined;
-    try {
-      const parsed = (await res.json()) as { error?: string; job?: Job };
-      if (parsed.error) message = parsed.error;
-      if (parsed.job) job = parsed.job;
-    } catch {
-      /* non-JSON error body */
-    }
-    if (res.status === 401) throw new UnauthorizedError(message);
-    if (res.status === 409 && message.includes("fenced"))
-      throw new FencedError(message);
-    throw new StateError(res.status, message, job);
   }
 
   acquireWriter(persona: string, holder: string, ttlMs: number) {
