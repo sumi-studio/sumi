@@ -2,7 +2,9 @@ package fileaccess
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -254,6 +256,52 @@ func TestFileWriteKeyReuseDifferentRequestConflicts(t *testing.T) {
 	_, err = applyToolKey(t, fx, ToolRemove, key, map[string]any{"path": "k.txt"})
 	if !errors.Is(err, agentstate.ErrBadRequest) {
 		t.Fatalf("key reuse across ops must conflict, got %v", err)
+	}
+}
+
+// A diverged receipt (filesvc settled the keyed op but could not confirm
+// its declared effect — F338) is a deterministic failure for the ledger,
+// never a bare success: the effect surfaces outcome_uncertain as a
+// recorded-failure error, does not mutate, and repeats identically.
+func TestFileWriteDivergedReceiptIsDeterministicFailure(t *testing.T) {
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	fx := FileEffects(c)
+
+	key := "diverged-op"
+	req := map[string]any{"path": "d.txt", "content_text": "ours"}
+	// Seed the receipt the real filesvc writes when a keyed write settles
+	// unconfirmed (foreign bytes at the path, landing unproven).
+	sum := sha256.Sum256([]byte("ours"))
+	f.receipts[testScope+"\x00"+effectOpKey(key)] = fakeReceipt{
+		reqHash: fakeReqHash("write", "d.txt", fakeIVCanon("none"), hex.EncodeToString(sum[:])),
+		op:      "write", version: 7, verdict: "diverged",
+	}
+
+	_, err := applyToolKey(t, fx, ToolWrite, key, req)
+	if !errors.Is(err, agentstate.ErrBadRequest) || !strings.Contains(err.Error(), "outcome_uncertain") {
+		t.Fatalf("diverged replay must be a deterministic outcome_uncertain failure, got %v", err)
+	}
+	if _, ok := f.files[testScope]["d.txt"]; ok {
+		t.Fatal("diverged replay mutated the tree")
+	}
+	// Same verdict on a second replay — no endless retry, no success.
+	if _, err := applyToolKey(t, fx, ToolWrite, key, req); !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("second diverged replay must still fail deterministically, got %v", err)
+	}
+	// A diverged remove receipt propagates the same way.
+	f.files[testScope] = map[string]fakeEntry{"/": {dir: true}, "v.txt": {body: []byte("v"), version: 9}}
+	rmKey := "diverged-rm"
+	f.receipts[testScope+"\x00"+effectOpKey(rmKey)] = fakeReceipt{
+		reqHash: fakeReqHash("remove", "v.txt", fakeIVCanon("any")),
+		op:      "remove", version: 9, verdict: "diverged",
+	}
+	_, err = applyToolKey(t, fx, ToolRemove, rmKey, map[string]any{"path": "v.txt"})
+	if !errors.Is(err, agentstate.ErrBadRequest) || !strings.Contains(err.Error(), "outcome_uncertain") {
+		t.Fatalf("diverged remove replay must fail deterministically, got %v", err)
+	}
+	if got := string(f.files[testScope]["v.txt"].body); got != "v" {
+		t.Fatalf("diverged remove replay deleted content: %q", got)
 	}
 }
 

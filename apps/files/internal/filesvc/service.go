@@ -267,8 +267,12 @@ func opIdentity(r *http.Request, parts ...string) (OpIdentity, error) {
 }
 
 // mutationResult answers a mutation handler: a *Replayed error is the
-// operation's committed receipt — success, with the recorded version —
-// everything else goes through mapErr.
+// operation's committed receipt — success, with the recorded version. A
+// *ReplayedDiverged is the receipt's diverged verdict — the operation was
+// accepted once and will never re-run, but its effect could not be
+// confirmed applied: a deterministic 409 that says so plainly, so neither
+// the ledger nor the caller ever reads it as success. Everything else
+// goes through mapErr.
 func (s *Service) mutationResult(w http.ResponseWriter, err error, ok map[string]any) {
 	if err == nil {
 		writeJSON(w, ok)
@@ -279,6 +283,20 @@ func (s *Service) mutationResult(w http.ResponseWriter, err error, ok map[string
 		ok["version"] = rep.Version
 		ok["replayed"] = true
 		writeJSON(w, ok)
+		return
+	}
+	var div *ReplayedDiverged
+	if errors.As(err, &div) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error":    div.Error(),
+			"code":     "outcome_uncertain",
+			"replayed": true,
+			"op":       div.Op,
+			"path":     div.Path,
+			"version":  div.Version,
+		})
 		return
 	}
 	s.mapErr(w, err)

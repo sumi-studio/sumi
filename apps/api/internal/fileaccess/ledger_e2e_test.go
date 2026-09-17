@@ -2,9 +2,12 @@ package fileaccess
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +94,64 @@ func e2eLedgerSetup(t *testing.T) (*agentstate.Store, *Client, string) {
 		t.Fatalf("ensure persona: %v", err)
 	}
 	return s, c, pa
+}
+
+// F338: a diverged receipt replay surfaces through the REAL operation
+// ledger as a deterministic claim failure — never a recorded success, and
+// never a retryable error that would re-run the mutation. The filesvc is
+// the wire-faithful fake (a real service cannot be forced into a diverged
+// settle through its public API); the ledger, claim path, and error
+// mapping are all real Postgres-backed machinery.
+func TestE2ELedgerDivergedReceiptFailsDeterministically(t *testing.T) {
+	if os.Getenv("SUMI_TEST_DB_URL") == "" {
+		t.Skip("SUMI_TEST_DB_URL unset; skipping Postgres integration test")
+	}
+	f := newFakeFilesvc(t)
+	c, _ := f.client(t)
+	s := e2eStore(t)
+	for tool, effect := range FileEffects(c) {
+		if err := s.RegisterEffect(tool, effect); err != nil {
+			t.Fatalf("register %s: %v", tool, err)
+		}
+	}
+	pa := "019a0000-0000-7000-8000-0000000000c5"
+	if _, _, err := s.EnsurePersona(context.Background(), pa, nil, ""); err != nil {
+		t.Fatalf("ensure persona: %v", err)
+	}
+	scope, _ := ScopeForPersona(pa)
+
+	// Seed the receipt a real filesvc writes when a keyed write settles
+	// unconfirmed: foreign bytes at the path, landing unproven.
+	req := map[string]any{"path": "diverged.txt", "content_text": "ours"}
+	inputID := "in-div-" + fmt.Sprint(time.Now().UnixNano())
+	opKey := effectOpKey(inputID + ":tool:0")
+	sum := sha256.Sum256([]byte("ours"))
+	f.receipts[scope+"\x00"+opKey] = fakeReceipt{
+		reqHash: fakeReqHash("write", "diverged.txt", fakeIVCanon("none"), hex.EncodeToString(sum[:])),
+		op:      "write", version: 4, verdict: "diverged",
+	}
+	// Foreign content occupies the path — the receipt must not claim it.
+	f.files[scope] = map[string]fakeEntry{"diverged.txt": {body: []byte("foreign"), version: 9}}
+
+	turn := planTurn(t, s, pa, "t-div-"+fmt.Sprint(time.Now().UnixNano()), inputID,
+		agentstate.PlanCall{Tool: ToolWrite, Route: "normal", Request: req})
+
+	_, _, err := claim(t, s, turn, ToolWrite, 0, req)
+	if !errors.Is(err, agentstate.ErrBadRequest) || !strings.Contains(err.Error(), "outcome_uncertain") {
+		t.Fatalf("diverged receipt must be a deterministic claim failure, got %v", err)
+	}
+	// The failure is durable and repeatable — the second claim answers the
+	// same refusal instead of re-running or wedging on retry.
+	_, _, err = claim(t, s, turn, ToolWrite, 0, req)
+	if !errors.Is(err, agentstate.ErrBadRequest) {
+		t.Fatalf("re-claim must repeat the deterministic failure, got %v", err)
+	}
+	// No mutation: the foreign bytes are untouched and no second version
+	// was minted.
+	if got := string(f.files[scope]["diverged.txt"].body); got != "foreign" {
+		t.Fatalf("diverged replay touched foreign content: %q", got)
+	}
+	finishTurn(t, s, turn, inputID)
 }
 
 func TestE2ELedgerFileWriteReplay(t *testing.T) {
