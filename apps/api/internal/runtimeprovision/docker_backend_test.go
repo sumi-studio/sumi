@@ -204,6 +204,25 @@ func TestParseSupervisorInspectionRejectsTrailingOutput(t *testing.T) {
 	}
 }
 
+func TestParseSupervisorInspectionExecutorWorkspace(t *testing.T) {
+	inspection, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","executor_workspace":"unhealthy"}`), testPAID)
+	if err != nil {
+		t.Fatalf("active inspection with workspace health rejected: %v", err)
+	}
+	if inspection.ExecutorWorkspace != ExecutorWorkspaceUnhealthy {
+		t.Fatalf("executor_workspace = %q, want unhealthy", inspection.ExecutorWorkspace)
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"active","generation":9,"rpc_boot_nonce":"nonce","executor_workspace":"bogus"}`), testPAID); err == nil {
+		t.Fatal("invalid executor workspace health was accepted")
+	}
+	if _, err := parseSupervisorInspection([]byte(
+		`{"personality_agent_id":"`+testPAID+`","phase":"unknown","executor_workspace":"healthy"}`), testPAID); err == nil {
+		t.Fatal("executor workspace health on an unknown inspection was accepted")
+	}
+}
+
 func TestExecCommandRunnerCancelsThroughSupervisorTermTrap(t *testing.T) {
 	// The runner signals the whole process group, so anything this script waits
 	// on in that same group receives SIGTERM at the same moment the shell does.

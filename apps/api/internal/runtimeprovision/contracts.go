@@ -131,11 +131,38 @@ type ReconcileRequest struct {
 	FencedEpoch *PreparedEpoch `json:"fenced_epoch,omitempty"`
 }
 
+// ExecutorWorkspaceHealth is the executor container's workspace-bind
+// usability as reported by its bounded healthcheck in canonical files scope
+// mode. It is deliberately independent of Phase: a secretary stays
+// phase-active while its workspace bind is unusable (the owned FUSE client
+// died and remounted; the executor's old bind still points at the dead
+// connection), and stopping the runtime just because one filesystem
+// operation is unavailable would discard unaffected capabilities.
+type ExecutorWorkspaceHealth string
+
+const (
+	ExecutorWorkspaceHealthy   ExecutorWorkspaceHealth = "healthy"
+	ExecutorWorkspaceUnhealthy ExecutorWorkspaceHealth = "unhealthy"
+	ExecutorWorkspaceStarting  ExecutorWorkspaceHealth = "starting"
+)
+
+func (health ExecutorWorkspaceHealth) valid() bool {
+	switch health {
+	case ExecutorWorkspaceHealthy, ExecutorWorkspaceUnhealthy, ExecutorWorkspaceStarting:
+		return true
+	}
+	return false
+}
+
 type Inspection struct {
 	PersonalityAgentID      string         `json:"personality_agent_id"`
 	Phase                   Phase          `json:"phase"`
 	Epoch                   *PreparedEpoch `json:"epoch,omitempty"`
 	ReapedThroughGeneration *uint64        `json:"reaped_through_generation,omitempty"`
+	// ExecutorWorkspace is present only when the supervisor runs in files
+	// scope mode and an executor container exists; empty means the signal is
+	// unavailable, not that the workspace is fine.
+	ExecutorWorkspace ExecutorWorkspaceHealth `json:"executor_workspace,omitempty"`
 }
 
 type OperationResponse struct {
@@ -423,10 +450,16 @@ func (inspection Inspection) Validate() error {
 	if err := ValidatePersonalityAgentID(inspection.PersonalityAgentID); err != nil {
 		return err
 	}
+	if inspection.ExecutorWorkspace != "" && !inspection.ExecutorWorkspace.valid() {
+		return fmt.Errorf("unknown executor workspace health %q", inspection.ExecutorWorkspace)
+	}
 	switch inspection.Phase {
 	case PhaseUnknown:
 		if inspection.Epoch != nil {
 			return errors.New("unknown inspection must not carry an epoch")
+		}
+		if inspection.ExecutorWorkspace != "" {
+			return errors.New("unknown inspection must not carry executor workspace health")
 		}
 	case PhasePrepared, PhaseActive, PhaseRecovery:
 		if inspection.Epoch == nil {

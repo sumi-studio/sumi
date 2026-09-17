@@ -92,6 +92,7 @@ type fakeBackend struct {
 	stopCalls      map[string]int
 	privateVolumes map[string]bool
 	reconcileReaps map[string]uint64
+	failPrepare    bool
 	// identitySurvivesReap reproduces the host shape that made every spawn after
 	// the first fail. A verified teardown runs `compose down` without removing
 	// the allocator's named volume, so the epoch identity written there outlives
@@ -131,6 +132,9 @@ func (backend *fakeBackend) Prepare(_ context.Context, request PrepareRequest) (
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.prepareCalls[request.PersonalityAgentID]++
+	if backend.failPrepare {
+		return PreparedEpoch{}, errors.New("backend prepare failed")
+	}
 	generation := backend.nextGeneration[request.PersonalityAgentID]
 	backend.nextGeneration[request.PersonalityAgentID] = generation + 1
 	epoch := PreparedEpoch{

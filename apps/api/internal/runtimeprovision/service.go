@@ -15,12 +15,32 @@ type Service struct {
 	backend   Backend
 	processes *processStore
 	reaps     *durableReapState
+	files     *durableFilesBindings
+	filesEnv  FilesEnvironment
 	mu        sync.Mutex
 	entries   map[string]*serviceEntry
 }
 
 type ServiceConfig struct {
 	StateDirectory string
+	// Files is the daemon's canonical-files scope configuration (the
+	// SUMI_FILES_* environment). When all three fields are set the supervisor
+	// runs in files scope mode and launches bind the canonical volume.
+	Files FilesEnvironment
+}
+
+// FilesEnvironment is the provisioner's own canonical-files configuration,
+// observed once at process start. It is the values the supervisor receives,
+// not a per-request input.
+type FilesEnvironment struct {
+	Mountpoint string
+	VolumeUUID string
+	CheckPath  string
+}
+
+func (environment FilesEnvironment) configured() bool {
+	return environment.Mountpoint != "" && environment.VolumeUUID != "" &&
+		environment.CheckPath != ""
 }
 
 type serviceEntry struct {
@@ -41,7 +61,17 @@ func NewService(backend Backend, config ServiceConfig) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize durable reap state: %w", err)
 	}
-	service := &Service{backend: backend, reaps: reaps, entries: make(map[string]*serviceEntry)}
+	files, err := newDurableFilesBindings(config.StateDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("initialize durable files bindings: %w", err)
+	}
+	service := &Service{
+		backend:  backend,
+		reaps:    reaps,
+		files:    files,
+		filesEnv: config.Files,
+		entries:  make(map[string]*serviceEntry),
+	}
 	if processBackend, ok := backend.(ProcessBackend); ok {
 		service.processes, err = newProcessStore(config.StateDirectory, processBackend)
 		if err != nil {
@@ -73,6 +103,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	if entry.known && (entry.phase == PhasePrepared || entry.phase == PhaseActive) {
 		if entry.idempotencyKey != "" && entry.idempotencyKey != request.IdempotencyKey {
 			return PreparedEpoch{}, fmt.Errorf("%w: personality agent already has a live prepared epoch", ErrConflict)
+		}
+		if err := service.recordFilesBinding(request.PersonalityAgentID); err != nil {
+			return PreparedEpoch{}, fmt.Errorf("persist canonical files binding: %w", err)
 		}
 		return entry.epoch, nil
 	}
@@ -114,9 +147,15 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 		entry.epoch = *inspection.Epoch
 		entry.idempotencyKey = request.IdempotencyKey
 		entry.stopped = false
+		if err := service.recordFilesBinding(request.PersonalityAgentID); err != nil {
+			return PreparedEpoch{}, fmt.Errorf("persist canonical files binding: %w", err)
+		}
 		return entry.epoch, nil
 	}
 
+	if err := service.checkFilesBinding(request.PersonalityAgentID); err != nil {
+		return PreparedEpoch{}, err
+	}
 	epoch, err := service.backend.Prepare(ctx, request)
 	if err != nil {
 		return PreparedEpoch{}, err
@@ -126,6 +165,9 @@ func (service *Service) Prepare(ctx context.Context, request PrepareRequest) (Pr
 	}
 	if epoch.PersonalityAgentID != request.PersonalityAgentID {
 		return PreparedEpoch{}, errors.New("backend prepared a different personality agent")
+	}
+	if err := service.recordFilesBinding(request.PersonalityAgentID); err != nil {
+		return PreparedEpoch{}, fmt.Errorf("persist canonical files binding: %w", err)
 	}
 	entry.known = true
 	entry.phase = PhasePrepared
@@ -153,6 +195,9 @@ func (service *Service) Activate(ctx context.Context, request ActivateRequest) (
 	}
 	if entry.phase == PhaseActive {
 		return inspectionOf(entry), nil
+	}
+	if err := service.checkFilesBinding(request.PersonalityAgentID); err != nil {
+		return Inspection{}, err
 	}
 	if err := service.backend.Activate(ctx, request); err != nil {
 		return Inspection{}, err
@@ -341,6 +386,50 @@ func (service *Service) settleReapedRecovery(entry *serviceEntry) {
 	entry.phase = PhaseUnknown
 	entry.stopped = true
 	entry.recordReap(reaped)
+}
+
+// checkFilesBinding refuses a launch-shaped transition that would silently
+// substitute a host-local workspace for a personality agent whose workspace
+// was already bound to the canonical files volume. The binding is recorded
+// when a files-mode prepare commits and lives in the durable state directory,
+// so losing the SUMI_FILES_* environment (recreated provisioner, removed
+// overlay) cannot turn the next launch into an unrelated local directory, and
+// pointing the configuration at a different mountpoint or volume cannot
+// retarget the established binding. Stop/abort/reconcile are deliberately
+// ungated: a bound personality agent must remain stoppable and fenced, and
+// only launches need the canonical configuration restored.
+func (service *Service) checkFilesBinding(personalityAgentID string) error {
+	binding, bound := service.files.lookup(personalityAgentID)
+	if !bound {
+		return nil
+	}
+	if !service.filesEnv.configured() {
+		return fmt.Errorf(
+			"%w: personality agent is bound to canonical files volume %s and SUMI_FILES_* configuration is absent or incomplete; refusing host-local workspace substitution",
+			ErrConflict, binding.VolumeUUID,
+		)
+	}
+	if service.filesEnv.VolumeUUID != binding.VolumeUUID {
+		return fmt.Errorf(
+			"%w: personality agent is bound to canonical files volume %s; refusing retarget to volume %s",
+			ErrConflict, binding.VolumeUUID, service.filesEnv.VolumeUUID,
+		)
+	}
+	return nil
+}
+
+// recordFilesBinding persists the canonical binding once a files-mode prepare
+// has committed (including the already-prepared inspection fall-through that
+// heals a crash between backend prepare and the binding write). Personality
+// agents never launched in files scope mode have no record and keep the
+// established local-workspace contract.
+func (service *Service) recordFilesBinding(personalityAgentID string) error {
+	if !service.filesEnv.configured() {
+		return nil
+	}
+	return service.files.record(personalityAgentID, filesBinding{
+		VolumeUUID: service.filesEnv.VolumeUUID,
+	})
 }
 
 // verifyReapAttestation recomputes a caller's claimed reap receipt against the

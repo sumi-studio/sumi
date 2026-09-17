@@ -718,11 +718,12 @@ func NewDockerBackend(config DockerBackendConfig) (*DockerBackend, error) {
 }
 
 type supervisorInspection struct {
-	PersonalityAgentID      string  `json:"personality_agent_id"`
-	Phase                   Phase   `json:"phase"`
-	Generation              uint64  `json:"generation,omitempty"`
-	RPCBootNonce            string  `json:"rpc_boot_nonce,omitempty"`
-	ReapedThroughGeneration *uint64 `json:"reaped_through_generation,omitempty"`
+	PersonalityAgentID      string                  `json:"personality_agent_id"`
+	Phase                   Phase                   `json:"phase"`
+	Generation              uint64                  `json:"generation,omitempty"`
+	RPCBootNonce            string                  `json:"rpc_boot_nonce,omitempty"`
+	ReapedThroughGeneration *uint64                 `json:"reaped_through_generation,omitempty"`
+	ExecutorWorkspace       ExecutorWorkspaceHealth `json:"executor_workspace,omitempty"`
 }
 
 func (backend *DockerBackend) Prepare(ctx context.Context, request PrepareRequest) (PreparedEpoch, error) {
@@ -1013,6 +1014,7 @@ func parseSupervisorInspection(output []byte, expectedPersonalityAgentID string)
 		PersonalityAgentID:      wire.PersonalityAgentID,
 		Phase:                   wire.Phase,
 		ReapedThroughGeneration: wire.ReapedThroughGeneration,
+		ExecutorWorkspace:       wire.ExecutorWorkspace,
 	}
 	if wire.Phase == PhasePrepared || wire.Phase == PhaseActive || wire.Phase == PhaseRecovery {
 		epoch := PreparedEpoch{

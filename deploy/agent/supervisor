@@ -1172,8 +1172,15 @@ prepared_containers_exist() {
 
 print_epoch_json() {
   local phase="$1"
-  printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
-    "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
+  local executor_workspace="${2:-}"
+  if [[ -n "${executor_workspace}" ]]; then
+    printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s","executor_workspace":"%s"}\n' \
+      "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}" \
+      "${executor_workspace}"
+  else
+    printf '{"personality_agent_id":"%s","phase":"%s","generation":%s,"rpc_boot_nonce":"%s"}\n' \
+      "${SUMI_PERSONALITY_AGENT_ID}" "${phase}" "${EPOCH_GENERATION}" "${EPOCH_NONCE}"
+  fi
 }
 
 print_unknown_json() {
@@ -1186,10 +1193,32 @@ print_reaped_json() {
     "${SUMI_PERSONALITY_AGENT_ID}" "${generation}"
 }
 
+# executor_workspace_state reads the executor container's healthcheck status
+# in files scope mode. The overlay healthcheck runs a bounded stat of
+# /workspace, so a stale FUSE bind — ENOTCONN after the owned client died and
+# the parent mount remounted — reports "unhealthy" while the runtime process
+# stays alive. Workspace usability and runtime liveness are separate facts:
+# this surfaces the former through inspect without changing the phase, and
+# prints nothing when files mode is off or no executor container exists.
+executor_workspace_state() {
+  (( FILES_WORKSPACE_MODE )) || return 0
+  local container health
+  container="$(lifecycle_compose ps --all --quiet executor 2>/dev/null)" || return 0
+  [[ "${container}" =~ ^[0-9a-f]{12,64}$ ]] || return 0
+  health="$(run_external docker inspect \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+    "${container}" 2>/dev/null)" || return 0
+  case "${health}" in
+    healthy|unhealthy|starting) printf '%s' "${health}" ;;
+  esac
+}
+
 inspect_epoch() {
+  local workspace_state
+  workspace_state="$(executor_workspace_state)"
   if long_lived_roles_match_expected_state running; then
     epoch_identity || fail "active project has no coherent prepared epoch"
-    print_epoch_json active
+    print_epoch_json active "${workspace_state}"
     return
   fi
   if ! long_lived_containers_exist && prepared_containers_exist &&
@@ -1202,7 +1231,7 @@ inspect_epoch() {
   # identity remains the authority needed by the API to fence local control
   # before its subsequent destructive reconcile.
   if epoch_identity; then
-    print_epoch_json recovery
+    print_epoch_json recovery "${workspace_state}"
   else
     print_unknown_json
   fi
