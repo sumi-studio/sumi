@@ -397,6 +397,9 @@ paths:
         - { name: limit, in: query, schema: { type: integer, maximum: 5000 } }
       responses:
         '200': { description: events[] ordered by seq }
+        # `changes` reads only the version/event store; it bypasses the mount
+        # gate, so mount_unavailable/mount_policy never apply here.
+        '503': { description: store_unavailable }
 components:
   securitySchemes:
     bearerScope:

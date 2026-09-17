@@ -29,6 +29,14 @@ set -a
 set +a
 jfs="${SUMI_FILES_JUICEFS:-/usr/local/bin/juicefs}"
 meta="${SUMI_FILES_META_URL:?}"
+# Same {docker:CONTAINER} host-token resolution as sumi-files-mount.
+if [[ "$meta" == *'{docker:'* ]]; then
+  self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  meta="$("$self_dir/sumi-files-resolve-url" "$meta")" || {
+    echo "refused: cannot resolve the metadata container address in SUMI_FILES_META_URL" >&2
+    exit 3
+  }
+fi
 : "${META_PASSWORD:?}" "${ACCESS_KEY:?}" "${SECRET_KEY:?}"
 name="${SUMI_FILES_VOLUME_NAME:?}"
 bucket="${SUMI_FILES_BUCKET_URL:?}"

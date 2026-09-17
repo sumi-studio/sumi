@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# sumi-files-resolve-url — resolve a `{docker:CONTAINER}` (or
+# `{docker:CONTAINER@NETWORK}`) token embedded as the host part of a URL to
+# the container's current bridge IP.
+#
+#   sumi-files-resolve-url 'postgres://user@{docker:sumi-dev-postgres-1}:5432/db?sslmode=disable'
+#       prints the resolved URL on stdout
+#
+#   sumi-files-resolve-url --env OUTFILE [--from ENVFILE] NAME [NAME...]
+#       writes "NAME=<resolved value>" lines to OUTFILE (mode 0600) for every
+#       listed variable. With --from, values are read by parsing ENVFILE
+#       line-wise (never sourcing it — values may contain shell-special
+#       characters) — required when the rendered fragment feeds back through
+#       EnvironmentFile=, because systemd loads env files (a previous run's
+#       resolved, token-free value) before ExecStartPre runs; without --from
+#       the template would be shadowed and the token never re-resolved.
+#       Without --from, values come from the process environment. Variables
+#       that are unset are skipped and variables without a token are written
+#       unchanged. Used by a unit's ExecStartPre to render a fragment
+#       EnvironmentFile — the resolved value (which may carry credentials)
+#       goes to the file only, never stdout/logs.
+#
+# Why: host-side clients reach a containerized PostgreSQL at its bridge IP,
+# which changes when the container is recreated — the address is runtime
+# evidence, not durable configuration. Resolving the named container at every
+# start keeps env files free of a stale address.
+#
+# Resolution fails closed: docker unavailable, an absent/unstarted container,
+# a malformed or unclosed token, an empty address, a non-IP result, or an
+# unqualified token on a multi-network container (ambiguous — qualify with
+# @NETWORK) all exit nonzero and print nothing to stdout.
+set -euo pipefail
+
+# container_ip NAME NETWORK-or-empty -> prints the single usable IP or fails
+container_ip() {
+  local name=$1 net=$2 ip count
+  if [[ -n "$net" ]]; then
+    # Parenthesised index: bare `{{index ...}}.IPAddress` prints the whole
+    # EndpointSettings object followed by a literal ".IPAddress".
+    ip="$(docker inspect -f '{{(index .NetworkSettings.Networks "'"$net"'").IPAddress}}' -- "$name" 2>/dev/null)" || return 1
+  else
+    # Unqualified: collect the non-empty address of every attached network.
+    # More than one means the host is ambiguous — refuse rather than
+    # concatenating addresses into an invalid URL.
+    local ips
+    ips="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}} {{end}}{{end}}' -- "$name" 2>/dev/null)" || return 1
+    ip=
+    count=0
+    for ip in $ips; do (( ++count )); done
+    [[ "$count" -eq 1 ]] || return 1
+  fi
+  [[ -n "$ip" && "$ip" != '<no value>' ]] || return 1
+  # Must be a usable URL host literal: IPv4 digits/dots or IPv6 (contains :).
+  if [[ "$ip" == *:* ]]; then
+    printf '[%s]' "$ip"
+  elif [[ "$ip" =~ ^[0-9.]+$ ]]; then
+    printf '%s' "$ip"
+  else
+    return 1
+  fi
+}
+
+resolve() {
+  local url=$1 token name net ip guard=0
+  while [[ "$url" == *'{docker:'*'}'* ]]; do
+    (( ++guard > 5 )) && return 1
+    token=${url#*\{docker:}
+    token=${token%%\}*}
+    name=${token%%@*}
+    net=
+    if [[ "$token" == *@* ]]; then
+      net=${token#*@}
+      [[ -n "$net" ]] || return 1   # `{docker:name@}` is malformed
+    fi
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || return 1
+    [[ "$net" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ || -z "$net" ]] || return 1
+    ip="$(container_ip "$name" "$net")" || return 1
+    url=${url/"{docker:${token}}"/"$ip"}
+  done
+  # An unclosed `{docker:` left the loop: never report success while a literal
+  # unresolved token remains in the host part.
+  [[ "$url" == *'{docker:'* ]] && return 1
+  printf '%s' "$url"
+}
+
+# Supported EnvironmentFile subset: one NAME=value per line; no export
+# prefix, line continuations or multiline values.
+# envfile_value FILE NAME -> the variable's value for this subset
+# parsing (last NAME= line wins; single quotes literal; double quotes allow
+# \" and \\ escapes; otherwise the raw text). Never sources the file.
+envfile_value() {
+  local file=$1 name=$2 line v
+  line=$(grep -E "^[[:space:]]*${name}=" -- "$file" | tail -n1) || return 1
+  v=${line#*=}
+  if [[ "$v" == '"'*'"' && ${#v} -ge 2 ]]; then
+    v=${v:1:${#v}-2}
+    v=${v//\\\"/\"}    # \" -> "
+    v=${v//\\\\/\\}    # \\ -> \   (after \" so \\ pairs don't re-escape)
+  elif [[ "$v" == "'"*"'" && ${#v} -ge 2 ]]; then
+    v=${v:1:${#v}-2}
+  fi
+  printf '%s' "$v"
+}
+
+# env_quote VALUE -> a double-quoted systemd EnvironmentFile value
+env_quote() {
+  local v=$1
+  [[ "$v" == *$'\n'* || "$v" == *$'\r'* ]] && return 1
+  v=${v//\\/\\\\}      # \ -> \\
+  v=${v//\"/\\\"}      # " -> \"
+  # % needs no escaping: systemd does not expand specifiers in
+  # EnvironmentFile values (verified: a written %% was delivered literally).
+  printf '"%s"' "$v"
+}
+
+if [[ "${1:-}" == --env ]]; then
+  out=${2:?usage: sumi-files-resolve-url --env OUTFILE [--from ENVFILE] NAME...}
+  shift 2
+  envfile=
+  if [[ "${1:-}" == --from ]]; then
+    envfile=${2:?usage: --from ENVFILE}
+    shift 2
+  fi
+  umask 077
+  tmp="${out}.tmp.$$"
+  : > "$tmp"
+  for name in "$@"; do
+    [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { rm -f "$tmp"; exit 2; }
+    if [[ -n "$envfile" ]]; then
+      value="$(envfile_value "$envfile" "$name")" || continue
+    else
+      value=${!name-}
+    fi
+    [[ -n "$value" ]] || continue
+    resolved="$(resolve "$value")" || { rm -f "$tmp"; exit 1; }
+    quoted="$(env_quote "$resolved")" || { rm -f "$tmp"; exit 1; }
+    printf '%s=%s\n' "$name" "$quoted" >> "$tmp" || { rm -f "$tmp"; exit 1; }
+  done
+  mv "$tmp" "$out"
+else
+  for url in "$@"; do
+    resolve "$url" || exit 1
+    printf '\n'
+  done
+fi

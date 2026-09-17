@@ -7,7 +7,9 @@
 # ENV_FILE (mode 0600 or 0400, owned by the client user; never in the repository):
 #   SUMI_FILES_ROLE          service | executor
 #   SUMI_FILES_JUICEFS       JuiceFS binary (default /usr/local/bin/juicefs)
-#   SUMI_FILES_META_URL      postgres://USER@HOST:PORT/DB?sslmode=... (no password)
+#   SUMI_FILES_META_URL      postgres://USER@HOST:PORT/DB?sslmode=... (no password);
+#                            HOST may be {docker:CONTAINER} to resolve a container's
+#                            current bridge IP at start (see sumi-files-resolve-url)
 #   META_PASSWORD            metadata database password
 #   SUMI_FILES_VOLUME_UUID   the volume this host must mount (refuses others)
 #   SUMI_FILES_MOUNTPOINT    e.g. /var/lib/sumi-files/mnt
@@ -49,6 +51,20 @@ owner="${SUMI_FILES_OWNER:-10002:10002}"
 : "${META_PASSWORD:?META_PASSWORD is required}"
 export META_PASSWORD
 
+# A `{docker:CONTAINER}` (or `{docker:CONTAINER@NETWORK}`) token as the URL
+# host resolves the named container's current bridge IP at start: a container
+# address is runtime evidence, not durable configuration. Sibling script
+# sumi-files-resolve-url does the lookup; failure refuses the mount.
+if [[ "$meta" == *'{docker:'* ]]; then
+  self_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+  meta="$("$self_dir/sumi-files-resolve-url" "$meta")" || {
+    echo "refused: cannot resolve the metadata container address in SUMI_FILES_META_URL" >&2
+    exit 3
+  }
+fi
+
+# Resolve host tokens before checking userinfo: a network-qualified token
+# itself contains a colon and @, but is not a URL password.
 case "$meta" in
   *://*:*@*) echo "refused: put the metadata password in META_PASSWORD, not the URL" >&2; exit 2 ;;
 esac
