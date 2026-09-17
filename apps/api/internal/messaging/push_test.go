@@ -324,12 +324,21 @@ func TestPushSubscriptionSavePurgesExpiredRowsAndRecoversEndpoint(t *testing.T) 
 	}
 
 	freshSession := testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("N", 43))
-	var devices int
-	if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
-		t.Fatal(err)
-	}
-	if devices != 1 {
-		t.Fatalf("expired device registrations accumulate: %d", devices)
+	// Device housekeeping is deliberately bounded so a contended database
+	// cannot delay the refresh; when the first pass cannot finish a detached
+	// retry settles it, so assert convergence rather than instant deletion.
+	devices := -1
+	for deadline := time.Now().Add(15 * time.Second); ; {
+		if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
+			t.Fatal(err)
+		}
+		if devices == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired device registrations accumulate: %d", devices)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if _, err := owner.SavePushSubscription(
 		ctx,
@@ -352,6 +361,144 @@ func TestPushSubscriptionSavePurgesExpiredRowsAndRecoversEndpoint(t *testing.T) 
 	if count != 1 || sessionID != freshSession ||
 		p256dh != "rotated-p256dh" || auth != "rotated-auth" {
 		t.Fatalf("post-expiry subscriptions = count %d session %q keys %q/%q", count, sessionID, p256dh, auth)
+	}
+}
+
+func TestPushDeviceRefreshRetriesPurgeSkippedByConcurrentLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	for _, deviceID := range []string{strings.Repeat("K", 43), strings.Repeat("L", 43)} {
+		testPushDevice(t, ctx, w.store.Store, w.humanB, deviceID)
+	}
+	if _, err := w.store.pool.Exec(ctx, `
+		UPDATE push_devices
+		SET expires_at = now() - interval '1 minute'
+		WHERE human_id = $1`, w.humanB.ID); err != nil {
+		t.Fatalf("expire devices: %v", err)
+	}
+
+	// Hold row locks the way a concurrent refresh does: the bounded pass can
+	// only skip these rows, so without a retry they would wait for a login
+	// that may never come.
+	blocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	if _, err := blocker.Exec(ctx, `
+		SELECT device_id FROM push_devices
+		WHERE human_id = $1 ORDER BY device_id FOR UPDATE`, w.humanB.ID); err != nil {
+		t.Fatalf("lock expired devices: %v", err)
+	}
+
+	testPushDevice(t, ctx, w.store.Store, w.humanB, strings.Repeat("M", 43))
+	var devices int
+	if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if devices != 3 {
+		t.Fatalf("locked expired devices vanished during refresh: %d", devices)
+	}
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(15 * time.Second); ; {
+		if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
+			t.Fatal(err)
+		}
+		if devices == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expired device registrations still accumulate after the lock cleared: %d", devices)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestPushDevicePurgeDrainRetainsPendingAcrossDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	w := newWorld(t, ctx)
+	for _, deviceID := range []string{strings.Repeat("Q", 43), strings.Repeat("R", 43)} {
+		testPushDevice(t, ctx, w.store.Store, w.humanB, deviceID)
+	}
+	if _, err := w.store.pool.Exec(ctx, `
+		UPDATE push_devices
+		SET expires_at = now() - interval '1 minute'
+		WHERE human_id = $1`, w.humanB.ID); err != nil {
+		t.Fatalf("expire devices: %v", err)
+	}
+	store := w.store.Store
+	store.pushDevicePurge.Lock()
+	store.pushDevicePurge.pending = map[string]struct{}{w.humanB.ID: {}}
+	store.pushDevicePurge.Unlock()
+	deadCtx, stop := context.WithCancel(ctx)
+	stop() // already expired: every pass fails before touching the rows
+	store.drainExpiredPushDevicePurges(deadCtx)
+	store.pushDevicePurge.Lock()
+	_, retained := store.pushDevicePurge.pending[w.humanB.ID]
+	running := store.pushDevicePurge.running
+	store.pushDevicePurge.Unlock()
+	if !retained {
+		t.Fatal("deadline exit dropped a pending purge entry")
+	}
+	if running {
+		t.Fatal("drainer still marked running after an expired-context exit")
+	}
+	var devices int
+	if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if devices != 2 {
+		t.Fatalf("expired rows vanished without a completed purge pass: %d", devices)
+	}
+	// The next refresh reschedules the retained work; a second human enqueue
+	// during the same drain coalesces instead of spawning another drainer.
+	for _, deviceID := range []string{strings.Repeat("T", 43), strings.Repeat("U", 43)} {
+		testPushDevice(t, ctx, store, w.humanA, deviceID)
+	}
+	if _, err := w.store.pool.Exec(ctx, `
+		UPDATE push_devices
+		SET expires_at = now() - interval '1 minute'
+		WHERE human_id = $1`, w.humanA.ID); err != nil {
+		t.Fatalf("expire devices: %v", err)
+	}
+	blocker, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	if _, err := blocker.Exec(ctx, `
+		SELECT device_id FROM push_devices
+		WHERE expires_at <= clock_timestamp()
+		ORDER BY device_id FOR UPDATE`); err != nil {
+		t.Fatalf("lock expired devices: %v", err)
+	}
+	testPushDevice(t, ctx, store, w.humanB, strings.Repeat("S", 43))
+	testPushDevice(t, ctx, store, w.humanA, strings.Repeat("V", 43))
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(15 * time.Second); ; {
+		var a, b, pending int
+		if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanA.ID).Scan(&a); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.store.pool.QueryRow(ctx, `SELECT count(*) FROM push_devices WHERE human_id=$1`, w.humanB.ID).Scan(&b); err != nil {
+			t.Fatal(err)
+		}
+		store.pushDevicePurge.Lock()
+		pending = len(store.pushDevicePurge.pending)
+		store.pushDevicePurge.Unlock()
+		if a == 1 && b == 1 && pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retained purge did not settle: humanA=%d humanB=%d pending=%d", a, b, pending)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

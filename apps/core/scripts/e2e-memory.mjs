@@ -35,6 +35,7 @@ import {
   existsSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
@@ -42,10 +43,82 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const CHILD = process.argv.includes("--child");
+const SELFTEST = process.argv.includes("--selftest");
 if (CHILD) {
   await childMain();
+} else if (SELFTEST) {
+  requestLogSelfTest();
 } else {
   await main();
+}
+
+// --------------------------------------------------------- request log ---
+// Each child appends one JSON record plus a newline per provider call to its
+// own requests-<pid>.jsonl through a single appendFileSync write. The newline
+// is therefore the commit marker: every newline-terminated line is one
+// complete record and is parsed strictly, so corrupt content still fails.
+// A final segment without a trailing newline can only be an append still in
+// flight or residue from a writer SIGKILLed mid-write — never a completed
+// record — so it is dropped and becomes visible once the write finishes.
+// Per-writer files mean a dead writer's torn tail can never merge onto a
+// later record from another process.
+function parseRequestLog(text) {
+  const lines = text.split("\n");
+  if (!text.endsWith("\n")) lines.pop();
+  return lines.filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function requestLogSelfTest() {
+  const record = (over) =>
+    JSON.stringify({
+      pid: 1234,
+      turnId: "t-1",
+      round: 0,
+      tools: [],
+      messages: [],
+      ...over,
+    });
+  const a = record({ turnId: "t-a" });
+  const b = record({ turnId: "t-b" });
+  const check = (name, cond) => {
+    if (!cond) {
+      console.error(`[e2e-memory] SELFTEST FAIL: ${name}`);
+      process.exit(1);
+    }
+    console.log(`[e2e-memory] selftest ok: ${name}`);
+  };
+  check(
+    "parses complete records",
+    parseRequestLog(`${a}\n${b}\n`).length === 2,
+  );
+  check(
+    "drops an unterminated in-flight tail",
+    parseRequestLog(`${a}\n${b.slice(0, 40)}`).length === 1,
+  );
+  check(
+    "drops a killed writer's torn residue and keeps complete records",
+    (() => {
+      const got = parseRequestLog(`${a}\n${b.slice(0, 25)}`);
+      return got.length === 1 && got[0].turnId === "t-a";
+    })(),
+  );
+  for (const [name, text] of [
+    ["mid-file corrupt record", `${a}\n{"pid":"tampered"xxx}\n`],
+    ["corrupt terminated tail", `${a}\nnot json\n`],
+    [
+      "corrupt prefix before a completed record",
+      `${a}\nnot-json-before-a-completed-record${b}\n`,
+    ],
+    ["non-record boundary shape", `${a}\n${b.slice(0, 25)}{"pid":5}\n`],
+  ]) {
+    let threw = false;
+    try {
+      parseRequestLog(text);
+    } catch {
+      threw = true;
+    }
+    check(`genuine corruption still fails: ${name}`, threw);
+  }
 }
 
 // ---------------------------------------------------------------- child ---
@@ -67,7 +140,7 @@ async function childMain() {
     name = "scripted-memory";
     async *stream(req) {
       appendFileSync(
-        join(dir, "requests.jsonl"),
+        join(dir, `requests-${process.pid}.jsonl`),
         JSON.stringify({
           pid: process.pid,
           turnId: req.turnId,
@@ -165,6 +238,9 @@ async function childMain() {
 
 // --------------------------------------------------------------- parent ---
 async function main() {
+  // Parser contract checks run on every invocation — including CI — so the
+  // framing rules and their negative controls cannot silently regress.
+  requestLogSelfTest();
   const DB_URL = process.env.SUMI_TEST_DB_URL ?? process.env.SUMI_DB_URL;
   if (!DB_URL) {
     console.error("e2e-memory: SUMI_TEST_DB_URL required — real PostgreSQL");
@@ -279,12 +355,9 @@ async function main() {
       (o) => o.payload.input_id === inputId,
     );
   const requests = () =>
-    existsSync(join(DIR, "requests.jsonl"))
-      ? readFileSync(join(DIR, "requests.jsonl"), "utf8")
-          .split("\n")
-          .filter(Boolean)
-          .map((l) => JSON.parse(l))
-      : [];
+    readdirSync(DIR)
+      .filter((f) => /^requests-\d+\.jsonl$/.test(f))
+      .flatMap((f) => parseRequestLog(readFileSync(join(DIR, f), "utf8")));
   const turnRequestFor = (text) =>
     requests()
       .filter(
