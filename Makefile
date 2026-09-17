@@ -5,13 +5,13 @@
 setup: ## Install JS dependencies
 	pnpm install
 
-dev: ## Start the supported authenticated local Sumi stack (Rust runtime for now)
+dev: ## Start the supported authenticated local Sumi stack (TypeScript core)
 	pnpm dev
 
-dev-core: ## Start the stack on the accepted TypeScript secretary core
+dev-core: ## Start the stack on the accepted TypeScript secretary core (explicit)
 	pnpm dev:core
 
-dev-rust: ## Start the stack on the Rust PersonalityAgent runtime (explicit)
+dev-rust: ## Start the stack on the Rust PersonalityAgent runtime (diagnostic path)
 	pnpm dev:rust
 
 dev-check: ## Validate real-stack credentials and identity configuration
