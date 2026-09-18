@@ -535,10 +535,15 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	default:
 		return fmt.Errorf("%w: the session is %s", ErrClosed, status)
 	}
-	// The seal is portable's own transaction and replays its recorded
-	// receipt for the same transfer; if its commit landed but the status
-	// update below did not, Reconcile promotes from the ledger.
-	if _, err := s.portable.Seal(ctx, personaID, sessionID, dest.PlacementID); err != nil {
+	// The seal joins this transaction (SealTx): the session row lock is
+	// held on this connection, so the seal must run here too — acquiring
+	// a second pooled connection while holding a lock the waiters need
+	// starves the pool against itself (portable.Activate documents the
+	// same contract for its advisory lock). It also makes the export
+	// ledger and the status update one commit: a crash between the
+	// binding commit and this point still leaves the resumable
+	// bound-and-awaiting state Reconcile knows.
+	if _, err := s.portable.SealTx(ctx, tx, personaID, sessionID, dest.PlacementID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'sealed', updated_at = now()

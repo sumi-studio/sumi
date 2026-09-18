@@ -10,17 +10,38 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
+	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 )
+
+// approvalStubSessions is the decision-route test authorizer: the cookie
+// value IS the human id and every authorized operation just runs. The
+// browser session machinery is covered by messaging's own tests; what
+// this fixture exercises is the route's real Store.ResolveApproval path.
+type approvalStubSessions struct{}
+
+func (approvalStubSessions) VerifySession(_ context.Context, cookie string) (agentevents.UserSessionClaims, error) {
+	if cookie == "" {
+		return agentevents.UserSessionClaims{}, fmt.Errorf("invalid session")
+	}
+	return agentevents.UserSessionClaims{TenantID: "tenant-1", UserID: cookie}, nil
+}
+
+func (approvalStubSessions) AuthorizeSession(_ context.Context, _ agentevents.UserSessionClaims, op func() error) error {
+	return op()
+}
 
 func TestParseReturnURLRules(t *testing.T) {
 	sid := uuid.Must(uuid.NewV7()).String()
@@ -430,26 +451,47 @@ func TestPendingApprovalGuidesThenRecovers(t *testing.T) {
 		t.Fatalf("the approval was dropped or decided: %v %d", err, pending)
 	}
 
-	// The human settles it on Cloud. Denying is what actually clears a
+	// The human settles it on Cloud through the real authenticated
+	// decision route — the same admission an owner's browser takes:
+	// session cookie → verified claims → the persona's bound human →
+	// Store.ResolveApproval, which transactionally records the denial,
+	// finalizes the parked operation failed, journals the decision, and
+	// requeues the waiting input. Denying is what actually clears a
 	// fresh Local: an approved-but-unconsumed grant is re-pended at
 	// import (consent must come from the destination's bound human), so
 	// approve-without-run would block again — deny, or let it finish on
-	// Cloud. The parked input un-waits with the decision.
-	if _, err := h.cloud.pool.Exec(h.ctx, `UPDATE core_tool_approvals
-		SET status = 'denied', decision = 'deny_once', decision_id = 'dec-1',
-		    decided_by_kind = 'human', decided_by_id = $2, decided_at = now()
-		WHERE persona_id = $1 AND approval_id = 'ap-pending'`, h.pid, h.human); err != nil {
+	// Cloud.
+	apprSrv := &messaging.CoreApprovalsServer{
+		Core:           agentstate.NewStore(h.cloud.pool),
+		Sessions:       approvalStubSessions{},
+		AllowedOrigins: []string{"http://approvals.test"},
+	}
+	apprMux := http.NewServeMux()
+	apprSrv.RegisterRoutes(apprMux)
+	apprTS := httptest.NewServer(apprMux)
+	defer apprTS.Close()
+	dreq, err := http.NewRequestWithContext(h.ctx, http.MethodPost,
+		apprTS.URL+"/me/approvals/ap-pending/decision",
+		strings.NewReader(`{"decision":"deny_once","decision_id":"dec-1"}`))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.cloud.pool.Exec(h.ctx, `UPDATE core_inputs
-		SET status = 'queued', waiting_since = NULL
-		WHERE persona_id = $1 AND input_id = 'in-carried'`, h.pid); err != nil {
+	dreq.AddCookie(&http.Cookie{Name: agentevents.BrowserSessionCookie, Value: h.human})
+	dreq.Header.Set("Origin", "http://approvals.test")
+	dreq.Header.Set("Content-Type", "application/json")
+	dres, err := apprTS.Client().Do(dreq)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.cloud.pool.Exec(h.ctx, `UPDATE core_operations
-		SET status = 'failed', completed_at = now()
-		WHERE persona_id = $1 AND operation_id = 'op-1'`, h.pid); err != nil {
-		t.Fatal(err)
+	draw, _ := io.ReadAll(dres.Body)
+	dres.Body.Close()
+	if dres.StatusCode != http.StatusOK {
+		t.Fatalf("the authenticated decision route refused: %d %s", dres.StatusCode, draw)
+	}
+	var cloudStatus string
+	if err := h.cloud.pool.QueryRow(h.ctx, `SELECT status FROM core_tool_approvals
+		WHERE persona_id = $1 AND approval_id = 'ap-pending'`, h.pid).Scan(&cloudStatus); err != nil || cloudStatus != "denied" {
+		t.Fatalf("the decision route did not record the denial: %v %s", err, cloudStatus)
 	}
 	sessionID2, returnURL2 := h.newReturn()
 	out.Reset()
@@ -555,5 +597,95 @@ func TestConfigValueQuotingRules(t *testing.T) {
 	raw, _ = os.ReadFile(path)
 	if !strings.Contains(string(raw), "SUMI_PERSONA_ID="+next+"\n") {
 		t.Fatalf("the rewrite added quoting to a bare file: %s", raw)
+	}
+}
+
+// TestStalledBundleBodyBoundsAndResumes: a peer that answers the bundle
+// request with headers and a partial body, then stops sending, must end
+// this attempt within the mover's silent-peer bound — not hang the CLI
+// forever (F384). The stall is the same transient class as a peer that
+// never answered: durable state and authority are untouched, the result
+// is pending guidance, and an ordinary resume finishes the return once
+// the peer recovers. A cancelled context is a different result than the
+// progress timeout — the run must not conflate them.
+func TestStalledBundleBodyBoundsAndResumes(t *testing.T) {
+	h := setupReturn(t)
+	config := writeConfig(t, h.home, h.slot)
+	_, returnURL := h.newReturn()
+
+	// The fixture answers the bundle GET with headers and a partial body,
+	// then goes silent until the client hangs up.
+	var stall atomic.Bool
+	stall.Store(true)
+	h.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if !stall.Load() || r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/bundle") {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"partial":true}` + "\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+		return true
+	})
+
+	m, out := h.mover()
+	m.stall = 150 * time.Millisecond
+	code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false)
+	if code != exitPending {
+		t.Fatalf("a stalled bundle body must end pending, got %d\n%s", code, out)
+	}
+	if !strings.Contains(out.String(), "stopped moving data") {
+		t.Fatalf("the stall was not reported as a stall:\n%s", out)
+	}
+	// Honest resumable state: the transfer is recorded, nothing was
+	// marked downloaded, no .part file survives, nothing activated.
+	r := m.newReturner(h.local.pool, config, false)
+	st, err := r.load()
+	if err != nil || st == nil {
+		t.Fatalf("the durable record is gone or unreadable: %v", err)
+	}
+	if st.Downloaded || st.Outcome != "" {
+		t.Fatalf("a stall must not commit progress: %+v", st)
+	}
+	if _, err := os.Stat(filepath.Join(h.home, "return", "bundle.ndjson.part")); !os.IsNotExist(err) {
+		t.Fatalf("a torn .part file survived the stall")
+	}
+	if got := authority(t, h.cloud, h.pid); got != "sealed" {
+		t.Fatalf("cloud authority %s", got)
+	}
+
+	// An operator interrupt is a different result than the silent-peer
+	// bound: cancel the context mid-stall and the run reports the
+	// cancellation, not the progress timeout.
+	cctx, cancel := context.WithCancel(h.ctx)
+	done := make(chan int, 1)
+	out.Reset()
+	go func() { done <- m.ReturnStart(cctx, returnURL, h.local.pool, config, false) }()
+	time.Sleep(120 * time.Millisecond)
+	cancel()
+	select {
+	case code := <-done:
+		if code != exitError {
+			t.Fatalf("a cancelled run must report the cancellation, got %d\n%s", code, out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cancelled run did not return")
+	}
+	if strings.Contains(out.String(), "stopped moving data") {
+		t.Fatalf("a cancellation was reported as a stall:\n%s", out)
+	}
+
+	// The peer recovers: the ordinary resume path re-downloads the whole
+	// bundle and finishes the return — no state surgery, no file cleanup.
+	stall.Store(false)
+	out.Reset()
+	if code := m.ReturnResume(h.ctx, h.local.pool, config, false); code != exitDone {
+		t.Fatalf("resume after the peer recovered: %d\n%s", code, out)
+	}
+	if got := authority(t, h.local, h.pid); got != "active" {
+		t.Fatalf("local authority %s", got)
 	}
 }

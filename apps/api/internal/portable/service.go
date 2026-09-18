@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -54,6 +55,7 @@ func NewService(pool *pgxpool.Pool) *Service {
 }
 
 type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
@@ -71,17 +73,23 @@ func validateIDs(personaID, transferID string) error {
 // PlacementID returns this placement's stable identity, minting it on first
 // use. A seal addresses its bundle to exactly one placement id.
 func (s *Service) PlacementID(ctx context.Context) (string, error) {
+	return ownPlacementID(ctx, s.pool)
+}
+
+// ownPlacementID is PlacementID on the caller's queryable — inside a caller's
+// transaction for the tx-joining paths, on the pool otherwise.
+func ownPlacementID(ctx context.Context, q querier) (string, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
-	if _, err := s.pool.Exec(ctx,
+	if _, err := q.Exec(ctx,
 		`INSERT INTO core_placement (placement_id) VALUES ($1) ON CONFLICT DO NOTHING`,
 		id.String()); err != nil {
 		return "", err
 	}
 	var got string
-	err = s.pool.QueryRow(ctx, `SELECT placement_id FROM core_placement`).Scan(&got)
+	err = q.QueryRow(ctx, `SELECT placement_id FROM core_placement`).Scan(&got)
 	return got, err
 }
 
@@ -226,24 +234,57 @@ func (s *Service) Status(ctx context.Context, direction, transferID string) (Rec
 // destinationID must name another placement (read it from the destination's
 // /internal/core/placement); retargeting means sealing a new transfer.
 func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID string) (Receipt, error) {
-	if err := validateIDs(personaID, transferID); err != nil {
+	if err := s.sealTarget(ctx, s.pool, personaID, transferID, destinationID); err != nil {
 		return Receipt{}, err
-	}
-	if !uuidv7Re.MatchString(destinationID) {
-		return Receipt{}, fmt.Errorf("%w: destination_id must be the destination's placement uuidv7", ErrBadRequest)
-	}
-	own, err := s.PlacementID(ctx)
-	if err != nil {
-		return Receipt{}, err
-	}
-	if destinationID == own {
-		return Receipt{}, fmt.Errorf("%w: destination_id %s is this placement", ErrBadRequest, destinationID)
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Receipt{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	rec, err := s.sealInTx(ctx, tx, personaID, transferID, destinationID)
+	if err != nil {
+		return Receipt{}, err
+	}
+	return rec, tx.Commit(ctx)
+}
+
+// SealTx is Seal inside the caller's transaction — same validations, same
+// replay rules, but every lock and mutation lands on the caller's one
+// connection under the caller's commit. It exists for a caller that must
+// hold its own row lock across the seal (the return-session gate): running
+// the seal on a second pooled connection while that lock is held is the
+// dependency inversion Activate's comment forbids — under pool saturation
+// the lock holder waits on a connection the waiters themselves pin.
+func (s *Service) SealTx(ctx context.Context, tx pgx.Tx, personaID, transferID, destinationID string) (Receipt, error) {
+	if err := s.sealTarget(ctx, tx, personaID, transferID, destinationID); err != nil {
+		return Receipt{}, err
+	}
+	return s.sealInTx(ctx, tx, personaID, transferID, destinationID)
+}
+
+// sealTarget validates the seal's arguments and the destination — the own-
+// placement id is read on q so SealTx does it inside the caller's tx.
+func (s *Service) sealTarget(ctx context.Context, q querier, personaID, transferID, destinationID string) error {
+	if err := validateIDs(personaID, transferID); err != nil {
+		return err
+	}
+	if !uuidv7Re.MatchString(destinationID) {
+		return fmt.Errorf("%w: destination_id must be the destination's placement uuidv7", ErrBadRequest)
+	}
+	own, err := ownPlacementID(ctx, q)
+	if err != nil {
+		return err
+	}
+	if destinationID == own {
+		return fmt.Errorf("%w: destination_id %s is this placement", ErrBadRequest, destinationID)
+	}
+	return nil
+}
+
+// sealInTx is the seal's body: every lock and mutation of Seal, on the
+// given transaction, with commit left to the caller.
+func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID, destinationID string) (Receipt, error) {
 	authority, _, err := lockPersona(ctx, tx, personaID)
 	if err != nil {
 		return Receipt{}, err
@@ -269,7 +310,7 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 			return Receipt{}, fmt.Errorf("%w: transfer_id %s was already used and aborted",
 				ErrTransferConflict, transferID)
 		}
-		return rec, tx.Commit(ctx)
+		return rec, nil
 	case !errors.Is(err, ErrTransferNotFound):
 		return Receipt{}, err
 	}
@@ -514,7 +555,7 @@ func (s *Service) Seal(ctx context.Context, personaID, transferID, destinationID
 		transferID, personaID, FormatVersion, destinationID, key, raw, sealedAt); err != nil {
 		return Receipt{}, fmt.Errorf("record transfer: %w", err)
 	}
-	return rec, tx.Commit(ctx)
+	return rec, nil
 }
 
 // Complete marks the source transferred once the destination committed

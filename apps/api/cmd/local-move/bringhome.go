@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -546,6 +547,9 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 		res, err := r.m.client.Do(req)
 		r.m.answered.Store(true)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("%w: %v", errUnreachable, err)
 		}
 		defer res.Body.Close()
@@ -558,10 +562,49 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(f, res.Body); err != nil {
+		// The same silent-peer bound the upload applies: headers arriving
+		// proves nothing about the body. There is no total-duration cap —
+		// a large bundle keeps going as long as bytes keep moving — but
+		// m.stall without a single byte ends this attempt. Closing the
+		// body is what unblocks the read.
+		body := &progress{r: res.Body}
+		body.last.Store(time.Now().UnixNano())
+		var stalled atomic.Bool
+		watch := make(chan struct{})
+		defer close(watch)
+		go func() {
+			tick := time.NewTicker(max(r.m.stall/4, 10*time.Millisecond))
+			defer tick.Stop()
+			for {
+				select {
+				case <-watch:
+					return
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if body.done.Load() {
+						return
+					}
+					if time.Since(time.Unix(0, body.last.Load())) >= r.m.stall {
+						stalled.Store(true)
+						_ = res.Body.Close()
+						return
+					}
+				}
+			}
+		}()
+		if _, err := io.Copy(f, body); err != nil {
 			_ = f.Close()
 			_ = os.Remove(tmp)
-			return err
+			switch {
+			case ctx.Err() != nil:
+				return ctx.Err()
+			case stalled.Load():
+				return fmt.Errorf("%w: %v for %s; the bundle download is retried by `sumi-local-move return-resume`",
+					errUnreachable, errStalled, r.m.stall)
+			default:
+				return fmt.Errorf("%w: %v", errUnreachable, err)
+			}
 		}
 		// Sync before the rename and the directory after it: a power loss
 		// must never leave a truncated bundle behind a committed
