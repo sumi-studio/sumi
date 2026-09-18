@@ -34,6 +34,24 @@ func (h *Handler) serveProcess(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		result, err = h.service.CancelProcess(r.Context(), input)
+	case "/v1/process/input":
+		var input ProcessInputRequest
+		if !decodeRequest(w, r, &input) {
+			return true
+		}
+		result, err = h.service.WriteProcessInput(r.Context(), input)
+	case "/v1/process/resize":
+		var input ProcessResizeRequest
+		if !decodeRequest(w, r, &input) {
+			return true
+		}
+		result, err = h.service.ResizeProcess(r.Context(), input)
+	case "/v1/process/signal":
+		var input ProcessSignalRequest
+		if !decodeRequest(w, r, &input) {
+			return true
+		}
+		result, err = h.service.SignalProcess(r.Context(), input)
 	case "/v1/process/completions":
 		var input struct{}
 		if !decodeRequest(w, r, &input) {
@@ -63,6 +81,10 @@ func (h *Handler) serveProcess(w http.ResponseWriter, r *http.Request) bool {
 			status, code = 409, "conflict"
 		case errors.Is(err, ErrProcessWorkspace):
 			status, code = 502, "workspace_unavailable"
+		case errors.Is(err, ErrProcessNotInteractive):
+			status, code = 409, "not_interactive"
+		case errors.Is(err, ErrProcessResizeUnsupported):
+			status, code = 502, "resize_unsupported"
 		}
 		writeError(w, status, code, err.Error())
 	} else {
@@ -96,6 +118,27 @@ func (c *Client) CancelProcess(ctx context.Context, r ProcessLookupRequest) (o P
 		return
 	}
 	e = c.call(ctx, "/v1/process/cancel", r, &o)
+	return
+}
+func (c *Client) WriteProcessInput(ctx context.Context, r ProcessInputRequest) (o ProcessInputReceipt, e error) {
+	if e = r.Validate(); e != nil {
+		return
+	}
+	e = c.call(ctx, "/v1/process/input", r, &o)
+	return
+}
+func (c *Client) ResizeProcess(ctx context.Context, r ProcessResizeRequest) (o ProcessOperation, e error) {
+	if e = r.Validate(); e != nil {
+		return
+	}
+	e = c.call(ctx, "/v1/process/resize", r, &o)
+	return
+}
+func (c *Client) SignalProcess(ctx context.Context, r ProcessSignalRequest) (o ProcessInputReceipt, e error) {
+	if e = r.Validate(); e != nil {
+		return
+	}
+	e = c.call(ctx, "/v1/process/signal", r, &o)
 	return
 }
 func (c *Client) PendingProcessCompletions(ctx context.Context) (o []ProcessOperation, e error) {

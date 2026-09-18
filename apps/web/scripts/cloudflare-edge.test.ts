@@ -141,6 +141,15 @@ test("the browser API, private transports, service worker, and SPA have distinct
     "/direct-chat/ws",
     "/messaging/bootstrap",
     "/messaging/ws",
+    "/terminal/list",
+    "/terminal/open",
+    "/terminal/session",
+    "/terminal/read",
+    "/terminal/input",
+    "/terminal/control",
+    "/terminal/close",
+    "/terminal/ws",
+    "/terminal/anything-else-the-api-may-add",
     "/feedback/bootstrap",
     "/feedback/threads",
     "/feedback/attachments",
@@ -219,6 +228,7 @@ test("the browser API, private transports, service worker, and SPA have distinct
   for (const path of [
     "/",
     "/direct",
+    "/terminal",
     "/feedback",
     "/c/0198f3aa-1111-7222-8333-444455556666",
     "/unknown-api",
@@ -292,6 +302,56 @@ test("origin forwarding preserves the incoming Request and exact Response", asyn
     "sumi_session=one; Secure; HttpOnly",
     "sumi_flow=two; Secure; HttpOnly",
   ]);
+});
+
+test("the shared terminal SPA page navigates while its API and WS reach origin", async () => {
+  // Bare /terminal is the person-facing page: it must never hit the
+  // private origin, which would answer with an API 404 instead of the app.
+  const page = await handleRequest(
+    new Request("https://workspace.example.com/terminal"),
+    {
+      ASSETS: {
+        fetch: async () =>
+          new Response("<!doctype html><title>Sumi</title>", {
+            headers: { "Content-Type": "text/html" },
+          }),
+      },
+    },
+    async () => assert.fail("terminal page reached the API origin"),
+  );
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Sumi/);
+
+  // Every subpath — REST routes and the live attach upgrade — proxies
+  // with the request untouched, cookies included.
+  for (const path of [
+    "/terminal/list",
+    "/terminal/read?session_id=s&cursor=512",
+    "/terminal/input",
+    "/terminal/control",
+    "/terminal/close",
+    "/terminal/ws",
+    "/terminal/",
+  ]) {
+    const incoming = new Request(`https://workspace.example.com${path}`, {
+      method: "POST",
+      headers: {
+        Cookie: "sumi_session=opaque",
+        Origin: "https://workspace.example.com",
+      },
+      body: "{}",
+    });
+    const expected = new Response('{"ok":true}', { status: 200 });
+    const actual = await handleRequest(
+      incoming,
+      { ASSETS: { fetch: () => assert.fail(`${path} reached SPA assets`) } },
+      async (observed) => {
+        assert.equal(observed, incoming);
+        return expected;
+      },
+    );
+    assert.equal(actual, expected, path);
+  }
 });
 
 test("a WebSocket 101 response is returned by identity", async () => {
@@ -642,7 +702,13 @@ test("every production API registration has an explicit edge disposition", async
     );
   }
 
-  for (const prefix of ["/auth/", "/direct-chat/", "/messaging/", "/files/"]) {
+  for (const prefix of [
+    "/auth/",
+    "/direct-chat/",
+    "/messaging/",
+    "/files/",
+    "/terminal/",
+  ]) {
     assert.ok(
       discovery.routes.some((route) => route.pattern.includes(` ${prefix}`)),
       `policy prefix ${prefix} has no production registrar`,

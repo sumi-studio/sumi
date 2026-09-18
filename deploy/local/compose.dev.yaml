@@ -280,6 +280,9 @@ services:
     image: ghcr.io/sumi-studio/sumi-provisioner:${SUMI_PROVISIONER_IMAGE_TAG:-latest}
     pull_policy: always
     user: "0:0"
+    # Interactive terminal signals target the container's foreground
+    # process group via /proc, which requires host PID visibility.
+    pid: "host"
     command:
       - -socket
       - /run/sumi/runtime-provisioner/control.sock
@@ -305,8 +308,19 @@ services:
       # Explicitly local-development-only. The supervisor still fails closed
       # unless the launcher confirms that this host has AppArmor disabled.
       SUMI_DEV_ALLOW_APPARMOR_UNCONFINED: ${SUMI_DEV_ALLOW_APPARMOR_UNCONFINED:-false}
+      # The interactive output pump tails the daemon's own json-file
+      # journal. DockerRootDir is a host path, so the data root is
+      # mounted read-only at a stable in-container point and the
+      # override names it.
+      SUMI_DOCKER_JOURNAL_ROOT: ${SUMI_DOCKER_JOURNAL_ROOT:-/run/sumi/docker-root}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${SUMI_DOCKER_ROOT_DIR:-/var/lib/docker}
+        target: /run/sumi/docker-root
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}
         target: /run/sumi/docker-config/config.json

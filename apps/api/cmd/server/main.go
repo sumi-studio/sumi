@@ -42,6 +42,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	"github.com/sumi-studio/sumi/apps/api/internal/termexec"
 	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 	"github.com/sumi-studio/sumi/apps/api/internal/usageview"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -112,6 +113,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startJobExec()
+	app.startTermExec()
 	app.startChatGPTActivation()
 	app.startRuntimeRecovery()
 	app.startWarmReconciliation()
@@ -277,6 +279,7 @@ type application struct {
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
 	jobExec                    *jobexec.Driver
+	termExec                   *termexec.Driver
 	transferSessions           *transfersession.Service
 	returnSessions             *returnsession.Service
 	coreDirectChat             *agentevents.CoreDirectChat
@@ -826,6 +829,39 @@ func newApplicationFromEnv() (*application, error) {
 			log.Printf("jobexec: Cloud subprocess jobs run through the runtime provisioner (runner %s, canonical files scope)", jobExec.Runner())
 		}
 	}
+	// Interactive terminal sessions: same Cloud execution environment and
+	// canonical files scope as subprocess jobs, but long-lived with a real
+	// PTY. Opt-in via SUMI_TERMEXEC_ENABLED (or implicitly with jobexec);
+	// a partial configuration is a startup error.
+	var termExec *termexec.Driver
+	{
+		var coreStore *agentstate.Store
+		if coreServer != nil {
+			coreStore = coreServer.Store()
+		}
+		var err error
+		termExec, err = termexecFromEnv(coreStore, filesClient)
+		if err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if termExec != nil {
+			log.Printf("termexec: Cloud interactive terminal sessions run through the runtime provisioner (runner %s, canonical files scope)", termExec.Runner())
+		}
+	}
+	// Person-facing terminal routes share the core state store — the
+	// verified browser session supplies the persona, so a caller can only
+	// ever reach its own secretary's sessions. Terminal requests authorize
+	// through the participant-owned 'terminal' AppInstallation, not the
+	// direct-chat installation the browser may also carry.
+	if coreServer != nil {
+		browser.Terminals = coreServer.Store()
+		if terminalAuth, ok := directChatAuthorizer.(agentevents.TerminalAuthorizer); ok {
+			browser.TerminalAuthorizer = terminalAuth
+		}
+		browser.RegisterTerminalRoutes(mux)
+		log.Print("person terminal routes ready (/terminal/*, session-scoped to the persona)")
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
@@ -949,6 +985,7 @@ func newApplicationFromEnv() (*application, error) {
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
 		jobExec:                    jobExec,
+		termExec:                   termExec,
 		transferSessions:           transferSessions,
 		returnSessions:             returnSessions,
 		coreDirectChat:             coreDirectChat,

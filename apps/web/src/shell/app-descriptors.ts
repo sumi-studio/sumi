@@ -1,4 +1,9 @@
-import { DoorOpen, MessageCircle, MessageSquarePlus } from "lucide-react";
+import {
+  DoorOpen,
+  MessageCircle,
+  MessageSquarePlus,
+  SquareTerminal,
+} from "lucide-react";
 import type { ComponentType } from "react";
 
 /**
@@ -28,6 +33,18 @@ export const DIRECT_CHAT_RENDERER = {
   label: "直通",
   icon: DoorOpen,
   route: "/direct",
+} as const;
+
+/**
+ * The shared Cloud terminal is also Participant-owned: the person and the
+ * secretary attach to the same durable session, independent of Workspace
+ * selection. `/terminal` is the SPA page; `/terminal/*` stays API.
+ */
+export const TERMINAL_RENDERER = {
+  appId: "terminal",
+  label: "ターミナル",
+  icon: SquareTerminal,
+  route: "/terminal",
 } as const;
 
 export const FEEDBACK_RENDERER = {

@@ -604,6 +604,63 @@ export interface ScriptJobRequest {
 export type JobTerminalReport = "done" | "failed" | "cancelled";
 
 /**
+ * A persistent interactive terminal session (migration 0062): a real PTY
+ * in the persona's Linux workspace, shared between the person and the
+ * secretary. Output lives in a durable bounded scrollback with absolute
+ * byte offsets; input is a serialized ledger with honest dispositions.
+ * Epochs/claims are runner fencing internals, not product surface.
+ */
+export type TerminalSessionStatus =
+  | "requested"
+  | "claimed"
+  | "active"
+  | "ending"
+  | "ended"
+  | "interrupted"
+  | "lost";
+
+export interface TerminalSession {
+  persona_id: string;
+  session_id: string;
+  name: string;
+  mode: string;
+  backend: string;
+  status: TerminalSessionStatus;
+  requested_by: string;
+  created_by: string;
+  exit_code: number | null;
+  exit_signal: string | null;
+  end_reason: string | null;
+  /** Total bytes ever emitted; retained range starts at output_base. */
+  output_bytes: number;
+  output_base: number;
+  control_holder: string | null;
+  created_at: string;
+  updated_at: string;
+  ended_at: string | null;
+}
+
+/** Disposition of a serialized terminal input ledger entry. */
+export type TerminalInputStatus =
+  | "intended"
+  | "dequeued"
+  | "written"
+  | "interrupted"
+  | "expired"
+  | "failed"
+  | "unknown";
+
+export interface TerminalInput {
+  input_id: string;
+  session_id: string;
+  seq: number;
+  kind: "stdin" | "resize" | "signal" | "eof";
+  source: "agent" | "human";
+  status: TerminalInputStatus;
+  created_at: string;
+}
+
+/**
  * Call sessions are the durable authority record for the secretary's
  * presence in a place's LiveKit room (migration 0055). The core creates one
  * through the delegated call.join effect; a per-placement media bridge

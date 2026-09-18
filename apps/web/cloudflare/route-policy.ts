@@ -31,6 +31,9 @@ export const originRoutes = Object.freeze({
     "/api/usage/",
     "/direct-chat/",
     "/messaging/",
+    // Shared terminal API + WS. Only the subpath prefix proxies: bare
+    // `/terminal` is the SPA page and must fall through to navigation.
+    "/terminal/",
     "/feedback/threads/",
     "/feedback/attachments/",
     // Keep transfer API requests out of the SPA fallback. The API origin

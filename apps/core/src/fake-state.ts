@@ -24,6 +24,7 @@ import type {
   RecoverResult,
   RenderedContext,
   Schedule,
+  TerminalSession,
   Turn,
   TurnPlan,
   UsageAdmitResult,
@@ -206,6 +207,15 @@ export const TOOL_AUTHORITY: Record<
   "job.start": { requiresApproval: false, elevatedOnly: false },
   "job.status": { requiresApproval: false, elevatedOnly: false },
   "job.cancel": { requiresApproval: false, elevatedOnly: false },
+  "terminal.open": { requiresApproval: false, elevatedOnly: false },
+  "terminal.list": { requiresApproval: false, elevatedOnly: false },
+  "terminal.read": { requiresApproval: false, elevatedOnly: false },
+  "terminal.inputs": { requiresApproval: false, elevatedOnly: false },
+  "terminal.write": { requiresApproval: false, elevatedOnly: false },
+  "terminal.resize": { requiresApproval: false, elevatedOnly: false },
+  "terminal.signal": { requiresApproval: false, elevatedOnly: false },
+  "terminal.eof": { requiresApproval: false, elevatedOnly: false },
+  "terminal.close": { requiresApproval: false, elevatedOnly: false },
   "message.send": { requiresApproval: false, elevatedOnly: true },
   conversation_history: { requiresApproval: false, elevatedOnly: false },
 };
@@ -259,6 +269,50 @@ function validateToolRequest(
       return typeof request.text === "string" && request.text !== ""
         ? null
         : "bad request: message.send requires text";
+    case "terminal.open":
+      return typeof request.name !== "string" || request.name.length > 80
+        ? "bad request: terminal.open name too long"
+        : null;
+    case "terminal.read":
+    case "terminal.inputs":
+    case "terminal.write":
+    case "terminal.resize":
+    case "terminal.signal":
+    case "terminal.eof":
+    case "terminal.close": {
+      const sid = request.session_id;
+      if (typeof sid !== "string" || !UUIDV7_RE.test(sid)) {
+        return `bad request: ${tool} requires a UUIDv7 session_id`;
+      }
+      if (tool === "terminal.write") {
+        if (request.eof !== true &&
+          (typeof request.data !== "string" || request.data === "")) {
+          return "bad request: terminal.write requires data or eof";
+        }
+        if (typeof request.data === "string" && request.data.length > 65536) {
+          return "bad request: terminal.write data exceeds 64 KiB";
+        }
+      }
+      if (tool === "terminal.resize") {
+        const cols = request.cols;
+        const rows = request.rows;
+        if (
+          typeof cols !== "number" || typeof rows !== "number" ||
+          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+        ) {
+          return "bad request: terminal.resize requires cols 2..1000 and rows 2..500";
+        }
+      }
+      if (tool === "terminal.signal") {
+        const allowed = new Set([
+          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+        ]);
+        if (typeof request.signal !== "string" || !allowed.has(request.signal)) {
+          return "bad request: terminal.signal not permitted";
+        }
+      }
+      return null;
+    }
     default:
       return null;
   }
@@ -288,6 +342,21 @@ function fakeDigest(s: string): string {
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return h.toString(16).padStart(8, "0");
+}
+
+const UUIDV7_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * Deterministic uuidv7-shaped id from a seed — terminal session ids
+ * derive from claim position like job ids, so a replayed open mints
+ * the same session, never a second one.
+ */
+function fakeUuidV7(seed: string): string {
+  const h = `${fakeDigest(`${seed}:a`)}${fakeDigest(`${seed}:b`)}` +
+    `${fakeDigest(`${seed}:c`)}${fakeDigest(`${seed}:d`)}`;
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7${h.slice(13, 16)}-` +
+    `${"89ab"[parseInt(h[16] ?? "0", 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
 function actionDigest(tool: string, route: string, request: Json): string {
@@ -339,6 +408,18 @@ export class FakeState implements StateClient {
   schedules = new Map<string, Schedule>();
   /** Persona-scoped execution records — key: persona|job_id. */
   jobs = new Map<string, Job>();
+  terminalSessions = new Map<string, TerminalSession>();
+  terminalInputs = new Map<
+    string,
+    {
+      input_id: string;
+      seq: number;
+      kind: string;
+      source: string;
+      status: string;
+      created_at: string;
+    }[]
+  >();
   outboxEntries: OutboxEntry[] = [];
   /** Sealed journal ranges and their L1 replacement lifecycle. */
   memoryChunks: MemoryChunk[] = [];
@@ -2183,6 +2264,14 @@ export class FakeState implements StateClient {
       // Read-only; runs inside the claim like Go so the receipt reflects
       // the same committed view.
       operation.response = this.historyTool(persona, op);
+    } else if (operation.tool.startsWith("terminal.")) {
+      operation.response = this.terminalTool(
+        persona,
+        operation.tool,
+        op,
+        inputId,
+        callIndex,
+      );
     } else {
       const effect = this.registeredEffects.get(operation.tool);
       if (effect !== undefined) {
@@ -3408,6 +3497,261 @@ export class FakeState implements StateClient {
       });
     }
     job.notified_at = new Date().toISOString();
+  }
+
+  /**
+   * Mirror of Go internalTerminalTool: the fake owns no real PTY, so a
+   * session it opens is 'active' immediately (the fake backend is
+   * instant). Inputs report 'intended' like the Go ledger — durable
+   * acceptance, not delivery; outcomes are read via terminal.inputs.
+   * Session ids derive from the claim position like job ids, so a
+   * replayed claim can never mint a second session.
+   */
+  private terminalTool(
+    persona: string,
+    tool: string,
+    op: Record<string, unknown>,
+    inputIdCtx: string,
+    callIndexCtx: number,
+  ): Record<string, unknown> {
+    const key = (sid: string) => `${persona}|${sid}`;
+    const mustSession = (sid: unknown): TerminalSession => {
+      if (typeof sid !== "string" || sid === "") {
+        throw new StateError(400, `${tool} requires session_id`);
+      }
+      const t = this.terminalSessions.get(key(sid));
+      if (!t) throw new StateError(400, "terminal session not found");
+      return t;
+    };
+    const submitInput = (
+      t: TerminalSession,
+      kind: string,
+      inputId: string,
+    ): Record<string, unknown> => {
+      if (t.status === "ended" || t.status === "lost") {
+        throw new StateError(400, "terminal session has ended");
+      }
+      // 'ending' refuses like the Go ledger (ErrTerminalNotLive): a
+      // session already closing accepts no new input.
+      if (t.status === "ending") {
+        throw new StateError(400, "terminal session is not live");
+      }
+      if (t.control_holder === "human") {
+        throw new StateError(
+          400,
+          "terminal session is under exclusive human control",
+        );
+      }
+      const ledger = this.terminalInputs.get(key(t.session_id)) ?? [];
+      const seq = ledger.length + 1;
+      const createdAt = new Date().toISOString();
+      ledger.push({
+        input_id: inputId,
+        seq,
+        kind,
+        source: "agent",
+        status: "intended",
+        created_at: createdAt,
+      });
+      this.terminalInputs.set(key(t.session_id), ledger);
+      return {
+        input_id: inputId,
+        session_id: t.session_id,
+        seq,
+        kind,
+        source: "agent",
+        // 'intended' = durable acceptance, not delivery — same as the Go
+        // ledger. A fake must not claim bytes were written to the PTY.
+        status: "intended",
+        created_at: createdAt,
+      };
+    };
+    switch (tool) {
+      case "terminal.open": {
+        const name = typeof op.name === "string" ? op.name : "";
+        if (name.length > 80) {
+          throw new StateError(400, "terminal name too long");
+        }
+        const sessionId = fakeUuidV7(
+          `terminal:${inputIdCtx}:${callIndexCtx}`,
+        );
+        const existing = this.terminalSessions.get(key(sessionId));
+        if (existing) {
+          if (existing.name !== name) {
+            throw new StateError(
+              409,
+              "session_id replay carries a different request",
+            );
+          }
+          return { session: structuredClone(existing) };
+        }
+        const live = [...this.terminalSessions.values()].filter(
+          (t) =>
+            t.persona_id === persona &&
+            ["requested", "claimed", "active", "ending", "interrupted"].includes(
+              t.status,
+            ),
+        ).length;
+        // Same live-session bound as the Go store (terminalMaxSessions).
+        if (live >= 4) {
+          throw new StateError(400, "terminal session capacity exhausted");
+        }
+        const now = new Date().toISOString();
+        const session: TerminalSession = {
+          persona_id: persona,
+          session_id: sessionId,
+          name,
+          mode: "pty",
+          backend: "fake",
+          status: "active",
+          requested_by: "agent",
+          created_by: "agent",
+          exit_code: null,
+          exit_signal: null,
+          end_reason: null,
+          output_bytes: 0,
+          output_base: 0,
+          control_holder: null,
+          created_at: now,
+          updated_at: now,
+          ended_at: null,
+        };
+        this.terminalSessions.set(key(sessionId), session);
+        return { session: structuredClone(session) };
+      }
+      case "terminal.list":
+        return {
+          sessions: [...this.terminalSessions.values()]
+            .filter((t) => t.persona_id === persona)
+            .map((t) => structuredClone(t)),
+        };
+      case "terminal.read": {
+        const t = mustSession(op.session_id);
+        return {
+          session: structuredClone(t),
+          base: t.output_base,
+          cursor: t.output_base,
+          next_cursor: t.output_bytes,
+          gap: false,
+          eof: t.status === "ended" || t.status === "lost",
+          content: "",
+          content_b64: "",
+        };
+      }
+      case "terminal.inputs": {
+        // Same durable-ledger read as GET /terminal/inputs — acceptance
+        // is not delivery; this is where the outcome is learned.
+        const t = mustSession(op.session_id);
+        const afterSeq = typeof op.after_seq === "number" ? op.after_seq : 0;
+        const inputs = (this.terminalInputs.get(key(t.session_id)) ?? [])
+          .filter((i) => i.seq > afterSeq)
+          .map((i) => ({
+            input_id: i.input_id,
+            session_id: t.session_id,
+            seq: i.seq,
+            kind: i.kind,
+            source: i.source,
+            status: i.status,
+            created_at: i.created_at,
+          }));
+        return { session: structuredClone(t), inputs };
+      }
+      case "terminal.write": {
+        const t = mustSession(op.session_id);
+        if (op.eof === true) {
+          return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+        }
+        const data = op.data;
+        if (typeof data !== "string" || data === "") {
+          throw new StateError(400, "terminal.write requires data");
+        }
+        if (data.length > 65536) {
+          throw new StateError(400, "terminal.write data exceeds 64 KiB");
+        }
+        return { input: submitInput(t, "stdin", `in:${inputIdCtx}:${callIndexCtx}`) };
+      }
+      case "terminal.resize": {
+        const t = mustSession(op.session_id);
+        const cols = op.cols;
+        const rows = op.rows;
+        if (
+          typeof cols !== "number" || typeof rows !== "number" ||
+          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+        ) {
+          throw new StateError(
+            400,
+            "resize requires cols 2..1000 and rows 2..500",
+          );
+        }
+        return { input: submitInput(t, "resize", `in:${inputIdCtx}:${callIndexCtx}`) };
+      }
+      case "terminal.signal": {
+        const t = mustSession(op.session_id);
+        const allowed = new Set([
+          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+        ]);
+        if (typeof op.signal !== "string" || !allowed.has(op.signal)) {
+          throw new StateError(400, "signal not permitted");
+        }
+        return { input: submitInput(t, "signal", `in:${inputIdCtx}:${callIndexCtx}`) };
+      }
+      case "terminal.eof": {
+        const t = mustSession(op.session_id);
+        return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+      }
+      case "terminal.close": {
+        const t = mustSession(op.session_id);
+        if (t.status !== "ended" && t.status !== "lost") {
+          t.status = "ended";
+          t.end_reason = "closed";
+          t.ended_at = new Date().toISOString();
+          t.updated_at = t.ended_at;
+          this.notifyTerminalEnded(t);
+        }
+        return { session: structuredClone(t) };
+      }
+      default:
+        throw new StateError(400, `unknown tool: ${tool}`);
+    }
+  }
+
+  /** Queue the 'terminal:<id>' ended notification input exactly once. */
+  private notifyTerminalEnded(t: TerminalSession) {
+    const inputId = `terminal:${t.session_id}`;
+    if (
+      !this.inputs.some(
+        (i) => i.persona_id === t.persona_id && i.input_id === inputId,
+      )
+    ) {
+      const payload: Record<string, unknown> = {
+        session_id: t.session_id,
+        status: t.status,
+        end_reason: t.end_reason,
+        text: `Terminal session "${t.name}" ended (${t.end_reason}).`,
+      };
+      if (t.exit_code !== null) payload.exit_code = t.exit_code;
+      if (t.exit_signal) payload.exit_signal = t.exit_signal;
+      this.inputs.push({
+        persona_id: t.persona_id,
+        input_id: inputId,
+        kind: "terminal_ended",
+        payload,
+        actor_kind: "terminal",
+        actor_id: t.session_id,
+        source_surface: "core_terminal_sessions",
+        thread_id: "",
+        occurred_at: null,
+        attention: "reply",
+        status: "queued",
+        claimed_generation: null,
+        turn_id: null,
+        created_at: new Date().toISOString(),
+        done_at: null,
+        not_before: null,
+        waiting_since: null,
+        waited_ms: 0,
+      });
+    }
   }
 
   private jobCommandSummary(job: Job): string {

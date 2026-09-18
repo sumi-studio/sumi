@@ -3,7 +3,12 @@ import { isAbsolute } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, type ProxyOptions, type ServerOptions } from "vite";
+import {
+  defineConfig,
+  type ProxyOptions,
+  type ServerOptions,
+  searchForWorkspaceRoot,
+} from "vite";
 
 export const SUMI_DEV_HOST = "127.0.0.1";
 export const SUMI_DEV_PORT = 5173;
@@ -58,11 +63,33 @@ export function parseDevPort(raw: string | undefined): number {
   return port;
 }
 
+/**
+ * Extra directories the dev server may serve files from
+ * (SUMI_DEV_FS_ALLOW, comma-separated absolute paths). Worktrees whose
+ * node_modules are symlinks into a shared store resolve bundled assets
+ * (for example fonts) outside the workspace root; the launcher lists
+ * those real dependency directories here. Dev-server file serving only —
+ * this does not change build output or any edge filesystem policy.
+ */
+export function parseDevFsAllow(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value !== "")
+    .map((value) => {
+      if (!isAbsolute(value)) {
+        throw new Error(`Sumi dev fs.allow entry is not absolute: ${value}`);
+      }
+      return value;
+    });
+}
+
 export function createDevServerConfig(
   apiOrigin = SUMI_DEV_API_ORIGIN,
   host = SUMI_DEV_HOST,
   allowedHosts: readonly string[] = [],
   port = SUMI_DEV_PORT,
+  fsAllow: readonly string[] = [],
 ): ServerOptions {
   const target = new URL(apiOrigin);
   if (
@@ -89,6 +116,15 @@ export function createDevServerConfig(
     port,
     strictPort: true,
     ...(allowedHosts.length > 0 ? { allowedHosts: [...allowedHosts] } : {}),
+    // Extra allow entries replace Vite's implicit workspace-root default,
+    // so the workspace root itself stays listed when extras are present.
+    ...(fsAllow.length > 0
+      ? {
+          fs: {
+            allow: [searchForWorkspaceRoot(process.cwd()), ...fsAllow],
+          },
+        }
+      : {}),
     proxy: {
       "/auth": apiProxy(target.origin),
       "/api/model-connections": apiProxy(target.origin),
@@ -96,6 +132,9 @@ export function createDevServerConfig(
       "/api/secretary-return": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
+      // The shared terminal SPA page owns bare `/terminal`; every path
+      // below it is an API route (including the /terminal/ws upgrade).
+      "^/terminal/": apiProxy(target.origin, true),
       "^/feedback/(bootstrap|threads|attachments|diagnostics)(?:/|\\?|$)":
         apiProxy(target.origin),
       "/workspaces": apiProxy(target.origin),
@@ -128,6 +167,7 @@ export default defineConfig({
     process.env.SUMI_DEV_HOST?.trim() || SUMI_DEV_HOST,
     parseDevAllowedHosts(process.env.SUMI_DEV_ALLOWED_HOSTS),
     parseDevPort(process.env.SUMI_DEV_PORT),
+    parseDevFsAllow(process.env.SUMI_DEV_FS_ALLOW),
   ),
   // `vite preview` serves the production build locally; it shares the dev
   // server's same-origin API proxy so a built bundle can be exercised

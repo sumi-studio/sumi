@@ -35,6 +35,10 @@ type ProcessObservation struct {
 type processRecord struct {
 	mu             *sync.Mutex
 	outputUnloaded bool
+	// interactive is the live supervisor for an interactive op —
+	// runtime state only, never journaled. Its durable half (ttylog)
+	// lives on disk and is reopened on demand.
+	interactive *interactiveIO `json:"-"`
 
 	Operation        ProcessOperation          `json:"operation"`
 	ContainerRemoved bool                      `json:"container_removed"`
@@ -94,17 +98,42 @@ func newProcessStore(directory string, backend ProcessBackend) (*processStore, e
 		r.releaseTerminalOutput()
 		s.records[r.Operation.OperationID] = &r
 	}
+	// Reattach output supervision for interactive ops that outlived a
+	// provisioner restart. The containers belong to the daemon and are
+	// still running; the first reattach journals an explicit gap for
+	// the restart window.
+	for _, r := range s.records {
+		if r.Operation.Interactive && !r.Operation.State.terminal() {
+			if _, err := s.ensureInteractive(r); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return s, nil
 }
 
 // Terminal records keep metadata only in RAM. The existing journal still
 // contains the complete bounded output; metadata rewrites must rehydrate it.
+// Interactive ops never populate Stdout/Stderr — their output is the
+// durable ttylog — so there is nothing to release, and marking them
+// unloaded would make every later save fail the integrity check that
+// compares StdoutBytes (the ttylog total) against the empty snapshot.
 func (r *processRecord) releaseTerminalOutput() {
-	if r.Operation.State.terminal() {
+	if r.Operation.State.terminal() && !r.Operation.Interactive {
 		r.Stdout = nil
 		r.Stderr = nil
 		r.outputUnloaded = true
 	}
+}
+
+// status returns the operation with computed, non-journalled evidence
+// filled in: Quiesced certifies no physical writer remains for a
+// terminal op (nothing launched, or the container was verifiably
+// removed). Call with r.mu held or on a record that is not yet shared.
+func (r *processRecord) status() ProcessOperation {
+	o := r.Operation
+	o.Quiesced = o.State.terminal() && (!r.LaunchAttempted || r.ContainerRemoved)
+	return o
 }
 func (s *processStore) output(r *processRecord) ([]byte, []byte, error) {
 	if !r.outputUnloaded {
@@ -206,19 +235,37 @@ func (service *Service) StartProcess(ctx context.Context, request ProcessStartRe
 	if r := s.records[id]; r != nil {
 		return replayProcessOperation(r, request)
 	}
-	active := 0
+	// Interactive operations get their own capacity budget: a terminal
+	// session held for hours must never starve the one-shot job slot,
+	// and a burst of jobs must not leave a persona unable to open a
+	// terminal. Batch caps are unchanged (1 per persona, 4 total);
+	// interactive caps sit beside them (4 per persona, 8 total).
+	active, interactiveActive := 0, 0
+	samePersonaActive, samePersonaInteractive := 0, 0
 	for _, r := range s.records {
 		r.mu.Lock()
 		o := r.Operation
 		r.mu.Unlock()
-		if !o.State.terminal() {
-			active++
+		if o.State.terminal() {
+			continue
+		}
+		if o.Interactive {
+			interactiveActive++
 			if o.PersonalityAgentID == request.PersonalityAgentID {
-				return ProcessOperation{}, ErrProcessBusy
+				samePersonaInteractive++
 			}
+			continue
+		}
+		active++
+		if o.PersonalityAgentID == request.PersonalityAgentID {
+			samePersonaActive++
 		}
 	}
-	if active >= 4 {
+	if request.Interactive {
+		if samePersonaInteractive >= 4 || interactiveActive >= 8 {
+			return ProcessOperation{}, ErrProcessBusy
+		}
+	} else if samePersonaActive >= 1 || active >= 4 {
 		return ProcessOperation{}, ErrProcessBusy
 	}
 	event, err := uuid.NewV7()
@@ -232,12 +279,12 @@ func (service *Service) StartProcess(ctx context.Context, request ProcessStartRe
 	if err := ctx.Err(); err != nil {
 		return ProcessOperation{}, err
 	}
-	record := &processRecord{mu: &sync.Mutex{}, Operation: ProcessOperation{OperationID: id, PersonalityAgentID: request.PersonalityAgentID, OriginatingToolCallID: request.OriginatingToolCallID, Executable: request.Executable, Args: request.Args, Cwd: request.Cwd, TimeoutSeconds: request.TimeoutSeconds, Env: request.Env, Image: request.Image, WorkspaceBind: workspaceBind, FilesVolumeUUID: workspaceUUID, State: ProcessAccepted, EventID: event.String(), OccurredAt: time.Now().UTC()}}
+	record := &processRecord{mu: &sync.Mutex{}, Operation: ProcessOperation{OperationID: id, PersonalityAgentID: request.PersonalityAgentID, OriginatingToolCallID: request.OriginatingToolCallID, Executable: request.Executable, Args: request.Args, Cwd: request.Cwd, TimeoutSeconds: request.TimeoutSeconds, Env: request.Env, Image: request.Image, WorkspaceBind: workspaceBind, FilesVolumeUUID: workspaceUUID, Interactive: request.Interactive, TTY: request.TTY, State: ProcessAccepted, EventID: event.String(), OccurredAt: time.Now().UTC()}}
 	if err = s.save(record); err != nil {
 		return ProcessOperation{}, err
 	}
 	s.records[id] = record
-	return record.Operation, nil
+	return record.status(), nil
 }
 
 // replayProcessOperation compares a journalled operation to a repeated
@@ -255,13 +302,14 @@ func replayProcessOperation(r *processRecord, request ProcessStartRequest) (Proc
 	// deterministic operation ID already binds this record to the
 	// (persona, tool call) the request names.
 	if o.Tombstone {
-		return o, nil
+		return r.status(), nil
 	}
 	if o.Executable != request.Executable || !reflect.DeepEqual(o.Args, request.Args) || o.Cwd != request.Cwd || o.TimeoutSeconds != request.TimeoutSeconds ||
-		!maps.Equal(o.Env, request.Env) || o.Image != request.Image || (o.WorkspaceBind != "") != (request.Workspace == "files-scope") {
+		!maps.Equal(o.Env, request.Env) || o.Image != request.Image || (o.WorkspaceBind != "") != (request.Workspace == "files-scope") ||
+		o.Interactive != request.Interactive || o.TTY != request.TTY {
 		return ProcessOperation{}, ErrConflict
 	}
-	return o, nil
+	return r.status(), nil
 }
 
 func (service *Service) ProcessStatus(ctx context.Context, r ProcessLookupRequest) (ProcessOperation, error) {
@@ -275,14 +323,28 @@ func (service *Service) ProcessStatus(ctx context.Context, r ProcessLookupReques
 	s.mu.Lock()
 	record := s.records[r.OperationID]
 	s.mu.Unlock()
-	if record != nil {
-		record.mu.Lock()
-		defer record.mu.Unlock()
-	}
-	if record == nil || record.Operation.PersonalityAgentID != r.PersonalityAgentID {
+	if record == nil {
 		return ProcessOperation{}, ErrProcessNotFound
 	}
-	return record.Operation, nil
+	record.mu.Lock()
+	op := record.status()
+	record.mu.Unlock()
+	if op.PersonalityAgentID != r.PersonalityAgentID {
+		return ProcessOperation{}, ErrProcessNotFound
+	}
+	if op.Interactive {
+		// Interactive cursors come from the durable ttylog, not the
+		// batch output snapshot. ensureInteractive takes the store
+		// mutex, so it must run after record.mu is released (the
+		// established order is store → record).
+		if io_, err := s.ensureInteractive(record); err == nil {
+			base, total := io_.tty.stats()
+			op.StdoutBase = base
+			op.StdoutBytes = total
+			op.OutputAttached = io_.attached.Load()
+		}
+	}
+	return op, nil
 }
 func (service *Service) ReadProcessOutput(ctx context.Context, r ProcessOutputRequest) (ProcessOutput, error) {
 	if err := r.Validate(); err != nil {
@@ -295,13 +357,45 @@ func (service *Service) ReadProcessOutput(ctx context.Context, r ProcessOutputRe
 	s.mu.Lock()
 	record := s.records[r.OperationID]
 	s.mu.Unlock()
-	if record != nil {
-		record.mu.Lock()
-		defer record.mu.Unlock()
-	}
-	if record == nil || record.Operation.PersonalityAgentID != r.PersonalityAgentID {
+	if record == nil {
 		return ProcessOutput{}, ErrProcessNotFound
 	}
+	record.mu.Lock()
+	operation := record.Operation
+	record.mu.Unlock()
+	if operation.PersonalityAgentID != r.PersonalityAgentID {
+		return ProcessOutput{}, ErrProcessNotFound
+	}
+	if r.Limit == 0 {
+		r.Limit = 16 << 10
+	}
+	if operation.Interactive {
+		// Interactive streams are served from the durable ttylog with
+		// absolute offsets: a TTY op has one merged stream on "stdout";
+		// stderr reads return empty so callers learn there is no
+		// second stream rather than receiving duplicated content.
+		if r.Stream != "stdout" {
+			return ProcessOutput{OperationID: r.OperationID, Stream: r.Stream, Offset: r.Offset, NextOffset: r.Offset, EOF: operation.State.terminal()}, nil
+		}
+		io_, err := s.ensureInteractive(record)
+		if err != nil {
+			return ProcessOutput{}, err
+		}
+		data, base, next, gap, err := io_.tty.read(r.Offset, r.Limit)
+		if err != nil {
+			return ProcessOutput{}, err
+		}
+		_, total := io_.tty.stats()
+		return ProcessOutput{
+			OperationID: r.OperationID, Stream: r.Stream, Offset: r.Offset,
+			NextOffset: next, Content: string(data),
+			EOF:        operation.State.terminal() && next >= total,
+			Truncated:  gap,
+			BaseOffset: base, Gap: gap,
+		}, nil
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
 	stdout, stderr, err := s.output(record)
 	if err != nil {
 		return ProcessOutput{}, err
@@ -385,7 +479,7 @@ func (service *Service) CancelProcess(ctx context.Context, r ProcessLookupReques
 		rec.releaseTerminalOutput()
 		s.records[r.OperationID] = rec
 		s.mu.Unlock()
-		return rec.Operation, nil
+		return rec.status(), nil
 	}
 	s.mu.Unlock()
 	record.mu.Lock()
@@ -394,7 +488,7 @@ func (service *Service) CancelProcess(ctx context.Context, r ProcessLookupReques
 		return ProcessOperation{}, ErrProcessNotFound
 	}
 	if record.Operation.State.terminal() {
-		return record.Operation, nil
+		return record.status(), nil
 	}
 	next := *record
 	next.CancelRequested = true
@@ -402,7 +496,7 @@ func (service *Service) CancelProcess(ctx context.Context, r ProcessLookupReques
 		return ProcessOperation{}, err
 	}
 	*record = next
-	return record.Operation, nil
+	return record.status(), nil
 }
 func (service *Service) PendingProcessCompletions(ctx context.Context) ([]ProcessOperation, error) {
 	result := []ProcessOperation{}
@@ -418,7 +512,7 @@ func (service *Service) PendingProcessCompletions(ctx context.Context) ([]Proces
 		// channel awaits their outcome, so they never enter the pending
 		// feed (which would otherwise retain them forever).
 		if r.Operation.State.terminal() && r.Receipt == nil && !r.Operation.Tombstone {
-			result = append(result, r.Operation)
+			result = append(result, r.status())
 		}
 		r.mu.Unlock()
 	}
@@ -517,6 +611,21 @@ func (service *Service) observeProcesses(ctx context.Context) {
 	}
 }
 
+// assignRecord writes the mutable record state back, preserving the
+// mutex pointer: a whole-struct copy would write the mu field too, and
+// any goroutine loading r.mu to acquire it would race that write.
+func assignRecord(original, next *processRecord) {
+	original.outputUnloaded = next.outputUnloaded
+	original.interactive = next.interactive
+	original.Operation = next.Operation
+	original.ContainerRemoved = next.ContainerRemoved
+	original.LaunchAttempted = next.LaunchAttempted
+	original.CancelRequested = next.CancelRequested
+	original.Receipt = next.Receipt
+	original.Stdout = next.Stdout
+	original.Stderr = next.Stderr
+}
+
 // commitProcess publishes only durably stored state and preserves cancellation
 // accepted while Docker inspection was in flight.
 func (s *processStore) commitProcess(original, next *processRecord) error {
@@ -524,6 +633,12 @@ func (s *processStore) commitProcess(original, next *processRecord) error {
 	defer original.mu.Unlock()
 	next.CancelRequested = original.CancelRequested
 	next.Receipt = original.Receipt
+	// interactive is runtime state, not journaled: the snapshot taken
+	// before Docker I/O predates any supervisor a late attach created,
+	// so the live pointer is carried across the commit — writing back
+	// a stale nil would orphan one pump and let the next attach start
+	// a second writer on the same tty log.
+	next.interactive = original.interactive
 	if next.Operation.State.terminal() && next.CancelRequested {
 		next.Operation.State = ProcessCancelled
 	}
@@ -534,7 +649,7 @@ func (s *processStore) commitProcess(original, next *processRecord) error {
 		return err
 	}
 	next.releaseTerminalOutput()
-	*original = *next
+	assignRecord(original, next)
 	return nil
 }
 func terminalProcess(r *processRecord, state ProcessState, message string) {
@@ -554,6 +669,15 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 		if next.ContainerRemoved {
 			return
 		}
+		// A terminal verdict is not physical-stop proof: a launch may have
+		// landed after the last inspect, or an earlier inspect may have
+		// raced a still-starting container. StopProcess is a no-op when
+		// the container is absent or already stopped, so it is safe to
+		// issue unconditionally before removal. ContainerRemoved commits
+		// only when the operation container is verifiably gone; while a
+		// stop or remove keeps failing the op stays non-quiesced and the
+		// reconcile retries each tick instead of certifying a live writer.
+		_ = s.backend.StopProcess(ctx, next.Operation)
 		if remover, ok := s.backend.(interface {
 			RemoveProcess(context.Context, ProcessOperation) error
 		}); ok {
@@ -575,7 +699,8 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 			}
 			if s.save(&next) == nil {
 				next.releaseTerminalOutput()
-				*original = next
+				next.interactive = original.interactive
+				assignRecord(original, &next)
 			}
 			original.mu.Unlock()
 			return
@@ -594,13 +719,23 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 			original.mu.Unlock()
 			return
 		}
-		*original = next
+		next.interactive = original.interactive
+		assignRecord(original, &next)
 	}
 	original.mu.Unlock()
 	// No record or store mutex is held during Docker I/O.
 	if launch {
 		if err := s.backend.LaunchProcess(ctx, next.Operation); err != nil {
 			next.Operation.Error = "process launch could not be confirmed"
+		}
+		if next.Operation.Interactive {
+			// Start output supervision regardless of launch outcome —
+			// the pump's own reattach loop tolerates a container that
+			// is not up yet, and stopping it only happens on a
+			// terminal state.
+			if io_, err := s.ensureInteractive(original); err == nil {
+				_ = io_
+			}
 		}
 	}
 	observation, err := s.backend.InspectProcess(ctx, next.Operation)
@@ -610,6 +745,9 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 	if !observation.Exists {
 		terminalProcess(&next, ProcessIndeterminate, "process container unavailable; operation will not be repeated")
 		_ = s.commitProcess(original, &next)
+		if io_ := s.interactiveIOFor(next.Operation.OperationID); io_ != nil {
+			s.stopInteractive(io_)
+		}
 		return
 	}
 	if !observation.StartedAt.IsZero() {
@@ -655,4 +793,19 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 	}
 	terminalProcess(&next, state, next.Operation.Error)
 	_ = s.commitProcess(original, &next)
+	if next.Operation.Interactive {
+		// The output child exits with the container and the pump's
+		// copy drains the last bytes; give the drain a short window
+		// before snapshotting cursors and ending supervision.
+		if io_ := s.interactiveIOFor(next.Operation.OperationID); io_ != nil {
+			time.Sleep(300 * time.Millisecond)
+			base, total := io_.tty.stats()
+			original.mu.Lock()
+			original.Operation.StdoutBase = base
+			original.Operation.StdoutBytes = total
+			_ = s.save(original)
+			original.mu.Unlock()
+			s.stopInteractive(io_)
+		}
+	}
 }

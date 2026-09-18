@@ -92,6 +92,15 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	args := []string{"create", "--name", processContainer(o)}
 	args = append(args, labels...)
 	args = append(args, "--read-only", "--network", "none", "--user", "10002:10002", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--cpus", "1", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=33554432", "--workdir", path.Join("/workspace", o.Cwd), "--mount", mount, "--env", "PATH=/usr/local/bin:/usr/bin:/bin", "--env", "HOME=/workspace", "--env", "LANG=C.UTF-8")
+	if o.Interactive {
+		// A held session keeps stdin open; a TTY session allocates the
+		// pseudo-terminal so the shell/job control is real. TERM is a
+		// fixed launch property like LANG — a request cannot pick it.
+		args = append(args, "--interactive")
+		if o.TTY {
+			args = append(args, "--tty", "--env", "TERM=xterm-256color")
+		}
+	}
 	envKeys := make([]string, 0, len(o.Env))
 	for k := range o.Env {
 		envKeys = append(envKeys, k)
@@ -100,7 +109,17 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	for _, k := range envKeys {
 		args = append(args, "--env", k+"="+o.Env[k])
 	}
-	args = append(args, "--log-driver", "json-file", "--log-opt", "max-size=16m", "--log-opt", "max-file=1", "--entrypoint", "/bin/bash", image, "-c", `printf '%s\n' "$1"; shift; exec "$@"`, "sumi-process", processMarker(o), "/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "--", strconv.Itoa(o.TimeoutSeconds), o.Executable)
+	args = append(args, "--log-driver", "json-file", "--log-opt", "max-size=16m", "--log-opt", "max-file=1")
+	if o.Interactive {
+		// Interactive ops run the executable directly as PID 1: the
+		// session's lifetime bound is enforced by the observer's
+		// deadline kill, and the inner /usr/bin/timeout wrapper would
+		// only duplicate it while hiding the real entrypoint signal
+		// semantics (a TTY shell must be the session leader).
+		args = append(args, image, o.Executable)
+	} else {
+		args = append(args, "--entrypoint", "/bin/bash", image, "-c", `printf '%s\n' "$1"; shift; exec "$@"`, "sumi-process", processMarker(o), "/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "--", strconv.Itoa(o.TimeoutSeconds), o.Executable)
+	}
 	args = append(args, o.Args...)
 	if _, err = b.processDocker(ctx, args...); err != nil {
 		return err
@@ -161,6 +180,13 @@ func (b *DockerBackend) InspectProcess(ctx context.Context, o ProcessOperation) 
 	observation, err := b.inspectProcessState(ctx, o)
 	if err != nil || !observation.Exists {
 		return observation, err
+	}
+	if o.Interactive {
+		// Interactive output is streamed to the durable ttylog by the
+		// supervised pump, not snapshotted here. A `docker logs` read
+		// on every observe would do the same work twice for sessions
+		// that can emit for hours.
+		return observation, nil
 	}
 	logTimeout := b.processLogTimeout
 	if logTimeout <= 0 {

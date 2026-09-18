@@ -381,6 +381,14 @@ type Store struct {
 	// separate local-runner processes, so 'local'/unstamped work is never
 	// refused here. Set at wiring time; not synchronized.
 	jobBackendAvailable map[string]bool
+	// defaultTerminalBackend stamps new terminal sessions. "cloud" is
+	// set only after the termexec driver is verified ready; sessions
+	// for a backend with no live runner are refused at create rather
+	// than left to queue forever.
+	defaultTerminalBackend string
+	// terminalBackendAvailable names terminal backends a verified live
+	// runner claims. Set at wiring time; not synchronized.
+	terminalBackendAvailable map[string]bool
 }
 
 // SetDefaultJobBackend configures the backend stamped onto job submissions
@@ -405,6 +413,27 @@ func (s *Store) SetJobBackendAvailable(backend string) {
 		s.jobBackendAvailable = map[string]bool{}
 	}
 	s.jobBackendAvailable[backend] = true
+}
+
+// SetDefaultTerminalBackend configures the backend stamped onto new
+// terminal sessions. Declaring a default also declares it served —
+// wiring sets it only after the runner behind it is proven live, so a
+// 'cloud' session request on a deployment without termexec is refused
+// at admission instead of queueing forever.
+func (s *Store) SetDefaultTerminalBackend(backend string) {
+	s.defaultTerminalBackend = backend
+	if backend != "" {
+		s.SetTerminalBackendAvailable(backend)
+	}
+}
+
+// SetTerminalBackendAvailable declares that a live runner claims the
+// named terminal backend's sessions.
+func (s *Store) SetTerminalBackendAvailable(backend string) {
+	if s.terminalBackendAvailable == nil {
+		s.terminalBackendAvailable = map[string]bool{}
+	}
+	s.terminalBackendAvailable[backend] = true
 }
 
 // TerminalFailure carries the resolved input/turn identity and the recorded
@@ -2132,6 +2161,10 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, idemKey string, request map[string]any) (map[string]any, bool, error) {
 	if strings.HasPrefix(tool, "job.") || tool == "script.start" {
 		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
+		return resp, resp != nil, err
+	}
+	if strings.HasPrefix(tool, "terminal.") {
+		resp, err := s.internalTerminalTool(ctx, tx, personaID, tool, request)
 		return resp, resp != nil, err
 	}
 	switch tool {

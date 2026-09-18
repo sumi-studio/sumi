@@ -625,6 +625,145 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
   {
     internal: true,
+    name: "terminal.open",
+    description:
+      "Open a persistent interactive terminal session in your Linux workspace — a real PTY shell that keeps running even after you stop. You and your person share the same session: either of you can watch it and type into it. Returns a session_id; output accumulates in a durable scrollback you read with terminal.read, and you write keystrokes with terminal.write. Use it for long builds, servers, watchers, or anything interactive — the session survives disconnects until it exits or is ended with terminal.close.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "short human-readable session name (max 80 chars), e.g. 'dev server'",
+        },
+      },
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.list",
+    description:
+      "List your terminal sessions — live ones you can reattach to and recently ended ones with their exit results. Reconnecting to an existing session is always better than opening a duplicate.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.read",
+    description:
+      "Read terminal output from a durable scrollback. Returns base64 chunks with absolute byte offsets plus the session status. Keep the returned cursor and pass it back to continue where you left off; a gap entry means output was compacted away before your cursor — treat the bytes as lost, not silently skipped.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "id from terminal.open or terminal.list" },
+        cursor: {
+          type: "integer",
+          minimum: 0,
+          description: "absolute output offset to read from; omit for the latest tail",
+        },
+        tail: {
+          type: "boolean",
+          description: "when true and no cursor is given, return only the recent end of the scrollback",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.inputs",
+    description:
+      "Read the session's durable input ledger — every input you and your person sent, in order, with its honest outcome. 'intended' is only queued acceptance, never delivery; the ledger is where 'written', 'failed', 'unknown', 'interrupted', or 'expired' is learned. 'unknown' means a claim was lost after dequeue — a prefix may have been delivered, so never blind-resend it. Pass after_seq to see only newer entries.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        after_seq: {
+          type: "integer",
+          minimum: 0,
+          description: "only inputs with seq greater than this",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.write",
+    description:
+      "Send input to a live terminal session — bytes the PTY receives as if typed (include \\n to run a command line). Returns an acceptance receipt: 'intended' means queued for delivery in order, NOT yet typed. The runner delivers asynchronously; check terminal.read for your input's echo to confirm it landed. If the input later ends 'unknown' the stream may have delivered a prefix — never blind-resend. Rejected with an error when your person holds exclusive control.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        data: {
+          type: "string",
+          description: "input text as typed (max 64 KiB) — JSON escapes carry control bytes, e.g. \\u0003 for Ctrl-C, though terminal.signal is usually clearer",
+        },
+      },
+      required: ["session_id", "data"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.resize",
+    description: "Resize a live terminal session's PTY window (cols/rows).",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        cols: { type: "integer", minimum: 2, maximum: 1000 },
+        rows: { type: "integer", minimum: 2, maximum: 500 },
+      },
+      required: ["session_id", "cols", "rows"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.signal",
+    description:
+      "Send a signal to the session's foreground process group — the job currently running in the terminal, exactly what a keystroke signal would hit (e.g. INT for Ctrl-C, TSTP for Ctrl-Z, TERM/KILL to stop a wedged build). At a bare prompt the target is the shell itself.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+        signal: {
+          type: "string",
+          enum: ["INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2"],
+        },
+      },
+      required: ["session_id", "signal"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.eof",
+    description:
+      "Send end-of-input (Ctrl-D) to a live terminal session's PTY — asks the shell to exit cleanly.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    internal: true,
+    name: "terminal.close",
+    description:
+      "End a terminal session: the runner stops the container and records the real exit result. Ended sessions stay listed with their outcome; the workspace files they wrote remain.",
+    parameters: {
+      type: "object",
+      properties: {
+        session_id: { type: "string" },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    internal: true,
     delegated: true,
     name: "call.join",
     description:
