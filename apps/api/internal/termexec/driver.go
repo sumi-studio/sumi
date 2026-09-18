@@ -144,6 +144,23 @@ func New(store *agentstate.Store, proc ProcessAPI, scope ScopeEnsurer, cfg Confi
 // sessions — stable across restarts so owned sessions are recovered.
 func (d *Driver) Runner() string { return d.cfg.RunnerID }
 
+// OutputAttached reports the runtime's own read-time output health
+// for a session's live op: the journal pump is attached and appending
+// records. attached=false on a live op means emitted bytes are not
+// being captured — the surface must not claim a healthy terminal.
+// known=false means the runtime could not answer (or the op already
+// ended); callers omit the field rather than guess either way.
+func (d *Driver) OutputAttached(ctx context.Context, personaID, sessionID string) (attached, known bool) {
+	op, err := d.proc.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
+		PersonalityAgentID: personaID,
+		OperationID:        runtimeprovision.ProcessOperationID(personaID, "term:"+sessionID),
+	})
+	if err != nil || op.State.Terminal() {
+		return false, false
+	}
+	return op.OutputAttached, true
+}
+
 func (d *Driver) Run(ctx context.Context) {
 	d.sweep(ctx)
 	tick := time.NewTicker(d.cfg.Interval)

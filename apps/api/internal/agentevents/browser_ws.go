@@ -56,6 +56,10 @@ type BrowserServer struct {
 	// Terminals, when set, backs the /terminal/* person routes and the
 	// attach socket (RegisterTerminalRoutes). Nil fails them closed.
 	Terminals TerminalBackend
+	// TerminalHealth, when set, adds the runtime's read-time output
+	// health to single-session responses (`output_attached`). Nil or a
+	// 'known=false' answer omits the field — the wire never guesses.
+	TerminalHealth TerminalHealthChecker
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration

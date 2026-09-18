@@ -42,12 +42,15 @@ import {
   isTerminalAcceptingInput,
   type TerminalInputReceipt,
   type TerminalSession,
+  terminalInputUnresolved,
   terminalStatusLabel,
 } from "./model";
 
 const LIST_REFRESH_MS = 15_000;
 const SESSION_REFRESH_MS = 15_000;
 const NOTICE_TTL_MS = 4_000;
+const INPUT_OBSERVE_MS = 2_500;
+const RESIZE_RETRY_MAX = 3;
 
 /**
  * The shared Cloud terminal screen: one named durable session that the
@@ -368,6 +371,12 @@ export function TerminalSessionView({
 
   const applySession = useCallback(
     (next: TerminalSession) => {
+      // Session lifecycle is monotonic — once a final state is
+      // authoritative, a delayed REST/poll response claiming a live
+      // status is stale and must not resurrect admission.
+      if (admissionRef.current.final && isLiveTerminalStatus(next.status)) {
+        return;
+      }
       admissionRef.current = {
         accepting: isTerminalAcceptingInput(next),
         final: !isLiveTerminalStatus(next.status),
@@ -437,7 +446,12 @@ export function TerminalSessionView({
           setEnded(info);
           term.options.disableStdin = true;
         },
-        onServerError: (code, message) => {
+        onServerError: (code, message, inputKind) => {
+          // Rejected housekeeping input (resize during a lifecycle
+          // transition, etc.) must not surface as a user-facing
+          // failure — the ledger observer retries/surfaces it when it
+          // matters. Genuine input rejections still show.
+          if (inputKind === "resize") return;
           setServerError(serverErrorMessage(code, message));
         },
         onConnection: (state, info) => {
@@ -500,6 +514,74 @@ export function TerminalSessionView({
       term.dispose();
     };
   }, [sessionId]);
+
+  // Observe the durable input ledger so real delivery outcomes are
+  // visible: `failed` user input surfaces a notice, `unknown` is shown
+  // as unresolvable and is never resent, and a provably-undelivered
+  // housekeeping resize is re-sent (bounded) since dims are idempotent.
+  // The read window always restarts at the OLDEST unresolved row —
+  // after_seq pages by creation order, so advancing past an `intended`
+  // row would hide the failed/unknown outcome it reaches later. The
+  // unresolved set survives socket reconnects because the ledger is
+  // durable state, not a connection property.
+  useEffect(() => {
+    if (ended !== null) return;
+    let cancelled = false;
+    const unresolved = new Map<string, { seq: number }>();
+    const reported = new Set<string>();
+    let lastSeq = 0;
+    let resizeRetries = 0;
+    const timer = setInterval(() => {
+      let windowStart = lastSeq;
+      for (const row of unresolved.values()) {
+        if (row.seq - 1 < windowStart) windowStart = row.seq - 1;
+      }
+      client
+        .listInputs(sessionId, Math.max(0, windowStart))
+        .then((rows) => {
+          if (cancelled) return;
+          for (const row of rows) {
+            if (row.seq > lastSeq) lastSeq = row.seq;
+            if (terminalInputUnresolved(row.status)) {
+              if (!unresolved.has(row.inputId)) {
+                unresolved.set(row.inputId, { seq: row.seq });
+              }
+              continue;
+            }
+            unresolved.delete(row.inputId);
+            if (reported.has(row.inputId)) continue;
+            if (row.status === "written") {
+              if (row.kind === "resize") resizeRetries = 0;
+              continue;
+            }
+            if (row.status !== "failed" && row.status !== "unknown") continue;
+            reported.add(row.inputId);
+            if (row.kind === "resize") {
+              if (
+                row.status === "failed" &&
+                resizeRetries < RESIZE_RETRY_MAX &&
+                admissionRef.current.accepting
+              ) {
+                resizeRetries += 1;
+                const term = termRef.current;
+                if (term) attachRef.current?.sendResize(term.cols, term.rows);
+              }
+              continue;
+            }
+            flashNotice(
+              row.status === "failed"
+                ? "入力を届けられませんでした"
+                : "入力の結果が不明です（自動再送しません）",
+            );
+          }
+        })
+        .catch(() => undefined);
+    }, INPUT_OBSERVE_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [client, sessionId, ended, flashNotice]);
 
   // Poll the session row so fields the socket does not push (for example
   // control_holder after the secretary yields) stay honest.
@@ -623,6 +705,18 @@ export function TerminalSessionView({
           >
             一覧へ戻る
           </Button>
+        </div>
+      ) : null}
+
+      {current?.outputAttached === false && ended === null ? (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-border border-b bg-muted/40 px-3 py-1.5 text-xs"
+        >
+          <CircleAlert className="size-3.5 shrink-0 text-amber-600" />
+          <span className="min-w-0 flex-1">
+            出力を受信できていません。セッションは動いている可能性がありますが、新しい表示が届きません。
+          </span>
         </div>
       ) : null}
 

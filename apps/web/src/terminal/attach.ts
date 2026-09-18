@@ -34,7 +34,12 @@ export interface TerminalAttachEvents {
   onGap(base: number, to: number | null): void;
   onInputAck(ack: TerminalInputReceipt): void;
   onEnded(info: TerminalEndedInfo): void;
-  onServerError(code: string, message: string): void;
+  /**
+   * `inputKind` is set when the server rejected a submitted input
+   * frame — housekeeping kinds (resize) must not produce the same
+   * alarming surface as a rejected keystroke.
+   */
+  onServerError(code: string, message: string, inputKind?: string): void;
   onConnection(
     state: TerminalAttachState,
     info?: { willRetry?: boolean; reason?: string },
@@ -294,6 +299,9 @@ export class TerminalAttach {
           events.onServerError(
             String(frame.code ?? "error"),
             String(frame.message ?? ""),
+            typeof frame.input_kind === "string"
+              ? frame.input_kind
+              : undefined,
           );
           break;
         }

@@ -1,8 +1,10 @@
 import {
   parseTerminalInputReceipt,
+  parseTerminalInputs,
   parseTerminalRead,
   parseTerminalSession,
   type TerminalInputReceipt,
+  type TerminalInputRow,
   type TerminalReadResult,
   type TerminalSession,
 } from "./model";
@@ -161,6 +163,25 @@ export class TerminalApiClient {
       await this.request(this.scoped("/terminal/read", params)),
     );
     return parseTerminalRead(body);
+  }
+
+  /**
+   * Reads the durable input ledger. `after_seq` pages by *creation*
+   * order only — a row consumed while `intended` then skipped past
+   * would hide its later `failed`/`unknown` outcome, so observers
+   * must re-read from their oldest unresolved row instead of blindly
+   * advancing.
+   */
+  async listInputs(
+    sessionId: string,
+    afterSeq: number,
+  ): Promise<TerminalInputRow[]> {
+    const params: Record<string, string> = { session_id: sessionId };
+    if (afterSeq > 0) params.after_seq = String(afterSeq);
+    const body = asRecord(
+      await this.request(this.scoped("/terminal/inputs", params)),
+    );
+    return parseTerminalInputs(body.inputs);
   }
 
   async submitInput(

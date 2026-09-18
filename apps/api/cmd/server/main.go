@@ -859,6 +859,9 @@ func newApplicationFromEnv() (*application, error) {
 		if terminalAuth, ok := directChatAuthorizer.(agentevents.TerminalAuthorizer); ok {
 			browser.TerminalAuthorizer = terminalAuth
 		}
+		if termExec != nil {
+			browser.TerminalHealth = termExec
+		}
 		browser.RegisterTerminalRoutes(mux)
 		log.Print("person terminal routes ready (/terminal/*, session-scoped to the persona)")
 	}

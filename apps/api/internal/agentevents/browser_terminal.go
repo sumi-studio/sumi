@@ -31,6 +31,16 @@ type TerminalBackend interface {
 	CloseTerminalSession(ctx context.Context, personaID, sessionID, reason string) (agentstate.TerminalSession, error)
 }
 
+// TerminalHealthChecker reports a live session's runtime output
+// health. The termexec driver implements it against the provisioner's
+// own read-time OutputAttached: attached=false on a live op means
+// emitted bytes are not being captured — the surface must not claim
+// a healthy terminal. known=false means the runtime could not answer;
+// the wire omits the field rather than guess.
+type TerminalHealthChecker interface {
+	OutputAttached(ctx context.Context, personaID, sessionID string) (attached, known bool)
+}
+
 const (
 	terminalHumanControlLease = 5 * time.Minute
 	terminalReadDefaultLimit  = 64 * 1024
@@ -154,6 +164,30 @@ func terminalSessionJSON(t agentstate.TerminalSession) map[string]any {
 	return out
 }
 
+// sessionWire is terminalSessionJSON plus the runtime's read-time
+// output health for a live bound session: `output_attached` appears
+// only when the runtime can actually answer, so a degraded pump is
+// surfaced honestly and an unanswered probe never fakes health.
+// List responses stay on the bare shape — one provisioner call per
+// row is the wrong cost for a collection read.
+func (s *BrowserServer) sessionWire(ctx context.Context, t agentstate.TerminalSession) map[string]any {
+	out := terminalSessionJSON(t)
+	if attached, known := s.outputHealth(ctx, t); known {
+		out["output_attached"] = attached
+	}
+	return out
+}
+
+// outputHealth asks the runtime for the session's live output state.
+// Only a bound, active session has a stream whose health is
+// meaningful; anything else reports unknown so the field is omitted.
+func (s *BrowserServer) outputHealth(ctx context.Context, t agentstate.TerminalSession) (attached, known bool) {
+	if s.TerminalHealth == nil || t.Status != "active" || t.OperationID == "" {
+		return false, false
+	}
+	return s.TerminalHealth.OutputAttached(ctx, t.PersonaID, t.SessionID)
+}
+
 type terminalOpenRequest struct {
 	Name string `json:"name"`
 }
@@ -192,7 +226,7 @@ func (s *BrowserServer) serveTerminalOpen(w http.ResponseWriter, r *http.Request
 	}) {
 		return
 	}
-	writeTerminalJSON(w, map[string]any{"session": terminalSessionJSON(session)})
+	writeTerminalJSON(w, map[string]any{"session": s.sessionWire(r.Context(), session)})
 }
 
 func terminalSessionIDParam(r *http.Request) string {
@@ -209,7 +243,7 @@ func (s *BrowserServer) serveTerminalGet(w http.ResponseWriter, r *http.Request)
 	}) {
 		return
 	}
-	writeTerminalJSON(w, map[string]any{"session": terminalSessionJSON(session)})
+	writeTerminalJSON(w, map[string]any{"session": s.sessionWire(r.Context(), session)})
 }
 
 func (s *BrowserServer) serveTerminalRead(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +283,7 @@ func (s *BrowserServer) serveTerminalRead(w http.ResponseWriter, r *http.Request
 		chunks = append(chunks, item)
 	}
 	writeTerminalJSON(w, map[string]any{
-		"session": terminalSessionJSON(read.Session),
+		"session": s.sessionWire(r.Context(), read.Session),
 		"chunks":  chunks,
 		"cursor":  read.Cursor,
 	})
@@ -515,7 +549,7 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 	sendError := func(code, msg string) {
 		send(map[string]any{"type": "error", "code": code, "message": msg})
 	}
-	if !send(map[string]any{"type": "session", "session": terminalSessionJSON(session)}) {
+	if !send(map[string]any{"type": "session", "session": s.sessionWire(ctx, session)}) {
 		return
 	}
 	if session.OutputBase > cursor {
@@ -592,6 +626,14 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 	authPoll := time.NewTicker(authInterval)
 	defer authPoll.Stop()
 	lastStatus := session.Status
+	// lastAttached is the output health the client was last told:
+	// nil = not yet reported (unknown or not applicable). The admission
+	// frame already carried whatever the runtime answered then.
+	var lastAttached *bool
+	if attached, known := s.outputHealth(ctx, session); known {
+		v := attached
+		lastAttached = &v
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -613,6 +655,28 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 					time.Now().Add(2*time.Second))
 				wg.Wait()
 				return
+			}
+			// Output health is only meaningful on a live bound session;
+			// re-check it on this slow tick and push a session frame when
+			// it changes so a detached journal pump surfaces honestly
+			// instead of the client believing output still flows.
+			if t, gerr := s.Terminals.GetTerminalSession(ctx, paid, session.SessionID); gerr == nil {
+				wire := s.sessionWire(ctx, t)
+				cur, known := wire["output_attached"].(bool)
+				var curPtr *bool
+				if known {
+					v := cur
+					curPtr = &v
+				}
+				changed := (curPtr == nil) != (lastAttached == nil) ||
+					(curPtr != nil && lastAttached != nil && *curPtr != *lastAttached)
+				if changed {
+					lastAttached = curPtr
+					if !send(map[string]any{"type": "session", "session": wire}) {
+						wg.Wait()
+						return
+					}
+				}
 			}
 		case <-poll.C:
 			read, err := s.Terminals.ReadTerminalOutput(ctx, paid, session.SessionID, cursor, terminalReadDefaultLimit)
@@ -650,7 +714,13 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 			cursor = read.NextCursor
 			if read.Session.Status != lastStatus {
 				lastStatus = read.Session.Status
-				if !send(map[string]any{"type": "session", "session": terminalSessionJSON(read.Session)}) {
+				wire := s.sessionWire(ctx, read.Session)
+				if v, ok := wire["output_attached"].(bool); ok {
+					lastAttached = &v
+				} else {
+					lastAttached = nil
+				}
+				if !send(map[string]any{"type": "session", "session": wire}) {
 					wg.Wait()
 					return
 				}
@@ -683,7 +753,12 @@ func (s *BrowserServer) terminalWSInput(ctx context.Context, claims UserSessionC
 		return ierr
 	})
 	if err != nil {
-		sendError(terminalErrorCode(err), "input rejected")
+		send(map[string]any{
+			"type":       "error",
+			"code":       terminalErrorCode(err),
+			"message":    "input rejected",
+			"input_kind": kind,
+		})
 		return
 	}
 	send(map[string]any{"type": "input_ack", "input_id": input.InputID, "seq": input.Seq, "status": input.Status})

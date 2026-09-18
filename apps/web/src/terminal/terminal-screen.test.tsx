@@ -183,6 +183,7 @@ function client(overrides: Record<string, unknown> = {}): TerminalApiClient {
       session("active", { controlHolder: "human" }),
     ),
     closeSession: vi.fn(async () => session("ending")),
+    listInputs: vi.fn(async () => []),
     ...overrides,
   } as unknown as TerminalApiClient;
 }
@@ -376,5 +377,102 @@ describe("TerminalSessionView uncertain mutation (TUI-02)", () => {
     ).not.toBeInTheDocument();
     expect(api.closeSession).toHaveBeenCalledTimes(1);
     expect(api.getSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TerminalSessionView input ledger observer", () => {
+  function inputRow(inputId: string, seq: number, kind: string, status: string) {
+    return { inputId, seq, kind, source: "human", status, detail: null };
+  }
+
+  it("re-sends a provably failed resize, bounded to RESIZE_RETRY_MAX", async () => {
+    vi.useFakeTimers();
+    let n = 0;
+    const api = client({
+      listInputs: vi.fn(async () => [inputRow(`r${++n}`, n, "resize", "failed")]),
+    });
+    const { attach } = mount(api, session("active"));
+
+    act(() => attach.events.onConnection("open"));
+    act(() => attach.events.onSession(session("active")));
+    expect(attach.resizeCalls).toEqual([[80, 24]]);
+
+    for (let i = 0; i < 6; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+    }
+
+    // One mount-time sync + exactly RESIZE_RETRY_MAX re-sends; each failed
+    // row is retried once and the global bound caps further housekeeping.
+    expect(attach.resizeCalls).toHaveLength(1 + 3);
+    expect(screen.queryByText("入力を届けられませんでした")).not.toBeInTheDocument();
+  });
+
+  it("re-reads from the oldest unresolved row, not the highest seq", async () => {
+    vi.useFakeTimers();
+    const afterSeqs: number[] = [];
+    const api = client({
+      listInputs: vi.fn(async (_sessionId: string, afterSeq?: number) => {
+        afterSeqs.push(afterSeq ?? 0);
+        return [inputRow("pending", 7, "stdin", "intended")];
+      }),
+    });
+    mount(api, session("active"));
+
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+    }
+    // The window must restart at seq-1 of the unresolved row (6), never
+    // advancing past it while its outcome is still open. The first call
+    // legitimately starts at 0 — the row is only discovered by that read.
+    expect(afterSeqs.length).toBeGreaterThan(2);
+    expect(new Set(afterSeqs.slice(1))).toEqual(new Set([6]));
+  });
+
+  it("surfaces a failed stdin row honestly and reports it once", async () => {
+    vi.useFakeTimers();
+    const api = client({
+      listInputs: vi.fn(async () => [inputRow("s1", 1, "stdin", "failed")]),
+    });
+    const { attach } = mount(api, session("active"));
+
+    act(() => attach.events.onConnection("open"));
+    act(() => attach.events.onSession(session("active")));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    expect(screen.getByText("入力を届けられませんでした")).toBeInTheDocument();
+    expect(attach.stdinData).toEqual([]);
+  });
+
+  it("shows unknown as unresolvable and never resends it", async () => {
+    vi.useFakeTimers();
+    const api = client({
+      listInputs: vi.fn(async () => [inputRow("u1", 1, "stdin", "unknown")]),
+    });
+    const { attach } = mount(api, session("active"));
+
+    act(() => attach.events.onConnection("open"));
+    act(() => attach.events.onSession(session("active")));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    // The unresolvable outcome is surfaced honestly (assert before the
+    // notice TTL expires) — and further ticks never resend it.
+    expect(
+      screen.getByText("入力の結果が不明です（自動再送しません）"),
+    ).toBeInTheDocument();
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500);
+      });
+    }
+    expect(attach.stdinData).toEqual([]);
+    expect(attach.resizeCalls).toEqual([[80, 24]]);
   });
 });

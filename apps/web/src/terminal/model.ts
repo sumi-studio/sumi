@@ -30,6 +30,13 @@ export interface TerminalSession {
   outputBytes: number;
   outputBase: number;
   controlHolder: string;
+  /**
+   * Read-time runtime output health, present only when the runtime can
+   * answer for a live bound session. false means emitted bytes are not
+   * being captured — the UI must not claim a healthy terminal. Absent
+   * means unknown (never assume healthy either way).
+   */
+  outputAttached: boolean | null;
   exitCode: number | null;
   exitSignal: string | null;
   endReason: string | null;
@@ -54,6 +61,44 @@ export interface TerminalInputReceipt {
   seq: number;
   /** 'intended' means queued only — never present it as written. */
   status: string;
+}
+
+/**
+ * One durable input ledger row. `intended`/`dequeued` are unresolved;
+ * `written` reached the backend, `failed` definitely did not, and
+ * `unknown` may have — unknown rows are never resent.
+ */
+export interface TerminalInputRow {
+  inputId: string;
+  seq: number;
+  kind: string;
+  source: string;
+  status: string;
+  detail: unknown;
+}
+
+export function parseTerminalInputs(value: unknown): TerminalInputRow[] {
+  if (!Array.isArray(value)) return [];
+  const rows: TerminalInputRow[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const seq = Number(item.seq);
+    if (!Number.isSafeInteger(seq)) continue;
+    rows.push({
+      inputId: asString(item.input_id),
+      seq,
+      kind: asString(item.kind),
+      source: asString(item.source),
+      status: asString(item.status),
+      detail: item.detail,
+    });
+  }
+  return rows;
+}
+
+/** True while a ledger row has no delivery outcome yet. */
+export function terminalInputUnresolved(status: string): boolean {
+  return status === "intended" || status === "dequeued";
 }
 
 export function isLiveTerminalStatus(status: string): boolean {
@@ -104,6 +149,10 @@ export function parseTerminalSession(value: unknown): TerminalSession {
     outputBase: asOffset(value.output_base ?? 0),
     controlHolder:
       typeof value.control_holder === "string" ? value.control_holder : "",
+    outputAttached:
+      typeof value.output_attached === "boolean"
+        ? value.output_attached
+        : null,
     exitCode: Number.isSafeInteger(value.exit_code)
       ? (value.exit_code as number)
       : null,
