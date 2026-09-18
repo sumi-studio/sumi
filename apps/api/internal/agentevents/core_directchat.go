@@ -88,6 +88,56 @@ type coreDirectChatPersona struct {
 
 var errCoreDirectChatUnavailable = errors.New("core direct chat is unavailable")
 
+// CommandRejectionError reports a command whose committed durable
+// disposition is a terminal rejection other than secretary_moved — that
+// reason keeps the agentstate sentinels so existing ErrPersonaTransferred
+// handling still applies. It carries the committed reject_reason so first
+// answers, replays, HTTP, and WebSocket all describe the same durable
+// outcome instead of a bare receipt masquerading a rejected command as
+// accepted. On a first admission the refusal just observed is kept as the
+// cause, so errors.Is checks callers already make — ErrPersonaInactive
+// for a sealed persona, for example — still resolve; on a replay there is
+// no live refusal to unwrap and the committed reason alone stands.
+type CommandRejectionError struct {
+	Reason RejectReason
+	cause  error
+}
+
+func (e *CommandRejectionError) Error() string {
+	return "command rejected: " + string(e.Reason)
+}
+
+func (e *CommandRejectionError) Unwrap() error { return e.cause }
+
+// committedDispositionError translates a committed command_disposition
+// into the caller-visible admission answer: applied or superseded replays
+// as accepted, and a committed rejection replays as the same terminal
+// rejection the first answer carried.
+func committedDispositionError(disposition json.RawMessage, cause error) error {
+	var d struct {
+		Status       string `json:"status"`
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := json.Unmarshal(disposition, &d); err != nil {
+		return fmt.Errorf("decode committed command disposition: %w", err)
+	}
+	switch d.Status {
+	case "applied", "superseded":
+		return nil
+	case "rejected":
+		if d.RejectReason == string(RejectSecretaryMoved) {
+			// The first answer was the moved rejection; the replay returns
+			// the same terminal answer rather than a bare receipt of a
+			// command that never ran.
+			return fmt.Errorf("%w: %w",
+				agentstate.ErrPersonaInactive, agentstate.ErrPersonaTransferred)
+		}
+		return &CommandRejectionError{Reason: RejectReason(d.RejectReason), cause: cause}
+	default:
+		return fmt.Errorf("committed command disposition has unknown status %q", d.Status)
+	}
+}
+
 // Append implements CommandAppender.
 func (c *CoreDirectChat) Append(
 	ctx context.Context,
@@ -119,11 +169,67 @@ func (c *CoreDirectChat) AppendWithIdempotencyStatus(
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
+	if existing {
+		// A replayed command that already holds a committed terminal receipt
+		// must keep that result exactly: re-dispatching would resubmit a
+		// rejected command's input as fresh work the moment the persona
+		// accepts inputs again — e.g. after a return transfer reactivates it
+		// here. The first committed command_disposition is the durable truth;
+		// the reconciler already refuses a second one, and admission must not
+		// manufacture the work the receipt says never ran.
+		disposition, found, derr := c.Gateway.CommandDispositionFor(ctx, env)
+		if derr != nil {
+			return env, true, derr
+		}
+		if found {
+			return env, true, committedDispositionError(disposition, nil)
+		}
+	}
 	if err := c.dispatch(ctx, provenance, env); err != nil {
+		if isPermanentCoreSubmitError(err) {
+			return c.commitTerminalRefusal(ctx, env, existing, err)
+		}
 		return env, existing, err
 	}
 	c.notePersona(provenance.PersonalityAgentID)
 	return env, existing, nil
+}
+
+// commitTerminalRefusal makes a permanent core refusal durable before it is
+// reported: the caller's terminal answer must be a fact the log can back
+// after a crash, a stopped reconciler, or a placement return — never a
+// classification the process only remembered. A disposition already
+// committed — by the reconciler racing this dispatch or by an earlier
+// admission — wins; the answer then reports that durable truth, whatever it
+// is. A persistence failure is returned as its own error rather than
+// dressed as the refusal, so the caller never holds a terminal answer the
+// log cannot back, and the command stays undecided and recoverable. Only
+// isPermanentCoreSubmitError failures reach here: unknown or transient
+// failures stay undecided work for the reconciler.
+func (c *CoreDirectChat) commitTerminalRefusal(
+	ctx context.Context,
+	env CommandEnvelope,
+	existing bool,
+	dispatchErr error,
+) (CommandEnvelope, bool, error) {
+	disposition, found, derr := c.Gateway.CommandDispositionFor(ctx, env)
+	if derr != nil {
+		return env, existing, derr
+	}
+	if !found {
+		raw := dispositionEvent(env, "rejected", commandRejectReason(dispatchErr, false))
+		if _, err := c.Gateway.CommitCommandDisposition(ctx, env, raw); err != nil {
+			return env, existing, fmt.Errorf("commit command rejection: %w", err)
+		}
+		disposition, found, derr = c.Gateway.CommandDispositionFor(ctx, env)
+		if derr != nil {
+			return env, existing, derr
+		}
+	}
+	if !found {
+		return env, existing, errors.New("committed command rejection is not readable")
+	}
+	return env, existing, committedDispositionError(disposition, dispatchErr)
 }
 
 func (c *CoreDirectChat) dispatch(
@@ -645,6 +751,22 @@ func (c *CoreDirectChat) reconcileCommands(ctx context.Context, personaID string
 			// re-dispositioned — a restarted projector or a changed
 			// authority must not mint a second one with a different
 			// reason.
+			st.commandSeq = env.Seq
+			continue
+		}
+		// This projector's cache is rebuilt once at load; a receipt
+		// committed since — by the synchronous refusal path answering a
+		// caller or by another writer — is authoritative even though the
+		// cache predates it. Consult the durable log before reviving the
+		// command as fresh work: a command whose rejection is committed
+		// must never mint the input it was denied.
+		disposition, found, derr := c.Gateway.CommandDispositionFor(ctx, env)
+		if derr != nil {
+			return derr
+		}
+		if found {
+			st.disposedCommands[env.CommandID] = struct{}{}
+			st.seen[sha256.Sum256(disposition)] = struct{}{}
 			st.commandSeq = env.Seq
 			continue
 		}

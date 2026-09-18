@@ -3047,8 +3047,9 @@ func TestBrowserWebSocketTransferredPersonaRejectsWithMoved(t *testing.T) {
 // rejected while sealed keeps exactly that receipt after the transfer
 // completes and the projector restarts. Replaying it over a reconnected
 // WebSocket must reach CommandDispositionFor, find the single committed
-// receipt, and answer command_accepted — not error the lookup and drop the
-// connection (the pre-fix behavior once two dispositions existed).
+// receipt, and answer the committed rejection — not error the lookup and
+// drop the connection (the pre-fix behavior once two dispositions existed),
+// and never a bare command_accepted masquerading the committed truth.
 func TestBrowserWebSocketReplayedCommandKeepsSoleDispositionAfterTransferRestart(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Create(t)
@@ -3203,7 +3204,8 @@ func TestBrowserWebSocketReplayedCommandKeepsSoleDispositionAfterTransferRestart
 	}
 
 	// The browser reconnects and resends the command whose acceptance it
-	// lost: the single committed receipt comes back on the acceptance.
+	// lost: the single committed receipt answers as the rejection it is —
+	// the same committed outcome every surface reports.
 	httpServer = newServer(restarted, gateway)
 	defer httpServer.Close()
 	conn = dialBrowserWS(t, httpServer, cookie, pa)
@@ -3212,21 +3214,28 @@ func TestBrowserWebSocketReplayedCommandKeepsSoleDispositionAfterTransferRestart
 		t.Fatal(err)
 	}
 	assertDirectChatStatus(t, conn, "ready")
-	replayed := sendAbort(conn)
-	if replayed.Type != "command_accepted" ||
-		replayed.CommandID != accepted.CommandID ||
-		replayed.Seq != accepted.Seq {
-		t.Fatalf("replayed abort lost its identity: %+v", replayed)
+	if err := conn.WriteJSON(browserCommandFrame{
+		Type:           "command",
+		IdempotencyKey: "abort-lost-acceptance",
+		Command:        json.RawMessage(`{"type":"abort"}`),
+	}); err != nil {
+		t.Fatalf("send replayed abort: %v", err)
 	}
-	var disposition struct {
-		Status       string `json:"status"`
-		RejectReason string `json:"reject_reason"`
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var replayed browserCommandRejectedFrame
+	if err := conn.ReadJSON(&replayed); err != nil {
+		t.Fatalf("read replayed answer: %v", err)
 	}
-	if err := json.Unmarshal(replayed.Disposition, &disposition); err != nil {
-		t.Fatalf("replayed acceptance carried no disposition: %v", err)
+	if replayed.Type != "command_rejected" ||
+		replayed.IdempotencyKey != "abort-lost-acceptance" ||
+		replayed.RejectReason != RejectNotAllowed {
+		t.Fatalf("replayed committed rejection: %+v", replayed)
 	}
-	if disposition.Status != "rejected" ||
-		disposition.RejectReason != string(RejectNotAllowed) {
-		t.Fatalf("authoritative disposition changed: %s", replayed.Disposition)
+	// The committed receipt itself is unchanged — one disposition,
+	// not_allowed, still bound to the first admission's durable identity.
+	if got := commandDispositions(t, gateway, pa); len(got) != 2 ||
+		got[0]["command_id"] != accepted.CommandID ||
+		got[0]["reject_reason"] != string(RejectNotAllowed) {
+		t.Fatalf("committed dispositions changed: %v", got)
 	}
 }
