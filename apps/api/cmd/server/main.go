@@ -783,7 +783,8 @@ func newApplicationFromEnv() (*application, error) {
 					return nil, fmt.Errorf("register core file effect %s: %w", tool, err)
 				}
 			}
-			log.Print("core file tools ready (file.* effects scoped to the claiming persona)")
+			coreServer.SetJobFileService(fileaccess.JobFileService(filesClient))
+			log.Print("core file tools ready (file.* effects scoped to the claiming persona; job file capability armed)")
 		}
 	}
 	mux.HandleFunc("GET /health", handler.Health)

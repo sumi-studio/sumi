@@ -50,6 +50,7 @@ type Server struct {
 	maxBody    int64
 	conns      *modelconnections.Store
 	callBridge CallBridge
+	jobFiles   JobFileService
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
@@ -185,6 +186,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/cancel", s.cancelJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/heartbeat", s.heartbeatJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/complete", s.completeJob)
+	// Job-scoped file capability (script jobs): every op authorized against
+	// the live runner claim; mutating ops settle through the durable
+	// core_job_file_ops ledger — never caller-scoped, never credential-bearing.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/files/{op}", s.jobFileOp)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/jobs/{job}/files/ops", s.listJobFileOps)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/files/ops/{opid}/resolve", s.resolveJobFileOp)
 	// Call sessions: persona-token scoped like jobs — the media bridge's claim
 	// is its own authority, deliberately not writer-generation gated.
 	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/claim", s.claimCallSessions)
