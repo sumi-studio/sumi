@@ -40,7 +40,7 @@ import { defaultDispatcherPath, Runner } from "../src/runner.ts";
 import { Reconciler } from "../src/reconcile.ts";
 import { Journal } from "../src/journal.ts";
 import { Supervisor, stableRunnerID } from "../src/main.ts";
-import { childrenOf, bootID, startTicks } from "../src/proc.ts";
+import { childrenOf, bootID, startTicks, commForExe } from "../src/proc.ts";
 import { writeConfig } from "../src/workerd/config.ts";
 import { ensurePrivateDir, writePrivateFile } from "../src/privatefs.ts";
 import { StubFileSvc } from "./filesvc_stub.mts";
@@ -58,6 +58,11 @@ const DB_URL = req("SUMI_TEST_DB_URL").replace(/\/[^/?]+(\?.*)?$/, `/sumi_recove
 const STATE_DEV_BIN = process.env.PRODUCER_STATE_DEV_BIN ?? "";
 const WORKERD_BIN = req("WORKERD_BIN");
 const RUNLIMITED_BIN = req("RUNLIMITED_BIN");
+// The comm the configured payload image execs under: its basename
+// truncated to TASK_COMM_LEN-1. A versioned path (workerd-2026-08-04)
+// is 'workerd-2026-08' here — never the literal "workerd" the scan
+// used to assume; a stable-name path still derives 'workerd'.
+const WORKERD_COMM = commForExe(WORKERD_BIN);
 const EXTERNAL_API = process.env.CONSUMER_API ?? "";
 
 const ADMIN = "recovery-admin-token-0123456789abcdef";
@@ -110,7 +115,7 @@ function workerdPids(): number[] {
   for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
     try {
-      if (readFileSync(`/proc/${name}/comm`, "utf8").trim() !== "workerd") continue;
+      if (readFileSync(`/proc/${name}/comm`, "utf8").trim() !== WORKERD_COMM) continue;
       const stat = readFileSync(`/proc/${name}/stat`, "utf8");
       const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
       if (state !== "Z" && state !== "X") out.push(Number(name));
