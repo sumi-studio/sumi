@@ -689,3 +689,178 @@ func TestStalledBundleBodyBoundsAndResumes(t *testing.T) {
 		t.Fatalf("local authority %s", got)
 	}
 }
+
+// TestBundleErrorAnswerClassifiesBounded (F384 residual / A F-A4 note): the
+// error-answer path must be as bounded as the bundle body — a 503 that
+// sends headers then goes silent stalls the drain the same way. And the
+// classification must stay honest: a refused grant is a permanent,
+// actionable refusal (F370), never an endless pending; a 5xx or transport
+// weirdness is transient pending.
+func TestBundleErrorAnswerClassifiesBounded(t *testing.T) {
+	h := setupReturn(t)
+	config := writeConfig(t, h.home, h.slot)
+	_, returnURL := h.newReturn()
+
+	var answer atomic.Int32
+	var hang atomic.Bool
+	h.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/bundle") {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(int(answer.Load()))
+		_, _ = w.Write([]byte(`{"error":"fixture"}` + "\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if hang.Load() {
+			<-r.Context().Done()
+		}
+		return true
+	})
+
+	// Headers-only 503 that then goes silent: bounded transient — pending,
+	// not hung and not a hard failure.
+	answer.Store(503)
+	hang.Store(true)
+	m, out := h.mover()
+	m.stall = 150 * time.Millisecond
+	if code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false); code != exitPending {
+		t.Fatalf("a silent 503 must end bounded-pending, got %d\n%s", code, out)
+	}
+
+	// A refused grant stays permanent even while its error body stalls:
+	// bounded, and a hard actionable refusal — never endless pending.
+	answer.Store(401)
+	out.Reset()
+	if code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false); code != exitError {
+		t.Fatalf("a refused grant must be a bounded hard error, got %d\n%s", code, out)
+	}
+	if !strings.Contains(out.String(), "rejected") {
+		t.Fatalf("the grant refusal was not reported:\n%s", out)
+	}
+}
+
+// TestTornBundleHeaderRefetchesAndRecovers (F385 / A2): a committed bundle
+// whose first line is torn — power loss past the fsync window, a proxy
+// that cut the stream — used to strand forever: Downloaded=true, the
+// header check failed as an ordinary error, and every resume read the same
+// file. Now the unusable committed bundle is discarded and refetched from
+// the still-sealed source; the drive's step bound caps in-run retries.
+func TestTornBundleHeaderRefetchesAndRecovers(t *testing.T) {
+	h := setupReturn(t)
+	config := writeConfig(t, h.home, h.slot)
+	_, returnURL := h.newReturn()
+
+	// The first bundle answer is torn mid-header; later answers delegate
+	// to the real handler, which serves the genuine bundle.
+	var fetches atomic.Int32
+	h.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/bundle") {
+			return false
+		}
+		if fetches.Add(1) > 1 {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"transfer_id":"01a0b`))
+		return true
+	})
+
+	m, out := h.mover()
+	if code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false); code != exitDone {
+		t.Fatalf("a torn committed header should refetch and finish: %d\n%s", code, out)
+	}
+	if got := fetches.Load(); got != 2 {
+		t.Fatalf("expected exactly 2 bundle fetches, got %d", got)
+	}
+	if got := authority(t, h.local, h.pid); got != "active" {
+		t.Fatalf("local authority %s", got)
+	}
+	if got := authority(t, h.cloud, h.pid); got != "transferred" {
+		t.Fatalf("cloud authority %s", got)
+	}
+}
+
+// TestTornBundleHeaderPersistentlyBadEndsPending (F385 bound): a source
+// that keeps answering torn bundles cannot spin an infinite retry loop —
+// the drive's step bound ends the run pending, and an ordinary resume
+// after the source recovers still finishes with no manual cleanup.
+func TestTornBundleHeaderPersistentlyBadEndsPending(t *testing.T) {
+	h := setupReturn(t)
+	config := writeConfig(t, h.home, h.slot)
+	_, returnURL := h.newReturn()
+
+	var torn atomic.Bool
+	torn.Store(true)
+	h.setIntercept(func(w http.ResponseWriter, r *http.Request) bool {
+		if !torn.Load() || r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/bundle") {
+			return false
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"transfer_id":"01a0b`))
+		return true
+	})
+
+	m, out := h.mover()
+	if code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false); code != exitPending {
+		t.Fatalf("a persistently torn bundle must end pending, got %d\n%s", code, out)
+	}
+	// The recorded state is still honest resumable state — the download
+	// keeps being marked incomplete, nothing imported.
+	r := m.newReturner(h.local.pool, config, false)
+	st, err := r.load()
+	if err != nil || st == nil || st.Downloaded || st.Outcome != "" {
+		t.Fatalf("a persistently torn bundle must not commit progress: %+v %v", st, err)
+	}
+	// The source recovers: an ordinary resume finishes — no manual
+	// deletion, no state edits.
+	torn.Store(false)
+	out.Reset()
+	if code := m.ReturnResume(h.ctx, h.local.pool, config, false); code != exitDone {
+		t.Fatalf("resume after the source recovered: %d\n%s", code, out)
+	}
+	if got := authority(t, h.local, h.pid); got != "active" {
+		t.Fatalf("local authority %s", got)
+	}
+}
+
+// TestCommittedTornBundleRecoveredByResume is A2's exact crash shape: the
+// state file already says Downloaded and the committed bundle file is torn
+// (a zero-byte first line, the emptiest possible). An ordinary resume must
+// discard it and re-fetch — never requiring manual deletion.
+func TestCommittedTornBundleRecoveredByResume(t *testing.T) {
+	h := setupReturn(t)
+	config := writeConfig(t, h.home, h.slot)
+	sessionID, returnURL := h.newReturn()
+	grant := returnURL[strings.Index(returnURL, "#grant=")+7:]
+
+	// Seed the committed-but-torn crash state directly: the record says
+	// downloaded and bound, the file's first line is empty.
+	rdir := filepath.Join(h.home, "return")
+	if err := os.MkdirAll(rdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st := &returnState{
+		Version: 1, SessionURL: h.srv.URL + "/api/secretary-return/sessions/" + sessionID,
+		SessionID: sessionID, Grant: grant, SlotPersona: h.slot,
+		Bound: true, Downloaded: true, UpdatedAt: time.Now().UTC(),
+	}
+	raw, _ := json.Marshal(st)
+	if err := os.WriteFile(filepath.Join(rdir, "state.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rdir, "bundle.ndjson"), []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, out := h.mover()
+	if code := m.ReturnResume(h.ctx, h.local.pool, config, false); code != exitDone {
+		t.Fatalf("resume over a torn committed bundle: %d\n%s", code, out)
+	}
+	if got := authority(t, h.local, h.pid); got != "active" {
+		t.Fatalf("local authority %s", got)
+	}
+}

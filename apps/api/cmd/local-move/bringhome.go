@@ -553,20 +553,13 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 			return fmt.Errorf("%w: %v", errUnreachable, err)
 		}
 		defer res.Body.Close()
-		if res.StatusCode != http.StatusOK {
-			_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
-			return fmt.Errorf("Cloud answered HTTP %d for the bundle", res.StatusCode)
-		}
-		tmp := r.bundlePath() + ".part"
-		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-		if err != nil {
-			return err
-		}
 		// The same silent-peer bound the upload applies: headers arriving
-		// proves nothing about the body. There is no total-duration cap —
-		// a large bundle keeps going as long as bytes keep moving — but
-		// m.stall without a single byte ends this attempt. Closing the
-		// body is what unblocks the read.
+		// proves nothing about the body — a 503 that goes quiet after its
+		// status line stalls the drain exactly like a sealed bundle going
+		// quiet mid-copy. There is no total-duration cap — a large bundle
+		// keeps going as long as bytes move — but m.stall without a
+		// single byte ends this attempt. Closing the body is what
+		// unblocks the read.
 		body := &progress{r: res.Body}
 		body.last.Store(time.Now().UnixNano())
 		var stalled atomic.Bool
@@ -593,6 +586,26 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 				}
 			}
 		}()
+		if res.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<16))
+			switch {
+			case ctx.Err() != nil:
+				return ctx.Err()
+			case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
+				// The grant is permanent state: a refusal is an
+				// actionable error, never an endless pending (F370).
+				return fmt.Errorf("%w: Cloud answered HTTP %d for the bundle", errGrantRejected, res.StatusCode)
+			default:
+				// 5xx, transport weirdness, or an inconsistent 4xx while
+				// the session still says sealed — transient; resume.
+				return fmt.Errorf("%w: HTTP %d for the bundle", errUnreachable, res.StatusCode)
+			}
+		}
+		tmp := r.bundlePath() + ".part"
+		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			return err
+		}
 		if _, err := io.Copy(f, body); err != nil {
 			_ = f.Close()
 			_ = os.Remove(tmp)
@@ -642,15 +655,22 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 	// a row moves.
 	line, err := br.ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("the bundle is empty or unreadable")
+		return r.discardBundle(st, "the recorded bundle is truncated; fetching it again")
 	}
 	var header struct {
 		TransferID  string `json:"transfer_id"`
 		PersonaID   string `json:"persona_id"`
 		Destination string `json:"destination_id"`
 	}
-	if err := json.Unmarshal([]byte(line), &header); err != nil || header.TransferID != st.SessionID {
-		return fmt.Errorf("the bundle does not match this return")
+	if err := json.Unmarshal([]byte(line), &header); err != nil {
+		return r.discardBundle(st, "the recorded bundle's header is unreadable; fetching it again")
+	}
+	// A well-formed header naming a different transfer or placement is not
+	// a torn file — it is a different bundle, and a refetch returns the
+	// same bytes. Refuse permanently rather than retry or, worse, import it.
+	if header.TransferID != st.SessionID {
+		return fmt.Errorf("the bundle names transfer %s, not this return (%s) — refusing to import it",
+			header.TransferID, st.SessionID)
 	}
 	own := mustPlacement(ctx, r.m.src)
 	if header.Destination != own {
@@ -679,14 +699,7 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 			// The recorded bundle fails its own integrity check — a
 			// truncated write that survived a crash. The source still
 			// serves it while sealed, so drop the file and re-download.
-			if rmErr := os.Remove(r.bundlePath()); rmErr != nil {
-				return rmErr
-			}
-			st.Downloaded = false
-			if saveErr := r.save(st); saveErr != nil {
-				return saveErr
-			}
-			return nil
+			return r.discardBundle(st, "the recorded bundle failed its integrity check; fetching it again")
 		}
 		return err
 	}
@@ -694,6 +707,23 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 		st.RetargetTo = rec.PersonaID
 	}
 	st.Persona = rec.PersonaID
+	return r.save(st)
+}
+
+// discardBundle drops a committed bundle file that proved unusable — a torn
+// first line, an unparseable header, or a failed integrity check — and marks
+// the transfer undownloaded so the drive loop re-fetches it from the
+// still-sealed source. Returning nil keeps the run going: the drive's step
+// bound caps in-run retries, a persistently bad source ends pending, and an
+// ordinary resume retries once the source is healthy — never manual file
+// surgery. A bundle that is well-formed but names a different transfer or
+// placement is NOT this case: refusing it permanently is the caller's job.
+func (r *returner) discardBundle(st *returnState, reason string) error {
+	r.m.say("sumi-local-move: %s", reason)
+	if err := os.Remove(r.bundlePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	st.Downloaded = false
 	return r.save(st)
 }
 

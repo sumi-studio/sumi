@@ -869,8 +869,12 @@ func (s *Service) resolveNeverSealedCancel(ctx context.Context, sessionID string
 }
 
 // Sweep reconciles every session with a due step: an elapsed admission
-// deadline, a ledger outcome the session row has not caught up with, or a
-// bind whose seal committed before its status did.
+// deadline, a ledger outcome the session row has not caught up with, a
+// bind whose seal committed before its status did, or a bound cancel that
+// committed 'cancelling' and crashed before its reconcile — the no-export
+// selection is only a work list; resolveNeverSealedCancel re-decides under
+// the session row lock, so an in-flight seal (which holds that lock) is
+// never misjudged by an unlocked export snapshot.
 func (s *Service) Sweep(ctx context.Context) (int, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id FROM return_sessions
@@ -882,6 +886,12 @@ func (s *Service) Sweep(ctx context.Context) (int, error) {
 		WHERE t.direction = 'export'
 		  AND ((t.status = 'sealed' AND s.status = 'awaiting_destination')
 		    OR (t.status IN ('completed','aborted') AND s.status IN ('sealed','cancelling')))
+		UNION
+		SELECT session_id FROM return_sessions
+		WHERE status = 'cancelling'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM core_transfers t
+		    WHERE t.direction = 'export' AND t.transfer_id = return_sessions.session_id)
 		LIMIT 200`)
 	if err != nil {
 		return 0, err

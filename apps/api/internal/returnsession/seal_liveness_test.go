@@ -9,6 +9,8 @@ package returnsession_test
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -129,5 +131,82 @@ func TestSealSucceedsWithOneHeldConn(t *testing.T) {
 	}
 	if got := rowStatus(t, pool, created.View.SessionID); got != returnsession.StatusCancelling {
 		t.Fatalf("session %s after cancel", got)
+	}
+}
+
+// TestSweepResolvesBoundCancellingNeverSealed (F386 / A3): the crash window
+// between the cancel's commit and its reconcile — bound, cancelling, no
+// export — used to be invisible to Sweep, so the row only resolved on an
+// interactive read. The new no-export selection is only a work list:
+// resolveNeverSealedCancel re-decides under the session row lock, so an
+// in-flight seal holding that lock is never misjudged by the snapshot.
+func TestSweepResolvesBoundCancellingNeverSealed(t *testing.T) {
+	h := setup(t, returnsession.Config{})
+	sessionID, _, grant := h.create()
+	d := dest(t, h.local, newID(t), "absent")
+	// The crash window: the cancel committed bound+cancelling and the
+	// process stopped before reconciledView — no export exists.
+	mustExec(t, h.cloud.pool, `UPDATE return_sessions
+		SET destination_placement_id = $2, destination_persona_id = $3,
+		    destination_slot_state = $4, destination_bound_at = now(),
+		    status = 'cancelling', updated_at = now()
+		WHERE session_id = $1`, sessionID, d.PlacementID, d.PersonaID, d.SlotState)
+
+	n, err := h.sessions.Sweep(h.ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("sweep did not select the bound never-sealed cancelling session")
+	}
+	if got := h.sessionStatus(sessionID); got != returnsession.StatusCancelled {
+		t.Fatalf("session %s after sweep (want cancelled — nothing ever sealed)", got)
+	}
+	if got := authority(t, h.cloud, h.persona); got != "active" {
+		t.Fatalf("authority %s (still the source's)", got)
+	}
+	// The seal fence is intact: a re-bind after the swept close is refused.
+	code, raw := h.grantReq(http.MethodPost,
+		fmt.Sprintf("/api/secretary-return/sessions/%s/destination", sessionID),
+		grant, jsonBody(d))
+	if code != http.StatusGone {
+		t.Fatalf("re-bind after swept cancelled: %d %s (want 410)", code, raw)
+	}
+	var exports int
+	if err := h.cloud.pool.QueryRow(h.ctx, `SELECT count(*) FROM core_transfers
+		WHERE direction = 'export' AND transfer_id = $1`, sessionID).Scan(&exports); err != nil || exports != 0 {
+		t.Fatalf("a seal committed after the session closed: %d exports", exports)
+	}
+}
+
+// TestSweepKeepsCancellingAwaitingProof: a cancelling session that DOES
+// have a sealed export must not be resolved by the sweep — it owes a real
+// destination retirement proof, and only that proof may unseal the source.
+func TestSweepKeepsCancellingAwaitingProof(t *testing.T) {
+	h := setup(t, returnsession.Config{})
+	sessionID, _, grant := h.create()
+	code, raw := h.grantReq(http.MethodPost,
+		fmt.Sprintf("/api/secretary-return/sessions/%s/destination", sessionID),
+		grant, jsonBody(dest(t, h.local, h.persona, "absent")))
+	if code != http.StatusOK {
+		t.Fatalf("bind: %d %s", code, raw)
+	}
+	code, raw = h.ownerReq(http.MethodPost,
+		fmt.Sprintf("/api/secretary-return/sessions/%s/cancel", sessionID), nil)
+	if code != http.StatusOK {
+		t.Fatalf("cancel: %d %s", code, raw)
+	}
+	if got := h.sessionStatus(sessionID); got != returnsession.StatusCancelling {
+		t.Fatalf("session %s after cancel", got)
+	}
+
+	if _, err := h.sessions.Sweep(h.ctx); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if got := h.sessionStatus(sessionID); got != returnsession.StatusCancelling {
+		t.Fatalf("sweep resolved a proof-owed cancel: %s", got)
+	}
+	if got := authority(t, h.cloud, h.persona); got != "sealed" {
+		t.Fatalf("the sweep unsealed the source without a proof: %s", got)
 	}
 }
