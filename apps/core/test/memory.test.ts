@@ -17,7 +17,6 @@ import {
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import { toolSpecs } from "../src/tools.ts";
 import type { MemoryChunk } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-0000000000a1";
@@ -160,10 +159,7 @@ test("memory: a correction during preparation survives; the replacement renders 
   // definitions, with the instruction and target appended at the end.
   const branch = provider.requests.find((r) => r.turnId === "memory-l1-1")!;
   assert.equal(branch.messages[0]!.content, lastTurn().messages[0]!.content);
-  assert.deepEqual(
-    branch.tools.map((t) => t.name),
-    toolSpecs().map((t) => t.name),
-  );
+  assert.deepEqual(branch.tools, lastTurn().tools);
   const tail = branch.messages[branch.messages.length - 1]!.content;
   assert.ok(
     tail.startsWith(COMPACT_L1_PROMPT) && tail.includes("compact_target"),
