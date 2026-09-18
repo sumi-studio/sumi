@@ -65,6 +65,7 @@ export class Supervisor {
       client: this.runner.client,
       journal: this.runner.journal,
       runnerID: this.cfg.runnerID,
+      workerdBin: this.runner.cfg.workerdBin,
       log: this.cfg.log,
     });
     const res = await rec.run();

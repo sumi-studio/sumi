@@ -20,7 +20,7 @@ import { Journal, type JobJournal, type JournalExit } from "./journal.ts";
 import { normalizeSpec, SpecError, type ScriptSpec } from "./spec.ts";
 import { writeConfig } from "./workerd/config.ts";
 import { spawnJob, parseRusage, type Spawned } from "./spawn.ts";
-import { bootID, startTicks, alive, findDescendant, killVerified, verifyIdentity } from "./proc.ts";
+import { bootID, startTicks, alive, isExeImage, findDescendantWhere, killVerified, verifyIdentity } from "./proc.ts";
 
 export interface RunnerConfig {
   api: string;
@@ -229,7 +229,7 @@ export class Runner {
         // workerd is its descendant — prlimit execs it, so it is the only
         // child in prlimit mode. Record the real workerd pid + start ticks
         // as the durable identity.
-        const resolved = findDescendant(spawned.pid, "workerd") ?? spawned.pid;
+        const resolved = this.workerdPid(spawned.pid) ?? spawned.pid;
         const ticks = startTicks(resolved);
         this.journal.update(j, { status: "running", pid: resolved, start_ticks: ticks });
         this.log(`job ${job.job_id} workerd ready pid=${resolved}`);
@@ -263,7 +263,7 @@ export class Runner {
         // fork→exec window is unnameable to a walk, so the owned
         // process group is the atomic backstop (the j-pp leak).
         try {
-          const workerPid = findDescendant(spawned.pid, "workerd");
+          const workerPid = this.workerdPid(spawned.pid);
           const killed = workerPid != null &&
             killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: bootID() }, "SIGKILL");
           if (!killed) spawned.killGroup();
@@ -312,9 +312,10 @@ export class Runner {
     const boot = j.boot_id;
     const pid = j.pid ?? spawned.pid;
     // Verified payload kill first — a dead wrapper orphans its child to
-    // init, and the child still mid-exec (comm not yet "workerd") is
-    // invisible to any descendant walk (the j-pp leak proved both).
-    const workerPid = findDescendant(spawned.pid, "workerd");
+    // init, and the child still mid-exec (comm not yet the workerd
+    // image) is invisible to any descendant walk (the j-pp leak proved
+    // both).
+    const workerPid = this.workerdPid(spawned.pid);
     let payloadKilled = false;
     if (workerPid != null && workerPid !== pid) {
       payloadKilled = killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: boot }, "SIGKILL");
@@ -334,6 +335,16 @@ export class Runner {
    *  verified identities only. */
   killAllOwned(): void {
     for (const id of [...this.liveSpawns.keys()]) this.killOwned(id);
+  }
+
+  /** The workerd payload under an owned spawn, identified by the image
+   *  this deployment actually exec'd: comm is the configured binary's
+   *  basename truncated to TASK_COMM_LEN-1, argv[0] is the verbatim
+   *  configured path. Never a bare "workerd" name — a versioned binary
+   *  (workerd-2026-08-04 → comm workerd-2026-08) would be invisible to
+   *  every descendant lookup and rusage/kill path that depends on it. */
+  private workerdPid(rootPid: number): number | null {
+    return findDescendantWhere(rootPid, (p) => isExeImage(p, this.cfg.workerdBin));
   }
 
   /**
@@ -553,9 +564,9 @@ export class Runner {
       if (kill) {
         // The workerd payload dies BEFORE the wrapper: killing the
         // wrapper first orphans the child to init, and every later
-        // findDescendant(spawned.pid) walk then sees a dead process —
-        // the orphan escapes (the j-pp leak proved this).
-        const workerPid = findDescendant(spawned.pid, "workerd");
+        // descendant walk then sees a dead process — the orphan escapes
+        // (the j-pp leak proved this).
+        const workerPid = this.workerdPid(spawned.pid);
         let payloadKilled = false;
         if (workerPid != null && workerPid !== j.pid) {
           payloadKilled = killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");

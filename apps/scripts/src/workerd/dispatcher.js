@@ -148,7 +148,13 @@ export default {
     const input = await request.json();
     try {
       if (typeof run !== "function") throw new Error("module must export async function run(input, sumi)");
-      const value = await run(input, env.SUMI);
+      // The advertised script contract is a single sumi capability:
+      // sumi.files (stat/list/read/write/mkdir/remove over the job's
+      // shared files) plus sumi.log. env.SUMI is the flat SumiFiles
+      // entrypoint — it is exposed ONLY under .files, so the script sees
+      // exactly the documented shape and no ambient flat alias.
+      const sumi = { files: env.SUMI, log: (message) => env.SUMI.log(message) };
+      const value = await run(input, sumi);
       return Response.json({ ok: true, value });
     } catch (e) {
       return Response.json(

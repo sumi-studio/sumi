@@ -42,6 +42,36 @@ export function cmdlineOf(pid: number): string {
   }
 }
 
+/** argv[0] — the verbatim exec path. Survives a process renaming its
+ *  comm via prctl; empty for kernel threads/zombies/unreadable. */
+export function argv0Of(pid: number): string {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")[0] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** The comm a process gets when exec'd from `exePath`: the basename
+ *  truncated to TASK_COMM_LEN-1 (15 chars). A versioned binary path
+ *  like `workerd-2026-08-04` yields comm `workerd-2026-08` — callers
+ *  matching process names must derive it, never assume a fixed name. */
+export function commForExe(exePath: string): string {
+  const base = exePath.split("/").pop() ?? exePath;
+  return base.slice(0, 15);
+}
+
+/** True when `pid` is the image exec'd from `exePath`: comm is the
+ *  basename truncated to TASK_COMM_LEN-1, and argv[0] is the verbatim
+ *  exec path (which also survives a self-renamed comm). Matching only
+ *  a bare basename like "workerd" fails for every versioned path the
+ *  config legitimately supplies (workerd-2026-08-04 → comm
+ *  workerd-2026-08) — identity must be derived, not assumed. */
+export function isExeImage(pid: number, exePath: string): boolean {
+  if (commOf(pid) === commForExe(exePath)) return true;
+  return argv0Of(pid) === exePath;
+}
+
 export function commOf(pid: number): string | null {
   try {
     return readFileSync(`/proc/${pid}/comm`, "utf8").trim();
@@ -78,20 +108,25 @@ export function childrenOf(pid: number): number[] {
   }
 }
 
-/** Walk a process tree depth-first for a pid whose comm matches. */
-export function findDescendant(rootPid: number, comm: string, maxDepth = 4): number | null {
+/** Walk a process tree depth-first for the first pid matching `pred`. */
+export function findDescendantWhere(rootPid: number, pred: (pid: number) => boolean, maxDepth = 4): number | null {
   let frontier = [rootPid];
   for (let d = 0; d < maxDepth; d++) {
     const next: number[] = [];
     for (const p of frontier) {
       for (const c of childrenOf(p)) {
-        if (commOf(c) === comm) return c;
+        if (pred(c)) return c;
         next.push(c);
       }
     }
     frontier = next;
   }
   return null;
+}
+
+/** Walk a process tree depth-first for a pid whose comm matches. */
+export function findDescendant(rootPid: number, comm: string, maxDepth = 4): number | null {
+  return findDescendantWhere(rootPid, (c) => commOf(c) === comm, maxDepth);
 }
 
 export interface GroupMember {
