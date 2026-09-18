@@ -52,6 +52,11 @@ export interface JobJournal {
   exited_at: string | null;
   exit: JournalExit | null;
   result: Record<string, unknown> | null;
+  // The exact `result` object attempted on the wire (CompleteJob result /
+  // lost-outcome outcome.result). CompleteJob and AttachLostOutcome both
+  // replay ONLY an identical payload — recovery must resend this verbatim,
+  // never a reconstruction with fresh file-op counts or added keys.
+  wire_result: Record<string, unknown> | null;
   usage_fact_id: string;
   usage_status: "pending" | "recorded" | "unknown";
   file_ops_pending: number | null;
@@ -90,7 +95,7 @@ export class Journal {
     renameSync(tmp, p);
   }
 
-  create(fields: Omit<JobJournal, "v" | "status" | "created_at" | "updated_at" | "spawned_at" | "exited_at" | "exit" | "result" | "usage_status" | "file_ops_pending" | "notes"> & Partial<JobJournal>): JobJournal {
+  create(fields: Omit<JobJournal, "v" | "status" | "created_at" | "updated_at" | "spawned_at" | "exited_at" | "exit" | "result" | "wire_result" | "usage_status" | "file_ops_pending" | "notes"> & Partial<JobJournal>): JobJournal {
     const j: JobJournal = {
       v: 1,
       status: "spawned",
@@ -98,6 +103,7 @@ export class Journal {
       exited_at: null,
       exit: null,
       result: null,
+      wire_result: null,
       usage_status: "pending",
       file_ops_pending: null,
       notes: [],

@@ -53,6 +53,9 @@ export class Runner {
   readonly client: StateClient;
   readonly journal: Journal;
   private log: (line: string) => void;
+  /** Jobs this live supervisor owns right now — recovery must never
+   *  treat their journals as restart evidence (no reap, no re-report). */
+  private activeJobs = new Set<string>();
 
   readonly cfg: RunnerConfig;
   constructor(cfg: RunnerConfig) {
@@ -79,8 +82,22 @@ export class Runner {
     }
   }
 
+  /** Snapshot of job ids this supervisor currently owns. */
+  activeJobIds(): ReadonlySet<string> {
+    return this.activeJobs;
+  }
+
   /** Execute one claimed job end to end. */
   async runJob(job: JobRow): Promise<void> {
+    this.activeJobs.add(job.job_id);
+    try {
+      await this.runJobInner(job);
+    } finally {
+      this.activeJobs.delete(job.job_id);
+    }
+  }
+
+  private async runJobInner(job: JobRow): Promise<void> {
     let spec: ScriptSpec;
     try {
       spec = normalizeSpec(job.request);
@@ -390,9 +407,16 @@ export class Runner {
 
     // Persist the terminal outcome BEFORE the CompleteJob write — if the
     // supervisor dies in between, the reconciler re-reports this stored
-    // result rather than losing the measurement.
+    // result rather than losing the measurement. wire_result is the EXACT
+    // payload attempted: both CompleteJob and the lost-outcome route
+    // replay only identical outcomes, so recovery must resend this object
+    // verbatim (frozen file_ops_pending snapshot included), never a
+    // reconstruction.
     const j0 = this.journal.read(job.job_id);
-    if (j0) this.journal.update(j0, { result: { ...result, terminal_status: status, error } });
+    if (j0) this.journal.update(j0, {
+      result: { ...result, terminal_status: status, error },
+      wire_result: JSON.parse(JSON.stringify(result)) as Record<string, unknown>,
+    });
 
     try {
       await this.client.complete(job.persona_id, job.job_id, this.cfg.runnerID, status, result, error);
@@ -402,20 +426,30 @@ export class Runner {
       // Complete failed — the journal stays 'exited' with the evidence;
       // the reconciler retries rather than re-executing. If the row was
       // swept to 'lost' in the meantime the verdict is immutable: attach
-      // the observed outcome via the shared lost-outcome route when it
-      // exists (409 = divergent terminal row — never retry as success).
+      // the observed outcome via the shared lost-outcome route (identical
+      // replay lands; divergent conflicts and is surfaced, not rewritten).
       this.log(`job ${job.job_id} complete: ${e}`);
       try {
         const { job: cur } = await this.client.getJob(job.persona_id, job.job_id);
         if (cur.status === "lost") {
-          const r = await this.client.attachLostOutcome(job.persona_id, job.job_id, this.cfg.runnerID, {
-            observed_status: status, result, error,
-          });
           const j = this.journal.read(job.job_id);
+          const r = await this.client.attachLostOutcome(job.persona_id, job.job_id, this.cfg.runnerID, {
+            observed_status: status, result: j?.wire_result ?? result, error,
+          });
           if (r.status >= 200 && r.status < 300) {
             if (j) this.journal.update(j, { status: "reported", notes: [...j.notes, "outcome attached to lost verdict via shared route"] });
           } else if (j) {
-            this.journal.update(j, { notes: [...j.notes, `lost-outcome attach status=${r.status}; evidence retained in journal`] });
+            const why = r.status === 403 ? "not the recorded claimant"
+              : r.status === 409 ? "divergent evidence or row not lost"
+              : `status=${r.status}`;
+            // 403/409 are permanent refusals — the verdict stands and the
+            // evidence is durable here; mark reported-with-conflict rather
+            // than silently retrying a payload that can never land.
+            const permanent = r.status === 403 || r.status === 409;
+            this.journal.update(j, {
+              ...(permanent ? { status: "reported" as const } : {}),
+              notes: [...j.notes, `lost-outcome attach refused (${why}); evidence retained in journal${permanent ? " — permanent refusal, not retried" : ""}`],
+            });
           }
         }
       } catch (e2) {
