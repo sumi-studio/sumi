@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# sumi-local-move — bring this Local secretary into a Sumi Cloud registration.
+# sumi-local-move — move this Local secretary into a Sumi Cloud registration,
+# or bring a Cloud secretary home to this install.
 #
-#   sumi-local-move start     paste the move URL shown by Sumi Cloud (stdin)
-#   sumi-local-move resume    continue an interrupted move
-#   sumi-local-move cancel    cancel before the Cloud account is created
-#   sumi-local-move status    show where the move stands
+#   sumi-local-move start          paste the move URL shown by Sumi Cloud (stdin)
+#   sumi-local-move resume         continue an interrupted move
+#   sumi-local-move cancel         cancel before the Cloud account is created
+#   sumi-local-move status         show where the move stands
+#
+#   sumi-local-move return         paste the return URL shown by Sumi Cloud (stdin)
+#   sumi-local-move return-resume  continue a recorded or pending return
+#   sumi-local-move return-status  show where the return stands
+#   sumi-local-move return-cancel  give up the recorded return
 #
 # Reads the same state home and config.env as sumi-local (SUMI_LOCAL_HOME,
 # default $XDG_STATE_HOME/sumi/local) and hands the Local database URL and
 # persona id to the Go command through its environment — never argv. The
-# move URL is read from stdin. Progress lives in <state-home>/move (0700).
-# Docs: docs/local-cloud-move.md
+# move and return URLs are read from stdin. Progress lives in
+# <state-home>/move and <state-home>/return (0700). SUMI_LOCAL_CONFIG lets a
+# return that arrived on a fresh install retarget SUMI_PERSONA_ID, guarded:
+# the file must still name the slot the return was checked against, and the
+# write happens only after the secretary's activation committed on both
+# sides.
+# Docs: docs/local-cloud-move.md, docs/cloud-local-return.md
 set -Eeuo pipefail
 
 readonly PROG=sumi-local-move
@@ -75,4 +86,5 @@ elif [[ -z $bin && -f $SCRIPT_DIR/../../apps/api/cmd/local-move/main.go ]]; then
 fi
 [[ -n $bin ]] || die "sumi-local-move binary not found; set SUMI_LOCAL_MOVE_BIN"
 
-SUMI_LOCAL_HOME="$home" SUMI_DB_URL="$db_url" SUMI_PERSONA_ID="$persona" exec "$bin" "$@"
+SUMI_LOCAL_HOME="$home" SUMI_DB_URL="$db_url" SUMI_PERSONA_ID="$persona" \
+  SUMI_LOCAL_CONFIG="$config" exec "$bin" "$@"
