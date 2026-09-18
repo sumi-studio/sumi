@@ -1,0 +1,494 @@
+/**
+ * Script job supervisor: claim → journal → spawn per-job workerd →
+ * dispatch over a unix socket → monitor heartbeats/cancel/wall →
+ * complete with honest usage evidence. One workerd process per job, so
+ * a CPU-bound or memory-hogging script can never wedge a sibling job or
+ * the control loop — the process is killed by identity, the claim is
+ * never silently retried, and an indeterminate exit stays 'lost' or
+ * 'failed', never re-executed.
+ */
+
+import { createHash } from "node:crypto";
+import { mkdirSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as http from "node:http";
+
+import { StateClient, type JobRow } from "./api.ts";
+import { Journal, type JobJournal, type JournalExit } from "./journal.ts";
+import { normalizeSpec, SpecError, type ScriptSpec } from "./spec.ts";
+import { writeConfig } from "./workerd/config.ts";
+import { spawnJob, parseRusage, type Spawned } from "./spawn.ts";
+import { bootID, startTicks, alive, findDescendant, killVerified, verifyIdentity } from "./proc.ts";
+
+export interface RunnerConfig {
+  api: string;
+  token: string;            // internal runtime/admin credential
+  runnerID: string;
+  workDir: string;          // durable journal dir
+  workerdBin: string;
+  runlimitedBin: string;
+  dispatcherPath: string;   // src/workerd/dispatcher.js
+  leaseMs: number;
+  heartbeatMs: number;
+  claimLimit: number;
+  cgroupMode: "systemd" | "prlimit";
+  log?: (line: string) => void;
+}
+
+const TERMINAL = new Set(["done", "failed", "cancelled", "lost"]);
+
+export function defaultDispatcherPath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return join(here, "workerd", "dispatcher.js");
+}
+
+interface RunOutcome {
+  status: "done" | "failed" | "cancelled";
+  result: Record<string, unknown>;
+  error: string;
+}
+
+export class Runner {
+  readonly client: StateClient;
+  readonly journal: Journal;
+  private log: (line: string) => void;
+
+  readonly cfg: RunnerConfig;
+  constructor(cfg: RunnerConfig) {
+    this.cfg = cfg;
+    this.client = new StateClient({ api: cfg.api, token: cfg.token });
+    this.journal = new Journal(cfg.workDir);
+    this.log = cfg.log ?? ((l) => console.log(`[scripts] ${l}`));
+    mkdirSync(cfg.workDir, { recursive: true });
+  }
+
+  /** Claim up to cfg.claimLimit script jobs for one persona. */
+  async claimPersona(personaID: string): Promise<JobRow[]> {
+    try {
+      const { claimed, swept } = await this.client.claimJobs(
+        personaID, this.cfg.runnerID, this.cfg.leaseMs, this.cfg.claimLimit,
+      );
+      for (const j of swept) {
+        this.log(`swept ${j.job_id} (expired claim -> ${j.status})`);
+      }
+      return claimed;
+    } catch (e) {
+      this.log(`claim ${personaID}: ${e}`);
+      return [];
+    }
+  }
+
+  /** Execute one claimed job end to end. */
+  async runJob(job: JobRow): Promise<void> {
+    let spec: ScriptSpec;
+    try {
+      spec = normalizeSpec(job.request);
+    } catch (e) {
+      if (e instanceof SpecError) {
+        // Bad stored request: fail terminally, never spawn.
+        await this.finish(job, "failed", { reason: "invalid_spec", detail: e.message }, e.message);
+        return;
+      }
+      throw e;
+    }
+
+    const jobDir = join(this.cfg.workDir, "tmp", `run-${job.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}`);
+    mkdirSync(jobDir, { recursive: true });
+    const socketPath = this.journal.socketPath(job.job_id);
+    const statsPath = this.journal.statsPath(job.job_id);
+    const usageFactID = `script:${job.job_id}:exec`;
+
+    const j = this.journal.create({
+      job_id: job.job_id,
+      persona_id: job.persona_id,
+      runner_id: this.cfg.runnerID,
+      pid: null,
+      start_ticks: null,
+      boot_id: bootID(),
+      unit_name: null,
+      socket_path: socketPath,
+      stats_path: statsPath,
+      cgroup_mode: this.cfg.cgroupMode,
+      limits: spec.limits as unknown as Record<string, number>,
+      spec: { code_sha256: createHash("sha256").update(spec.code).digest("hex") },
+      usage_fact_id: usageFactID,
+    });
+
+    const configPath = writeConfig(jobDir, {
+      socketPath,
+      dispatcherPath: this.cfg.dispatcherPath,
+      api: this.cfg.api,
+      token: this.cfg.token,
+      personaID: job.persona_id,
+      jobID: job.job_id,
+      runnerID: this.cfg.runnerID,
+      limits: {
+        cpu_ms: spec.limits.cpu_seconds * 1000,
+        file_calls: spec.limits.file_calls,
+        file_bytes: spec.limits.file_bytes,
+        log_bytes: spec.limits.log_bytes,
+      },
+    });
+
+    const unitName = this.cfg.cgroupMode === "systemd"
+      ? `sumi-script-${job.job_id.replace(/[^A-Za-z0-9]/g, "-")}`
+      : undefined;
+
+    const spawned = spawnJob({
+      configPath, socketPath, statsPath,
+      cpuSeconds: spec.limits.cpu_seconds,
+      memoryMib: spec.limits.memory_mib,
+      cgroupMode: this.cfg.cgroupMode,
+      unitName, workerdBin: this.cfg.workerdBin,
+      runlimitedBin: this.cfg.runlimitedBin,
+    }, (line) => this.log(`job ${job.job_id} workerd: ${line}`));
+
+    this.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString(), pid: spawned.pid });
+
+    try {
+      // Wait for the worker to accept on its unix socket.
+      await this.waitReady(socketPath, spawned, 30_000);
+      // The spawned pid is the wrapper (systemd-run or /usr/bin/time);
+      // workerd is its descendant — prlimit execs it, so it is the only
+      // child in prlimit mode. Record the real workerd pid + start ticks
+      // as the durable identity.
+      const resolved = findDescendant(spawned.pid, "workerd") ?? spawned.pid;
+      const ticks = startTicks(resolved);
+      this.journal.update(j, { status: "running", pid: resolved, start_ticks: ticks });
+      this.log(`job ${job.job_id} workerd ready pid=${resolved}`);
+
+      const outcome = await this.drive(job, spec, j, socketPath, spawned);
+      await this.finish(job, outcome.status, outcome.result, outcome.error);
+    } catch (e) {
+      // Dispatch/ready failure: kill the process by identity, capture
+      // whatever rusage exists, and report failed (not re-executed).
+      const exit = await this.terminate(j, spawned, "unknown");
+      const result: Record<string, unknown> = {
+        reason: "runner_error", detail: String(e),
+        usage: this.usageFromExit(exit, spec),
+      };
+      await this.finish(job, "failed", result, String(e));
+    }
+  }
+
+  /** The monitor loop: heartbeat, cancel observation, wall timeout. */
+  private async drive(job: JobRow, spec: ScriptSpec, j: JobJournal, socketPath: string, spawned: Spawned): Promise<RunOutcome> {
+    const deadline = Date.now() + spec.limits.wall_ms;
+    const dispatch = this.postRun(socketPath, { code: spec.code, input: spec.input });
+    let cancelled = false;
+
+    for (;;) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        const exit = await this.terminate(j, spawned, "wall_timeout");
+        const res = await dispatch.catch(() => null);
+        return {
+          status: "failed",
+          result: {
+            reason: "wall_timeout",
+            limit_ms: spec.limits.wall_ms,
+            logs: res?.logs ?? null,
+            usage: this.usageFromExit(exit, spec),
+          },
+          error: `wall timeout ${spec.limits.wall_ms}ms`,
+        };
+      }
+
+      const raced = await Promise.race([
+        dispatch.then((r) => ({ kind: "done" as const, r })).catch((e) => ({ kind: "error" as const, e })),
+        this.sleep(Math.min(this.cfg.heartbeatMs, left)).then(() => ({ kind: "tick" as const })),
+      ]);
+
+      if (raced.kind === "done" || raced.kind === "error") {
+        // The run resolved — the worker has nothing left to do; reap it
+        // (kill=false only when it already exited) so a completed job
+        // never leaves an idle workerd behind.
+        const exit = await this.terminate(j, spawned, "unknown", true);
+        if (raced.kind === "error") {
+          // The socket request failed — worker died or reset. If the exit
+          // was SIGXCPU it was our CPU cap; otherwise a crash/kill.
+          const reason = exit?.signal === "SIGXCPU" || exit?.signal === "SIGCPU" ? "cpu_limit" : "worker_error";
+          return {
+            status: "failed",
+            result: { reason, detail: String(raced.e), usage: this.usageFromExit(exit, spec) },
+            error: String(raced.e),
+          };
+        }
+        const r = raced.r as Record<string, unknown>;
+        const value = r.value;
+        const ok = r.ok === true;
+        const bounded = this.boundOutput(value, spec);
+        return {
+          status: ok ? (cancelled ? "cancelled" : "done") : "failed",
+          result: {
+            value: ok ? bounded.value : undefined,
+            error: ok ? undefined : r.error,
+            logs: r.logs ?? null,
+            output_truncated: bounded.truncated || undefined,
+            wall_ms: r.wall_ms,
+            usage: this.usageFromExit(exit, spec),
+          },
+          error: ok ? "" : JSON.stringify(r.error ?? "script error"),
+        };
+      }
+
+      // tick: heartbeat + cancel observation + liveness
+      try {
+        const { job: cur } = await this.client.heartbeat(
+          job.persona_id, job.job_id, this.cfg.runnerID, this.cfg.leaseMs,
+        );
+        if (cur.status === "cancel_requested" && !cancelled) {
+          cancelled = true;
+          this.log(`job ${job.job_id} cancel requested`);
+          const exit = await this.terminate(j, spawned, "cancel");
+          return {
+            status: "cancelled",
+            result: { reason: "cancel_requested", usage: this.usageFromExit(exit, spec) },
+            error: "cancelled",
+          };
+        }
+        if (TERMINAL.has(cur.status)) {
+          // The row left us (claimed away / swept / completed elsewhere):
+          // stop the execution we still hold, do not report.
+          await this.terminate(j, spawned, "unknown");
+          return { status: "failed", result: { reason: "claim_lost" }, error: `job became ${cur.status}` };
+        }
+      } catch (e) {
+        // Heartbeat failure (409 => claim lost; network => keep watching
+        // until wall deadline; the claim expiry sweeps us to lost).
+        const status = (e as { status?: number }).status;
+        if (status === 409) {
+          await this.terminate(j, spawned, "unknown");
+          return { status: "failed", result: { reason: "claim_lost", detail: String(e) }, error: String(e) };
+        }
+        this.log(`job ${job.job_id} heartbeat: ${e}`);
+      }
+      if (j.pid != null && !alive(j.pid) && !spawnedExited(spawned)) {
+        // Process vanished without the dispatch resolving — handled next
+        // lap when the socket errors; keep it simple.
+      }
+    }
+  }
+
+  private async postRun(socketPath: string, body: unknown): Promise<Record<string, unknown>> {
+    const payload = JSON.stringify(body);
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        { socketPath, path: "/run", method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+            catch (e) { reject(e); }
+          });
+        },
+      );
+      req.on("error", reject);
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  private boundOutput(value: unknown, spec: ScriptSpec): { value: unknown; truncated: boolean } {
+    const raw = JSON.stringify(value ?? null) ?? "null";
+    if (Buffer.byteLength(raw) <= spec.limits.output_bytes) {
+      return { value, truncated: false };
+    }
+    return { value: raw.slice(0, spec.limits.output_bytes), truncated: true };
+  }
+
+  private usageFromExit(exit: JournalExit | null, spec: ScriptSpec): Record<string, unknown> {
+    return {
+      cpu_ms: exit?.cpu_ms ?? null,
+      cpu_ms_source: exit?.cpu_ms != null ? "measured" : "unknown",
+      max_rss_bytes: exit?.max_rss_bytes ?? null,
+      max_rss_source: exit?.max_rss_bytes != null ? "measured" : "unknown",
+      wall_ms: exit?.wall_ms ?? null,
+      wall_ms_source: exit?.wall_ms != null ? "measured" : "unknown",
+      cpu_limit_seconds: spec.limits.cpu_seconds,      // RLIMIT_CPU granularity
+      memory_limit_mib: spec.limits.memory_mib,
+      memory_enforcement: this.cfg.cgroupMode === "systemd" ? "cgroup" : "v8_heap_bound",
+      exit_code: exit?.code ?? null,
+      exit_signal: exit?.signal ?? null,
+      rusage_source: exit?.rusage_source ?? "none",
+    };
+  }
+
+  /** Kill the tracked workerd by identity (or just reap its exit status). */
+  private async terminate(j: JobJournal, spawned: Spawned, why: JournalExit["killed_by"], kill = true): Promise<JournalExit | null> {
+    const started = j.spawned_at ? Date.parse(j.spawned_at) : Date.now();
+    let exit: JournalExit | null = null;
+    try {
+      const identity = { pid: j.pid ?? spawned.pid, start_ticks: j.start_ticks, boot_id: j.boot_id };
+      if (kill) {
+        if (verifyIdentity(identity)) {
+          killVerified(identity, "SIGKILL");
+        }
+        // The launcher (runlimited) exits on its own via wait4; if the
+        // recorded pid didn't verify, kill the workerd descendant of the
+        // wrapper so nothing is stranded. Give the wrapper a bounded
+        // window to record the child's wait4 stats BEFORE killing it —
+        // killing it first is the race that loses measured usage.
+        const workerPid = findDescendant(spawned.pid, "workerd");
+        if (workerPid != null && workerPid !== j.pid) {
+          killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");
+        }
+        if (j.stats_path) {
+          const deadline = Date.now() + 3000;
+          while (!existsSync(j.stats_path) && Date.now() < deadline) {
+            await this.sleep(100);
+          }
+        }
+        if (!verifyIdentity(identity) && alive(spawned.pid)) {
+          spawned.kill();
+        }
+      }
+      const res = await Promise.race([spawned.wait, this.sleep(5000).then(() => null)]);
+      const rusage = parseRusage(j.stats_path ?? "");
+      // The runlimited stats file carries the WORKER's exit status — the
+      // spawned wrapper's own status is only a fallback (e.g. stats lost).
+      const sigMap: Record<number, NodeJS.Signals> = { 9: "SIGKILL", 15: "SIGTERM", 24: "SIGXCPU", 6: "SIGABRT", 11: "SIGSEGV" };
+      exit = {
+        code: rusage.exit_code ?? res?.code ?? null,
+        signal: (rusage.signal != null && rusage.signal !== 0
+          ? (sigMap[rusage.signal] ?? `SIG${rusage.signal}` as NodeJS.Signals)
+          : res?.signal) ?? null,
+        wall_ms: Date.now() - started,
+        cpu_ms: rusage.cpu_ms,
+        max_rss_bytes: rusage.max_rss_bytes,
+        rusage_source: rusage.cpu_ms != null ? "wait4" : "none",
+        killed_by: why,
+      };
+    } catch { /* best effort */ }
+    this.journal.update(j, {
+      status: "exited", exited_at: new Date().toISOString(), exit,
+    });
+    return exit;
+  }
+
+  /** Resolve pending file ops, then CompleteJob; record usage facts. */
+  private async finish(job: JobRow, status: string, result: Record<string, unknown>, error: string): Promise<void> {
+    // Settle admitted file ops whose upstream call never resolved —
+    // keyed resend through the API's resolve route, honest statuses.
+    let pending: number | null = null;
+    try {
+      const { ops } = await this.client.listFileOps(job.persona_id, job.job_id, true);
+      for (const op of ops) {
+        try {
+          await this.client.resolveFileOp(job.persona_id, job.job_id, op.op_id, this.cfg.runnerID);
+        } catch { /* stays pending — reported below */ }
+      }
+      // Re-read the truth: a resolve call can return 200 while the op is
+      // still 'unknown' (another lost upstream response). The terminal
+      // record reports what the ledger actually says.
+      const after = await this.client.listFileOps(job.persona_id, job.job_id, true);
+      pending = after.pending;
+    } catch { pending = null; }
+    result.file_ops_pending = pending;
+
+    // Persist the terminal outcome BEFORE the CompleteJob write — if the
+    // supervisor dies in between, the reconciler re-reports this stored
+    // result rather than losing the measurement.
+    const j0 = this.journal.read(job.job_id);
+    if (j0) this.journal.update(j0, { result: { ...result, terminal_status: status, error } });
+
+    try {
+      await this.client.complete(job.persona_id, job.job_id, this.cfg.runnerID, status, result, error);
+      const j = this.journal.read(job.job_id);
+      if (j) this.journal.update(j, { status: "reported" });
+    } catch (e) {
+      // Complete failed — the journal stays 'exited' with the evidence;
+      // the reconciler retries rather than re-executing. If the row was
+      // swept to 'lost' in the meantime the verdict is immutable: attach
+      // the observed outcome via the shared lost-outcome route when it
+      // exists (409 = divergent terminal row — never retry as success).
+      this.log(`job ${job.job_id} complete: ${e}`);
+      try {
+        const { job: cur } = await this.client.getJob(job.persona_id, job.job_id);
+        if (cur.status === "lost") {
+          const r = await this.client.attachLostOutcome(job.persona_id, job.job_id, this.cfg.runnerID, {
+            observed_status: status, result, error,
+          });
+          const j = this.journal.read(job.job_id);
+          if (r.status >= 200 && r.status < 300) {
+            if (j) this.journal.update(j, { status: "reported", notes: [...j.notes, "outcome attached to lost verdict via shared route"] });
+          } else if (j) {
+            this.journal.update(j, { notes: [...j.notes, `lost-outcome attach status=${r.status}; evidence retained in journal`] });
+          }
+        }
+      } catch (e2) {
+        this.log(`job ${job.job_id} lost-outcome check: ${e2}`);
+      }
+    }
+    await this.recordUsage(job, status, result);
+  }
+
+  private async recordUsage(job: JobRow, status: string, result: Record<string, unknown>): Promise<void> {
+    const j = this.journal.read(job.job_id);
+    const usage = (result.usage ?? {}) as Record<string, unknown>;
+    const measured = usage.cpu_ms != null;
+    const fact: Record<string, unknown> = {
+      fact_id: j?.usage_fact_id ?? `script:${job.job_id}:exec`,
+      kind: "script_job",
+      phase: "execution",
+      funding: { kind: "operator", id: "env" },
+      // 'reported' = complete usage report resolved. A script job has
+      // genuinely zero model tokens (explicit zero, not a fabricated
+      // bill) and carries compute quantities; 'unknown' when wait4
+      // rusage was not durably recovered — a later accurate fact can
+      // still supersede it.
+      status: measured ? "reported" : "unknown",
+      input_tokens: 0,
+      output_tokens: 0,
+      quantities: {
+        job_id: job.job_id,
+        terminal_status: status,
+        ...usage,
+      },
+    };
+    try {
+      await this.client.recordUsage(job.persona_id, fact);
+      if (j) this.journal.update(j, { usage_status: measured ? "recorded" : "unknown" });
+    } catch (e) {
+      this.log(`job ${job.job_id} usage: ${e}`);
+    }
+  }
+
+  /** Wait until the unix socket accepts HTTP, or the child exits. */
+  private async waitReady(socketPath: string, spawned: Spawned, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await this.ping(socketPath);
+        return;
+      } catch {
+        if (Date.now() > deadline) throw new Error("workerd did not listen in time");
+        // Detect early exit.
+        const exited = await Promise.race([spawned.wait.then(() => true), this.sleep(50).then(() => false)]);
+        if (exited) throw new Error("workerd exited before listening");
+      }
+    }
+  }
+
+  private ping(socketPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const req = http.request({ socketPath, path: "/ready", method: "GET", timeout: 1000 }, (res) => {
+        res.resume();
+        resolve();
+      });
+      req.on("error", reject);
+      req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+      req.end();
+    });
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+}
+
+function spawnedExited(_s: Spawned): boolean {
+  return false; // exit status is observed via the wait promise
+}

@@ -103,6 +103,9 @@ var toolAuthority = map[string]struct {
 	"job.start":  {internal: true},
 	"job.status": {internal: true, readOnly: true},
 	"job.cancel": {internal: true},
+	// Lightweight scripts (M10): same ordinary internal effect, a bounded
+	// JavaScript run(input, sumi) job — no human decision, same lifecycle.
+	"script.start": {internal: true},
 	// Speaking into the shared channel on the human's behalf is an
 	// outward-facing act requiring consent. Per ADR 0013 §2 the Normal
 	// route does not ask the human, so a normal call is recorded as a
@@ -172,6 +175,12 @@ func validateToolRequest(tool string, request map[string]any) error {
 	case "message.send":
 		if text, _ := request["text"].(string); text == "" {
 			return fmt.Errorf("%w: message.send requires text", ErrBadRequest)
+		}
+	case "script.start":
+		// Same deterministic gate as execution: a call without code can
+		// never run, so it never parks a grant.
+		if code, _ := request["code"].(string); code == "" {
+			return fmt.Errorf("%w: script.start requires code (a JavaScript module exporting run(input, sumi))", ErrBadRequest)
 		}
 	case "messaging.send":
 		// The delegated Messaging effect performs the full deterministic

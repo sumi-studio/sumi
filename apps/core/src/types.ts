@@ -555,7 +555,7 @@ export type JobStatus =
 export interface Job {
   persona_id: string;
   job_id: string;
-  /** Executor family; 'subprocess' is the implemented local kind. */
+  /** Executor family: 'subprocess' (Linux) or 'script' (bounded JS worker). */
   kind: string;
   request: Json;
   status: JobStatus;
@@ -577,6 +577,27 @@ export interface SubprocessJobRequest {
   cwd?: string;
   env?: Record<string, string>;
   timeout_ms?: number;
+}
+
+/**
+ * Request shape for kind 'script': a bounded JavaScript module exporting
+ * `run(input, sumi)`, executed per-job in a supervised worker. The only
+ * capability is `sumi.files` over the persona's permitted shared files
+ * plus `sumi.log` — no network, credentials, mounts, or ambient APIs.
+ */
+export interface ScriptJobRequest {
+  code: string;
+  input?: unknown;
+  limits?: {
+    /** CPU bound, whole seconds (RLIMIT_CPU granularity — not exact ms). */
+    cpu_seconds?: number;
+    wall_ms?: number;
+    memory_mib?: number;
+    output_bytes?: number;
+    log_bytes?: number;
+    file_calls?: number;
+    file_bytes?: number;
+  };
 }
 
 /** Terminal statuses a runner may report to completeJob. */

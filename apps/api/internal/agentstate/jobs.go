@@ -96,11 +96,84 @@ func scanJob(row inputScanner) (Job, error) {
 	return j, err
 }
 
+// Script job admission bounds (kind 'script'): the first lightweight
+// slice runs JavaScript only — a module source exporting run(input, sumi)
+// — under a per-job supervised workerd. These are admission bounds; the
+// runner enforces execution with its own supervision (CPU is
+// seconds-granularity RLIMIT_CPU, never a millisecond-exact promise).
+const (
+	scriptCodeMaxBytes  = 64 << 10
+	scriptInputMaxBytes = 32 << 10
+	scriptLimitMaxes    = "cpu_seconds<=600 wall_ms<=3600000 memory_mib<=1024 output_bytes<=65536 log_bytes<=65536 file_calls<=256 file_bytes<=16777216"
+)
+
+// validateScriptLimits checks the optional limits object: known keys only,
+// positive integers inside the runner's enforceable ranges. An
+// unenforceable spec is a deterministic 400, not a queued job a runner
+// would have to refuse later.
+func validateScriptLimits(raw any) error {
+	limits, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: script limits must be an object", ErrBadRequest)
+	}
+	bounds := map[string][2]int64{
+		"cpu_seconds":  {1, 600}, // RLIMIT_CPU granularity: whole seconds only
+		"wall_ms":      {100, 3_600_000},
+		"memory_mib":   {32, 1024},
+		"output_bytes": {1, 64 << 10},
+		"log_bytes":    {0, 64 << 10},
+		"file_calls":   {0, 256},
+		"file_bytes":   {0, 16 << 20},
+	}
+	for key, val := range limits {
+		b, known := bounds[key]
+		if !known {
+			return fmt.Errorf("%w: unknown script limit %q (%s)", ErrBadRequest, key, scriptLimitMaxes)
+		}
+		n, ok := val.(float64)
+		if !ok || n != float64(int64(n)) || int64(n) < b[0] || int64(n) > b[1] {
+			return fmt.Errorf("%w: script limit %q must be an integer in [%d, %d]", ErrBadRequest, key, b[0], b[1])
+		}
+	}
+	return nil
+}
+
 // validateJobRequest enforces the per-kind request shape at the persistence
 // boundary, so a malformed spec is a deterministic 400 — never a queued job
 // no runner can execute.
 func validateJobRequest(kind string, request map[string]any) error {
 	switch kind {
+	case "script":
+		// Script jobs route to the local scripts runner only — an explicit
+		// non-local backend names no claimant that can ever serve the kind,
+		// so refuse it at admission instead of stranding the row.
+		if b, ok := request["backend"]; ok {
+			if backend, isStr := b.(string); !isStr || backend != "local" {
+				return fmt.Errorf("%w: script jobs route only to the local backend (got %v)", ErrBadRequest, b)
+			}
+		}
+		code, ok := request["code"].(string)
+		if !ok || code == "" {
+			return fmt.Errorf("%w: script job requires non-empty code (a JavaScript module exporting run(input, sumi))", ErrBadRequest)
+		}
+		if len(code) > scriptCodeMaxBytes {
+			return fmt.Errorf("%w: script code exceeds %d bytes", ErrBadRequest, scriptCodeMaxBytes)
+		}
+		if input, ok := request["input"]; ok {
+			raw, err := json.Marshal(input)
+			if err != nil {
+				return fmt.Errorf("%w: script input must be JSON-serializable", ErrBadRequest)
+			}
+			if len(raw) > scriptInputMaxBytes {
+				return fmt.Errorf("%w: script input exceeds %d bytes serialized", ErrBadRequest, scriptInputMaxBytes)
+			}
+		}
+		if limits, ok := request["limits"]; ok {
+			if err := validateScriptLimits(limits); err != nil {
+				return err
+			}
+		}
+		return nil
 	case "subprocess":
 		// The numeric bounds mirror the process launch contract
 		// (runtimeprovision.ProcessStartRequest.Validate): an admitted spec
@@ -246,10 +319,13 @@ func (s *Store) SubmitJob(ctx context.Context, personaID, jobID, kind string, re
 // job.start tool effect (which runs inside the operation claim transaction).
 func (s *Store) submitJobTx(ctx context.Context, tx pgx.Tx, personaID, jobID, kind string, request map[string]any, createdBy string) (Job, bool, error) {
 	// Route deterministically: a submission with no backend intent takes the
-	// deployment default. The stamped request is what both the insert and
-	// the replay identity check see, so a resubmitted unstamped request
-	// replays cleanly against the stamped row.
-	if _, ok := request["backend"]; !ok && s.defaultJobBackend != "" {
+	// deployment default — for the kind that deployment default governs.
+	// Script jobs stay unstamped: they claim under the local predicate via
+	// the scripts runner, and stamping them 'cloud' would strand them on
+	// every deployment (no runner claims script+cloud). The stamped
+	// request is what both the insert and the replay identity check see,
+	// so a resubmitted unstamped request replays cleanly against the row.
+	if _, ok := request["backend"]; !ok && s.defaultJobBackend != "" && kind == "subprocess" {
 		stamped := make(map[string]any, len(request)+1)
 		for k, v := range request {
 			stamped[k] = v
@@ -923,17 +999,24 @@ func (s *Store) AttachLostOutcome(ctx context.Context, personaID, jobID, runnerI
 // input's job.
 func (s *Store) internalJobTool(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, request map[string]any) (map[string]any, error) {
 	switch tool {
-	case "job.start":
-		// The tool's request IS the subprocess spec; kind is fixed so the
+	case "job.start", "script.start":
+		kind := "subprocess"
+		if tool == "script.start" {
+			// The tool's request is the bounded script spec; kind is fixed
+			// so the model cannot assert a job family this slice has no
+			// runner for, and cannot mint a subprocess through this tool.
+			kind = "script"
+		}
+		// The tool's request IS the job spec; kind is fixed so the
 		// model cannot assert a job family this slice has no runner for.
-		if err := validateJobRequest("subprocess", request); err != nil {
+		if err := validateJobRequest(kind, request); err != nil {
 			return nil, err
 		}
 		if hasNUL(request) {
-			return nil, fmt.Errorf("%w: job.start request contains a NUL byte jsonb cannot store", ErrBadRequest)
+			return nil, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
 		}
 		jobID := jobToolPrefix + inputID + ":" + strconv.Itoa(callIndex)
-		j, _, err := s.submitJobTx(ctx, tx, personaID, jobID, "subprocess", request,
+		j, _, err := s.submitJobTx(ctx, tx, personaID, jobID, kind, request,
 			"tool:"+turnID+":"+strconv.Itoa(callIndex))
 		if err != nil {
 			return nil, err

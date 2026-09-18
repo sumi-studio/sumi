@@ -527,6 +527,78 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
   {
     internal: true,
+    name: "script.start",
+    description:
+      "Start a small JavaScript job that runs without your Linux environment. code is a JS module exporting `run(input, sumi)`; it runs in an isolated worker with no network, no credentials, no filesystem mounts, and no ambient APIs — the only capability is `sumi.files` (stat/list/read/write/mkdir/remove over your permitted shared files) plus `sumi.log`. Results are bounded and arrive through the job's notification — read them with job.status. Execution is bounded by configured limits (CPU is whole-second granularity, not exact); job.cancel stops a running job, though an effect already admitted may still be recorded. For real programs, shell access, or other languages use job.start on Linux instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        code: {
+          type: "string",
+          description:
+            "JavaScript module source (max 64 KiB) exporting `run(input, sumi)`",
+        },
+        input: {
+          description:
+            "JSON value passed to run() as its first argument (max 32 KiB serialized)",
+        },
+        limits: {
+          type: "object",
+          description:
+            "optional execution bounds; all values integers, defaults apply when omitted",
+          properties: {
+            cpu_seconds: {
+              type: "integer",
+              minimum: 1,
+              maximum: 600,
+              description: "CPU seconds bound (whole-second granularity)",
+            },
+            wall_ms: {
+              type: "integer",
+              minimum: 100,
+              maximum: 3600000,
+              description: "wall-clock bound in milliseconds",
+            },
+            memory_mib: {
+              type: "integer",
+              minimum: 32,
+              maximum: 1024,
+              description: "memory bound in MiB",
+            },
+            output_bytes: {
+              type: "integer",
+              minimum: 1,
+              maximum: 65536,
+              description: "max result size in bytes",
+            },
+            log_bytes: {
+              type: "integer",
+              minimum: 0,
+              maximum: 65536,
+              description: "max sumi.log capture in bytes",
+            },
+            file_calls: {
+              type: "integer",
+              minimum: 0,
+              maximum: 256,
+              description: "max sumi.files calls",
+            },
+            file_bytes: {
+              type: "integer",
+              minimum: 0,
+              maximum: 16777216,
+              description: "max bytes through sumi.files",
+            },
+          },
+          additionalProperties: false,
+        },
+      },
+      required: ["code"],
+      additionalProperties: false,
+    },
+  },
+  {
+    internal: true,
     name: "job.status",
     description:
       "Read a job's current status and, once finished, its recorded result. Reading a result never re-runs the job.",

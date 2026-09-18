@@ -2130,7 +2130,7 @@ func withoutJournaledInput(ctx context.Context, tx pgx.Tx, personaID string, eve
 // delegated effects (e.g. messaging.send) use to derive their own dedup
 // identity.
 func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, idemKey string, request map[string]any) (map[string]any, bool, error) {
-	if strings.HasPrefix(tool, "job.") {
+	if strings.HasPrefix(tool, "job.") || tool == "script.start" {
 		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
 		return resp, resp != nil, err
 	}
@@ -2384,7 +2384,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			}
 			return op, nil, true, nil
 		}
-		if strings.HasPrefix(tool, "job.") && op.Status == "done" {
+		if (strings.HasPrefix(tool, "job.") || tool == "script.start") && op.Status == "done" {
 			if op.Response, err = withCurrentJobTx(ctx, tx, personaID, op.Response); err != nil {
 				return Operation{}, nil, false, err
 			}

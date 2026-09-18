@@ -695,3 +695,93 @@ func contains(xs []string, x string) bool {
 	}
 	return false
 }
+
+// Combined-deployment routing: the two backends share one store, so kind
+// and backend must keep their work separated. The cloud default applies
+// to subprocess only — a script job must stay unstamped and claimable by
+// the local scripts runner even when the deployment default is 'cloud',
+// and an explicit non-local backend on a script names no claimant.
+func TestSubmitJob_ScriptRoutingCombinedDeployment(t *testing.T) {
+	s, _ := newStore(t)
+	// The combined deployment: cloud runner live, default backend cloud.
+	s.SetJobBackendAvailable("cloud")
+	s.SetDefaultJobBackend("cloud")
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	scriptReq := map[string]any{"code": "export function run() { return 1 }"}
+
+	// An unstamped script job must NOT inherit the cloud default — no
+	// runner claims script+cloud, so stamping would strand it.
+	j, _, err := s.SubmitJob(ctx, pa, "sc-default", "script", scriptReq, "assistant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, ok := j.Request["backend"]; ok {
+		t.Fatalf("script request must stay unstamped under a cloud default: %v", b)
+	}
+	// An explicit non-local backend names no script claimant — refused.
+	if _, _, err := s.SubmitJob(ctx, pa, "sc-cloud", "script",
+		map[string]any{"code": "x", "backend": "cloud"}, "assistant"); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("script+cloud must be refused at admission: %v", err)
+	}
+	// Explicit local is honored.
+	lj, _, err := s.SubmitJob(ctx, pa, "sc-local", "script",
+		map[string]any{"code": "x", "backend": "local"}, "assistant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lj.Request["backend"] != "local" {
+		t.Fatalf("explicit local must be preserved: %#v", lj.Request)
+	}
+	// A subprocess job on the same deployment still takes the cloud stamp.
+	pj, _, err := s.SubmitJob(ctx, pa, "sub-default", "subprocess", subReq("echo", "x"), "assistant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pj.Request["backend"] != "cloud" {
+		t.Fatalf("subprocess must take the cloud default: %#v", pj.Request)
+	}
+
+	// The scripts runner (kind script, local predicate — the baseline
+	// client sends no backend) claims both script jobs and no subprocess.
+	claimed, _, err := s.ClaimJobs(ctx, pa, "script-runner", []string{"script"}, 2*time.Minute, 8, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := jobIDs(claimed)
+	if len(ids) != 2 || !contains(ids, "sc-default") || !contains(ids, "sc-local") {
+		t.Fatalf("script claim pass must take exactly the script jobs: %v", ids)
+	}
+	// The cloud runner sees only its kind+backend; the script jobs were
+	// already claimed, the subprocess goes to jobexec.
+	claimed, _, err = s.ClaimJobs(ctx, pa, "jobexec-docker", []string{"subprocess"}, 2*time.Minute, 8, "cloud")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids = jobIDs(claimed); len(ids) != 1 || ids[0] != "sub-default" {
+		t.Fatalf("cloud claim pass must take only the cloud subprocess job: %v", ids)
+	}
+	// A script claim pass never takes subprocess work, and vice versa:
+	// submit both kinds again and claim with crossed kinds.
+	if _, _, err := s.SubmitJob(ctx, pa, "sc2", "script", scriptReq, "assistant"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.SubmitJob(ctx, pa, "sub2", "subprocess", subReq("echo", "y"), "assistant"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, _, err = s.ClaimJobs(ctx, pa, "jobexec-docker", []string{"subprocess"}, 2*time.Minute, 8, "cloud")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids = jobIDs(claimed); len(ids) != 1 || ids[0] != "sub2" {
+		t.Fatalf("subprocess claim must not see script work: %v", ids)
+	}
+	claimed, _, err = s.ClaimJobs(ctx, pa, "script-runner", []string{"script"}, 2*time.Minute, 8, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids = jobIDs(claimed); len(ids) != 1 || ids[0] != "sc2" {
+		t.Fatalf("script claim must not see subprocess work: %v", ids)
+	}
+}
