@@ -96,24 +96,46 @@ export class StateClient {
   }
 
   /**
-   * Proposed shared seam: attach this runner's observed outcome to a job
-   * whose claim expired and was swept to 'lost'. 'lost' is an immutable
-   * verdict — CompleteJob conflicts on it — so the observed result/usage
-   * evidence attaches through a dedicated route that the shared job
-   * owner (copy-lotus) is implementing. Consumer contract:
+   * Shared discovery seam (producer: apps/api job_discovery.go +
+   * http.go). Both routes are service-credential only — this client
+   * must be built with the runtime/admin token, never a persona token
+   * (cross-persona visibility must not ride a single-persona grant).
+   *
+   * Fair cursor contract: rows strictly after (after_persona,
+   * after_job) sort first; 'next' is present iff the page is full —
+   * an absent next means the next call wraps to the start.
+   */
+  runnableJobs(kinds: string[], limit: number, afterPersona = "", afterJob = ""): Promise<JobPage> {
+    const q = `kinds=${encodeURIComponent(kinds.join(","))}&limit=${limit}` +
+      `&after_persona=${encodeURIComponent(afterPersona)}&after_job=${encodeURIComponent(afterJob)}`;
+    return this.call("GET", `/internal/core/jobs/runnable?${q}`) as Promise<JobPage>;
+  }
+
+  attentionJobs(runnerID: string, kinds: string[], limit: number, afterPersona = "", afterJob = ""): Promise<JobPage> {
+    const q = `runner_id=${encodeURIComponent(runnerID)}&kinds=${encodeURIComponent(kinds.join(","))}&limit=${limit}` +
+      `&after_persona=${encodeURIComponent(afterPersona)}&after_job=${encodeURIComponent(afterJob)}`;
+    return this.call("GET", `/internal/core/jobs/attention?${q}`) as Promise<JobPage>;
+  }
+
+  /**
+   * Shared seam (wired by the producer): attach this runner's observed
+   * outcome to a job whose claim expired and was swept to 'lost'.
+   * 'lost' is an immutable verdict — CompleteJob conflicts on it — so
+   * observed result/usage evidence attaches under result.observed_outcome:
    *
    *   POST .../jobs/{j}/lost-outcome
    *   { runner_id, observed_status, result, error }
    *
-   *   - 404 job: persona/job unknown.
-   *   - 403: caller is not the job's original claiming runner.
-   *   - 409: job is not 'lost' (live or already terminal — a real
-   *     CompleteJob is the path for live claims).
-   *   - 200: outcome stored WITHOUT changing the 'lost' verdict —
-   *     e.g. result.lost_outcome = {...}; idempotent replay of an
-   *     identical outcome; a divergent attach conflicts.
-   *   - 404/501 route: seam not yet wired — caller keeps the evidence
-   *     in its journal + usage facts, which ARE durable today.
+   *   - 200: outcome stored WITHOUT changing the 'lost' verdict, or an
+   *     identical attach replayed (idempotent resend).
+   *   - 403: runner_id is not the swept claim's recorded claimant —
+   *     a stable runner identity matters (see main.ts runner-id).
+   *   - 404: persona/job unknown.
+   *   - 400: missing runner_id / malformed body.
+   *   - 409: job is not 'lost' (a live claim completes via /complete),
+   *     or divergent evidence conflicts with the recorded outcome.
+   *   - 404/405/501 route: seam not deployed — caller keeps the
+   *     evidence in its journal + usage facts, which are durable.
    *
    * Returns the raw status so the caller can distinguish "not wired"
    * from a real refusal — this client does not invent a verdict.
@@ -142,14 +164,54 @@ export interface FileOpRow {
   error: string | null;
 }
 
-/** Adapter for "which personas may have runnable script jobs" — the
- *  shared discovery seam (PersonasWithRunnableJobs) belongs to the
- *  sibling implementation; until root wires that route, the runner is
- *  configured with an explicit persona list. */
+export interface JobPage {
+  jobs: JobRow[];
+  next?: { after_persona: string; after_job: string };
+}
+
+/** Adapter for "which personas may have runnable script jobs". */
 export interface Discovery {
   personas(): Promise<string[]>;
 }
 
+/**
+ * Production discovery: page the shared `GET /internal/core/jobs/runnable`
+ * route and return the distinct persona ids on the current page, in
+ * cursor order. The (after_persona, after_job) cursor persists across
+ * polls and wraps when a page comes back short — so a queue deeper
+ * than one page is walked fairly instead of re-reading the same
+ * prefix, and a persona queued between polls is found without any
+ * service configuration. Actual claiming still goes through the
+ * per-persona claim route (kinds=["script"], backend unset → the
+ * local/unstamped predicate — cloud-stamped work is never taken).
+ */
+export class SharedDiscovery implements Discovery {
+  private afterPersona = "";
+  private afterJob = "";
+  private client: StateClient;
+  private kinds: string[];
+  private pageSize: number;
+  constructor(client: StateClient, kinds = ["script"], pageSize = 64) {
+    this.client = client;
+    this.kinds = kinds;
+    this.pageSize = pageSize;
+  }
+  async personas(): Promise<string[]> {
+    const page = await this.client.runnableJobs(this.kinds, this.pageSize, this.afterPersona, this.afterJob);
+    const personas = [...new Set(page.jobs.map((j) => j.persona_id))];
+    if (page.next) {
+      this.afterPersona = page.next.after_persona;
+      this.afterJob = page.next.after_job;
+    } else {
+      this.afterPersona = "";
+      this.afterJob = "";
+    }
+    return personas;
+  }
+}
+
+/** Explicit persona list — local/dev filter only (SUMI_PERSONAS).
+ *  Production discovery needs no persona configuration. */
 export class ConfiguredDiscovery implements Discovery {
   readonly list: string[];
   constructor(list: string[]) { this.list = list; }

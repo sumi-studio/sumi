@@ -59,7 +59,6 @@ export class StubFileSvc {
     const answer = (): { status: number; json?: Record<string, unknown>; raw?: Buffer; headers?: Record<string, string> } => {
       const fs = this.scopeFiles(scope);
       const f = fs.get(path);
-      const version = this.versions.get(scope) ?? 0;
       switch (op) {
         case "stat":
           if (!f) return { status: 404, json: { error: "not found", code: "not_found" } };
