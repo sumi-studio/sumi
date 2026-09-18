@@ -1,0 +1,16 @@
+{
+  "name": "@sumi/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "run": "node run.mjs"
+  },
+  "devDependencies": {
+    "@sumi/typescript-config": "workspace:*",
+    "@types/node": "^24.13.2",
+    "typescript": "~6.0.3"
+  }
+}

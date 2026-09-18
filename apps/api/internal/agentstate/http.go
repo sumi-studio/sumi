@@ -50,6 +50,7 @@ type Server struct {
 	maxBody    int64
 	conns      *modelconnections.Store
 	callBridge CallBridge
+	jobFiles   JobFileService
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
@@ -185,6 +186,20 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/cancel", s.cancelJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/heartbeat", s.heartbeatJob)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/complete", s.completeJob)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/lost-outcome", s.attachJobLostOutcome)
+	mux.HandleFunc("GET /internal/core/jobs/runnable", s.listRunnableJobs)
+	mux.HandleFunc("GET /internal/core/jobs/attention", s.listJobsNeedingAttention)
+	// POST, not GET: this MUTATES. It applies the same expiry verdict the
+	// claim pass performs but takes no reservation — a consumer's periodic
+	// recovery calls it so a quiet persona's orphaned claim still reaches
+	// honest 'lost' instead of waiting for new user work to trigger it.
+	mux.HandleFunc("POST /internal/core/jobs/sweep-expired", s.sweepExpiredJobs)
+	// Job-scoped file capability (script jobs): every op authorized against
+	// the live runner claim; mutating ops settle through the durable
+	// core_job_file_ops ledger — never caller-scoped, never credential-bearing.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/files/{op}", s.jobFileOp)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/jobs/{job}/files/ops", s.listJobFileOps)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/files/ops/{opid}/resolve", s.resolveJobFileOp)
 	// Call sessions: persona-token scoped like jobs — the media bridge's claim
 	// is its own authority, deliberately not writer-generation gated.
 	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/claim", s.claimCallSessions)
@@ -1096,6 +1111,7 @@ func (s *Server) claimJobs(w http.ResponseWriter, r *http.Request) {
 		Kinds    []string `json:"kinds"`
 		LeaseMs  int64    `json:"lease_ms"`
 		Limit    int      `json:"limit"`
+		Backend  string   `json:"backend"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
 		return
@@ -1105,7 +1121,7 @@ func (s *Server) claimJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claimed, swept, err := s.store.ClaimJobs(r.Context(), personaID, req.RunnerID, req.Kinds,
-		time.Duration(req.LeaseMs)*time.Millisecond, req.Limit)
+		time.Duration(req.LeaseMs)*time.Millisecond, req.Limit, req.Backend)
 	if err != nil {
 		storeError(w, err)
 		return
@@ -1178,4 +1194,165 @@ func (s *Server) completeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"job": j})
+}
+
+// serviceOnly authorizes cross-persona discovery: the admin state token or
+// the runtime service token (SUMI_CORE_RUNTIME_TOKEN). A single-persona
+// grant must never widen into fleet visibility — runners hold the service
+// credential; browsers and persona tokens stop here.
+func (s *Server) serviceOnly(r *http.Request) bool {
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(token), s.secret) == 1 {
+		return true
+	}
+	return len(s.runtime) > 0 && subtle.ConstantTimeCompare([]byte(token), s.runtime) == 1
+}
+
+// attachJobLostOutcome is the shared seam every job backend uses to record
+// what its execution actually did after the claim expired and the sweep
+// committed 'lost'. The verdict never moves — this attaches evidence under
+// result.observed_outcome. Contract:
+//
+//	POST /internal/core/personas/{persona}/jobs/{job}/lost-outcome
+//	{ runner_id, observed_status, result, error }
+//
+// 200 — outcome stored (or an identical attach replayed); 404 — persona or
+// job unknown; 403 — runner_id is not the job's original claiming runner;
+// 409 — the row is not 'lost' (live claims complete through
+// /complete instead) or a different outcome is already attached.
+func (s *Server) attachJobLostOutcome(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		RunnerID       string         `json:"runner_id"`
+		ObservedStatus string         `json:"observed_status"`
+		Result         map[string]any `json:"result"`
+		Error          string         `json:"error"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.RunnerID == "" {
+		writeError(w, http.StatusBadRequest, "runner_id required")
+		return
+	}
+	j, err := s.store.AttachLostOutcome(r.Context(), personaID, r.PathValue("job"), req.RunnerID,
+		map[string]any{
+			"observed_status": req.ObservedStatus,
+			"result":          req.Result,
+			"error":           req.Error,
+		})
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"job": j})
+	case errors.Is(err, ErrJobNotClaimed):
+		// Not this runner's swept claim — forbidden, not a conflict.
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, ErrJobNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrJobConflict):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "job": j})
+	default:
+		storeError(w, err)
+	}
+}
+
+// Job-level discovery routes — the HTTP surface of the shared discovery
+// seam in job_discovery.go. Both are service-credential only: they answer
+// across personas, which a persona grant must never see. The fair cursor
+// is (after_persona, after_job); 'next' is present iff the page is full —
+// an absent next wraps the caller back to the start.
+//
+//	GET /internal/core/jobs/runnable?kinds=script,subprocess&limit=64&after_persona=&after_job=
+//	GET /internal/core/jobs/attention?runner_id=<id>&kinds=...&limit=64&after_persona=&after_job=
+func (s *Server) listRunnableJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.serviceOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	kinds := splitCSV(r.URL.Query().Get("kinds"))
+	if len(kinds) == 0 {
+		writeError(w, http.StatusBadRequest, "kinds required")
+		return
+	}
+	limit := discoveryLimit(r.URL.Query().Get("limit"))
+	jobs, err := s.store.RunnableJobs(r.Context(), kinds, limit,
+		r.URL.Query().Get("after_persona"), r.URL.Query().Get("after_job"))
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, jobPage(jobs, limit))
+}
+
+func (s *Server) listJobsNeedingAttention(w http.ResponseWriter, r *http.Request) {
+	if !s.serviceOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	kinds := splitCSV(r.URL.Query().Get("kinds"))
+	runnerID := r.URL.Query().Get("runner_id")
+	if len(kinds) == 0 || runnerID == "" {
+		writeError(w, http.StatusBadRequest, "runner_id and kinds required")
+		return
+	}
+	limit := discoveryLimit(r.URL.Query().Get("limit"))
+	jobs, err := s.store.ClaimJobsNeedingAttention(r.Context(), runnerID, kinds, limit,
+		r.URL.Query().Get("after_persona"), r.URL.Query().Get("after_job"))
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, jobPage(jobs, limit))
+}
+
+func (s *Server) sweepExpiredJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.serviceOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		Kinds []string `json:"kinds"`
+		Limit int      `json:"limit"`
+	}
+	if !decode(w, r, &req, 1<<20) {
+		return
+	}
+	swept, err := s.store.SweepExpiredJobs(r.Context(), req.Kinds, req.Limit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"swept": len(swept), "jobs": swept})
+}
+
+func splitCSV(v string) []string {
+	out := []string{}
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func discoveryLimit(v string) int {
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return n
+	}
+	return 64
+}
+
+func jobPage(jobs []Job, limit int) map[string]any {
+	resp := map[string]any{"jobs": jobs}
+	if len(jobs) >= limit && len(jobs) > 0 {
+		last := jobs[len(jobs)-1]
+		resp["next"] = map[string]string{"after_persona": last.PersonaID, "after_job": last.JobID}
+	}
+	return resp
 }

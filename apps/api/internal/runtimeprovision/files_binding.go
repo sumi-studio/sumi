@@ -1,14 +1,22 @@
 package runtimeprovision
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
+
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 )
 
 const (
@@ -241,4 +249,99 @@ func (state *durableFilesBindings) persistEntries(entries map[string]filesBindin
 		return true, fmt.Errorf("sync files bindings directory: %w", err)
 	}
 	return true, nil
+}
+
+// resolveProcessWorkspace verifies that this provisioner can bind-mount the
+// personality agent's canonical files scope for a process launch, and
+// returns the verified scope path plus the volume UUID it was checked
+// against. The chain mirrors the epoch launch contract: the check binary
+// proves the mountpoint is the configured volume, the scope directory must
+// already exist (the file service is the storage authority that creates
+// scopes — the provisioner never mints one), and the durable binding record
+// refuses a volume retarget the same way it refuses a retargeted epoch.
+// Every failure is ErrProcessWorkspace: configuration-level, worth failing
+// the owning job over rather than silently substituting another workspace.
+func (service *Service) resolveProcessWorkspace(ctx context.Context, personalityAgentID string) (string, string, error) {
+	env := service.filesEnv
+	if !env.configured() {
+		return "", "", fmt.Errorf("%w: canonical files volume is not configured on this provisioner", ErrProcessWorkspace)
+	}
+	scopeName, err := fileaccess.ScopeForPersona(personalityAgentID)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %v", ErrProcessWorkspace, err)
+	}
+	// sumi-files-check proves the mountpoint is the live canonical volume,
+	// that the scope exists as a real directory, and prints the kernel-
+	// resolved path — the only path an executor may bind. The provisioner
+	// never mints a scope: the file service is the storage authority that
+	// creates them, so scope_missing refuses honestly.
+	args := []string{}
+	if env.CheckWaitSeconds > 0 {
+		args = append(args, "--wait", strconv.Itoa(env.CheckWaitSeconds))
+	}
+	args = append(args, env.Mountpoint, env.VolumeUUID, scopeName)
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(env.CheckWaitSeconds+15)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(checkCtx, env.CheckPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("%w: canonical files mount check failed: %s", ErrProcessWorkspace, strings.TrimSpace(stderr.String()))
+	}
+	scope := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(scope) || filepath.Base(scope) != scopeName {
+		return "", "", fmt.Errorf("%w: canonical files check returned unusable scope path", ErrProcessWorkspace)
+	}
+	if err := service.checkFilesBinding(personalityAgentID); err != nil {
+		return "", "", fmt.Errorf("%w: %v", ErrProcessWorkspace, err)
+	}
+	if _, bound := service.files.lookup(personalityAgentID); !bound {
+		if err := service.files.record(personalityAgentID, filesBinding{VolumeUUID: env.VolumeUUID}); err != nil {
+			return "", "", fmt.Errorf("%w: persist canonical files binding: %v", ErrProcessWorkspace, err)
+		}
+	}
+	return scope, env.VolumeUUID, nil
+}
+
+// recheckProcessWorkspace re-verifies a journaled operation's workspace at
+// the deferred launch point. Acceptance proved the mount, volume, scope and
+// binding once; this proves they still hold now — a mount that changed or
+// died since the record was written must not receive the bind, and a scope
+// that now resolves somewhere other than the recorded path means the
+// volume's topology changed underneath the journal.
+func (service *Service) recheckProcessWorkspace(ctx context.Context, o ProcessOperation) error {
+	if o.WorkspaceBind == "" {
+		return nil
+	}
+	env := service.filesEnv
+	if !env.configured() {
+		return errors.New("canonical files volume is not configured")
+	}
+	scopeName, err := fileaccess.ScopeForPersona(o.PersonalityAgentID)
+	if err != nil {
+		return err
+	}
+	args := []string{}
+	if env.CheckWaitSeconds > 0 {
+		args = append(args, "--wait", strconv.Itoa(env.CheckWaitSeconds))
+	}
+	args = append(args, env.Mountpoint, o.FilesVolumeUUID, scopeName)
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(env.CheckWaitSeconds+15)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(checkCtx, env.CheckPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("canonical files mount recheck failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	scope := strings.TrimSpace(string(out))
+	if scope != o.WorkspaceBind {
+		return fmt.Errorf("canonical files scope %s moved from recorded bind %s", scope, o.WorkspaceBind)
+	}
+	if err := service.checkFilesBinding(o.PersonalityAgentID); err != nil {
+		return err
+	}
+	return nil
 }

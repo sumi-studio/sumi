@@ -53,6 +53,18 @@ importers:
         specifier: 4.120.1
         version: 4.120.1
 
+  apps/scripts:
+    devDependencies:
+      '@sumi/typescript-config':
+        specifier: workspace:*
+        version: link:../../packages/typescript-config
+      '@types/node':
+        specifier: ^24.13.2
+        version: 24.13.3
+      typescript:
+        specifier: ~6.0.3
+        version: 6.0.3
+
   apps/web:
     dependencies:
       '@modelcontextprotocol/ext-apps':

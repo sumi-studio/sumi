@@ -33,9 +33,10 @@ type ServiceConfig struct {
 // observed once at process start. It is the values the supervisor receives,
 // not a per-request input.
 type FilesEnvironment struct {
-	Mountpoint string
-	VolumeUUID string
-	CheckPath  string
+	Mountpoint       string
+	VolumeUUID       string
+	CheckPath        string
+	CheckWaitSeconds int
 }
 
 func (environment FilesEnvironment) configured() bool {
@@ -77,6 +78,9 @@ func NewService(backend Backend, config ServiceConfig) (*Service, error) {
 		service.processes, err = newProcessStore(config.StateDirectory, processBackend)
 		if err != nil {
 			return nil, err
+		}
+		if service.filesEnv.configured() {
+			service.processes.reverify = service.recheckProcessWorkspace
 		}
 	}
 	return service, nil

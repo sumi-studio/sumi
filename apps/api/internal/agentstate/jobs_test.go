@@ -103,7 +103,7 @@ func TestJobCompleteNULBoundaries(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("echo"), "api"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
@@ -122,7 +122,7 @@ func TestJobCompleteNULBoundaries(t *testing.T) {
 		t.Fatalf("complete after rejection: %+v err=%v", done, err)
 	}
 	// NUL in a claim runner_id is rejected at the same boundary.
-	if _, _, err := s.ClaimJobs(ctx, pa, "r\x00", []string{"subprocess"}, time.Minute, 4); !errors.Is(err, ErrBadRequest) {
+	if _, _, err := s.ClaimJobs(ctx, pa, "r\x00", []string{"subprocess"}, time.Minute, 4, "*"); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL runner_id err = %v, want ErrBadRequest", err)
 	}
 }
@@ -138,7 +138,7 @@ func TestJobClaimHeartbeatComplete(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 
-	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 1 || len(swept) != 0 {
 		t.Fatalf("claim: claimed=%+v swept=%+v err=%v", claimed, swept, err)
 	}
@@ -147,7 +147,7 @@ func TestJobClaimHeartbeatComplete(t *testing.T) {
 		t.Fatalf("claimed job: %+v", j)
 	}
 	// A second runner sees nothing to claim.
-	claimed2, _, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed2, _, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed2) != 0 {
 		t.Fatalf("second claim: %+v err=%v", claimed2, err)
 	}
@@ -219,7 +219,7 @@ func TestJobCancelSemantics(t *testing.T) {
 		t.Fatalf("cancel notification missing: %v", err)
 	}
 	// Nothing remains to claim.
-	claimed, _, err := s.ClaimJobs(ctx, pa, "r", []string{"subprocess"}, time.Minute, 4)
+	claimed, _, err := s.ClaimJobs(ctx, pa, "r", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 {
 		t.Fatalf("claim after cancel: %+v err=%v", claimed, err)
 	}
@@ -229,7 +229,7 @@ func TestJobCancelSemantics(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-r", "subprocess", subReq("sleep", "9"), "api"); err != nil {
 		t.Fatalf("submit j-r: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-r: %v", err)
 	}
 	j, err = s.CancelJob(ctx, pa, "j-r")
@@ -252,7 +252,7 @@ func TestJobCancelSemantics(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-late", "subprocess", subReq("echo", "x"), "api"); err != nil {
 		t.Fatalf("submit j-late: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-late: %v", err)
 	}
 	if _, err := s.CancelJob(ctx, pa, "j-late"); err != nil {
@@ -282,13 +282,13 @@ func TestJobClaimExpiryLost(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 	// Tiny lease so the claim expires.
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, 20*time.Millisecond, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, 20*time.Millisecond, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(40 * time.Millisecond)
 
 	// The next claim pass (any runner) sweeps the expired job to lost.
-	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 || len(swept) != 1 || swept[0].Status != "lost" {
 		t.Fatalf("sweep: claimed=%+v swept=%+v err=%v", claimed, swept, err)
 	}
@@ -311,9 +311,105 @@ func TestJobClaimExpiryLost(t *testing.T) {
 		t.Fatalf("dead-runner heartbeat: %+v err=%v", hb, err)
 	}
 	// No re-execution: the job never returns to 'queued' on later passes.
-	claimed, swept, err = s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err = s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 || len(swept) != 0 {
 		t.Fatalf("second sweep: claimed=%+v swept=%+v", claimed, swept)
+	}
+}
+
+// The standalone expiry sweep applies the same 'lost' verdict WITHOUT
+// taking reservations — the recovery path for personas that queue no
+// further work. Kind-fenced, bounded per call, keeps claimed_by so the
+// recorded claimant can still attach its observed outcome.
+func TestSweepExpiredJobs(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+
+	scriptReq := map[string]any{"code": "export async function run(){ return 1 }"}
+	// Foreign-kind orphaned claim — must be invisible to a script sweep.
+	if _, _, err := s.SubmitJob(ctx, pa, "j-foreign", "subprocess", subReq("sleep", "9"), "api"); err != nil {
+		t.Fatalf("submit j-foreign: %v", err)
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"subprocess"}, 20*time.Millisecond, 4, "*"); err != nil {
+		t.Fatalf("claim j-foreign: %v", err)
+	}
+	// Healthy claim and a queued job — neither may be touched.
+	if _, _, err := s.SubmitJob(ctx, pa, "j-live", "script", scriptReq, "api"); err != nil {
+		t.Fatalf("submit j-live: %v", err)
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-live", []string{"script"}, time.Minute, 4, "*"); err != nil {
+		t.Fatalf("claim j-live: %v", err)
+	}
+	// Orphaned claim LAST — no intermediate claim pass can pre-sweep it:
+	// 'running' under a dead runner with an already-dead lease.
+	if _, _, err := s.SubmitJob(ctx, pa, "j-exp", "script", scriptReq, "api"); err != nil {
+		t.Fatalf("submit j-exp: %v", err)
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"script"}, 20*time.Millisecond, 4, "*"); err != nil {
+		t.Fatalf("claim j-exp: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	swept, err := s.SweepExpiredJobs(ctx, []string{"script"}, 64)
+	if err != nil || len(swept) != 1 || swept[0].JobID != "j-exp" || swept[0].Status != "lost" {
+		t.Fatalf("sweep: %+v err=%v", swept, err)
+	}
+	if swept[0].ClaimedBy == nil || *swept[0].ClaimedBy != "runner-dead" {
+		t.Fatalf("swept row keeps the recorded claimant: %+v", swept[0])
+	}
+	j, err := s.GetJob(ctx, pa, "j-exp")
+	if err != nil || j.Status != "lost" || j.FinishedAt == nil {
+		t.Fatalf("j-exp: %+v err=%v", j, err)
+	}
+	if _, _, err := s.GetInput(ctx, pa, "job:j-exp"); err != nil {
+		t.Fatalf("terminal notification missing: %v", err)
+	}
+	if j, _ := s.GetJob(ctx, pa, "j-foreign"); j.Status != "running" {
+		t.Fatalf("kind fence: foreign-kind expired claim untouched: %+v", j)
+	}
+	if j, _ := s.GetJob(ctx, pa, "j-live"); j.Status != "running" {
+		t.Fatalf("healthy claim untouched: %+v", j)
+	}
+	// Nothing swept twice; the other kind sweeps on its own terms.
+	if again, _ := s.SweepExpiredJobs(ctx, []string{"script"}, 64); len(again) != 0 {
+		t.Fatalf("re-sweep: %+v", again)
+	}
+	fswept, err := s.SweepExpiredJobs(ctx, []string{"subprocess"}, 64)
+	if err != nil || len(fswept) != 1 || fswept[0].JobID != "j-foreign" {
+		t.Fatalf("foreign sweep: %+v err=%v", fswept, err)
+	}
+
+	// Bounded work: the limit caps a single call, oldest expiry first.
+	for _, id := range []string{"j-b1", "j-b2", "j-b3"} {
+		if _, _, err := s.SubmitJob(ctx, pa, id, "script", scriptReq, "api"); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"script"}, 20*time.Millisecond, 4, "*"); err != nil {
+		t.Fatalf("claim backlog: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	// A queued job submitted now proves the sweep takes no reservations.
+	if _, _, err := s.SubmitJob(ctx, pa, "j-queued", "script", scriptReq, "api"); err != nil {
+		t.Fatalf("submit j-queued: %v", err)
+	}
+	first, err := s.SweepExpiredJobs(ctx, []string{"script"}, 2)
+	if err != nil || len(first) != 2 {
+		t.Fatalf("bounded page: %+v err=%v", first, err)
+	}
+	rest, err := s.SweepExpiredJobs(ctx, []string{"script"}, 64)
+	if err != nil || len(rest) != 1 {
+		t.Fatalf("drained remainder: %+v err=%v", rest, err)
+	}
+	// Sweeping claims nothing: j-queued is still queued for a real claim.
+	if j, _ := s.GetJob(ctx, pa, "j-queued"); j.Status != "queued" {
+		t.Fatalf("sweep must never take reservations: %+v", j)
+	}
+	// Kinds are mandatory — an unscoped sweep is a caller error.
+	if _, err := s.SweepExpiredJobs(ctx, nil, 64); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("empty kinds err = %v, want ErrBadRequest", err)
 	}
 }
 
@@ -442,7 +538,7 @@ func TestJobNotificationEntersInputStream(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("echo", "hi"), "api"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
@@ -505,7 +601,7 @@ func TestJobCompletionBeforeOriginTurn(t *testing.T) {
 	if _, ok := op.Response["current_job"]; ok {
 		t.Fatalf("fresh receipt must not carry current_job: %+v", op.Response)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim job: %v", err)
 	}
 	// The job ends while in-1 is still unfinished.

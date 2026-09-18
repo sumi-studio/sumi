@@ -16,8 +16,11 @@ package agentstate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +43,9 @@ const jobInputPrefix = "job:"
 // job.start tool effect; a caller-supplied job_id in that namespace could
 // collide with a plan-position-derived id.
 const jobToolPrefix = "op:"
+
+// jobEnvName mirrors the process launch contract's environment-name rule.
+var jobEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Job struct {
 	PersonaID         string         `json:"persona_id"`
@@ -72,6 +78,12 @@ const jobCols = `persona_id, job_id, kind, request, status, claimed_by,
 	claim_expires_at, created_by, created_at, started_at, finished_at,
 	cancel_requested_at, result, error, notified_at`
 
+// jobColsJ is jobCols qualified for joined queries (persona_id exists on
+// both core_jobs and core_personas).
+const jobColsJ = `j.persona_id, j.job_id, j.kind, j.request, j.status, j.claimed_by,
+	j.claim_expires_at, j.created_by, j.created_at, j.started_at, j.finished_at,
+	j.cancel_requested_at, j.result, j.error, j.notified_at`
+
 func scanJob(row inputScanner) (Job, error) {
 	var j Job
 	err := row.Scan(&j.PersonaID, &j.JobID, &j.Kind, &j.Request, &j.Status,
@@ -84,25 +96,124 @@ func scanJob(row inputScanner) (Job, error) {
 	return j, err
 }
 
+// Script job admission bounds (kind 'script'): the first lightweight
+// slice runs JavaScript only — a module source exporting run(input, sumi)
+// — under a per-job supervised workerd. These are admission bounds; the
+// runner enforces execution with its own supervision (CPU is
+// seconds-granularity RLIMIT_CPU, never a millisecond-exact promise).
+const (
+	scriptCodeMaxBytes  = 64 << 10
+	scriptInputMaxBytes = 32 << 10
+	scriptLimitMaxes    = "cpu_seconds<=600 wall_ms<=3600000 memory_mib<=1024 output_bytes<=65536 log_bytes<=65536 file_calls<=256 file_bytes<=16777216"
+)
+
+// validateScriptLimits checks the optional limits object: known keys only,
+// positive integers inside the runner's enforceable ranges. An
+// unenforceable spec is a deterministic 400, not a queued job a runner
+// would have to refuse later.
+func validateScriptLimits(raw any) error {
+	limits, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%w: script limits must be an object", ErrBadRequest)
+	}
+	bounds := map[string][2]int64{
+		"cpu_seconds":  {1, 600}, // RLIMIT_CPU granularity: whole seconds only
+		"wall_ms":      {100, 3_600_000},
+		"memory_mib":   {32, 1024},
+		"output_bytes": {1, 64 << 10},
+		"log_bytes":    {0, 64 << 10},
+		"file_calls":   {0, 256},
+		"file_bytes":   {0, 16 << 20},
+	}
+	for key, val := range limits {
+		b, known := bounds[key]
+		if !known {
+			return fmt.Errorf("%w: unknown script limit %q (%s)", ErrBadRequest, key, scriptLimitMaxes)
+		}
+		n, ok := val.(float64)
+		if !ok || n != float64(int64(n)) || int64(n) < b[0] || int64(n) > b[1] {
+			return fmt.Errorf("%w: script limit %q must be an integer in [%d, %d]", ErrBadRequest, key, b[0], b[1])
+		}
+	}
+	return nil
+}
+
 // validateJobRequest enforces the per-kind request shape at the persistence
 // boundary, so a malformed spec is a deterministic 400 — never a queued job
 // no runner can execute.
 func validateJobRequest(kind string, request map[string]any) error {
 	switch kind {
+	case "script":
+		// Script jobs route to the local scripts runner only — an explicit
+		// non-local backend names no claimant that can ever serve the kind,
+		// so refuse it at admission instead of stranding the row.
+		if b, ok := request["backend"]; ok {
+			if backend, isStr := b.(string); !isStr || backend != "local" {
+				return fmt.Errorf("%w: script jobs route only to the local backend (got %v)", ErrBadRequest, b)
+			}
+		}
+		code, ok := request["code"].(string)
+		if !ok || code == "" {
+			return fmt.Errorf("%w: script job requires non-empty code (a JavaScript module exporting run(input, sumi))", ErrBadRequest)
+		}
+		if len(code) > scriptCodeMaxBytes {
+			return fmt.Errorf("%w: script code exceeds %d bytes", ErrBadRequest, scriptCodeMaxBytes)
+		}
+		if input, ok := request["input"]; ok {
+			raw, err := json.Marshal(input)
+			if err != nil {
+				return fmt.Errorf("%w: script input must be JSON-serializable", ErrBadRequest)
+			}
+			if len(raw) > scriptInputMaxBytes {
+				return fmt.Errorf("%w: script input exceeds %d bytes serialized", ErrBadRequest, scriptInputMaxBytes)
+			}
+		}
+		if limits, ok := request["limits"]; ok {
+			if err := validateScriptLimits(limits); err != nil {
+				return err
+			}
+		}
+		return nil
 	case "subprocess":
+		// The numeric bounds mirror the process launch contract
+		// (runtimeprovision.ProcessStartRequest.Validate): an admitted spec
+		// must map to a launchable request, not be claimed and then fail.
 		rawCmd, ok := request["command"].([]any)
 		if !ok || len(rawCmd) == 0 {
 			return fmt.Errorf("%w: subprocess job requires a non-empty command array", ErrBadRequest)
 		}
+		if len(rawCmd) > 129 {
+			return fmt.Errorf("%w: subprocess command may have at most 129 entries", ErrBadRequest)
+		}
+		argvBytes := 0
 		for i, arg := range rawCmd {
 			s, ok := arg.(string)
 			if !ok || s == "" {
 				return fmt.Errorf("%w: subprocess command[%d] must be a non-empty string", ErrBadRequest, i)
 			}
+			if strings.ContainsRune(s, 0) {
+				return fmt.Errorf("%w: subprocess command[%d] contains NUL", ErrBadRequest, i)
+			}
+			if i == 0 && len(s) > 1024 {
+				return fmt.Errorf("%w: subprocess executable exceeds 1024 characters", ErrBadRequest)
+			}
+			argvBytes += len(s)
+		}
+		if argvBytes > 32<<10 {
+			return fmt.Errorf("%w: subprocess command exceeds 32 KiB", ErrBadRequest)
 		}
 		if cwd, ok := request["cwd"]; ok {
-			if _, ok := cwd.(string); !ok {
+			c, ok := cwd.(string)
+			if !ok {
 				return fmt.Errorf("%w: subprocess cwd must be a string", ErrBadRequest)
+			}
+			if len(c) > 1024 || strings.ContainsRune(c, 0) || path.IsAbs(c) || (c != "" && path.Clean(c) != c) {
+				return fmt.Errorf("%w: subprocess cwd must be clean and relative", ErrBadRequest)
+			}
+			for _, seg := range strings.Split(c, "/") {
+				if seg == ".." {
+					return fmt.Errorf("%w: subprocess cwd escapes the workspace", ErrBadRequest)
+				}
 			}
 		}
 		if t, ok := request["timeout_ms"]; ok {
@@ -116,10 +227,34 @@ func validateJobRequest(kind string, request map[string]any) error {
 			if !ok {
 				return fmt.Errorf("%w: subprocess env must be an object of strings", ErrBadRequest)
 			}
+			if len(env) > 32 {
+				return fmt.Errorf("%w: subprocess env may have at most 32 entries", ErrBadRequest)
+			}
+			payload := 0
 			for k, v := range env {
-				if _, ok := v.(string); !ok {
+				if len(k) > 64 || !jobEnvName.MatchString(k) {
+					return fmt.Errorf("%w: subprocess env name %q is invalid", ErrBadRequest, k)
+				}
+				if k == "PATH" || k == "HOME" || k == "LANG" {
+					return fmt.Errorf("%w: subprocess env name %q is backend-owned", ErrBadRequest, k)
+				}
+				s, ok := v.(string)
+				if !ok {
 					return fmt.Errorf("%w: subprocess env[%q] must be a string", ErrBadRequest, k)
 				}
+				if len(s) > 4096 || strings.ContainsRune(s, 0) {
+					return fmt.Errorf("%w: subprocess env[%q] value is invalid", ErrBadRequest, k)
+				}
+				payload += len(k) + len(s)
+			}
+			if payload > 8<<10 {
+				return fmt.Errorf("%w: subprocess env payload exceeds 8 KiB", ErrBadRequest)
+			}
+		}
+		if b, ok := request["backend"]; ok {
+			s, ok := b.(string)
+			if !ok || (s != "local" && s != "cloud") {
+				return fmt.Errorf("%w: subprocess backend must be \"local\" or \"cloud\"", ErrBadRequest)
 			}
 		}
 		return nil
@@ -183,6 +318,29 @@ func (s *Store) SubmitJob(ctx context.Context, personaID, jobID, kind string, re
 // submitJobTx is the insert-or-replay core shared by the API route and the
 // job.start tool effect (which runs inside the operation claim transaction).
 func (s *Store) submitJobTx(ctx context.Context, tx pgx.Tx, personaID, jobID, kind string, request map[string]any, createdBy string) (Job, bool, error) {
+	// Route deterministically: a submission with no backend intent takes the
+	// deployment default — for the kind that deployment default governs.
+	// Script jobs stay unstamped: they claim under the local predicate via
+	// the scripts runner, and stamping them 'cloud' would strand them on
+	// every deployment (no runner claims script+cloud). The stamped
+	// request is what both the insert and the replay identity check see,
+	// so a resubmitted unstamped request replays cleanly against the row.
+	if _, ok := request["backend"]; !ok && s.defaultJobBackend != "" && kind == "subprocess" {
+		stamped := make(map[string]any, len(request)+1)
+		for k, v := range request {
+			stamped[k] = v
+		}
+		stamped["backend"] = s.defaultJobBackend
+		request = stamped
+	}
+	// Honest surface: a cloud-routed request is servable only while a
+	// verified Cloud runner is wired. Without one the job would queue
+	// forever, so refuse at admission instead of pretending capacity.
+	// 'local'/unstamped work is never gated — local runners are separate
+	// processes the store cannot probe.
+	if b, _ := request["backend"].(string); b == "cloud" && !s.jobBackendAvailable["cloud"] {
+		return Job{}, false, fmt.Errorf("%w: cloud job backend is not running in this deployment", ErrBadRequest)
+	}
 	// Share-lock the persona row, the same rule SubmitInput follows: a
 	// transfer seal holds it FOR NO KEY UPDATE while it checks for in-flight
 	// jobs, so a submit either lands before the seal's check (and the seal
@@ -484,7 +642,13 @@ func (s *Store) cancelJobTx(ctx context.Context, tx pgx.Tx, personaID, jobID str
 // ClaimJobs is the runner's one periodic call: it first sweeps live jobs whose
 // claim expired (→ 'lost' + notification — indeterminate, never re-run), then
 // claims up to limit queued jobs of the requested kinds for this runner.
-func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds []string, lease time.Duration, limit int) ([]Job, []Job, error) {
+//
+// backend is the routing split: "cloud" claims only requests stamped
+// backend:"cloud"; "local" or "" claims unstamped/local requests; "*"
+// disables the filter. Cloud-stamped work is therefore unreachable to a
+// caller that does not ask for it — an unrestricted local runner can never
+// take a Cloud job, and the Cloud driver never takes local work.
+func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds []string, lease time.Duration, limit int, backend string) ([]Job, []Job, error) {
 	if runnerID == "" || len(runnerID) > 256 {
 		return nil, nil, fmt.Errorf("%w: runner_id must be 1-256 characters", ErrBadRequest)
 	}
@@ -547,12 +711,15 @@ func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds
 		WHERE (persona_id, job_id) IN (
 			SELECT j.persona_id, j.job_id FROM core_jobs j
 			WHERE j.persona_id = $1 AND j.status = 'queued' AND j.kind = ANY($3::text[])
+				AND (CASE WHEN $6::text = '*' THEN true
+				          WHEN $6::text = 'cloud' THEN j.request->>'backend' = 'cloud'
+				          ELSE COALESCE(j.request->>'backend', 'local') = 'local' END)
 				AND EXISTS (SELECT 1 FROM core_personas p
 				            WHERE p.persona_id = j.persona_id AND p.authority = 'active')
 			ORDER BY j.created_at, j.job_id LIMIT $5 FOR UPDATE SKIP LOCKED
 		)
 		RETURNING `+jobCols,
-		personaID, runnerID, kinds, lease, limit)
+		personaID, runnerID, kinds, lease, limit, backend)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -607,6 +774,69 @@ func (s *Store) HeartbeatJob(ctx context.Context, personaID, jobID, runnerID str
 		return Job{}, err
 	}
 	return j, nil
+}
+
+// runnerWaitKey namespaces the driver's durable wait bookkeeping inside
+// result — a live job's record states *why* it is still unresolved instead
+// of carrying an in-memory clock that resets on restart. Terminal writes
+// replace result wholesale, and AttachLostOutcome strips the key.
+const runnerWaitKey = "runner_wait"
+
+// NoteWait renews the claim and durably records that the job is waiting on
+// its backend for `cause`. The first-observed timestamp is kept while the
+// cause stays the same and resets when the cause changes, so a bound
+// measured from `since` survives driver restarts. The returned row carries
+// the stored wait — like HeartbeatJob's stale-scan caveat, readers should
+// prefer it over the caller's copy.
+func (s *Store) NoteWait(ctx context.Context, personaID, jobID, runnerID string, lease time.Duration, cause string) (Job, error) {
+	if lease <= 0 || cause == "" {
+		return Job{}, fmt.Errorf("%w: positive lease_ms and wait cause required", ErrBadRequest)
+	}
+	updated, err := scanJob(s.pool.QueryRow(ctx,
+		`UPDATE core_jobs SET claim_expires_at = now() + $4::interval,
+			result = CASE WHEN result->'`+runnerWaitKey+`'->>'cause' = $5::text THEN result
+			              ELSE COALESCE(result, '{}'::jsonb) || jsonb_build_object('`+runnerWaitKey+`',
+			                   jsonb_build_object('cause', $5::text, 'since', now())) END
+		WHERE persona_id = $1 AND job_id = $2 AND claimed_by = $3
+			AND status IN ('running','cancel_requested')
+		RETURNING `+jobCols,
+		personaID, jobID, runnerID, lease, cause))
+	if errors.Is(err, ErrJobNotFound) {
+		return Job{}, ErrJobNotClaimed
+	}
+	return updated, err
+}
+
+// ClearWait removes the wait bookkeeping once the backend answers
+// affirmatively. It is deliberately not a heartbeat — the claim was already
+// renewed by whichever call learned the backend state.
+func (s *Store) ClearWait(ctx context.Context, personaID, jobID, runnerID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE core_jobs SET result = result - '`+runnerWaitKey+`'
+		WHERE persona_id = $1 AND job_id = $2 AND claimed_by = $3
+			AND status IN ('running','cancel_requested','lost')
+			AND result ? '`+runnerWaitKey+`'`,
+		personaID, jobID, runnerID)
+	if err != nil {
+		return dataErr(err)
+	}
+	_ = tag
+	return nil
+}
+
+// JobWait reads the durable wait bookkeeping, if any.
+func JobWait(j Job) (cause string, since time.Time, ok bool) {
+	w, ok := j.Result[runnerWaitKey].(map[string]any)
+	if !ok {
+		return "", time.Time{}, false
+	}
+	c, _ := w["cause"].(string)
+	s, _ := w["since"].(string)
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if c == "" || err != nil {
+		return "", time.Time{}, false
+	}
+	return c, t, true
 }
 
 // CompleteJob records the runner-observed terminal outcome and enqueues the
@@ -688,6 +918,80 @@ func (s *Store) CompleteJob(ctx context.Context, personaID, jobID, runnerID, sta
 	return j, nil
 }
 
+// AttachLostOutcome records the backend's observed terminal state on a job
+// the sweep already marked lost. The verdict does not move — status stays
+// 'lost' and the already-enqueued notification stays the only one — but the
+// durable record now carries what actually happened: a swept job whose
+// container ran to success shows 'lost' plus the real exit/stdout instead of
+// leaving that truth in the provisioner journal only, and a swept job that
+// never reached the backend shows nothing was executed.
+//
+// Only the original claiming runner may attach (claimed_by must equal
+// runnerID). The claim_expired sweep marker in result is preserved; the
+// outcome lands under result.observed_outcome. Re-attaching the identical
+// outcome replays the stored row; a divergent re-attach and every
+// non-'lost' status refuse — a lost verdict can be enriched, never
+// rewritten into a success.
+func (s *Store) AttachLostOutcome(ctx context.Context, personaID, jobID, runnerID string, outcome map[string]any) (Job, error) {
+	personaID = strings.TrimSpace(personaID)
+	jobID = strings.TrimSpace(jobID)
+	runnerID = strings.TrimSpace(runnerID)
+	if personaID == "" || jobID == "" || runnerID == "" || outcome == nil {
+		return Job{}, fmt.Errorf("%w: persona_id, job_id, runner_id, and outcome required", ErrBadRequest)
+	}
+	if hasNUL(outcome) {
+		return Job{}, fmt.Errorf("%w: outcome must not contain NUL bytes", ErrBadRequest)
+	}
+	serialized, err := json.Marshal(outcome)
+	if err != nil {
+		return Job{}, fmt.Errorf("%w: outcome must be JSON-serializable", ErrBadRequest)
+	}
+	if len(serialized) > 64*1024 {
+		return Job{}, fmt.Errorf("%w: outcome too large", ErrBadRequest)
+	}
+	row, err := scanJob(s.pool.QueryRow(ctx,
+		`SELECT `+jobCols+` FROM core_jobs WHERE persona_id=$1 AND job_id=$2`,
+		personaID, jobID))
+	if err != nil {
+		return Job{}, err
+	}
+	if row.Status != "lost" {
+		return Job{}, fmt.Errorf("%w: job %s is not lost", ErrJobConflict, jobID)
+	}
+	if row.ClaimedBy == nil || *row.ClaimedBy != runnerID {
+		return Job{}, ErrJobNotClaimed
+	}
+	if existing, ok := row.Result["observed_outcome"].(map[string]any); ok {
+		if !jsonbEqual(existing, outcome) {
+			return Job{}, fmt.Errorf("%w: job %s already has a different observed outcome", ErrJobConflict, jobID)
+		}
+		return row, nil
+	}
+	updated, err := scanJob(s.pool.QueryRow(ctx, `UPDATE core_jobs SET result = (COALESCE(result, '{}'::jsonb) - '`+runnerWaitKey+`') || $4::jsonb
+		WHERE persona_id=$1 AND job_id=$2
+			AND status='lost' AND claimed_by=$3
+			AND NOT (COALESCE(result, '{}'::jsonb) ? 'observed_outcome')
+		RETURNING `+jobCols, personaID, jobID, runnerID,
+		json.RawMessage(`{"observed_outcome":`+string(serialized)+`}`)))
+	if err != nil {
+		// A racer attached between the read and the update: replay decides.
+		if errors.Is(err, ErrJobNotFound) {
+			fresh, ferr := scanJob(s.pool.QueryRow(ctx,
+				`SELECT `+jobCols+` FROM core_jobs WHERE persona_id=$1 AND job_id=$2`,
+				personaID, jobID))
+			if ferr != nil {
+				return Job{}, ferr
+			}
+			if existing, ok := fresh.Result["observed_outcome"].(map[string]any); ok && jsonbEqual(existing, outcome) {
+				return fresh, nil
+			}
+			return Job{}, fmt.Errorf("%w: job %s observed outcome changed concurrently", ErrJobConflict, jobID)
+		}
+		return Job{}, err
+	}
+	return updated, nil
+}
+
 // internalJobTool runs the job tools' state-internal effects inside the
 // operation claim transaction. job.start's job_id is derived from the plan
 // position (op:<input_id>:<call_index>) so a replayed claim can never mint a
@@ -695,17 +999,24 @@ func (s *Store) CompleteJob(ctx context.Context, personaID, jobID, runnerID, sta
 // input's job.
 func (s *Store) internalJobTool(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID, tool string, callIndex int, request map[string]any) (map[string]any, error) {
 	switch tool {
-	case "job.start":
-		// The tool's request IS the subprocess spec; kind is fixed so the
+	case "job.start", "script.start":
+		kind := "subprocess"
+		if tool == "script.start" {
+			// The tool's request is the bounded script spec; kind is fixed
+			// so the model cannot assert a job family this slice has no
+			// runner for, and cannot mint a subprocess through this tool.
+			kind = "script"
+		}
+		// The tool's request IS the job spec; kind is fixed so the
 		// model cannot assert a job family this slice has no runner for.
-		if err := validateJobRequest("subprocess", request); err != nil {
+		if err := validateJobRequest(kind, request); err != nil {
 			return nil, err
 		}
 		if hasNUL(request) {
-			return nil, fmt.Errorf("%w: job.start request contains a NUL byte jsonb cannot store", ErrBadRequest)
+			return nil, fmt.Errorf("%w: %s request contains a NUL byte jsonb cannot store", ErrBadRequest, tool)
 		}
 		jobID := jobToolPrefix + inputID + ":" + strconv.Itoa(callIndex)
-		j, _, err := s.submitJobTx(ctx, tx, personaID, jobID, "subprocess", request,
+		j, _, err := s.submitJobTx(ctx, tx, personaID, jobID, kind, request,
 			"tool:"+turnID+":"+strconv.Itoa(callIndex))
 		if err != nil {
 			return nil, err

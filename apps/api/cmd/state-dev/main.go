@@ -112,7 +112,8 @@ func main() {
 				log.Fatalf("register core file effect %s: %v", tool, err)
 			}
 		}
-		log.Print("core file tools ready (file.* effects scoped to the claiming persona)")
+		coreState.SetJobFileService(fileaccess.JobFileService(filesClient))
+		log.Print("core file tools ready (file.* effects scoped to the claiming persona; job file capability armed)")
 	}
 	coreState.RegisterRoutes(mux)
 	portable.NewServer(pool.Pool, token).RegisterRoutes(mux)

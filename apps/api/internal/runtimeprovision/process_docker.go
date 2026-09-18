@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,33 +33,55 @@ func (b *DockerBackend) processDocker(ctx context.Context, args ...string) ([]by
 	return out.Bytes(), nil
 }
 func processContainer(o ProcessOperation) string { return "sumi-process-" + o.OperationID }
+
+// LaunchProcess creates the detached container that observe() then polls.
+// Identity is labelled, not named, so an interrupted launch leaves no
+// colliding container name behind.
+//
+// An operation resolved onto a canonical files scope (WorkspaceBind set by
+// the service after the mount/volume/binding checks) gets a bind mount of
+// that verified path plus the volume-UUID label — never the legacy shared
+// workspace volume. Operations without a resolved bind keep the established
+// per-agent named-volume workspace with its ownership check.
 func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) error {
+	repo, tagEnv := "ghcr.io/sumi-studio/sumi-agent", "SUMI_AGENT_IMAGE_TAG"
+	if o.Image == "job" {
+		repo, tagEnv = "ghcr.io/sumi-studio/sumi-job", "SUMI_JOB_IMAGE_TAG"
+	}
 	tag := ""
 	for _, v := range b.baseEnvironment {
-		if strings.HasPrefix(v, "SUMI_AGENT_IMAGE_TAG=") {
-			tag = strings.TrimPrefix(v, "SUMI_AGENT_IMAGE_TAG=")
+		if strings.HasPrefix(v, tagEnv+"=") {
+			tag = strings.TrimPrefix(v, tagEnv+"=")
 		}
 	}
 	if !processImageTag.MatchString(tag) {
 		return errors.New("process image requires a pinned full revision")
 	}
-	volume := "sumi-" + strings.ReplaceAll(o.PersonalityAgentID, "-", "") + "_workspace"
-	raw, err := b.processDocker(ctx, "volume", "inspect", volume)
-	if err != nil {
-		return err
+	labels := []string{"--label", "sumi.operation_id=" + o.OperationID, "--label", "sumi.personality_agent_id=" + o.PersonalityAgentID}
+	mount := ""
+	if o.WorkspaceBind != "" {
+		labels = append(labels, "--label", "sumi.files_volume_uuid="+o.FilesVolumeUUID)
+		mount = "type=bind,src=" + o.WorkspaceBind + ",dst=/workspace"
+	} else {
+		volume := "sumi-" + strings.ReplaceAll(o.PersonalityAgentID, "-", "") + "_workspace"
+		raw, err := b.processDocker(ctx, "volume", "inspect", volume)
+		if err != nil {
+			return err
+		}
+		var volumes []struct {
+			Name   string
+			Labels map[string]string
+		}
+		if err = json.Unmarshal(raw, &volumes); err != nil {
+			return err
+		}
+		project := strings.TrimSuffix(volume, "_workspace")
+		if len(volumes) != 1 || volumes[0].Name != volume || volumes[0].Labels["com.docker.compose.project"] != project || volumes[0].Labels["com.docker.compose.volume"] != "workspace" {
+			return errors.New("workspace volume ownership mismatch")
+		}
+		mount = "type=volume,src=" + volume + ",dst=/workspace,volume-nocopy"
 	}
-	var volumes []struct {
-		Name   string
-		Labels map[string]string
-	}
-	if err = json.Unmarshal(raw, &volumes); err != nil {
-		return err
-	}
-	project := strings.TrimSuffix(volume, "_workspace")
-	if len(volumes) != 1 || volumes[0].Name != volume || volumes[0].Labels["com.docker.compose.project"] != project || volumes[0].Labels["com.docker.compose.volume"] != "workspace" {
-		return errors.New("workspace volume ownership mismatch")
-	}
-	raw, err = b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", "ghcr.io/sumi-studio/sumi-agent:"+tag)
+	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", repo+":"+tag)
 	if err != nil {
 		return err
 	}
@@ -66,7 +89,18 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(image) {
 		return errors.New("invalid pinned process image")
 	}
-	args := []string{"create", "--name", processContainer(o), "--label", "sumi.operation_id=" + o.OperationID, "--label", "sumi.personality_agent_id=" + o.PersonalityAgentID, "--read-only", "--network", "none", "--user", "10002:10002", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--cpus", "1", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=33554432", "--workdir", path.Join("/workspace", o.Cwd), "--mount", "type=volume,src=" + volume + ",dst=/workspace,volume-nocopy", "--env", "PATH=/usr/local/bin:/usr/bin:/bin", "--env", "HOME=/workspace", "--env", "LANG=C.UTF-8", "--log-driver", "json-file", "--log-opt", "max-size=16m", "--log-opt", "max-file=1", "--entrypoint", "/bin/bash", image, "-c", `printf '%s\n' "$1"; shift; exec "$@"`, "sumi-process", processMarker(o), "/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "--", strconv.Itoa(o.TimeoutSeconds), o.Executable}
+	args := []string{"create", "--name", processContainer(o)}
+	args = append(args, labels...)
+	args = append(args, "--read-only", "--network", "none", "--user", "10002:10002", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--cpus", "1", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=33554432", "--workdir", path.Join("/workspace", o.Cwd), "--mount", mount, "--env", "PATH=/usr/local/bin:/usr/bin:/bin", "--env", "HOME=/workspace", "--env", "LANG=C.UTF-8")
+	envKeys := make([]string, 0, len(o.Env))
+	for k := range o.Env {
+		envKeys = append(envKeys, k)
+	}
+	sort.Strings(envKeys)
+	for _, k := range envKeys {
+		args = append(args, "--env", k+"="+o.Env[k])
+	}
+	args = append(args, "--log-driver", "json-file", "--log-opt", "max-size=16m", "--log-opt", "max-file=1", "--entrypoint", "/bin/bash", image, "-c", `printf '%s\n' "$1"; shift; exec "$@"`, "sumi-process", processMarker(o), "/usr/bin/timeout", "--signal=TERM", "--kill-after=2", "--", strconv.Itoa(o.TimeoutSeconds), o.Executable)
 	args = append(args, o.Args...)
 	if _, err = b.processDocker(ctx, args...); err != nil {
 		return err

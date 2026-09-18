@@ -89,7 +89,7 @@ func TestProcessDurableReceiptAndNoReplay(t *testing.T) {
 	if err != nil || len(pending) != 0 {
 		t.Fatal(pending, err)
 	}
-	output, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{op.PersonalityAgentID, op.OperationID}, Stream: "stdout"})
+	output, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID}, Stream: "stdout"})
 	if err != nil || output.Content != "done\n" || !output.EOF {
 		t.Fatal(output, err)
 	}
@@ -106,7 +106,7 @@ func TestProcessMissingContainerNeverReexecutes(t *testing.T) {
 	b.observation = ProcessObservation{}
 	s.observeProcesses(ctx)
 	s.observeProcesses(ctx)
-	got, err := s.ProcessStatus(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+	got, err := s.ProcessStatus(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 	if err != nil || got.State != ProcessIndeterminate || b.launches != 1 {
 		t.Fatal(got, err, b.launches)
 	}
@@ -119,12 +119,12 @@ func TestProcessCancelBeforeLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.CancelProcess(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+	_, err = s.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.observeProcesses(ctx)
-	got, _ := s.ProcessStatus(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+	got, _ := s.ProcessStatus(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 	if got.State != ProcessCancelled || b.launches != 0 {
 		t.Fatal(got, b.launches)
 	}
@@ -156,7 +156,7 @@ func TestProcessOutputBeyondEOFDoesNotRewind(t *testing.T) {
 	b.observation.Running = false
 	b.observation.Stdout = []byte("abc")
 	s.observeProcesses(ctx)
-	output, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{op.PersonalityAgentID, op.OperationID}, Stream: "stdout", Offset: 100})
+	output, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID}, Stream: "stdout", Offset: 100})
 	if err != nil || output.NextOffset != 100 || output.Content != "" || !output.EOF {
 		t.Fatal(output, err)
 	}
@@ -192,7 +192,7 @@ func TestProcessBlockedInspectionDoesNotBlockOtherOperations(t *testing.T) {
 	go func() {
 		_, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "other", Executable: "true"})
 		if err == nil {
-			_, err = s.CancelProcess(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+			_, err = s.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 		}
 		completed <- err
 	}()
@@ -207,7 +207,7 @@ func TestProcessBlockedInspectionDoesNotBlockOtherOperations(t *testing.T) {
 	}
 	close(b.release)
 	<-done
-	op, err = s.ProcessStatus(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+	op, err = s.ProcessStatus(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,12 +232,12 @@ func TestProcessFailedCancelPersistenceDoesNotCancel(t *testing.T) {
 	}
 	originalDirectory := s.processes.directory
 	s.processes.directory = originalDirectory + "/missing"
-	if _, err = s.CancelProcess(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID}); err == nil {
+	if _, err = s.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID}); err == nil {
 		t.Fatal("expected persistence failure")
 	}
 	s.processes.directory = originalDirectory
 	s.observeProcesses(ctx)
-	got, _ := s.ProcessStatus(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+	got, _ := s.ProcessStatus(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 	if got.State != ProcessRunning || b.launches != 1 {
 		t.Fatal(got, b.launches)
 	}
@@ -289,7 +289,7 @@ func TestProcessPendingCompletionBatchIsFair(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = s.CancelProcess(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+		_, err = s.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -331,7 +331,7 @@ func TestProcessSmallUTF8PagesAdvanceWithoutCorruption(t *testing.T) {
 	result := ""
 	offset := int64(0)
 	for i := 0; i < 3; i++ {
-		page, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{op.PersonalityAgentID, op.OperationID}, Stream: "stdout", Offset: offset, Limit: 4})
+		page, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID}, Stream: "stdout", Offset: offset, Limit: 4})
 		if err != nil || page.NextOffset <= offset {
 			t.Fatal(page, err)
 		}
@@ -352,7 +352,7 @@ func TestProcessEscapedCompletionBatchFitsProtocol(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = s.CancelProcess(ctx, ProcessLookupRequest{op.PersonalityAgentID, op.OperationID})
+		_, err = s.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -445,7 +445,7 @@ func TestProcessTerminalOutputIsLazyAndSurvivesMetadataRewrites(t *testing.T) {
 	assertUnloaded()
 	for _, op := range operations {
 		for stream, want := range map[string]string{"stdout": "oooo", "stderr": "eeee"} {
-			page, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{op.PersonalityAgentID, op.OperationID}, Stream: stream, Offset: processOutputLimit - 4, Limit: 4})
+			page, err := s.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{PersonalityAgentID: op.PersonalityAgentID, OperationID: op.OperationID}, Stream: stream, Offset: processOutputLimit - 4, Limit: 4})
 			if err != nil || page.Content != want || !page.EOF || page.NextOffset != processOutputLimit {
 				t.Fatal(page, err)
 			}

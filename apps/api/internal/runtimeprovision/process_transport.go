@@ -61,6 +61,8 @@ func (h *Handler) serveProcess(w http.ResponseWriter, r *http.Request) bool {
 			status, code = 409, "process_busy"
 		case errors.Is(err, ErrConflict):
 			status, code = 409, "conflict"
+		case errors.Is(err, ErrProcessWorkspace):
+			status, code = 502, "workspace_unavailable"
 		}
 		writeError(w, status, code, err.Error())
 	} else {
