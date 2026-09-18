@@ -59,6 +59,16 @@
  *      could not be reported stays in the durable journal — claims
  *      expire to 'lost' and the next supervisor's startup reconcile
  *      attaches the honest indeterminate outcome, idempotently.
+ *
+ *      The shutdown PROMISE owns process completion — never the
+ *      start() await: discovery/startup-recovery/periodic-recovery
+ *      can be blocked inside a held HTTP response and start() would
+ *      not return for it. When shutdown resolves the process exits
+ *      even though start() is still pending; its settled/rejected
+ *      result is already handled, so nothing surfaces as an
+ *      unhandled rejection. A watchdog at grace+settle+2s is the
+ *      hard backstop — if shutdown() itself ever regresses past the
+ *      bound, owned children are killed and the process exits 2.
  *   5. Second signal = emergency: synchronous kill of every owned
  *      child, then immediate exit(2).
  *   6. A fatal start() error after children launched runs the same
@@ -76,6 +86,20 @@ try {
   process.exit(1);
 }
 
+// start()'s settle/reject is ALWAYS handled here — including when the
+// process exits on the shutdown path while start() is still pending,
+// so an abandoned startup/discovery/recovery await can never surface
+// as an unhandled rejection.
+const startResult = sup.start().then(
+  () => 0,
+  async (e) => {
+    console.error(`[scripts] fatal: ${e instanceof Error ? e.message : e}`);
+    // Children may already be launched — bound them before exiting.
+    try { await sup.shutdown(5_000); } catch { /* best effort */ }
+    return 1;
+  },
+);
+
 let stopping = false;
 const onSignal = (sig) => {
   if (stopping) {
@@ -88,21 +112,32 @@ const onSignal = (sig) => {
   }
   stopping = true;
   console.log(`[scripts] ${sig} — bounded shutdown: stop claims, cancel in-flight, drain, local-kill deadline`);
-  void sup.shutdown();
+  // The SHUTDOWN promise — not start() — owns process completion from
+  // here. start() may still be blocked inside a held HTTP request
+  // (shared discovery, the startup reconcile, periodic recovery) and
+  // will not return for it; the process must not wait on that. The
+  // watchdog is the hard backstop: if shutdown() itself ever regresses
+  // past its documented bound (grace + settle + kill pass), the
+  // process still cannot outlive the contract.
+  const bound = (sup.cfg.shutdownGraceMs ?? 20_000) + (sup.cfg.shutdownSettleMs ?? 3_000) + 2_000;
+  const watchdog = setTimeout(() => {
+    console.error(`[scripts] shutdown exceeded its bound — killing owned children, forcing exit`);
+    try { sup.runner.killAllOwned(); } catch { /* best effort */ }
+    process.exit(2);
+  }, bound);
+  watchdog.unref();
+  void sup.shutdown().then(
+    () => { clearTimeout(watchdog); process.exit(0); },
+    () => { clearTimeout(watchdog); process.exit(1); },
+  );
 };
 process.on("SIGTERM", () => onSignal("SIGTERM"));
 process.on("SIGINT", () => onSignal("SIGINT"));
 
-try {
-  await sup.start();
-  // start() returned — the stop flag was set by a shutdown in flight.
-  // Wait out its bounded work, then exit explicitly: leftover request/
-  // timer handles must never linger past the contract.
-  await sup.shutdown();
-  process.exit(0);
-} catch (e) {
-  console.error(`[scripts] fatal: ${e instanceof Error ? e.message : e}`);
-  // Children may already be launched — bound them before exiting.
-  try { await sup.shutdown(5_000); } catch { /* best effort */ }
-  process.exit(1);
-}
+// Normal completion: start() returns only once the stop flag is set
+// (i.e. a shutdown is already in flight) — wait out its bounded work,
+// then exit explicitly. Leftover request/timer handles must never
+// linger past the contract.
+const code = await startResult;
+await sup.shutdown();
+process.exit(code);

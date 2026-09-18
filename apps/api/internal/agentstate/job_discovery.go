@@ -91,6 +91,77 @@ func (s *Store) PersonasWithClaimedJobs(ctx context.Context, runnerID string, ki
 	return out, rows.Err()
 }
 
+// SweepExpiredJobs applies the claim-expiry verdict WITHOUT taking any
+// reservation — the same 'lost' transition ClaimJobs performs before
+// claiming, but callable on its own. The claim pass is otherwise the
+// only trigger: a persona that queues no further work never invokes it,
+// so an orphaned claim (supervisor crash between claim and journal,
+// a wiped runner workdir, a replaced runner identity) would sit
+// 'running' forever on a quiet persona. A consumer's periodic recovery
+// calls this so expiry resolves honestly without depending on new user
+// work.
+//
+// Bounded: at most `limit` rows per call, oldest expiry first — callers
+// repeat while a full page comes back. The verdict is indeterminate by
+// construction (an expired claim may still be executing orphaned) and
+// never re-queues work. Kind-filtered like the rest of the seam: a
+// backend sweeps only its own kinds. Ownership is untouched — the row
+// keeps claimed_by so the surviving claimant can attach its observed
+// outcome under the immutable verdict; nothing impersonates a dead
+// runner.
+func (s *Store) SweepExpiredJobs(ctx context.Context, kinds []string, limit int) ([]Job, error) {
+	if len(kinds) == 0 {
+		return nil, fmt.Errorf("%w: kinds required", ErrBadRequest)
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 64
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		UPDATE core_jobs SET status = 'lost', finished_at = now(),
+			error = 'runner claim expired; outcome is indeterminate',
+			result = COALESCE(result, '{}'::jsonb) || '{"reason":"claim_expired"}'::jsonb
+		WHERE (persona_id, job_id) IN (
+			SELECT j.persona_id, j.job_id FROM core_jobs j
+			WHERE j.status IN ('running','cancel_requested')
+				AND j.kind = ANY($1::text[])
+				AND j.claim_expires_at < now()
+			ORDER BY j.claim_expires_at, j.persona_id, j.job_id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		RETURNING `+jobCols, kinds, limit)
+	if err != nil {
+		return nil, err
+	}
+	swept := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		swept = append(swept, j)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range swept {
+		if err := s.notifyJobTerminalTx(ctx, tx, &swept[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return swept, nil
+}
+
 // Job-level discovery — the seam the reconcile loop actually drives on.
 // Persona-level pages cannot express "this runner's unresolved work": a
 // per-persona ListJobs(statuses, N) window is newest-first and unfiltered,

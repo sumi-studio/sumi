@@ -29,7 +29,7 @@
 import { test, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, statSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
@@ -40,7 +40,9 @@ import { defaultDispatcherPath, Runner } from "../src/runner.ts";
 import { Reconciler } from "../src/reconcile.ts";
 import { Journal } from "../src/journal.ts";
 import { Supervisor, stableRunnerID } from "../src/main.ts";
-import { childrenOf } from "../src/proc.ts";
+import { childrenOf, bootID, startTicks } from "../src/proc.ts";
+import { writeConfig } from "../src/workerd/config.ts";
+import { ensurePrivateDir, writePrivateFile } from "../src/privatefs.ts";
 import { StubFileSvc } from "./filesvc_stub.mts";
 
 const req = (k: string): string => {
@@ -179,8 +181,10 @@ async function jobRow(personaID: string, jobID: string): Promise<Record<string, 
  *   "down" — answer 502 without forwarding (API unreachable).
  *   "drop" — forward and let the upstream write COMMIT, then answer 502
  *            (the lost reply: producer has the effect, client saw failure).
+ *   "hold" — never answer: the request stays open until the client's own
+ *            timeout or the process exits (stalled-API reproduction).
  */
-type GateAction = "pass" | "down" | "drop";
+type GateAction = "pass" | "down" | "drop" | "hold";
 class Gate {
   url = "";
   rule: (method: string, path: string) => GateAction = () => "pass";
@@ -200,6 +204,7 @@ class Gate {
       const method = req.method ?? "GET";
       try { this.onRequest?.(method, path); } catch { /* observer only */ }
       const action = this.rule(method, path);
+      if (action === "hold") return; // never answered — the socket just stays open
       if (action === "down") {
         res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "gate: down" }));
@@ -1057,21 +1062,24 @@ test("reconcile reaps an exec'd orphan via its surviving process group — the l
   // Construct the exact j-pp leak shape: a detached group whose LEADER
   // dies while a member keeps running — the member reparents to init,
   // invisible to every descendant walk, but still carries pgrp == the
-  // dead leader's pid. A sleep binary named "workerd" stands in for the
-  // payload; only its comm matters to the reaper.
-  const fakeWorkerd = join(wd, "workerd");
-  writeFileSync(fakeWorkerd, readFileSync("/bin/sleep"), { mode: 0o755 });
-  const leader = spawn("/bin/sh", ["-c", `${fakeWorkerd} 60 & exec /bin/sleep 60`], { detached: true });
+  // dead leader's pid. The member's argv carries the job's unique
+  // config path exactly like the real launch (runlimited and workerd
+  // both get it on the command line) — the reaper's ownership proof.
+  const markerArg = join(wd, "tmp", "run-j-grp", "config.capnp");
+  const leader = spawn("/bin/sh", ["-c", `yes ${markerArg} > /dev/null & exec /bin/sleep 60`], { detached: true });
   await waitFor(() => childrenOf(leader.pid!).length > 0, 5_000, "payload forked in the group");
   const member = childrenOf(leader.pid!)[0]!;
+  const leaderTicks = startTicks(leader.pid!);
+  assert.ok(leaderTicks != null && leaderTicks > 0, "leader identity captured");
   leader.kill("SIGKILL");
   await waitFor(() => notRunning(leader.pid!), 5_000, "group leader dead");
   assert.ok(!notRunning(member), "the orphaned payload is still running — the leak to reap");
-  // Seed the journal exactly as a pre-ready crash left it: the recorded
-  // pid is the wrapper/leader — the workerd resolution never persisted.
+  // Seed the journal exactly as a pre-ready crash leaves it now: the
+  // recorded pid is the wrapper/leader (pgid), boot + leader ticks are
+  // the persisted identity — the workerd resolution never persisted.
   const j = runner.journal.create({
     job_id: "j-grp", persona_id: p.id, runner_id: RUNNER_ID,
-    pid: leader.pid!, start_ticks: null, boot_id: null, unit_name: null,
+    pid: leader.pid!, start_ticks: leaderTicks, boot_id: bootID(), unit_name: null,
     socket_path: null, stats_path: null, cgroup_mode: "prlimit",
     limits: {}, spec: { code_sha256: "x" }, usage_fact_id: `script:j-grp:exec`,
   });
@@ -1082,4 +1090,258 @@ test("reconcile reaps an exec'd orphan via its surviving process group — the l
   // group was the only reach that could touch it.
   await waitFor(() => notRunning(member), 5_000, "orphaned group member reaped via pgid");
   assert.equal(workerdPids().length, 0, "no workerd survives anywhere");
+});
+
+// ---------------------------------------------------------------- F397
+
+/** A live detached group: leader (sh->sleep) + one member whose argv is
+ *  controlled. Returns handles to verify kill/no-kill. */
+function spawnForeignGroup(memberArgv: string): { leaderPid: number; memberPid: Promise<number> } {
+  const leader = spawn("/bin/sh", ["-c", `${memberArgv} & exec /bin/sleep 60`], { detached: true });
+  const memberPid = (async () => {
+    await waitFor(() => childrenOf(leader.pid!).length > 0, 5_000, "member forked");
+    return childrenOf(leader.pid!)[0]!;
+  })();
+  return { leaderPid: leader.pid!, memberPid };
+}
+
+function killOrphanGroupOf(rec: Reconciler, j: Record<string, unknown>): boolean {
+  const m = (rec as unknown as { killOrphanGroup: (jj: never) => boolean }).killOrphanGroup;
+  return m.call(rec, j as never);
+}
+
+test("killOrphanGroup refuses a foreign same-name group: wrong boot, wrong ticks, no launch marker (F397)", { timeout: 30_000 }, async () => {
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-f397-"));
+  const rec = newReconciler(wd);
+  const journal = (over: Record<string, unknown>) => ({
+    job_id: "j-x", persona_id: "p", runner_id: RUNNER_ID,
+    pid: null, start_ticks: null, boot_id: null, unit_name: null,
+    socket_path: null, stats_path: null, cgroup_mode: "prlimit",
+    limits: {}, spec: {}, usage_fact_id: "u", notes: [], ...over,
+  });
+
+  // A FOREIGN live group whose member is literally named "workerd" —
+  // root's reproduction: a name match must never establish ownership.
+  const fakeWorkerd = join(wd, "workerd");
+  writeFileSync(fakeWorkerd, readFileSync("/bin/sleep"), { mode: 0o755 });
+  const foreign = spawnForeignGroup(`${fakeWorkerd} 60`);
+  const foreignMember = await foreign.memberPid;
+  try {
+    // Case 1 — root's exact probe shape: different boot + nonsense ticks.
+    assert.equal(killOrphanGroupOf(rec, journal({
+      pid: foreign.leaderPid, boot_id: "definitely-a-different-boot", start_ticks: -1, status: "spawned",
+    })), false, "different boot id: no kill");
+    // Case 2 — correct boot but leader-slot identity is a lie (recycled pid:
+    // the live leader at j.pid is not the recorded one).
+    assert.equal(killOrphanGroupOf(rec, journal({
+      pid: foreign.leaderPid, boot_id: bootID(), start_ticks: startTicks(foreign.leaderPid)! + 999_999, status: "spawned",
+    })), false, "live leader with mismatched ticks: no kill");
+    // Case 3 — the leader is dead but no member carries this job's launch
+    // path: a foreign same-name group is not ours even on the right boot.
+    process.kill(foreign.leaderPid, "SIGKILL");
+    await waitFor(() => notRunning(foreign.leaderPid), 5_000, "foreign leader dead");
+    assert.ok(!notRunning(foreignMember), "foreign member still running");
+    assert.equal(killOrphanGroupOf(rec, journal({
+      pid: foreign.leaderPid, boot_id: bootID(), start_ticks: null, status: "spawned",
+    })), false, "no argv launch marker: no kill");
+    assert.ok(!notRunning(foreignMember), "foreign member SURVIVES every refused case");
+  } finally {
+    try { process.kill(-foreign.leaderPid, "SIGKILL"); } catch { /* gone */ }
+  }
+});
+
+test("killOrphanGroup positive: marker-bearing member + consistent identity reaps the owned group (F397)", { timeout: 30_000 }, async () => {
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-f397ok-"));
+  const rec = newReconciler(wd);
+  const markerArg = join(wd, "tmp", "run-j-own", "config.capnp");
+  const own = spawnForeignGroup(`yes ${markerArg} > /dev/null`);
+  const member = await own.memberPid;
+  const leaderTicks = startTicks(own.leaderPid)!;
+  process.kill(own.leaderPid, "SIGKILL");
+  await waitFor(() => notRunning(own.leaderPid), 5_000, "leader dead");
+  try {
+    assert.equal(killOrphanGroupOf(rec, {
+      job_id: "j-own", persona_id: "p", runner_id: RUNNER_ID,
+      pid: own.leaderPid, start_ticks: leaderTicks, boot_id: bootID(), unit_name: null,
+      socket_path: null, stats_path: null, cgroup_mode: "prlimit",
+      limits: {}, spec: {}, usage_fact_id: "u", notes: [], status: "spawned",
+    } as never), true, "verified ownership kills the group");
+    await waitFor(() => notRunning(member), 5_000, "owned orphan dead");
+  } finally {
+    try { process.kill(-own.leaderPid, "SIGKILL"); } catch { /* gone */ }
+  }
+});
+
+// ---------------------------------------------------------------- F392
+
+test("runner state is private from creation: hostile umask, pre-existing permissive paths, symlink refusal (F392)", { timeout: 30_000 }, async () => {
+  const mode = (p: string) => statSync(p).mode & 0o777;
+  const prevUmask = process.umask(0o000); // worst case: everything would be 777/666
+  try {
+    const wd = mkdtempSync(join(tmpdir(), "sumi-rec-perm-"));
+    // Fresh dirs are 0700 and files 0600 AT CREATION under umask 000.
+    const j = new Journal(wd);
+    for (const d of [wd, join(wd, "jobs"), join(wd, "sock"), join(wd, "tmp")]) {
+      assert.equal(mode(d), 0o700, `${d} private from creation`);
+    }
+    j.create({
+      job_id: "j-perm", persona_id: "p", runner_id: RUNNER_ID,
+      pid: null, start_ticks: null, boot_id: null, unit_name: null,
+      socket_path: "", stats_path: "", cgroup_mode: "prlimit",
+      limits: {}, spec: { code_sha256: "x" }, usage_fact_id: "u",
+    });
+    assert.equal(mode(j.path("j-perm")), 0o600, "journal file 0600 under hostile umask");
+
+    // The credential file: 0600 at creation — no readable instant.
+    const jobDir = join(wd, "tmp", "run-j-perm");
+    ensurePrivateDir(jobDir);
+    writeConfig(jobDir, {
+      socketPath: join(wd, "sock", "j-perm.sock"), dispatcherPath: defaultDispatcherPath(),
+      api: "http://127.0.0.1:1", token: "runtime-token", personaID: "p",
+      jobID: "j-perm", runnerID: RUNNER_ID,
+      limits: { cpu_ms: 1, file_calls: 0, file_bytes: 0, log_bytes: 0 },
+    });
+    assert.equal(mode(join(jobDir, "config.capnp")), 0o600, "config.capnp 0600 under hostile umask");
+
+    // Pre-existing PERMISSIVE owned paths are tightened (dir before use,
+    // file before the credential lands in it).
+    const wd2 = mkdtempSync(join(tmpdir(), "sumi-rec-perm2-"));
+    chmodSync(wd2, 0o777);
+    new Journal(wd2);
+    assert.equal(mode(wd2), 0o700, "pre-existing permissive run dir tightened");
+    chmodSync(join(jobDir, "config.capnp"), 0o664);
+    writePrivateFile(join(jobDir, "config.capnp"), "secret");
+    assert.equal(mode(join(jobDir, "config.capnp")), 0o600, "pre-existing permissive file tightened before write");
+
+    // A symlinked 'directory' is refused — never followed, never chmod'd.
+    const victim = mkdtempSync(join(tmpdir(), "sumi-rec-victim-"));
+    const link = join(tmpdir(), `sumi-rec-link-${process.pid}`);
+    symlinkSync(victim, link);
+    assert.throws(() => ensurePrivateDir(link), /not a directory/);
+    rmSync(link, { force: true });
+  } finally {
+    process.umask(prevUmask);
+  }
+});
+
+// ---------------------------------------------------------------- F393
+
+test("quiet persona: an expired claim reaches 'lost' via the production recovery pass — no new work queued (F393)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("quiet");
+  // The crash window: a real claim exists but no journal was ever written.
+  await submitJob(p.id, "j-quiet", { code: 'export async function run(){ return 1 }' });
+  await client.claimJobs(p.id, RUNNER_ID, 400, 1);
+  assert.equal((await jobRow(p.id, "j-quiet")).status, "running");
+  // An OLD runner identity's expired claim on another persona: the new
+  // consumer cannot see it in its attention (claimed_by differs) — the
+  // producer-side sweep must still resolve it.
+  const p2 = await makePersona("quiet-old-runner");
+  await submitJob(p2.id, "j-old", { code: 'export async function run(){ return 1 }' });
+  await adminCall("POST", `/internal/core/personas/${p2.id}/jobs/claim`, {
+    runner_id: "dead-runner-identity", kinds: ["script"], lease_ms: 400, limit: 1,
+  });
+  assert.equal((await jobRow(p2.id, "j-old")).claimed_by, "dead-runner-identity");
+  // A cancel_requested row and a healthy claim, same expiry mechanics.
+  await submitJob(p.id, "j-cx", { code: 'export async function run(){ return 1 }' });
+  await client.claimJobs(p.id, RUNNER_ID, 400, 1);
+  await adminCall("POST", `/internal/core/personas/${p.id}/jobs/j-cx/cancel`);
+  assert.equal((await jobRow(p.id, "j-cx")).status, "cancel_requested");
+  await submitJob(p.id, "j-ok", { code: 'export async function run(){ return 1 }' });
+  await client.claimJobs(p.id, RUNNER_ID, 600_000, 1);
+  // NO further jobs are queued for these personas — the old code would
+  // leave j-quiet/j-old 'running' forever.
+  await new Promise((r) => setTimeout(r, 800));
+
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-quiet-"));
+  const lines: string[] = [];
+  const rec = new Reconciler({
+    client: new StateClient({ api: REAL_API, token: RUNTIME }),
+    journal: new Journal(wd), runnerID: RUNNER_ID,
+    log: (l) => lines.push(l),
+  });
+  const stats = await rec.runRecovery(new Set()); // the PRODUCTION trigger
+  assert.ok(stats.swept >= 2,
+    `recovery swept expired claims (got ${stats.swept}); reconcile: ${lines.join(" | ")}`);
+
+  const q = await jobRow(p.id, "j-quiet");
+  assert.equal(q.status, "lost", "orphaned claim reached the honest verdict without new work");
+  assert.equal((q.result as Record<string, unknown>).reason, "claim_expired");
+  assert.equal((await jobRow(p2.id, "j-old")).status, "lost",
+    "old runner identity's claim swept too — global by kind, not impersonated");
+  assert.equal((await jobRow(p.id, "j-cx")).status, "lost", "expired cancel_requested also resolves");
+  assert.equal((await jobRow(p.id, "j-ok")).status, "running", "healthy nonexpired claim untouched");
+
+  // Same pass's attention walk then settles OUR honest no-evidence record.
+  await waitFor(async () => {
+    const row = await jobRow(p.id, "j-quiet");
+    return Boolean((row.result as Record<string, unknown>)?.observed_outcome);
+  }, 15_000, "no-evidence outcome attached under the lost verdict");
+  const outcome = (await jobRow(p.id, "j-quiet")).result as Record<string, unknown>;
+  assert.equal(((outcome.observed_outcome as Record<string, unknown>).result as Record<string, unknown>).reason,
+    "runner_restart_no_journal");
+  // The old-runner row keeps its verdict but is NEVER attached by us —
+  // evidence belongs to the recorded claimant only.
+  const old = await jobRow(p2.id, "j-old");
+  assert.equal((old.result as Record<string, unknown>)?.observed_outcome, undefined,
+    "not the recorded claimant — no outcome attach, verdict stands alone");
+});
+
+test("sweep drains a backlog beyond one page in a single recovery pass (F393)", { timeout: 120_000 }, async () => {
+  const p = await makePersona("sweep-backlog");
+  const ids: string[] = [];
+  for (let i = 0; i < 70; i++) { // > the 64-row sweep page
+    const id = `j-bl${i}`;
+    ids.push(id);
+    await submitJob(p.id, id, { code: 'export async function run(){ return 1 }' });
+  }
+  // Claim them all under this runner with a tiny lease (real route,
+  // limit 32 per call) — nothing is journaled: the crash window at scale.
+  for (let c = 0; c < 3; c++) await client.claimJobs(p.id, RUNNER_ID, 400, 32);
+  await new Promise((r) => setTimeout(r, 800));
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-bl-"));
+  const stats = await newReconciler(wd).runRecovery(new Set());
+  assert.ok(stats.swept >= ids.length, `one pass swept ${stats.swept} >= ${ids.length} expired claims`);
+  for (const id of ids) {
+    assert.equal((await jobRow(p.id, id)).status, "lost", `${id} resolved`);
+  }
+});
+
+// ---------------------------------------------------------------- F391
+
+test("entrypoint: SIGTERM while shared discovery is held open — the process still exits inside the bound (F391)", { timeout: 60_000 }, async () => {
+  const gate = new Gate();
+  // The runnable route never answers — root's reproduction: start()
+  // awaits it forever and the process used to live until the client-side
+  // 15s timeout, far past the configured shutdown bound.
+  gate.rule = (_m, path) => (path.includes("/jobs/runnable") ? "hold" : "pass");
+  await gate.start();
+  const wd = mkdtempSync(join(tmpdir(), "sumi-entry-hold-"));
+  const runBin = new URL("../run.mjs", import.meta.url).pathname;
+  const proc = spawn(process.execPath, [runBin], {
+    env: {
+      ...process.env,
+      SUMI_STATE_API: gate.url, SUMI_STATE_TOKEN: RUNTIME,
+      SUMI_WORKERD_BIN: WORKERD_BIN, SUMI_RUNLIMITED_BIN: RUNLIMITED_BIN,
+      SUMI_CGROUP_MODE: "prlimit", SUMI_WORK_DIR: wd, SUMI_RUNNER_ID: RUNNER_ID,
+      SUMI_POLL_MS: "200", SUMI_SHUTDOWN_GRACE_MS: "100", SUMI_SHUTDOWN_SETTLE_MS: "0",
+    },
+  });
+  const out: string[] = [];
+  proc.stdout?.on("data", (d) => out.push(String(d)));
+  proc.stderr?.on("data", (d) => out.push(String(d)));
+  try {
+    // The child is blocked inside discovery (startup reconcile runs first,
+    // then the discovery poll — whichever, the held response gates both).
+    await new Promise((r) => setTimeout(r, 1_500));
+    const t0 = Date.now();
+    proc.kill("SIGTERM");
+    const code = await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? -1)));
+    const elapsed = Date.now() - t0;
+    assert.equal(code, 0, `exit 0 on bounded shutdown; logs: ${out.join("")}`);
+    assert.ok(elapsed < 5_000,
+      `process exited ${elapsed}ms after SIGTERM while the discovery response was STILL held — the stop promise governs, not start()`);
+  } finally {
+    proc.kill("SIGKILL");
+    gate.close();
+  }
 });

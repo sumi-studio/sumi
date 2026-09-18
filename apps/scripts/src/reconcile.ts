@@ -15,7 +15,15 @@
  *    kill what it cannot prove is orphaned, so such rows are left to
  *    the claim-expiry sweep and the lost-outcome attach.
  *
- * Both passes then deliver what is durably owed, each obligation
+ * Both passes then run the lease-expiry sweep (sweepPass): the
+ * producer's bounded, reservation-free operation that turns expired
+ * running/cancel_requested claims into the honest immutable 'lost'
+ * verdict. Without it the expiry verdict only fires inside a claim
+ * pass — which a quiet persona never triggers — so an orphaned claim
+ * could sit 'running' forever. It is kind-fenced, takes no work, and
+ * leaves ownership on the recorded claimant.
+ *
+ * Each pass then delivers what is durably owed, each obligation
  * independently retryable until resolved or permanently refused:
  *
  *  - result delivery: 'exited' journals re-report the stored outcome —
@@ -41,7 +49,7 @@
 
 import { StateClient, type JobRow } from "./api.ts";
 import { Journal, type JobJournal } from "./journal.ts";
-import { verifyIdentity, killVerified, findDescendant, startTicks, groupHasComm } from "./proc.ts";
+import { verifyIdentity, killVerified, findDescendant, startTicks, bootID, groupMembers, cmdlineOf } from "./proc.ts";
 
 export interface ReconcileConfig {
   client: StateClient;
@@ -58,6 +66,7 @@ export interface PassStats {
   reaped: number;
   reported: number;
   failed: number;
+  swept: number;
   attention: { seen: number; resolved: number; pending: number; failed: number };
 }
 
@@ -105,8 +114,40 @@ export class Reconciler {
         this.log(`job ${j.job_id}: ${e}`);
       }
     }
+    const swept = await this.sweepPass();
     const attention = await this.attentionPass(active, reapOrphans);
-    return { reaped, reported, failed, attention };
+    return { reaped, reported, failed, swept, attention };
+  }
+
+  /**
+   * Lease-expiry sweep — a PRODUCTION recovery trigger, not test
+   * plumbing. The claim pass is otherwise the only caller of the
+   * expiry verdict, and it only runs for personas with new queued
+   * work: a crash between claim and journal (or a wiped workdir, or
+   * a replaced runner identity) on a quiet persona would leave the
+   * row 'running' forever. This invokes the producer's bounded
+   * sweep-only operation — it never takes a reservation (ClaimJobs
+   * clamps limit >= 1 and would claim work we can't execute), never
+   * impersonates a runner (ownership stays claimed_by; the recorded
+   * claimant alone can attach its outcome), and is kind-fenced to
+   * this backend. Drains full pages within the pass, bounded.
+   */
+  private async sweepPass(): Promise<number> {
+    const PAGE = 64, MAX_PAGES = 8;
+    let swept = 0;
+    for (let p = 0; p < MAX_PAGES; p++) {
+      let res;
+      try {
+        res = await this.cfg.client.sweepExpiredJobs(["script"], PAGE);
+      } catch (e) {
+        this.log(`sweep: ${e}`);
+        break;
+      }
+      swept += res.swept;
+      if (res.swept < PAGE) break;
+    }
+    if (swept > 0) this.log(`sweep: ${swept} expired claim(s) -> lost`);
+    return swept;
   }
 
   /**
@@ -308,7 +349,8 @@ export class Reconciler {
         // the fork→exec window — invisible to the descendant walk. The
         // detached spawn's group survives the leader, so the exec'd
         // orphan (reparented to init) is still reachable by pgid —
-        // for a pre-ready journal pgid == spawned pid == j.pid.
+        // for a pre-ready journal pgid == spawned pid == j.pid. The
+        // group kill verifies ownership (boot/ticks/fork-order) first.
         if (!payloadKilled) this.killOrphanGroup(j);
         this.cfg.journal.update(j, { status: "reaped" });
         j.status = "reaped";
@@ -392,20 +434,45 @@ export class Reconciler {
     }
   }
 
-  /** SIGKILL the orphan's surviving process group — but only when a
-   *  live member still answers to "workerd". For a detached spawn,
-   *  pgid == the spawned (wrapper) pid recorded on a pre-ready journal,
-   *  and the group outlives its leader: an exec'd payload reparented
-   *  to init is unreachable by any descendant walk yet still carries
-   *  pgrp == j.pid. The comm check is the recycled-pgid guard: a pgid
-   *  reassigned after total group death would not contain a workerd.
-   *  For a 'running' journal j.pid IS the workerd (not a pgid) — the
-   *  pgrp match finds nothing and this is a no-op. */
+  /**
+   * SIGKILL the orphan's surviving process group — only with verifiable
+   * ownership. A process NAME proves nothing: a journal survives
+   * arbitrary downtime, a pgid can be recycled, and any unrelated job
+   * can run a process also named "workerd" (F397).
+   *
+   * The ownership proof is the launch path in argv: every process of a
+   * job's group — runlimited pre-exec, workerd post-exec, and systemd's
+   * wrapper — carries this job's unique `run-<job_id>/config.capnp` on
+   * its command line. A foreign process group cannot contain that path.
+   *
+   * Consistency guards around it:
+   *  - the journal must record this boot's id — processes from a prior
+   *    boot cannot be alive, so a live group would be a recycled pgid;
+   *  - with recorded leader ticks: a live process at the leader slot
+   *    j.pid must BE that leader (a different one means the pid was
+   *    recycled and the group is foreign), and no member may predate
+   *    the recorded leader (members are forked by it, never before it).
+   *
+   * Anything unverifiable returns false — an honest no-evidence skip,
+   * never a best-guess signal.
+   */
   private killOrphanGroup(j: JobJournal): boolean {
-    if (j.pid == null || !groupHasComm(j.pid, "workerd")) return false;
+    if (j.pid == null) return false;
+    if (j.boot_id == null || j.boot_id !== bootID()) return false;
+    const members = groupMembers(j.pid);
+    if (members.length === 0) return false;
+    if (j.start_ticks != null && j.start_ticks > 0) {
+      const leaderTicks = startTicks(j.pid);
+      if (leaderTicks != null && leaderTicks !== j.start_ticks) return false;
+      for (const m of members) {
+        if (m.startTicks == null || m.startTicks < j.start_ticks) return false;
+      }
+    }
+    const marker = `run-${j.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}/config.capnp`;
+    if (!members.some((m) => cmdlineOf(m.pid).includes(marker))) return false;
     try {
       process.kill(-j.pid, "SIGKILL");
-      this.log(`job ${j.job_id}: killed orphaned process group pgid=${j.pid}`);
+      this.log(`job ${j.job_id}: killed orphaned process group pgid=${j.pid} (${members.length} member(s), ownership proved via launch path)`);
       return true;
     } catch {
       return false;

@@ -10,6 +10,7 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, existsSync, unlinkSync, readdirSync } from "node:fs";
+import { ensurePrivateDir } from "./privatefs.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as http from "node:http";
@@ -71,7 +72,10 @@ export class Runner {
     this.client = new StateClient({ api: cfg.api, token: cfg.token });
     this.journal = new Journal(cfg.workDir);
     this.log = cfg.log ?? ((l) => console.log(`[scripts] ${l}`));
+    // Parents may not exist yet — recursive-create them, then pin OUR
+    // dir to 0700 (only ours: parents are never chmod'd — F392).
     mkdirSync(cfg.workDir, { recursive: true });
+    ensurePrivateDir(cfg.workDir);
   }
 
   /** Claim up to `limit` script jobs for one persona (default
@@ -137,7 +141,10 @@ export class Runner {
     // to leave configPath null and the residue untracked).
     const configFile = join(jobDir, "config.capnp");
     try {
-      mkdirSync(jobDir, { recursive: true });
+      // 0700 from creation / tightened when pre-existing-and-owned:
+      // the job dir holds config.capnp (runtime token), the control
+      // socket and rusage stats (F392).
+      ensurePrivateDir(jobDir);
       const socketPath = this.journal.socketPath(job.job_id);
       const statsPath = this.journal.statsPath(job.job_id);
       const usageFactID = `script:${job.job_id}:exec`;
@@ -202,7 +209,15 @@ export class Runner {
       }, (line) => this.log(`job ${job.job_id} workerd: ${line}`));
       this.liveSpawns.set(job.job_id, { spawned, j });
 
-      this.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString(), pid: spawned.pid });
+      // Record the leader's exact identity (pid + start_ticks): for a
+      // detached spawn pgid == pid, and the orphan reaper needs the
+      // leader's ticks for fork-order verification (F397).
+      this.journal.update(j, {
+        status: "spawned",
+        spawned_at: new Date().toISOString(),
+        pid: spawned.pid,
+        start_ticks: startTicks(spawned.pid),
+      });
 
       try {
         // Wait for the worker to accept on its unix socket — by then

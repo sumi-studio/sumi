@@ -8,8 +8,9 @@
  * bindings itself, so capnp `json` typing quirks never matter.
  */
 
-import { writeFileSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { writePrivateFile } from "../privatefs.ts";
 
 export interface WorkerdConfigInput {
   socketPath: string;
@@ -70,6 +71,11 @@ const config :Workerd.Config = (
 
 export function writeConfig(dir: string, c: WorkerdConfigInput): string {
   const p = join(dir, "config.capnp");
-  writeFileSync(p, renderCapnp(c));
+  // The rendered config carries the cross-persona runtime token — it is
+  // 0600 from creation (never a group/other-readable instant under any
+  // umask), and a pre-existing owned file is tightened BEFORE rewrite
+  // (F392). Deletion after startup (F390) shortens the lifetime but
+  // cannot close a readable launch window — permissions do.
+  writePrivateFile(p, renderCapnp(c));
   return p;
 }

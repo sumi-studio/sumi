@@ -125,6 +125,23 @@ export class StateClient {
   }
 
   /**
+   * Shared recovery seam: apply the claim-expiry verdict WITHOUT
+   * claiming. ClaimJobs is the only other trigger and it clamps
+   * limit to >=1 — calling it for sweep-only would take a reservation
+   * we have no capacity to execute (the F382 claim-beyond-capacity
+   * defect). A persona that queues no further work never invokes the
+   * claim pass, so without this an orphaned claim (crash between claim
+   * and journal, wiped workdir, replaced runner identity) sits
+   * 'running' forever on a quiet persona.
+   *
+   * Bounded page: the producer caps `limit` and returns the swept
+   * rows; callers repeat while a page comes back full.
+   */
+  sweepExpiredJobs(kinds: string[], limit: number): Promise<{ swept: number; jobs: JobRow[] }> {
+    return this.call("POST", "/internal/core/jobs/sweep-expired", { kinds, limit }) as Promise<{ swept: number; jobs: JobRow[] }>;
+  }
+
+  /**
    * Shared seam (wired by the producer): attach this runner's observed
    * outcome to a job whose claim expired and was swept to 'lost'.
    * 'lost' is an immutable verdict — CompleteJob conflicts on it — so

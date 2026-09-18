@@ -10,8 +10,9 @@
  * any process — never a name-wide kill.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, renameSync, writeFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { ensurePrivateDir } from "./privatefs.ts";
 
 export type JournalStatus =
   | "spawned"    // workerd launched, not yet confirmed listening
@@ -67,9 +68,13 @@ export class Journal {
   readonly dir: string;
   constructor(dir: string) {
     this.dir = dir;
-    mkdirSync(join(dir, "jobs"), { recursive: true });
-    mkdirSync(join(dir, "sock"), { recursive: true });
-    mkdirSync(join(dir, "tmp"), { recursive: true });
+    // Runner-owned state is private from creation (0700); a pre-existing
+    // directory is tightened only when owned by this uid — a foreign or
+    // shared path is an honest error, never chmod'd (F392).
+    ensurePrivateDir(dir);
+    ensurePrivateDir(join(dir, "jobs"));
+    ensurePrivateDir(join(dir, "sock"));
+    ensurePrivateDir(join(dir, "tmp"));
   }
 
   path(jobID: string): string {
@@ -91,7 +96,9 @@ export class Journal {
     j.updated_at = new Date().toISOString();
     const p = this.path(j.job_id);
     const tmp = join(this.dir, "tmp", `${j.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}.${process.pid}.json`);
-    writeFileSync(tmp, JSON.stringify(j, null, 2));
+    // 0600 at creation: rename carries the mode, so the journal is never
+    // group/other-readable at any instant, whatever the umask.
+    writeFileSync(tmp, JSON.stringify(j, null, 2), { mode: 0o600 });
     renameSync(tmp, p);
   }
 

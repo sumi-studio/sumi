@@ -189,6 +189,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/jobs/{job}/lost-outcome", s.attachJobLostOutcome)
 	mux.HandleFunc("GET /internal/core/jobs/runnable", s.listRunnableJobs)
 	mux.HandleFunc("GET /internal/core/jobs/attention", s.listJobsNeedingAttention)
+	// POST, not GET: this MUTATES. It applies the same expiry verdict the
+	// claim pass performs but takes no reservation — a consumer's periodic
+	// recovery calls it so a quiet persona's orphaned claim still reaches
+	// honest 'lost' instead of waiting for new user work to trigger it.
+	mux.HandleFunc("POST /internal/core/jobs/sweep-expired", s.sweepExpiredJobs)
 	// Job-scoped file capability (script jobs): every op authorized against
 	// the live runner claim; mutating ops settle through the durable
 	// core_job_file_ops ledger — never caller-scoped, never credential-bearing.
@@ -1304,6 +1309,26 @@ func (s *Server) listJobsNeedingAttention(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, jobPage(jobs, limit))
+}
+
+func (s *Server) sweepExpiredJobs(w http.ResponseWriter, r *http.Request) {
+	if !s.serviceOnly(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req struct {
+		Kinds []string `json:"kinds"`
+		Limit int      `json:"limit"`
+	}
+	if !decode(w, r, &req, 1<<20) {
+		return
+	}
+	swept, err := s.store.SweepExpiredJobs(r.Context(), req.Kinds, req.Limit)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"swept": len(swept), "jobs": swept})
 }
 
 func splitCSV(v string) []string {

@@ -11,6 +11,7 @@ import { ConfiguredDiscovery, SharedDiscovery, StateClient, type Discovery, type
 import { detectCgroupMode } from "./spawn.ts";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { ensurePrivateDir } from "./privatefs.ts";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -250,9 +251,10 @@ export function stableRunnerID(workDir: string): string {
     return id;
   }
   mkdirSync(workDir, { recursive: true });
+  ensurePrivateDir(workDir); // runner state is private from creation (F392)
   const id = `scripts-${hostname()}-${randomBytes(8).toString("hex")}`;
   try {
-    writeFileSync(f, id + "\n", { flag: "wx" });
+    writeFileSync(f, id + "\n", { flag: "wx", mode: 0o600 });
     return id;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "EEXIST") {

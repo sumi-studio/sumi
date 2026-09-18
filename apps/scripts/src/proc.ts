@@ -32,6 +32,16 @@ export function startTicks(pid: number): number | null {
   }
 }
 
+/** The process's argv as one string (NUL-separated on disk). Empty for
+ *  kernel threads/zombies and when unreadable — never throws. */
+export function cmdlineOf(pid: number): string {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+  } catch {
+    return "";
+  }
+}
+
 export function commOf(pid: number): string | null {
   try {
     return readFileSync(`/proc/${pid}/comm`, "utf8").trim();
@@ -84,26 +94,35 @@ export function findDescendant(rootPid: number, comm: string, maxDepth = 4): num
   return null;
 }
 
-/** True when process group `pgid` has a live member whose comm matches
- *  — proof the group still holds a spawn's payload. This is the only
- *  safe check before killpg on a stale pgid: a group id recycled after
- *  the whole original group died would not contain our workerd. */
-export function groupHasComm(pgid: number, comm: string): boolean {
+export interface GroupMember {
+  pid: number;
+  comm: string | null;
+  startTicks: number | null;
+}
+
+/** Live members of process group `pgid` (zombies excluded — they hold
+ *  no signalable payload). Membership alone does NOT prove the group is
+ *  ours: a comm match is just a name, and a journal survives arbitrary
+ *  downtime across pid/pgid recycling. Callers must establish ownership
+ *  separately (leader identity + fork-order ticks + boot id). */
+export function groupMembers(pgid: number): GroupMember[] {
+  const out: GroupMember[] = [];
   try {
     for (const name of readdirSync("/proc")) {
       if (!/^\d+$/.test(name)) continue;
+      const pid = Number(name);
       try {
-        const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
         const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
         // fields after comm: state(3) ppid(4) pgrp(5) — index 2 = pgrp.
         const state = after[0];
         if (state === "Z" || state === "X") continue;
         if (Number(after[2]) !== pgid) continue;
-        if (commOf(Number(name)) === comm) return true;
+        out.push({ pid, comm: commOf(pid), startTicks: Number(after[19]) });
       } catch { /* went away mid-scan */ }
     }
   } catch { /* /proc unreadable */ }
-  return false;
+  return out;
 }
 
 export interface ProcessIdentity {
