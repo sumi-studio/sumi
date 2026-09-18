@@ -161,10 +161,14 @@ func (h *retHarness) ownerCancel(sessionID string) int {
 	return res.StatusCode
 }
 
+// writeConfig writes config.env in the real installer's format — values
+// single-quoted through deploy/local-host/sumi-local's shq. The retarget
+// path must read and preserve that quoting, not just the bare fixture
+// format.
 func writeConfig(t *testing.T, dir, personaID string) string {
 	t.Helper()
 	path := filepath.Join(dir, "config.env")
-	content := "SUMI_LOCAL_ID=test-install\nSUMI_PERSONA_ID=" + personaID + "\nSUMI_LOCAL_DB_MODE=external\n"
+	content := "SUMI_LOCAL_ID='test-install'\nSUMI_PERSONA_ID='" + personaID + "'\nSUMI_LOCAL_DB_MODE=external\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

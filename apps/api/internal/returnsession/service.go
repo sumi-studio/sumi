@@ -226,6 +226,12 @@ type Preflight struct {
 	// on a packaged Local there is no human-bound selection, so the
 	// operator clears it explicitly (see docs/cloud-local-return.md).
 	ModelIntentKind string `json:"model_intent_kind,omitempty"`
+	// PendingApprovals counts tool approvals awaiting a human decision.
+	// An approval is an identity-scoped act: a fresh destination imports
+	// the persona unbound, and an unbound persona cannot activate while
+	// one is pending — the ordinary path is to decide it here before or
+	// after the move, or cancel and return again once decided.
+	PendingApprovals int `json:"pending_approvals"`
 	// Files states the unresolved product boundary plainly: shared files
 	// are not part of this transfer and are not deleted; whether they move
 	// to Local is a product decision still open. The returned secretary's
@@ -456,6 +462,10 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 			return fmt.Errorf("%w: it is held by placement %s for secretary slot %s",
 				ErrDestBound, bound.PlacementID, bound.PersonaID)
 		}
+		switch r.status {
+		case StatusCancelled, StatusExpired:
+			return fmt.Errorf("%w: the session is %s", ErrClosed, r.status)
+		}
 		// Already ours — a repeated bind falls through to the seal, which
 		// replays cleanly when it already committed and retries when the
 		// first attempt was lost between the binding write and the seal.
@@ -496,17 +506,46 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
+	// The seal runs under the session row lock. That lock is the fence
+	// that makes "no export exists yet" decidable: a cancel, a reconcile
+	// or a re-bind that needs to know whether the seal can still happen
+	// is serialized with it. A cancel arriving now waits, then sees the
+	// committed seal; a cancel that landed earlier already wrote
+	// cancelling and this pass refuses to seal instead.
+	tx, err = s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM return_sessions WHERE session_id = $1 FOR UPDATE`,
+		sessionID).Scan(&status); err != nil {
+		return err
+	}
+	switch status {
+	case StatusAwaitingDestination, StatusSealed:
+		// awaiting: the seal is still owed; sealed: a re-bind replays the
+		// recorded receipt below.
+	case StatusCancelling:
+		// The cancel won the window between the binding commit and this
+		// lock. Do not seal — the session resolves through the cancel
+		// path, and refusing here is what keeps a never-sealed session
+		// provably unable to acquire authority later.
+		return fmt.Errorf("%w: the session is cancelling", ErrConflict)
+	default:
+		return fmt.Errorf("%w: the session is %s", ErrClosed, status)
+	}
 	// The seal is portable's own transaction and replays its recorded
 	// receipt for the same transfer; if its commit landed but the status
 	// update below did not, Reconcile promotes from the ledger.
 	if _, err := s.portable.Seal(ctx, personaID, sessionID, dest.PlacementID); err != nil {
 		return err
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE return_sessions SET status = 'sealed', updated_at = now()
+	if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'sealed', updated_at = now()
 		WHERE session_id = $1 AND status = 'awaiting_destination'`, sessionID); err != nil {
 		return err
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // Status is the grant holder's view, after reconciling. It stays readable
@@ -651,12 +690,17 @@ func (s *Service) CancelByOwner(ctx context.Context, sessionID string, owner Own
 	return v, err
 }
 
-// cancel ends admission under the session row lock. Awaiting → cancelled:
-// nothing moved. Sealed → cancelling: the source stays sealed until the
-// destination's proof resolves it — expiry and caller assertion are never
-// that proof. Terminal states answer themselves: completed and aborted are
-// ErrConflict (the outcome already landed), cancelled and expired replay
-// their own status.
+// cancel ends admission under the session row lock. Awaiting with no
+// destination bound → cancelled: nothing moved. Awaiting with a committed
+// binding → cancelling: the binding means the seal may already be in
+// flight, so the cancel is advisory — either the in-flight seal commits
+// and the destination's retire proof resolves it, or no export exists
+// and reconcile closes it cancelled outright (the seal gate makes "no
+// export" exclusion-proof, so nothing ever moved). Sealed → cancelling:
+// the source stays sealed until the destination's proof lands — expiry
+// and caller assertion are never that proof. Terminal states answer
+// themselves: completed and aborted are ErrConflict (the outcome already
+// landed), cancelled and expired replay their own status.
 func (s *Service) cancel(ctx context.Context, sessionID string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -664,14 +708,24 @@ func (s *Service) cancel(ctx context.Context, sessionID string) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM return_sessions WHERE session_id = $1 FOR UPDATE`,
-		sessionID).Scan(&status); err != nil {
+	var bound bool
+	if err := tx.QueryRow(ctx, `SELECT status, destination_bound_at IS NOT NULL
+		FROM return_sessions WHERE session_id = $1 FOR UPDATE`,
+		sessionID).Scan(&status, &bound); err != nil {
 		return err
 	}
 	switch status {
 	case StatusAwaitingDestination:
-		if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'cancelled', updated_at = now()
-			WHERE session_id = $1`, sessionID); err != nil {
+		want := StatusCancelled
+		if bound {
+			// Admission already committed: the seal can be in flight
+			// right now. A terminal write here would strand a sealed
+			// persona under a dead session, so this is a request — the
+			// destination's proof decides the outcome.
+			want = StatusCancelling
+		}
+		if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = $2, updated_at = now()
+			WHERE session_id = $1`, sessionID, want); err != nil {
 			return err
 		}
 	case StatusSealed:
@@ -733,9 +787,13 @@ func (s *Service) Reconcile(ctx context.Context, sessionID string) error {
 			}
 		default:
 			// Admission expiry: the seal never happened, so nothing moved
-			// — the only transition an elapsed deadline may write.
+			// — the only transition an elapsed deadline may write. A
+			// committed destination binding means admission already
+			// happened and the seal may be in flight; the deadline bounds
+			// the binding, not the seal, so a bound session never expires.
 			if _, err := s.pool.Exec(ctx, `UPDATE return_sessions SET status = 'expired', updated_at = now()
-				WHERE session_id = $1 AND status = 'awaiting_destination' AND admit_until <= now()`, sessionID); err != nil {
+				WHERE session_id = $1 AND status = 'awaiting_destination'
+				  AND admit_until <= now() AND destination_bound_at IS NULL`, sessionID); err != nil {
 				return err
 			}
 		}
@@ -756,9 +814,53 @@ func (s *Service) Reconcile(ctx context.Context, sessionID string) error {
 					return err
 				}
 			}
+		} else if r.status == StatusCancelling {
+			// A cancel landed after the binding committed but before the
+			// seal: there is no export to abort and no retire proof could
+			// exist (the destination holds nothing). Under the session
+			// row lock — the same fence the bind's seal runs behind — "no
+			// export" is decidable durably: the seal either committed
+			// already or can never start, because the seal gate only runs
+			// while the session is awaiting/sealed. Nothing ever moved,
+			// so the cancel resolves to cancelled.
+			if err := s.resolveNeverSealedCancel(ctx, sessionID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// resolveNeverSealedCancel closes a cancelling session that has no export
+// — the seal gate's row lock makes "no export" exclusion-proof against
+// in-flight and future seals, so no destination proof is needed.
+func (s *Service) resolveNeverSealedCancel(ctx context.Context, sessionID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM return_sessions WHERE session_id = $1 FOR UPDATE`,
+		sessionID).Scan(&status); err != nil {
+		return err
+	}
+	if status != StatusCancelling {
+		return tx.Commit(ctx)
+	}
+	var hasExport bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM core_transfers WHERE direction = 'export' AND transfer_id = $1)`,
+		sessionID).Scan(&hasExport); err != nil {
+		return err
+	}
+	if !hasExport {
+		if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'cancelled', updated_at = now()
+			WHERE session_id = $1 AND status = 'cancelling'`, sessionID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // Sweep reconciles every session with a due step: an elapsed admission
@@ -767,7 +869,8 @@ func (s *Service) Reconcile(ctx context.Context, sessionID string) error {
 func (s *Service) Sweep(ctx context.Context) (int, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id FROM return_sessions
-		WHERE (status = 'awaiting_destination' AND admit_until <= now())
+		WHERE (status = 'awaiting_destination' AND admit_until <= now()
+		  AND destination_bound_at IS NULL)
 		UNION
 		SELECT s.session_id FROM core_transfers t
 		JOIN return_sessions s ON s.session_id = t.transfer_id
@@ -858,12 +961,14 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 	// deletes them.
 	var intentKind string
 	var intent json.RawMessage
-	var activeJobs int64
+	var activeJobs, pendingApprovals int64
 	if err := s.pool.QueryRow(ctx, `SELECT model_intent,
 		(SELECT count(*) FROM core_jobs
-		  WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested'))
+		  WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested')),
+		(SELECT count(*) FROM core_tool_approvals
+		  WHERE persona_id = $1 AND status = 'pending')
 		FROM core_personas WHERE persona_id = $1`, r.personaID).
-		Scan(&intent, &activeJobs); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		Scan(&intent, &activeJobs, &pendingApprovals); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return View{}, err
 	}
 	if len(intent) > 0 {
@@ -874,7 +979,8 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 			intentKind = k.Kind
 		}
 	}
-	v.Preflight = &Preflight{ActiveJobs: int(activeJobs), ModelIntentKind: intentKind, Files: filesNotCarried}
+	v.Preflight = &Preflight{ActiveJobs: int(activeJobs), ModelIntentKind: intentKind,
+		PendingApprovals: int(pendingApprovals), Files: filesNotCarried}
 	rec, err := s.portable.Status(ctx, "export", sessionID)
 	if errors.Is(err, portable.ErrTransferNotFound) {
 		return v, nil

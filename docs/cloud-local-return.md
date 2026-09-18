@@ -33,9 +33,9 @@ see "Model connection" below.
    shows the return URL:
    `https://<api>/api/secretary-return/sessions/<session_id>#grant=<grant>`.
    The grant is in the fragment, so it never reaches a request line or an
-   access log; Cloud stores only its hash. The app keeps the URL in local
-   storage so a lost create answer can be recovered, and offers a copy
-   button.
+   access log; Cloud stores only its hash. The app keeps the URL in the
+   tab's session storage (`sessionStorage`) so a lost create answer can
+   be recovered while the tab lives, and offers a copy button.
 2. On the Local host where the secretary should live:
    `sumi-local-move return`, then paste the URL. The command checks its
    own persona slot first:
@@ -67,9 +67,10 @@ interruption. Exit status 3 means "not finished yet; resume later".
 ## Deadlines and cancelling
 
 - A session admits a destination binding for 1 hour (`admit_until`).
-  Expiry stops new admission only — it is never treated as evidence that
-  the destination did not activate, and a sealed session keeps serving
-  proofs after it.
+  The deadline bounds the binding — once a destination is bound, admission
+  is durable and the session cannot expire even while the seal is still in
+  flight. Expiry is never treated as evidence that the destination did not
+  activate, and a sealed session keeps serving proofs after it.
 - `sumi-local-move return-cancel` works until activation commits on the
   Local side. If the bundle never landed, the command writes the
   tombstone and reports the retirement proof; Cloud unseals only on that
@@ -81,10 +82,17 @@ interruption. Exit status 3 means "not finished yet; resume later".
   it does not restore the old conversation snapshot. Cloud becomes active
   again only through the retirement proof — a committed activation always
   wins over a cancel in flight.
-- The owner can also cancel from the browser. Before the seal it just
-  closes the session; after the seal it marks `cancelling` — intent, not
-  authority — and the Local command's next status read retires and
-  reports the proof.
+- The owner can also cancel from the browser. Before the destination
+  binds, it closes the session outright (`cancelled` — nothing moved).
+  Once the binding has committed it marks `cancelling`: intent, not
+  authority. The bind's seal then runs under the session row lock — the
+  cancel either lands first (the seal is refused: the gate only seals
+  while the session is `awaiting`/`sealed`) or waits behind the seal and
+  sees it committed. With no export committed the next read closes the
+  session `cancelled` outright — no retire proof is needed because the
+  destination provably holds nothing; with a committed seal the
+  destination's retire proof resolves it to `aborted`. Either way a
+  racing seal can never strand the secretary under a dead session.
 - The grant keeps status access after every deadline and terminal status:
   a sealed source must always be able to serve the proof the destination
   earned.
@@ -115,7 +123,10 @@ stops and explains.
 | What happened | What converges it |
 | --- | --- |
 | Return URL pasted into a second Local | the second `return` is refused before Cloud seals; the first keeps the session |
-| Local occupied by a different secretary | refused before any request reaches Cloud; nothing binds |
+| Local occupied by a different live secretary | refused before any request reaches Cloud; nothing binds. An inert surrendered shell of another secretary is authored history — preserved, not disqualifying |
+| Cancel or the deadline lands while the bind's seal is in flight | the session goes `cancelling`, never terminal; the row lock serializes the seal — if it committed, the retire proof resolves to `aborted`; if it never did, the session closes `cancelled` (nothing ever moved) |
+| A tool approval is still pending when the return runs | `preflight.pending_approvals` shows it; the imported persona is unbound on a fresh Local so activation refuses until a human decides it — the command says to decide it on Cloud then `return-resume`, or `return-cancel` and return again once decided |
+| A new return after one already settled | the finished record is archived to `state-<session>.json` and the new return proceeds |
 | Download/import interrupted | `return-resume` re-reads the sealed session and imports again |
 | Activation committed, report lost | `return-resume` re-posts the proof; the source completes idempotently |
 | Report committed, local record lost | `return-status`/`return-resume` reads the import ledger and the session |

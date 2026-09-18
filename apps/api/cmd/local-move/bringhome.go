@@ -39,6 +39,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
+	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
 // parseReturnURL takes the URL the owner was given:
@@ -54,11 +55,16 @@ func parseReturnURL(raw string) (sessionURL, sessionID, grant string, err error)
 	if err != nil {
 		return "", "", "", err
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return "", "", "", fmt.Errorf("the return URL must be http(s)")
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && transfersession.IsLoopbackHost(u.Hostname()):
+	default:
+		// The grant is a live bearer credential — plain http is only
+		// tolerable on loopback, the same rule the move URL applies.
+		return "", "", "", fmt.Errorf("the return URL must use https (plain http is only allowed for loopback hosts)")
 	}
-	if u.User != nil {
-		return "", "", "", fmt.Errorf("the return URL must not embed a user or password")
+	if u.Host == "" || u.User != nil {
+		return "", "", "", fmt.Errorf("the return URL must name a host and must not embed a user or password")
 	}
 	if u.RawQuery != "" {
 		return "", "", "", fmt.Errorf("the return URL must not carry a query string")
@@ -69,8 +75,8 @@ func parseReturnURL(raw string) (sessionURL, sessionID, grant string, err error)
 		return "", "", "", fmt.Errorf("this does not look like a return URL (expecting %s/sessions/<id>) — a move-to-Cloud URL is handled by `sumi-local-move start`", returnsession.RoutePrefix)
 	}
 	q, err := url.ParseQuery(u.Fragment)
-	if err != nil || q.Get("grant") == "" || len(q) != 1 {
-		return "", "", "", fmt.Errorf("the return URL must end with #grant=<grant>")
+	if err != nil || len(q) != 1 || len(q["grant"]) != 1 || !grantRe.MatchString(q.Get("grant")) {
+		return "", "", "", fmt.Errorf("the return URL must end with #grant=<grant> — check that the whole URL was copied")
 	}
 	u.Fragment = ""
 	u.RawFragment = ""
@@ -182,6 +188,13 @@ func (r *returner) save(st *returnState) error {
 	return d.Sync()
 }
 
+// archive moves a settled return record aside — state-<session>.json, the
+// same convention the forward move uses — so a later return starts clean
+// while the old evidence (grant included, still 0600) stays inspectable.
+func (r *returner) archive(st *returnState) error {
+	return os.Rename(r.statePath(), filepath.Join(r.rdir, "state-"+st.SessionID+".json"))
+}
+
 // rlock takes the same single-driver lock the move commands take: a move
 // out and a return home never run at once on one install.
 func (m *mover) rlock() (func(), error) { return m.lock() }
@@ -232,15 +245,28 @@ func (m *mover) ReturnStart(ctx context.Context, rawURL string, pool *pgxpool.Po
 	if err := os.MkdirAll(r.rdir, 0o700); err != nil {
 		return m.fail(err)
 	}
+	// MkdirAll does not fix the mode of an existing directory; the grant
+	// lives here, so an inherited loose mode is tightened, contents kept.
+	if err := os.Chmod(r.rdir, 0o700); err != nil {
+		return m.fail(err)
+	}
 	st, err := r.load()
 	if err != nil {
 		return m.fail(err)
 	}
 	if st != nil && st.SessionURL != sessionURL {
-		m.say("A different return is already recorded here: session %s.", st.SessionID)
-		m.say("Run `sumi-local-move return-status` to see where it stands, or")
-		m.say("`sumi-local-move return-cancel` to give it up.")
-		return exitError
+		if st.Outcome == "" {
+			m.say("A different return is already recorded here: session %s.", st.SessionID)
+			m.say("Run `sumi-local-move return-status` to see where it stands, or")
+			m.say("`sumi-local-move return-cancel` to give it up.")
+			return exitError
+		}
+		// The recorded return already settled — archive it the way the
+		// forward move does and let this new one proceed.
+		if err := r.archive(st); err != nil {
+			return m.fail(err)
+		}
+		st = nil
 	}
 	if st == nil {
 		st = &returnState{
@@ -295,9 +321,17 @@ func (r *returner) drive(ctx context.Context, st *returnState) int {
 			case errors.Is(err, errPending):
 				// Guidance was already printed; the operator comes back.
 				return exitPending
-			case errors.Is(err, errUnreachable) || errors.Is(err, errGrantRejected):
+			case errors.Is(err, errUnreachable):
 				r.m.say("sumi-local-move: %v", err)
 				return exitPending
+			case errors.Is(err, errGrantRejected):
+				// A rejected grant never becomes valid — this is not a
+				// "resume later" condition. The record stays so status can
+				// still explain what happened; if the pasted URL was wrong,
+				// the operator removes it by hand.
+				r.m.say("sumi-local-move: %v — Cloud rejected this return's grant and will not accept it on retry.", err)
+				r.m.say("If the wrong URL was pasted, remove %s and re-run `sumi-local-move return` with the right one.", r.statePath())
+				return exitError
 			}
 			return r.m.fail(err)
 		}
@@ -401,7 +435,11 @@ func (r *returner) slotState(ctx context.Context) (returnsession.Destination, er
 	}
 	d := returnsession.Destination{PlacementID: own, PersonaID: r.m.personaID}
 	var auth *string
-	others := 0
+	// An unrelated persona is disqualifying only while it can still act —
+	// active, mid-seal, or mid-stage. A transferred shell is inert authored
+	// history (this install once owned a secretary that left), not a second
+	// secretary, and the return must preserve it rather than refuse on it.
+	otherLive := 0
 	rows, err := r.pool.Query(ctx, `SELECT persona_id::text, authority FROM core_personas`)
 	if err != nil {
 		return d, err
@@ -414,22 +452,22 @@ func (r *returner) slotState(ctx context.Context) (returnsession.Destination, er
 		}
 		if id == r.m.personaID {
 			auth = &a
-		} else {
-			others++
+		} else if a != "transferred" {
+			otherLive++
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return d, err
 	}
+	if otherLive > 0 {
+		return d, fmt.Errorf(
+			"this Local install already has a different secretary — " +
+				"a return cannot start a second one on the same install. " +
+				"Give the return a fresh Local install, or use the install that sent this secretary away")
+	}
 	switch {
 	case auth == nil:
-		if others > 0 {
-			return d, fmt.Errorf(
-				"this Local install already has a different secretary — " +
-					"a return cannot start a second one on the same install. " +
-					"Give the return a fresh Local install, or use the install that sent this secretary away")
-		}
 		d.SlotState = "absent"
 	case *auth == "transferred":
 		d.SlotState = "surrendered"
@@ -525,11 +563,24 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 			_ = os.Remove(tmp)
 			return err
 		}
+		// Sync before the rename and the directory after it: a power loss
+		// must never leave a truncated bundle behind a committed
+		// Downloaded flag — the import's digest check would catch it, but
+		// then only manual cleanup could recover.
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
 		if err := f.Close(); err != nil {
 			return err
 		}
 		if err := os.Rename(tmp, r.bundlePath()); err != nil {
 			return err
+		}
+		if d, err := os.Open(r.rdir); err == nil {
+			_ = d.Sync()
+			_ = d.Close()
 		}
 		st.Downloaded = true
 		if err := r.save(st); err != nil {
@@ -581,6 +632,19 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 		rec, _, err = r.m.src.Import(ctx, rdr, nil, false)
 	}
 	if err != nil {
+		if st.Downloaded && errors.Is(err, portable.ErrBadBundle) {
+			// The recorded bundle fails its own integrity check — a
+			// truncated write that survived a crash. The source still
+			// serves it while sealed, so drop the file and re-download.
+			if rmErr := os.Remove(r.bundlePath()); rmErr != nil {
+				return rmErr
+			}
+			st.Downloaded = false
+			if saveErr := r.save(st); saveErr != nil {
+				return saveErr
+			}
+			return nil
+		}
 		return err
 	}
 	if d.SlotState == "absent" {
@@ -594,6 +658,27 @@ func (r *returner) downloadAndImport(ctx context.Context, st *returnState, v ret
 // If the report is lost, resume finds the activated receipt and re-reports
 // it — the proof is durable.
 func (r *returner) activate(ctx context.Context, st *returnState) error {
+	// A pending approval is an identity-scoped act: it carried over in the
+	// sealed state and a fresh destination imports the persona unbound, so
+	// local activation will refuse until a human decides it. Local has no
+	// human-bound flow to do that, and resuming cannot help — the staged
+	// import is a snapshot taken before any decision. The honest path is
+	// to retire this staged copy, settle the approval on Cloud, and run a
+	// new return; say so now instead of letting the ledger's refusal
+	// arrive as a raw error. The approval itself is untouched.
+	var bound bool
+	var pending int
+	if err := r.pool.QueryRow(ctx, `SELECT human_id IS NOT NULL,
+		(SELECT count(*) FROM core_tool_approvals WHERE persona_id = $1 AND status = 'pending')
+		FROM core_personas WHERE persona_id = $1`, st.Persona).Scan(&bound, &pending); err != nil {
+		return err
+	}
+	if !bound && pending > 0 {
+		r.m.say("sumi-local-move: %d tool approval(s) still need a human's decision on this secretary", pending)
+		r.m.say("sumi-local-move: a fresh Local has no bound human to answer them, so the secretary cannot start here")
+		r.m.say("sumi-local-move: run `sumi-local-move return-cancel`, settle the approval(s) on Cloud — deny them or let the approved action finish — then start a new return")
+		return errPending
+	}
 	rec, err := r.m.src.Activate(ctx, st.Persona, st.SessionID)
 	if err != nil {
 		return err
@@ -719,7 +804,9 @@ func (r *returner) retarget(st *returnState) error {
 var errPending = errors.New("return pending")
 
 // configValue reads a key's effective value from an env file — last
-// assignment wins, matching the wrapper's config_val.
+// assignment wins, quoted values unquoted, matching the wrapper's
+// config_val. The installer writes SUMI_PERSONA_ID='…' through shq, so a
+// packaged config always carries single quotes.
 func configValue(path, key string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -735,12 +822,30 @@ func configValue(path, key string) (string, error) {
 	if val == "" {
 		return "", fmt.Errorf("%s does not set %s", path, key)
 	}
-	return val, nil
+	return unquoteEnv(val), nil
+}
+
+// unquoteEnv mirrors the data-only quoting the packaged wrapper's
+// config_val applies: '…' unwraps and \'-escapes ('\”) collapse to a
+// literal quote; "…" unwraps plainly; anything else is the bare value.
+func unquoteEnv(v string) string {
+	if len(v) >= 2 {
+		switch {
+		case v[0] == '\'' && v[len(v)-1] == '\'':
+			return strings.ReplaceAll(v[1:len(v)-1], `'\''`, `'`)
+		case v[0] == '"' && v[len(v)-1] == '"':
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
 }
 
 // rewriteConfigKey replaces the LAST assignment of key — the effective one
 // — in an env file, writing through a 0600 temp + rename so a crash cannot
-// leave a truncated config.
+// leave a truncated config. The replacement keeps the file's own quoting
+// style: a single-quoted value stays single-quoted (escaped the way the
+// installer's shq does it), a double-quoted one stays double-quoted, and a
+// bare value stays bare.
 func rewriteConfigKey(path, key, value string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -749,8 +854,17 @@ func rewriteConfigKey(path, key, value string) error {
 	lines := strings.Split(string(raw), "\n")
 	found := false
 	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.HasPrefix(strings.TrimSpace(lines[i]), key+"=") {
-			lines[i] = key + "=" + value
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, key+"=") {
+			old := strings.TrimSpace(strings.TrimPrefix(trimmed, key+"="))
+			out := value
+			switch {
+			case strings.HasPrefix(old, "'"):
+				out = "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+			case strings.HasPrefix(old, `"`):
+				out = `"` + value + `"`
+			}
+			lines[i] = key + "=" + out
 			found = true
 			break
 		}
@@ -854,6 +968,11 @@ func (m *mover) ReturnStatus(ctx context.Context, pool *pgxpool.Pool, config str
 	// need it, and an unfinished one treats silence as pending.
 	v, code, _, err := r.rcall(ctx, http.MethodGet, st.SessionURL, st.Grant, nil, "")
 	switch {
+	case errors.Is(err, errGrantRejected):
+		m.say("Cloud session: the recorded grant was rejected (%v)", err)
+		if st.Outcome == "" {
+			return exitPending
+		}
 	case err != nil:
 		m.say("Cloud session: unreachable (%v)", err)
 		if st.Outcome == "" {
@@ -904,6 +1023,10 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	}
 	_, code, _, err := r.rcall(ctx, http.MethodPost, st.SessionURL+"/cancel", st.Grant, nil, "")
 	if err != nil {
+		if errors.Is(err, errUnreachable) {
+			m.say("sumi-local-move: %v — the cancel may or may not have reached Cloud; run `sumi-local-move return-cancel` again, or `return-status` to check", err)
+			return exitPending
+		}
 		return m.fail(err)
 	}
 	if code != http.StatusOK {
@@ -915,8 +1038,18 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	for i := 0; i < 6; i++ {
 		_, again, err := r.step(ctx, st)
 		if err != nil {
-			if errors.Is(err, errPending) {
+			switch {
+			case errors.Is(err, errPending):
 				return exitPending
+			case errors.Is(err, errUnreachable):
+				// Cloud already accepted the cancel; only its answer was
+				// lost. The settle work — retire, report — stays
+				// resumable, so this is pending, not a failure.
+				m.say("sumi-local-move: %v — the cancel is recorded on Cloud; run `sumi-local-move return-cancel` to finish it", err)
+				return exitPending
+			case errors.Is(err, errGrantRejected):
+				m.say("sumi-local-move: %v", err)
+				return exitError
 			}
 			return m.fail(err)
 		}

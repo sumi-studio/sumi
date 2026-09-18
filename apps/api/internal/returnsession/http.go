@@ -41,17 +41,20 @@ type Server struct {
 	logf  func(string, ...any)
 }
 
-// NewServer builds the routes over svc. publicBaseURL is the origin (and
-// any path prefix) the Local command reaches this API at; return URLs are
-// built from it, never from request headers.
+// NewServer builds the routes over svc. publicBaseURL is the dedicated
+// origin the Local command reaches this API at; return URLs are built from
+// it, never from request headers. A path prefix is refused rather than
+// minted: the receiver validates session paths anchored at RoutePrefix, so
+// a prefixed base would produce URLs the Local command can never accept.
 func NewServer(svc *Service, proof OwnerProof, publicBaseURL string) (*Server, error) {
 	if proof == nil {
 		return nil, errors.New("returnsession: an owner proof adapter is required")
 	}
 	u, err := url.Parse(publicBaseURL)
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" ||
+		(u.Path != "" && u.Path != "/") ||
 		!(u.Scheme == "https" || (u.Scheme == "http" && loopback(u.Hostname()))) {
-		return nil, fmt.Errorf("returnsession: public base URL must be https (or http on loopback) without query or fragment")
+		return nil, fmt.Errorf("returnsession: public base URL must be an https origin (or http on loopback) without path, query or fragment — the API needs its own origin, not a path prefix")
 	}
 	return &Server{svc: svc, proof: proof, base: strings.TrimRight(publicBaseURL, "/"), logf: log.Printf}, nil
 }

@@ -215,6 +215,12 @@ export function SecretaryReturn({
                   <p className="text-muted-foreground text-xs">移行前の状態</p>
                   <ul className="mt-2 space-y-1 text-xs leading-relaxed">
                     <li>実行中の作業: {session.preflight.active_jobs}件</li>
+                    {session.preflight.pending_approvals > 0 ? (
+                      <li>
+                        承認待ちの操作が{session.preflight.pending_approvals}
+                        件引き継がれます。新しいローカルではあなたへの結び付きがないため、ここで決めるまでローカル側は起動できません（移行を進めるか、決めてからやり直してください）。
+                      </li>
+                    ) : null}
                     {session.preflight.model_intent_kind ? (
                       <li>
                         AI接続の指定が引き継がれます。ローカル側で接続を選ぶまで

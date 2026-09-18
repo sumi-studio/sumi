@@ -27,6 +27,7 @@ export interface SecretaryReturnSession {
   preflight?: {
     active_jobs: number;
     model_intent_kind?: string;
+    pending_approvals: number;
     files: string;
   };
   arrival?: {
