@@ -148,7 +148,7 @@ function newRunner(dir = workDir): Runner {
 }
 
 function newReconciler(dir = workDir): Reconciler {
-  return new Reconciler({ client: newRunner(dir).client, journal: new Journal(dir), runnerID: RUNNER_ID, log: (l) => apiLogs.push(l) });
+  return new Reconciler({ client: newRunner(dir).client, journal: new Journal(dir), runnerID: RUNNER_ID, workerdBin: WORKERD_BIN, log: (l) => apiLogs.push(l) });
 }
 
 before(async () => {

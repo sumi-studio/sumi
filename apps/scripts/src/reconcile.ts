@@ -49,12 +49,14 @@
 
 import { StateClient, type JobRow } from "./api.ts";
 import { Journal, type JobJournal } from "./journal.ts";
-import { verifyIdentity, killVerified, findDescendant, startTicks, bootID, groupMembers, cmdlineOf } from "./proc.ts";
+import { verifyIdentity, killVerified, findDescendantWhere, isExeImage, commOf, startTicks, bootID, groupMembers, cmdlineOf } from "./proc.ts";
 
 export interface ReconcileConfig {
   client: StateClient;
   journal: Journal;
   runnerID: string;
+  workerdBin?: string;       // configured payload image; when absent the
+                             // orphan walk falls back to the bare name
   log?: (line: string) => void;
   attentionPage?: number;    // rows per attention page (default 64)
   attentionMaxPages?: number; // pages per pass (default 8); the cursor
@@ -323,6 +325,16 @@ export class Reconciler {
     return j.notes.some((n) => n.includes("outcome attached to lost") || n.includes("attach refused"));
   }
 
+  /** The workerd payload under an owned launcher pid — same derived
+   *  image identity as the live runner: comm is the configured binary's
+   *  truncated basename, argv[0] its verbatim path. Without a configured
+   *  path the bare "workerd" name remains the fallback (test fixtures). */
+  private workerdPid(rootPid: number): number | null {
+    const exe = this.cfg.workerdBin;
+    return findDescendantWhere(rootPid, (p) =>
+      exe ? isExeImage(p, exe) : commOf(p) === "workerd");
+  }
+
   private async reconcileOne(j: JobJournal): Promise<void> {
     // 0. Pending file operations resolve FIRST, whatever the job's state.
     //    An admitted op's upstream effect may have landed while the
@@ -341,7 +353,7 @@ export class Reconciler {
         // The journal pid may be the launcher (runlimited) if the
         // supervisor died before the workerd-pid update — kill the
         // workerd descendant first so nothing survives the wrapper.
-        const workerPid = findDescendant(j.pid, "workerd");
+        const workerPid = this.workerdPid(j.pid);
         const payloadKilled = workerPid != null &&
           killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");
         killVerified(identity, "SIGKILL");

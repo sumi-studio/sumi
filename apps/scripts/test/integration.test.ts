@@ -170,9 +170,9 @@ test("success: script returns value, logs, measured usage", { timeout: 60_000 },
 test("files: write then read through the real authority chain", { timeout: 60_000 }, async () => {
   const row = await runOne("j-files", {
     code: `export async function run(input, sumi) {
-      await sumi.write("out/result.txt", "payload:" + input.msg);
-      const r = await sumi.read("out/result.txt");
-      const st = await sumi.stat("out/result.txt");
+      await sumi.files.write("out/result.txt", "payload:" + input.msg);
+      const r = await sumi.files.read("out/result.txt");
+      const st = await sumi.files.stat("out/result.txt");
       return { text: r.text, size: st.size };
     }`,
     input: { msg: "hi" },
@@ -244,13 +244,19 @@ test("wall timeout: a sleeping script is killed at wall_ms", { timeout: 60_000 }
   assert.equal(result.reason, "wall_timeout");
 });
 
-test("memory hog: worker dies, job failed, sibling unaffected", { timeout: 120_000 }, async () => {
-  // In prlimit mode there is no cgroup: V8's default heap bound is the
-  // only memory backstop, so the honest outcome depends on allocation
-  // speed — 'worker_error' (V8 abort) if the hog outruns the wall clock,
-  // 'wall_timeout' if the supervisor's deadline lands first. Both kill
-  // the worker and fail the job; neither is assumed to be the strict
-  // memory_mib bound (that requires systemd mode's MemoryMax).
+test("memory hog: worker dies, job failed, sibling unaffected", { timeout: 120_000 }, async (t) => {
+  // A memory hog is only safe to run when a REAL bound enforces the
+  // limit — systemd mode's cgroup MemoryMax constrains memory use.
+  // Under prlimit the only backstop is V8 heap accounting, which does
+  // NOT bound external ArrayBuffer growth: this exact 64MiB-chunk hog
+  // reached ~44 GiB anonymous RSS and triggered the host's global OOM
+  // killer before any abort fired (2026-09-18 pa02 incident). An
+  // unbounded hog on an uncapped process is a host-level hazard, not a
+  // test — skip honestly rather than accept either outcome.
+  if (runner.cfg.cgroupMode !== "systemd") {
+    t.skip(`no effective memory bound under ${runner.cfg.cgroupMode} — run under systemd MemoryMax instead`);
+    return;
+  }
   const row = await runOne("j-mem", {
     code: `export async function run() {
       const chunks = [];
@@ -288,7 +294,7 @@ test("cancel mid-write: the admitted op still settles via keyed resend", { timeo
   stub.faults.delayMs = 2500;
   await submitJob("j-cancel-write", {
     code: `export async function run(input, sumi) {
-      await sumi.write("later.txt", "committed-anyway");
+      await sumi.files.write("later.txt", "committed-anyway");
       return "done";
     }`,
     limits: { cpu_seconds: 30, wall_ms: 60_000 },
@@ -321,7 +327,7 @@ test("lost upstream response: op unknown then settled as replayed", { timeout: 9
   stub.faults.dropResponse = true;
   await submitJob("j-lost", {
     code: `export async function run(input, sumi) {
-      await sumi.write("maybe.txt", "did-commit");
+      await sumi.files.write("maybe.txt", "did-commit");
       return "done";
     }`,
     limits: { cpu_seconds: 30, wall_ms: 60_000 },
@@ -348,9 +354,9 @@ test("cancel: admitted write settles, post-cancel calls never happen", { timeout
   // and the authority gate would deny it anyway (Go-side tests).
   await submitJob("j-denied", {
     code: `export async function run(input, sumi) {
-      await sumi.write("first.txt", "ok");
+      await sumi.files.write("first.txt", "ok");
       await new Promise(r => setTimeout(r, 4000));
-      await sumi.write("should-not.txt", "x");
+      await sumi.files.write("should-not.txt", "x");
       return "unreachable";
     }`,
     limits: { cpu_seconds: 30, wall_ms: 60_000 },
@@ -404,7 +410,7 @@ test("reconcile: orphan workerd reaped by verified identity, no re-exec", { time
   await new Promise((r) => setTimeout(r, 800));
   assert.ok(alive(spawned.pid), "orphan process alive before reconcile");
 
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
   await new Promise((r) => setTimeout(r, 300));
   assert.ok(!alive(spawned.pid), "orphan killed by verified identity");
@@ -429,7 +435,7 @@ test("journal survives: exited result re-reported after lost complete", { timeou
   // Claim it ourselves so the row is ours to complete.
   const claimed = await runner.claimPersona(persona);
   assert.ok(claimed.some((c) => c.job_id === "j-replay"));
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
   const row = await jobRow("j-replay");
   assert.equal(row.status, "done", "re-reported terminal outcome landed");
@@ -492,7 +498,7 @@ test("reconcile: sleeping low-CPU orphan reaped by identity, no re-exec", { time
   });
   runner.journal.update(j, { status: "running" });
 
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
   await sleeping;
   await new Promise((r) => setTimeout(r, 300));
@@ -558,7 +564,7 @@ test("swept to lost: verdict preserved, pending op resolves, usage attaches", { 
     },
   });
 
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
 
   // 1. The verdict is immutable: still 'lost', still the sweep's result.
@@ -622,7 +628,7 @@ test("crash mid-write: reconciler settles op and reports failure, no re-exec", {
   });
   runner.journal.update(j, { status: "running" });
 
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
 
   const { ops, pending } = await client.listFileOps(persona, "j-crash");
@@ -660,7 +666,7 @@ test("usage boundary: exited-without-rusage reports unknown, not fabricated", { 
     result: { terminal_status: "done", value: 1, usage: { cpu_ms: 88, cpu_ms_source: "measured" } },
   });
 
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN });
   await rec.run();
 
   assert.equal(runner.journal.read("j-usage-unknown")!.usage_status, "unknown",

@@ -249,6 +249,7 @@ function newReconciler(wd = workDir, extra: Partial<{ attentionPage: number; att
     client: new StateClient({ api, token: RUNTIME }),
     journal: new Journal(wd),
     runnerID: RUNNER_ID,
+    workerdBin: WORKERD_BIN,
     log: () => {},
     ...extra,
   });
@@ -1084,7 +1085,7 @@ test("reconcile reaps an exec'd orphan via its surviving process group — the l
     limits: {}, spec: { code_sha256: "x" }, usage_fact_id: `script:j-grp:exec`,
   });
   runner.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString() });
-  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, log: () => {} });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, workerdBin: WORKERD_BIN, log: () => {} });
   await rec.run();
   // THE invariant: the exec'd orphan is dead — the surviving process
   // group was the only reach that could touch it.
@@ -1257,6 +1258,7 @@ test("quiet persona: an expired claim reaches 'lost' via the production recovery
   const rec = new Reconciler({
     client: new StateClient({ api: REAL_API, token: RUNTIME }),
     journal: new Journal(wd), runnerID: RUNNER_ID,
+    workerdBin: WORKERD_BIN,
     log: (l) => lines.push(l),
   });
   const stats = await rec.runRecovery(new Set()); // the PRODUCTION trigger
