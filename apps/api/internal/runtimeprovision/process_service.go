@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 // ProcessBackend is separate from generation lifecycle: stopping a PA never
@@ -48,6 +50,13 @@ type processStore struct {
 	backend          ProcessBackend
 	records          map[string]*processRecord
 	completionCursor string
+	// reverify re-checks a journaled operation's external launch
+	// preconditions at the deferred launch point. The canonical workspace
+	// bind is verified when the operation is accepted, but the mount can
+	// change before the observer launches the container — a bind resolved
+	// minutes ago proves nothing about the mount now. Failure holds the
+	// operation (no LaunchAttempted) until the deadline path bounds it.
+	reverify func(context.Context, ProcessOperation) error
 }
 
 func newProcessStore(directory string, backend ProcessBackend) (*processStore, error) {
@@ -159,17 +168,43 @@ func (service *Service) StartProcess(ctx context.Context, request ProcessStartRe
 	if s == nil {
 		return ProcessOperation{}, errors.New("process backend unavailable")
 	}
+	id := processID(request)
+	// The durable journal answers a replay first: an operation that already
+	// exists returns its recorded state even when the canonical mount is
+	// unreachable — results must survive environment loss, not depend on it.
+	s.mu.Lock()
+	r := s.records[id]
+	s.mu.Unlock()
+	if r != nil {
+		o, err := replayProcessOperation(r, request)
+		return o, err
+	}
+	// A canonical-scope launch resolves its verified bind before the record
+	// is journalled so the workspace evidence travels with the operation and
+	// the backend never has to ask where it came from. Failure here means no
+	// record: a files-scope request on an unconfigured, unmounted, or
+	// misbound volume refuses honestly instead of silently falling back to
+	// the legacy shared volume.
+	var workspaceBind, workspaceUUID string
+	if request.Workspace == "files-scope" {
+		var err error
+		workspaceBind, workspaceUUID, err = service.resolveProcessWorkspace(ctx, request.PersonalityAgentID)
+		if err != nil {
+			return ProcessOperation{}, err
+		}
+	}
+	// The journal write below is this operation's point of no return. A
+	// request whose caller already gave up (client deadline/disconnect —
+	// the exact delayed-response window the driver's fence protects
+	// against) must not publish a record nobody is watching.
+	if err := ctx.Err(); err != nil {
+		return ProcessOperation{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := processID(request)
+	// A racer resolved the same operation while the workspace check ran.
 	if r := s.records[id]; r != nil {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		o := r.Operation
-		if o.Executable != request.Executable || !reflect.DeepEqual(o.Args, request.Args) || o.Cwd != request.Cwd || o.TimeoutSeconds != request.TimeoutSeconds {
-			return ProcessOperation{}, ErrConflict
-		}
-		return o, nil
+		return replayProcessOperation(r, request)
 	}
 	active := 0
 	for _, r := range s.records {
@@ -190,13 +225,45 @@ func (service *Service) StartProcess(ctx context.Context, request ProcessStartRe
 	if err != nil {
 		return ProcessOperation{}, err
 	}
-	r := &processRecord{mu: &sync.Mutex{}, Operation: ProcessOperation{OperationID: id, PersonalityAgentID: request.PersonalityAgentID, OriginatingToolCallID: request.OriginatingToolCallID, Executable: request.Executable, Args: request.Args, Cwd: request.Cwd, TimeoutSeconds: request.TimeoutSeconds, State: ProcessAccepted, EventID: event.String(), OccurredAt: time.Now().UTC()}}
-	if err = s.save(r); err != nil {
+	// The save below is the publication boundary — the last point where
+	// a caller that expired while waiting on s.mu or a record mutex can
+	// still be turned away. After this check only a save error prevents
+	// the journal write, and a journaled op is fenced work, not a zombie.
+	if err := ctx.Err(); err != nil {
 		return ProcessOperation{}, err
 	}
-	s.records[id] = r
-	return r.Operation, nil
+	record := &processRecord{mu: &sync.Mutex{}, Operation: ProcessOperation{OperationID: id, PersonalityAgentID: request.PersonalityAgentID, OriginatingToolCallID: request.OriginatingToolCallID, Executable: request.Executable, Args: request.Args, Cwd: request.Cwd, TimeoutSeconds: request.TimeoutSeconds, Env: request.Env, Image: request.Image, WorkspaceBind: workspaceBind, FilesVolumeUUID: workspaceUUID, State: ProcessAccepted, EventID: event.String(), OccurredAt: time.Now().UTC()}}
+	if err = s.save(record); err != nil {
+		return ProcessOperation{}, err
+	}
+	s.records[id] = record
+	return record.Operation, nil
 }
+
+// replayProcessOperation compares a journalled operation to a repeated
+// request: identical requests replay the recorded operation; any divergence
+// in the identity-bearing fields is a conflict, never a second launch. The
+// caller may hold s.mu — record locking follows the same ordering the busy
+// scan uses.
+func replayProcessOperation(r *processRecord, request ProcessStartRequest) (ProcessOperation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	o := r.Operation
+	// A tombstone is the cancel fence: the operation was cancelled before
+	// it ever journaled a launch, so the only honest answer to a late
+	// start is the recorded cancellation — never a launch. The
+	// deterministic operation ID already binds this record to the
+	// (persona, tool call) the request names.
+	if o.Tombstone {
+		return o, nil
+	}
+	if o.Executable != request.Executable || !reflect.DeepEqual(o.Args, request.Args) || o.Cwd != request.Cwd || o.TimeoutSeconds != request.TimeoutSeconds ||
+		!maps.Equal(o.Env, request.Env) || o.Image != request.Image || (o.WorkspaceBind != "") != (request.Workspace == "files-scope") {
+		return ProcessOperation{}, ErrConflict
+	}
+	return o, nil
+}
+
 func (service *Service) ProcessStatus(ctx context.Context, r ProcessLookupRequest) (ProcessOperation, error) {
 	if err := r.Validate(); err != nil {
 		return ProcessOperation{}, err
@@ -281,12 +348,49 @@ func (service *Service) CancelProcess(ctx context.Context, r ProcessLookupReques
 	}
 	s.mu.Lock()
 	record := s.records[r.OperationID]
-	s.mu.Unlock()
-	if record != nil {
-		record.mu.Lock()
-		defer record.mu.Unlock()
+	if record == nil {
+		if !r.TombstoneIfAbsent {
+			s.mu.Unlock()
+			return ProcessOperation{}, ErrProcessNotFound
+		}
+		// The cancel fence: journal a terminal cancellation for an
+		// operation that never arrived. This check-and-create runs under
+		// the same store mutex as StartProcess's journal write, so the
+		// order is deterministic — whichever lands first wins. A start
+		// still resolving its workspace replays the tombstone; a start
+		// that already journaled is found by the normal cancel path
+		// below. After this write, 'the operation never existed' is a
+		// publishable fact, not a timeout guess.
+		event, err := uuid.NewV7()
+		if err != nil {
+			s.mu.Unlock()
+			return ProcessOperation{}, err
+		}
+		now := time.Now().UTC()
+		rec := &processRecord{mu: &sync.Mutex{}, Operation: ProcessOperation{
+			OperationID:           r.OperationID,
+			PersonalityAgentID:    r.PersonalityAgentID,
+			OriginatingToolCallID: r.OriginatingToolCallID,
+			State:                 ProcessCancelled,
+			Tombstone:             true,
+			EventID:               event.String(),
+			OccurredAt:            now,
+			FinishedAt:            &now,
+			Error:                 "cancelled before the operation was journaled",
+		}}
+		if err := s.save(rec); err != nil {
+			s.mu.Unlock()
+			return ProcessOperation{}, err
+		}
+		rec.releaseTerminalOutput()
+		s.records[r.OperationID] = rec
+		s.mu.Unlock()
+		return rec.Operation, nil
 	}
-	if record == nil || record.Operation.PersonalityAgentID != r.PersonalityAgentID {
+	s.mu.Unlock()
+	record.mu.Lock()
+	defer record.mu.Unlock()
+	if record.Operation.PersonalityAgentID != r.PersonalityAgentID {
 		return ProcessOperation{}, ErrProcessNotFound
 	}
 	if record.Operation.State.terminal() {
@@ -310,7 +414,10 @@ func (service *Service) PendingProcessCompletions(ctx context.Context) ([]Proces
 	defer s.mu.Unlock()
 	for _, r := range s.records {
 		r.mu.Lock()
-		if r.Operation.State.terminal() && r.Receipt == nil {
+		// Tombstones are cancel fences, not executions — no command
+		// channel awaits their outcome, so they never enter the pending
+		// feed (which would otherwise retain them forever).
+		if r.Operation.State.terminal() && r.Receipt == nil && !r.Operation.Tombstone {
 			result = append(result, r.Operation)
 		}
 		r.mu.Unlock()
@@ -337,7 +444,7 @@ func (service *Service) PendingProcessCompletions(ctx context.Context) ([]Proces
 	return result, nil
 }
 func (service *Service) AcknowledgeProcessCompletion(ctx context.Context, r ProcessCompletionReceipt) error {
-	if err := (ProcessLookupRequest{r.PersonalityAgentID, r.OperationID}).Validate(); err != nil {
+	if err := (ProcessLookupRequest{PersonalityAgentID: r.PersonalityAgentID, OperationID: r.OperationID}).Validate(); err != nil {
 		return err
 	}
 	if _, err := uuid.Parse(r.CommandID); err != nil || r.CommandSeq == 0 {
@@ -472,6 +579,15 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 			}
 			original.mu.Unlock()
 			return
+		}
+		// The deferred launch re-verifies the recorded workspace: a mount
+		// that changed or died since acceptance must not receive a bind.
+		// Hold the operation unlaunched — the deadline branch bounds it.
+		if s.reverify != nil {
+			if err := s.reverify(ctx, next.Operation); err != nil {
+				original.mu.Unlock()
+				return
+			}
 		}
 		next.LaunchAttempted = true
 		if s.save(&next) != nil {

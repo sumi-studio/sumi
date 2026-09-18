@@ -103,7 +103,7 @@ func TestJobCompleteNULBoundaries(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("echo"), "api"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
@@ -122,7 +122,7 @@ func TestJobCompleteNULBoundaries(t *testing.T) {
 		t.Fatalf("complete after rejection: %+v err=%v", done, err)
 	}
 	// NUL in a claim runner_id is rejected at the same boundary.
-	if _, _, err := s.ClaimJobs(ctx, pa, "r\x00", []string{"subprocess"}, time.Minute, 4); !errors.Is(err, ErrBadRequest) {
+	if _, _, err := s.ClaimJobs(ctx, pa, "r\x00", []string{"subprocess"}, time.Minute, 4, "*"); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("NUL runner_id err = %v, want ErrBadRequest", err)
 	}
 }
@@ -138,7 +138,7 @@ func TestJobClaimHeartbeatComplete(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 
-	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 1 || len(swept) != 0 {
 		t.Fatalf("claim: claimed=%+v swept=%+v err=%v", claimed, swept, err)
 	}
@@ -147,7 +147,7 @@ func TestJobClaimHeartbeatComplete(t *testing.T) {
 		t.Fatalf("claimed job: %+v", j)
 	}
 	// A second runner sees nothing to claim.
-	claimed2, _, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed2, _, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed2) != 0 {
 		t.Fatalf("second claim: %+v err=%v", claimed2, err)
 	}
@@ -219,7 +219,7 @@ func TestJobCancelSemantics(t *testing.T) {
 		t.Fatalf("cancel notification missing: %v", err)
 	}
 	// Nothing remains to claim.
-	claimed, _, err := s.ClaimJobs(ctx, pa, "r", []string{"subprocess"}, time.Minute, 4)
+	claimed, _, err := s.ClaimJobs(ctx, pa, "r", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 {
 		t.Fatalf("claim after cancel: %+v err=%v", claimed, err)
 	}
@@ -229,7 +229,7 @@ func TestJobCancelSemantics(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-r", "subprocess", subReq("sleep", "9"), "api"); err != nil {
 		t.Fatalf("submit j-r: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-r: %v", err)
 	}
 	j, err = s.CancelJob(ctx, pa, "j-r")
@@ -252,7 +252,7 @@ func TestJobCancelSemantics(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-late", "subprocess", subReq("echo", "x"), "api"); err != nil {
 		t.Fatalf("submit j-late: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-late: %v", err)
 	}
 	if _, err := s.CancelJob(ctx, pa, "j-late"); err != nil {
@@ -282,13 +282,13 @@ func TestJobClaimExpiryLost(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 	// Tiny lease so the claim expires.
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, 20*time.Millisecond, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, 20*time.Millisecond, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	time.Sleep(40 * time.Millisecond)
 
 	// The next claim pass (any runner) sweeps the expired job to lost.
-	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err := s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 || len(swept) != 1 || swept[0].Status != "lost" {
 		t.Fatalf("sweep: claimed=%+v swept=%+v err=%v", claimed, swept, err)
 	}
@@ -311,7 +311,7 @@ func TestJobClaimExpiryLost(t *testing.T) {
 		t.Fatalf("dead-runner heartbeat: %+v err=%v", hb, err)
 	}
 	// No re-execution: the job never returns to 'queued' on later passes.
-	claimed, swept, err = s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4)
+	claimed, swept, err = s.ClaimJobs(ctx, pa, "runner-2", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 0 || len(swept) != 0 {
 		t.Fatalf("second sweep: claimed=%+v swept=%+v", claimed, swept)
 	}
@@ -442,7 +442,7 @@ func TestJobNotificationEntersInputStream(t *testing.T) {
 	if _, _, err := s.SubmitJob(ctx, pa, "j-1", "subprocess", subReq("echo", "hi"), "api"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	if _, err := s.CompleteJob(ctx, pa, "j-1", "runner-1", "done",
@@ -505,7 +505,7 @@ func TestJobCompletionBeforeOriginTurn(t *testing.T) {
 	if _, ok := op.Response["current_job"]; ok {
 		t.Fatalf("fresh receipt must not carry current_job: %+v", op.Response)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim job: %v", err)
 	}
 	// The job ends while in-1 is still unfinished.

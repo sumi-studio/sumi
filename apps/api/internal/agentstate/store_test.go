@@ -561,7 +561,7 @@ func TestConcurrentJobNotifyVsReceiptCommit(t *testing.T) {
 			map[string]any{"command": []any{"echo", "hi"}}, "api"); err != nil {
 			t.Fatalf("submit %s: %v", jobID, err)
 		}
-		claimed, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 1)
+		claimed, _, err := s.ClaimJobs(ctx, pa, "runner-1", []string{"subprocess"}, time.Minute, 1, "*")
 		if err != nil || len(claimed) != 1 {
 			t.Fatalf("claim %s: claimed=%+v err=%v", jobID, claimed, err)
 		}

@@ -370,6 +370,41 @@ type Store struct {
 	// notice that could not land in-transaction is retried once after the
 	// commit on a fresh transaction. Set at wiring time; not synchronized.
 	TerminalFailureNotice TerminalFailureNoticeFunc
+	// defaultJobBackend stamps request.backend on submissions that leave it
+	// unset, so a deployment routes new work deterministically instead of
+	// letting whichever runner claims first decide. "" leaves requests
+	// unstamped; an unstamped request claims under the 'local' side of the
+	// backend predicate. Set at wiring time; not synchronized.
+	defaultJobBackend string
+	// jobBackendAvailable names backends a verified live runner claims.
+	// Only "cloud" is gated at admission — the store cannot probe the
+	// separate local-runner processes, so 'local'/unstamped work is never
+	// refused here. Set at wiring time; not synchronized.
+	jobBackendAvailable map[string]bool
+}
+
+// SetDefaultJobBackend configures the backend stamped onto job submissions
+// that carry no request.backend — "cloud" on deployments whose Cloud driver
+// is verified ready, "" (the zero value) to preserve unstamped requests.
+// Explicit request.backend values are never overridden. Declaring a default
+// also declares that backend served — wiring sets the default only after
+// the runner behind it is proven live.
+func (s *Store) SetDefaultJobBackend(backend string) {
+	s.defaultJobBackend = backend
+	if backend != "" {
+		s.SetJobBackendAvailable(backend)
+	}
+}
+
+// SetJobBackendAvailable declares that a live runner claims the named
+// backend's work. An explicit request.backend="cloud" submission is
+// refused while no cloud backend is available — queuing it would be a
+// silent forever-wait, since only the wired Cloud driver can claim it.
+func (s *Store) SetJobBackendAvailable(backend string) {
+	if s.jobBackendAvailable == nil {
+		s.jobBackendAvailable = map[string]bool{}
+	}
+	s.jobBackendAvailable[backend] = true
 }
 
 // TerminalFailure carries the resolved input/turn identity and the recorded

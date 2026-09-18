@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -48,9 +49,10 @@ func run() error {
 	service, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{
 		StateDirectory: stateDirectory,
 		Files: runtimeprovision.FilesEnvironment{
-			Mountpoint: os.Getenv("SUMI_FILES_MOUNTPOINT"),
-			VolumeUUID: os.Getenv("SUMI_FILES_VOLUME_UUID"),
-			CheckPath:  os.Getenv("SUMI_FILES_CHECK"),
+			Mountpoint:       os.Getenv("SUMI_FILES_MOUNTPOINT"),
+			VolumeUUID:       os.Getenv("SUMI_FILES_VOLUME_UUID"),
+			CheckPath:        os.Getenv("SUMI_FILES_CHECK"),
+			CheckWaitSeconds: envInt("SUMI_FILES_CHECK_WAIT_SECONDS", 15),
 		},
 	})
 	if err != nil {
@@ -101,7 +103,7 @@ func run() error {
 }
 
 func hostEnvironment() []string {
-	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_AGENT_IMAGE_TAG", "SUMI_AGENT_IMAGE_PULL_POLICY", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG", "SUMI_FILES_MOUNTPOINT", "SUMI_FILES_VOLUME_UUID", "SUMI_FILES_CHECK", "SUMI_FILES_CHECK_WAIT_SECONDS"}
+	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_AGENT_IMAGE_TAG", "SUMI_AGENT_IMAGE_PULL_POLICY", "SUMI_JOB_IMAGE_TAG", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG", "SUMI_FILES_MOUNTPOINT", "SUMI_FILES_VOLUME_UUID", "SUMI_FILES_CHECK", "SUMI_FILES_CHECK_WAIT_SECONDS"}
 	environment := make([]string, 0, len(names))
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {
@@ -109,4 +111,16 @@ func hostEnvironment() []string {
 		}
 	}
 	return environment
+}
+
+func envInt(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }

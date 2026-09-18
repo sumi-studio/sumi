@@ -104,6 +104,8 @@ func (client *Client) call(ctx context.Context, path string, input, output any) 
 				return fmt.Errorf("%w: %s", ErrInvalidProcessRequest, protocolError.Message)
 			case "conflict":
 				return fmt.Errorf("%w: %s", ErrConflict, protocolError.Message)
+			case "workspace_unavailable":
+				return fmt.Errorf("%w: %s", ErrProcessWorkspace, protocolError.Message)
 			}
 			return fmt.Errorf("provisioner %s: %s", protocolError.Code, protocolError.Message)
 		}

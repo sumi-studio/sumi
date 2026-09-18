@@ -32,6 +32,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/feedback"
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
+	"github.com/sumi-studio/sumi/apps/api/internal/jobexec"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
@@ -109,6 +110,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startCoreDirectChat()
 	app.startFeedbackAttention()
 	app.startProcessAttention()
+	app.startJobExec()
 	app.startChatGPTActivation()
 	app.startRuntimeRecovery()
 	app.startWarmReconciliation()
@@ -268,6 +270,7 @@ type application struct {
 	cleanupFeedbackAttachments func(context.Context) error
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
+	jobExec                    *jobexec.Driver
 	transferSessions           *transfersession.Service
 	coreDirectChat             *agentevents.CoreDirectChat
 	// stopBackground cancels process-lifetime workers such as the attachment
@@ -786,6 +789,26 @@ func newApplicationFromEnv() (*application, error) {
 			log.Print("core file tools ready (file.* effects scoped to the claiming persona)")
 		}
 	}
+	// Cloud Linux jobs: subprocess-kind core_jobs run on the root
+	// provisioner's durable process service, bind-mounted to the persona's
+	// canonical files scope. Opt-in; a partial configuration is a startup
+	// error, not a silently queued backend.
+	var jobExec *jobexec.Driver
+	{
+		var coreStore *agentstate.Store
+		if coreServer != nil {
+			coreStore = coreServer.Store()
+		}
+		var err error
+		jobExec, err = jobexecFromEnv(coreStore, filesClient)
+		if err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if jobExec != nil {
+			log.Printf("jobexec: Cloud subprocess jobs run through the runtime provisioner (runner %s, canonical files scope)", jobExec.Runner())
+		}
+	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	if messagingServer != nil && messagingServer.Store.AttachmentsEnabled() {
@@ -904,6 +927,7 @@ func newApplicationFromEnv() (*application, error) {
 		emailDelivery:              emailDeliveryWorkerFor(authServer),
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
+		jobExec:                    jobExec,
 		transferSessions:           transferSessions,
 		coreDirectChat:             coreDirectChat,
 		publicMux:                  mux,

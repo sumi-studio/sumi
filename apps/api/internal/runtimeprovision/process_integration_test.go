@@ -78,7 +78,7 @@ func TestProcessDockerIntegration(t *testing.T) {
 		deadline := time.Now().Add(20 * time.Second)
 		for time.Now().Before(deadline) {
 			service.observeProcesses(ctx)
-			current, err := service.ProcessStatus(ctx, ProcessLookupRequest{paid, o.OperationID})
+			current, err := service.ProcessStatus(ctx, ProcessLookupRequest{PersonalityAgentID: paid, OperationID: o.OperationID})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -140,7 +140,7 @@ func TestProcessDockerIntegration(t *testing.T) {
 	if err != nil || again.OperationID != first.OperationID || again.State != ProcessSucceeded {
 		t.Fatal(again, err)
 	}
-	output, err := service.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{paid, first.OperationID}, Stream: "stdout"})
+	output, err := service.ReadProcessOutput(ctx, ProcessOutputRequest{ProcessLookupRequest: ProcessLookupRequest{PersonalityAgentID: paid, OperationID: first.OperationID}, Stream: "stdout"})
 	if err != nil || output.Content != "finished" {
 		t.Fatal(output, err)
 	}
@@ -150,7 +150,7 @@ func TestProcessDockerIntegration(t *testing.T) {
 	}
 	cancel := start("cancel", "sleep 30")
 	service.observeProcesses(ctx)
-	if _, err = service.CancelProcess(ctx, ProcessLookupRequest{paid, cancel.OperationID}); err != nil {
+	if _, err = service.CancelProcess(ctx, ProcessLookupRequest{PersonalityAgentID: paid, OperationID: cancel.OperationID}); err != nil {
 		t.Fatal(err)
 	}
 	if done = wait(cancel); done.State != ProcessCancelled {

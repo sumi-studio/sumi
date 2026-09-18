@@ -1648,7 +1648,7 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 		t.Fatalf("refused seal left authority %s", a)
 	}
 
-	claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4)
+	claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4, "*")
 	if err != nil || len(claimed) != 1 || claimed[0].JobID != "j-1" {
 		t.Fatalf("claim after refused seal: claimed=%+v err=%v", claimed, err)
 	}
@@ -1664,7 +1664,7 @@ func TestJobsStayWithThePlacementThatRunsThem(t *testing.T) {
 	if j, created, err := local.state.SubmitJob(ctx, pid, "j-1", "subprocess", jobReq, "api"); err != nil || created || j.Status != "done" {
 		t.Fatalf("replay j-1 after seal: created=%v status=%s err=%v", created, j.Status, err)
 	}
-	if claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4); err != nil || len(claimed) != 0 {
+	if claimed, _, err := local.state.ClaimJobs(ctx, pid, "runner-1", []string{"subprocess"}, time.Minute, 4, "*"); err != nil || len(claimed) != 0 {
 		t.Fatalf("claim on the sealed persona: claimed=%+v err=%v", claimed, err)
 	}
 

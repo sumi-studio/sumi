@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
@@ -603,5 +604,199 @@ func TestListToolsRoute(t *testing.T) {
 	withEffect := get()
 	if !withEffect["messaging.send"] {
 		t.Fatalf("registered messaging.send not advertised: %v", withEffect)
+	}
+}
+
+// The shared lost-outcome seam over HTTP (the producer half the scripts
+// runner consumes): attach observed evidence to a swept-lost job without
+// moving the verdict — 200 attach/replay, 403 wrong runner, 409 not-lost
+// or divergent, 404 unknown job.
+func TestHTTPLostOutcomeSeam(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	ctx := context.Background()
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+	tok := created.PersonaToken
+	base := "/internal/core/personas/" + pa + "/jobs"
+
+	// A job the runner never claimed is not attachable: the claim is the
+	// identity the outcome binds to.
+	if _, _, err := srv.store.SubmitJob(ctx, pa, "j1", "subprocess",
+		map[string]any{"command": []any{"echo", "x"}}, "assistant"); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, mux, "POST", base+"/j1/lost-outcome", tok,
+		`{"runner_id":"script-runner","observed_status":"done","result":{"ok":true},"error":""}`)
+	if rec.Code != 409 {
+		t.Fatalf("attach on a queued job: %d %s (want 409 — not lost)", rec.Code, rec.Body)
+	}
+
+	// Claim it as a script runner, let the lease expire, sweep to lost.
+	if _, _, err := srv.store.ClaimJobs(ctx, pa, "script-runner", []string{"subprocess"},
+		50*time.Millisecond, 4, "*"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if _, swept, err := srv.store.ClaimJobs(ctx, pa, "foreign", []string{"script"},
+		time.Minute, 4, "*"); err != nil || len(swept) != 1 || swept[0].Status != "lost" {
+		t.Fatalf("sweep: %v %v", swept, err)
+	}
+
+	// Wrong original runner → 403.
+	if rec := do(t, mux, "POST", base+"/j1/lost-outcome", tok,
+		`{"runner_id":"other-runner","observed_status":"done","result":{},"error":""}`); rec.Code != 403 {
+		t.Fatalf("wrong runner: %d %s (want 403)", rec.Code, rec.Body)
+	}
+	// Unknown job → 404.
+	if rec := do(t, mux, "POST", base+"/nope/lost-outcome", tok,
+		`{"runner_id":"script-runner","observed_status":"done","result":{},"error":""}`); rec.Code != 404 {
+		t.Fatalf("unknown job: %d %s (want 404)", rec.Code, rec.Body)
+	}
+	// Original runner attaches → 200, verdict stays lost.
+	rec = do(t, mux, "POST", base+"/j1/lost-outcome", tok,
+		`{"runner_id":"script-runner","observed_status":"done","result":{"stdout":"real"},"error":""}`)
+	if rec.Code != 200 {
+		t.Fatalf("attach: %d %s", rec.Code, rec.Body)
+	}
+	var attached struct {
+		Job Job `json:"job"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &attached)
+	if attached.Job.Status != "lost" {
+		t.Fatalf("lost verdict must not move: %s", attached.Job.Status)
+	}
+	out, ok := attached.Job.Result["observed_outcome"].(map[string]any)
+	if !ok || out["observed_status"] != "done" {
+		t.Fatalf("outcome must land under observed_outcome: %#v", attached.Job.Result)
+	}
+	// Identical resend replays 200.
+	if rec := do(t, mux, "POST", base+"/j1/lost-outcome", tok,
+		`{"runner_id":"script-runner","observed_status":"done","result":{"stdout":"real"},"error":""}`); rec.Code != 200 {
+		t.Fatalf("identical resend: %d %s", rec.Code, rec.Body)
+	}
+	// Divergent evidence conflicts.
+	if rec := do(t, mux, "POST", base+"/j1/lost-outcome", tok,
+		`{"runner_id":"script-runner","observed_status":"failed","result":{"stdout":"other"},"error":""}`); rec.Code != 409 {
+		t.Fatalf("divergent attach: %d %s (want 409)", rec.Code, rec.Body)
+	}
+	// A different persona's token cannot attach.
+	pb := pid(t)
+	rec = do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pb+`"}`)
+	var b struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &b)
+	if rec := do(t, mux, "POST", base+"/j1/lost-outcome", b.PersonaToken,
+		`{"runner_id":"script-runner","observed_status":"done","result":{},"error":""}`); rec.Code != 401 {
+		t.Fatalf("cross-persona attach: %d (want 401)", rec.Code)
+	}
+}
+
+// The shared discovery seam over HTTP: cross-persona job discovery is a
+// service-credential surface — persona tokens get 401, the runtime token
+// gets bounded, kind-filtered pages with a fair cursor.
+func TestHTTPJobDiscoverySeam(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	if err := srv.SetRuntimeToken("runtime-secret-0123456789abcdef01234567"); err != nil {
+		t.Fatal(err)
+	}
+	rt := "runtime-secret-0123456789abcdef01234567"
+	ctx := context.Background()
+	pa := pid(t)
+	rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	var created struct {
+		PersonaToken string `json:"persona_token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &created)
+
+	// Seed: one running job claimed by script-runner, one resolved lost
+	// row that must NOT surface, then one queued job.
+	for _, id := range []string{"jr1", "jl1"} {
+		if _, _, err := srv.store.SubmitJob(ctx, pa, id, "subprocess",
+			map[string]any{"command": []any{"echo", id}}, "assistant"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := srv.store.ClaimJobs(ctx, pa, "script-runner", []string{"subprocess"},
+		50*time.Millisecond, 4, "*"); err != nil {
+		t.Fatal(err)
+	}
+	// jr1 stays claimed (renewed below); jl1's lease expires → swept to
+	// lost → outcome attached → fully resolved.
+	if _, err := srv.store.pool.Exec(ctx,
+		`UPDATE core_jobs SET claim_expires_at = CASE WHEN job_id='jl1' THEN now() - interval '1 second' ELSE now() + interval '5 minutes' END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, swept, err := srv.store.ClaimJobs(ctx, pa, "other", []string{"subprocess"},
+		time.Minute, 4, "*"); err != nil || len(swept) == 0 {
+		t.Fatalf("sweep jl1: %v %v", swept, err)
+	}
+	if _, err := srv.store.AttachLostOutcome(ctx, pa, "jl1", "script-runner",
+		map[string]any{"state": "absent"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := srv.store.SubmitJob(ctx, pa, "jq1", "subprocess",
+		map[string]any{"command": []any{"echo", "jq1"}}, "assistant"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Auth boundary: no token and persona tokens are refused.
+	for _, tok := range []string{"", created.PersonaToken} {
+		if rec := do(t, mux, "GET", "/internal/core/jobs/runnable?kinds=subprocess", tok, ""); rec.Code != 401 {
+			t.Fatalf("runnable with bad token: %d", rec.Code)
+		}
+		if rec := do(t, mux, "GET", "/internal/core/jobs/attention?runner_id=script-runner&kinds=subprocess", tok, ""); rec.Code != 401 {
+			t.Fatalf("attention with bad token: %d", rec.Code)
+		}
+	}
+
+	// Runnable: only queued rows of the requested kind.
+	rec = do(t, mux, "GET", "/internal/core/jobs/runnable?kinds=subprocess&limit=10", rt, "")
+	if rec.Code != 200 {
+		t.Fatalf("runnable: %d %s", rec.Code, rec.Body)
+	}
+	var page struct {
+		Jobs []Job `json:"jobs"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	found := map[string]bool{}
+	for _, j := range page.Jobs {
+		found[j.JobID] = true
+	}
+	if !found["jq1"] || found["jr1"] || found["jl1"] {
+		t.Fatalf("runnable must list only queued rows: %v", found)
+	}
+
+	// Attention: the running claim surfaces; the resolved lost row does not.
+	rec = do(t, mux, "GET", "/internal/core/jobs/attention?runner_id=script-runner&kinds=subprocess&limit=10", rt, "")
+	if rec.Code != 200 {
+		t.Fatalf("attention: %d %s", rec.Code, rec.Body)
+	}
+	page = struct {
+		Jobs []Job `json:"jobs"`
+	}{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	found = map[string]bool{}
+	for _, j := range page.Jobs {
+		found[j.JobID] = true
+	}
+	if !found["jr1"] || found["jq1"] || found["jl1"] {
+		t.Fatalf("attention must list unresolved claimed work only: %v", found)
+	}
+
+	// Kind filtering keeps backends from stealing or stranding each other:
+	// a script-only query sees nothing here.
+	rec = do(t, mux, "GET", "/internal/core/jobs/attention?runner_id=script-runner&kinds=script&limit=10", rt, "")
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Jobs) != 0 {
+		t.Fatalf("kind filter must exclude subprocess rows: %v", page.Jobs)
+	}
+	// runner_id required.
+	if rec := do(t, mux, "GET", "/internal/core/jobs/attention?kinds=subprocess", rt, ""); rec.Code != 400 {
+		t.Fatalf("missing runner_id: %d", rec.Code)
 	}
 }
