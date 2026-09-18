@@ -45,7 +45,7 @@
 import { createServer, type Server } from "node:http";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { Runner, defaultDispatcherPath } from "../src/runner.ts";
 import type { JobRow } from "../src/api.ts";
@@ -265,16 +265,24 @@ ck("usage fact recorded for A with real terminal status",
   usageA != null && (usageA.quantities?.terminal_status === "failed" || usageA.quantities?.terminal_status === "done" || usageA.quantities?.terminal_status === "cancelled"),
   `status=${usageA?.quantities?.terminal_status}`);
 
-// Post: nothing owned survives. Match comm==workerd AND the fixture's
-// own WORKDIR in argv — a bare substring pgrep matches the invoking
-// shell's own cmdline and produces a false positive.
+// Post: nothing owned survives. Identify the payload like isExeImage:
+// comm == basename(WORKERD_BIN) truncated to 15 (TASK_COMM_LEN-1) OR
+// argv[0] == WORKERD_BIN verbatim — a versioned basename like
+// workerd-2026-08-04 gives comm workerd-2026-08, which a literal
+// "workerd" match can never see. The fixture's own WORKDIR in argv
+// scopes to owned jobs; a bare substring pgrep would match the
+// invoking shell's own cmdline and produce a false positive.
+const workerdComm = basename(WORKERD_BIN).slice(0, 15);
 await sleep(500);
-let leftovers = "";
-try {
-  leftovers = execFileSync("bash", ["-c",
-    `ps -eo pid=,comm=,args= | awk -v w="${WORKDIR}" '$2=="workerd" && index($0,w) {print $1" "$3" "$4}'`,
-  ], { encoding: "utf8" }).trim();
-} catch { /* none */ }
+// Pass paths as arguments, never interpolate them into shell source.
+// A failed process scan must fail the proof, not mean "no leftovers".
+const leftovers = execFileSync("awk", [
+  "-v", `w=${WORKDIR}`, "-v", `c=${workerdComm}`, "-v", `exe=${WORKERD_BIN}`,
+  '($2==c || $3==exe) && index($0,w) {print $1" "$3" "$4}',
+], {
+  input: execFileSync("ps", ["-eo", "pid=,comm=,args="], { encoding: "utf8" }),
+  encoding: "utf8",
+}).trim();
 ck("no owned workerd survives after the run", leftovers === "", leftovers.slice(0, 120));
 
 const failed = checks.filter((c) => !c.pass);

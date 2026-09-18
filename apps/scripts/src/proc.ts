@@ -61,12 +61,19 @@ export function commForExe(exePath: string): string {
   return base.slice(0, 15);
 }
 
-/** True when `pid` is the image exec'd from `exePath`: comm is the
- *  basename truncated to TASK_COMM_LEN-1, and argv[0] is the verbatim
- *  exec path (which also survives a self-renamed comm). Matching only
- *  a bare basename like "workerd" fails for every versioned path the
- *  config legitimately supplies (workerd-2026-08-04 → comm
- *  workerd-2026-08) — identity must be derived, not assumed. */
+/** True when `pid` carries the image shape of `exePath`: comm equals
+ *  the basename truncated to TASK_COMM_LEN-1 OR argv[0] equals the
+ *  verbatim exec path (argv[0] also survives a self-renamed comm).
+ *  This is a name-shape match, not an exact-image proof: a sibling
+ *  image sharing the 15-char comm prefix (workerd-2026-08-04 vs
+ *  -2026-08-19, both 'workerd-2026-08') satisfies it too, and comm
+ *  alone does not pin the path. That is sound for its only use —
+ *  FINDING the payload under an owned launcher; the kill decision is
+ *  still verified at killVerified by pid + start_ticks + boot_id.
+ *  Matching only a bare basename like "workerd" fails for every
+ *  versioned path the config legitimately supplies
+ *  (workerd-2026-08-04 → comm workerd-2026-08) — identity must be
+ *  derived, not assumed. */
 export function isExeImage(pid: number, exePath: string): boolean {
   if (commOf(pid) === commForExe(exePath)) return true;
   return argv0Of(pid) === exePath;
