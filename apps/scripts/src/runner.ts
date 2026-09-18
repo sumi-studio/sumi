@@ -66,11 +66,14 @@ export class Runner {
     mkdirSync(cfg.workDir, { recursive: true });
   }
 
-  /** Claim up to cfg.claimLimit script jobs for one persona. */
-  async claimPersona(personaID: string): Promise<JobRow[]> {
+  /** Claim up to `limit` script jobs for one persona (default
+   *  cfg.claimLimit). The caller bounds the reservation: a claim is
+   *  durable immediately, so claiming more than we can start strands
+   *  owned/running rows until their lease expires into 'lost'. */
+  async claimPersona(personaID: string, limit = this.cfg.claimLimit): Promise<JobRow[]> {
     try {
       const { claimed, swept } = await this.client.claimJobs(
-        personaID, this.cfg.runnerID, this.cfg.leaseMs, this.cfg.claimLimit,
+        personaID, this.cfg.runnerID, this.cfg.leaseMs, limit,
       );
       for (const j of swept) {
         this.log(`swept ${j.job_id} (expired claim -> ${j.status})`);
@@ -416,6 +419,10 @@ export class Runner {
     if (j0) this.journal.update(j0, {
       result: { ...result, terminal_status: status, error },
       wire_result: JSON.parse(JSON.stringify(result)) as Record<string, unknown>,
+      // The live ledger count, not the frozen wire snapshot: any
+      // unresolved admitted effect keeps this journal eligible for
+      // resolve-file-op retries after terminal (see journal.unfinished).
+      file_ops_pending: pending,
     });
 
     try {

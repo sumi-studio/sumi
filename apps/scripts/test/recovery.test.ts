@@ -9,62 +9,63 @@
  * API — every request it forwards hits the real producer and real PG;
  * "down" answers 502 without forwarding (outage), "drop" forwards and
  * commits upstream then answers 502 (a lost reply after a landed write).
- * Labeled boundary: 'script' admission and jobfiles routes are not on
- * the producer branch, so script jobs are SQL-seeded and file-op
- * settlement is exercised only to the producer's route surface.
+ *
+ * On the merged producer every job state below is produced through the
+ * real API surface — admission via POST /jobs, 'running' via the claim
+ * route, 'lost' via a short lease + the claim-transaction sweep. No SQL
+ * seeding: the producer's own transitions are the fixture. File effects
+ * run through the real jobfiles routes against an in-process filesvc
+ * protocol stub (keyed committed-receipt idempotency).
  *
  * Env:
- *   SUMI_TEST_DB_URL     postgres://... (dedicated throwaway DB — truncated)
+ *   SUMI_TEST_DB_URL     postgres://... (a fresh <name>_<pid> database is
+ *                        derived from it — per-run isolation, no truncation)
  *   CONSUMER_API         http://host:port of an already-running producer
  *                        (else PRODUCER_STATE_DEV_BIN is spawned here)
  *   PRODUCER_STATE_DEV_BIN  state-dev binary built from the producer tree
- *   SQL_HELPER           "<bin>" invoked as `<bin> <SQL_DB_URL> <query>`
- *                        (pgx exec shim for containers without psql)
- *   SQL_DB_URL           DB URL as reachable from the helper (default DB_URL)
- *   PG_CONTAINER         docker container with psql (host-side alternative)
- *   PSQL_BIN             psql fallback
- *   WORKERD_BIN, RUNLIMITED_BIN — real worker for the live-job test
+ *   WORKERD_BIN, RUNLIMITED_BIN — real worker for the live-job tests
  */
 
 import { test, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 
-import { StateClient, ConfiguredDiscovery } from "../src/api.ts";
-import { defaultDispatcherPath } from "../src/runner.ts";
+import { StateClient, ConfiguredDiscovery, SharedDiscovery } from "../src/api.ts";
+import { defaultDispatcherPath, Runner } from "../src/runner.ts";
 import { Reconciler } from "../src/reconcile.ts";
 import { Journal } from "../src/journal.ts";
 import { Supervisor, stableRunnerID } from "../src/main.ts";
+import { StubFileSvc } from "./filesvc_stub.mts";
 
 const req = (k: string): string => {
   const v = process.env[k];
   if (!v) throw new Error(`${k} required`);
   return v;
 };
-const DB_URL = req("SUMI_TEST_DB_URL");
+// Fresh database + runner identity per run — random, not pid-derived:
+// container pids are constant across runs, so pid-based names get reused
+// and stale rows pollute claim/attention/discovery assertions.
+const RUN_SUFFIX = crypto.randomUUID().slice(0, 8);
+const DB_URL = req("SUMI_TEST_DB_URL").replace(/\/[^/?]+(\?.*)?$/, `/sumi_recovery_${RUN_SUFFIX}$1`);
 const STATE_DEV_BIN = process.env.PRODUCER_STATE_DEV_BIN ?? "";
 const WORKERD_BIN = req("WORKERD_BIN");
 const RUNLIMITED_BIN = req("RUNLIMITED_BIN");
-const PSQL = process.env.PSQL_BIN ?? "psql";
-const PG_CONTAINER = process.env.PG_CONTAINER ?? "";
-const SQL_HELPER = process.env.SQL_HELPER ?? "";
-const SQL_DB_URL = process.env.SQL_DB_URL ?? DB_URL;
 const EXTERNAL_API = process.env.CONSUMER_API ?? "";
 
 const ADMIN = "recovery-admin-token-0123456789abcdef";
 const RUNTIME = "recovery-runtime-token-0123456789abcdef";
-const RUNNER_ID = `recovery-it-${process.pid}`;
+const RUNNER_ID = `recovery-it-${RUN_SUFFIX}`;
 const REAL_API = EXTERNAL_API || "http://127.0.0.1:8185";
 
 let apiProc: ReturnType<typeof spawn> | null = null;
 let workDir = "";
 let client: StateClient;
+const stub = new StubFileSvc();
 const apiLogs: string[] = [];
 
 function uuidv7(): string {
@@ -101,26 +102,31 @@ async function makePersona(name: string): Promise<{ id: string; token: string }>
   return { id, token: res.persona_token };
 }
 
-function sql(q: string): void {
-  if (SQL_HELPER) {
-    execFileSync(SQL_HELPER, [SQL_DB_URL, q]);
-  } else if (PG_CONTAINER) {
-    const db = DB_URL.split("/").pop()!.split("?")[0]!;
-    execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", "postgres", "-d", db, "-Xq", "-c", q]);
-  } else {
-    execFileSync(PSQL, [DB_URL, "-Xq", "-c", q]);
-  }
+// Job states are produced through the producer's own transitions, never
+// SQL: admission via POST /jobs, a live 'running' claim via the claim
+// route, and 'lost' via a short lease plus the claim-transaction sweep.
+async function submitJob(personaID: string, jobID: string, request: unknown): Promise<void> {
+  await adminCall("POST", `/internal/core/personas/${personaID}/jobs`, {
+    job_id: jobID, kind: "script", request,
+  });
 }
 
-function seedJob(personaID: string, jobID: string, request: unknown, status = "queued", extra = ""): void {
-  const r = JSON.stringify(request).replace(/'/g, "''");
-  sql(`INSERT INTO core_jobs (persona_id, job_id, kind, request, status${extra ? ", claimed_by, claim_expires_at" : ""})` +
-    ` VALUES ('${personaID}', '${jobID}', 'script', '${r}'::jsonb, '${status}'${extra})`);
+/** Real admission + real claim: the row is 'running', claimed by RUNNER_ID. */
+async function claimRunning(personaID: string, jobID: string, request: unknown = { code: "x" }, leaseMs = 3_600_000): Promise<void> {
+  await submitJob(personaID, jobID, request);
+  const { claimed } = await client.claimJobs(personaID, RUNNER_ID, leaseMs, 4);
+  if (!claimed.some((j) => j.job_id === jobID)) throw new Error(`${jobID} was not claimed`);
 }
 
-function seedClaimed(personaID: string, jobID: string, status: string, runner = RUNNER_ID, expires = "now() + interval '1 hour'"): void {
-  seedJob(personaID, jobID, { code: "x", input: null, limits: {} }, status,
-    `, '${runner}', ${expires}`);
+/** Real admission + real claim + real lease expiry + real sweep: 'lost'. */
+async function claimToLost(personaID: string, jobID: string): Promise<void> {
+  await submitJob(personaID, jobID, { code: "x" });
+  await client.claimJobs(personaID, RUNNER_ID, 400, 4);
+  await new Promise((r) => setTimeout(r, 900));
+  // The next claim on this persona runs the expiry sweep inside its tx.
+  await client.claimJobs(personaID, RUNNER_ID, 400, 4);
+  const row = await jobRow(personaID, jobID);
+  if (row.status !== "lost") throw new Error(`${jobID} not swept to lost: ${row.status}`);
 }
 
 async function jobRow(personaID: string, jobID: string): Promise<Record<string, unknown>> {
@@ -209,6 +215,7 @@ function plantExited(wd: string, personaID: string, jobID: string, wire: Record<
 }
 
 before(async () => {
+  const stubURL = await stub.start();
   workDir = mkdtempSync(join(tmpdir(), "sumi-recovery-it-"));
   client = new StateClient({ api: REAL_API, token: RUNTIME });
   if (!EXTERNAL_API) {
@@ -221,6 +228,8 @@ before(async () => {
         SUMI_CORE_STATE_TOKEN: ADMIN,
         SUMI_CORE_RUNTIME_TOKEN: RUNTIME,
         SUMI_STATE_LISTEN: "127.0.0.1:8185",
+        SUMI_FILESVC_URL: stubURL,
+        SUMI_FILESVC_TOKEN: "svc-token",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -233,11 +242,11 @@ before(async () => {
       return res.status === 200;
     } catch { return false; }
   }, 15000, "producer state-dev listen");
-  sql("TRUNCATE core_jobs, core_personas CASCADE");
 });
 
-after(() => {
+after(async () => {
   apiProc?.kill();
+  await stub.stop();
   try { rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
@@ -245,7 +254,7 @@ after(() => {
 
 test("recovery continues after an API outage — no supervisor restart needed", async () => {
   const p = await makePersona("outage");
-  seedClaimed(p.id, "j-out", "running", RUNNER_ID);
+  await claimRunning(p.id, "j-out");
   const gate = new Gate();
   gate.rule = () => "down";
   await gate.start();
@@ -298,9 +307,9 @@ test("attention backlog deeper than one bounded pass progresses, unresolvable pr
   const p1 = await makePersona("backlog-stuck");
   const p2 = await makePersona("backlog-a");
   const p3 = await makePersona("backlog-b");
-  seedClaimed(p1.id, "j-stuck", "running", RUNNER_ID);
-  seedClaimed(p2.id, "j-b1", "lost", RUNNER_ID, "now() - interval '1 hour'");
-  seedClaimed(p3.id, "j-b2", "lost", RUNNER_ID, "now() - interval '1 hour'");
+  await claimRunning(p1.id, "j-stuck");
+  await claimToLost(p2.id, "j-b1");
+  await claimToLost(p3.id, "j-b2");
 
   const wd = mkdtempSync(join(tmpdir(), "sumi-rec-backlog-"));
   const rec = newReconciler(wd, { attentionPage: 1, attentionMaxPages: 1 });
@@ -330,7 +339,7 @@ test("attention backlog deeper than one bounded pass progresses, unresolvable pr
 
 test("a concurrently running script survives a periodic recovery pass", async () => {
   const p = await makePersona("livejob");
-  seedJob(p.id, "j-live", {
+  await submitJob(p.id, "j-live", {
     code: 'export async function run(input){ await new Promise(r=>setTimeout(r,input.ms)); return "slept"; }',
     input: { ms: 2500 },
     limits: { cpu_seconds: 10, wall_ms: 30000, memory_mib: 64, output_bytes: 4096, log_bytes: 0, file_calls: 0, file_bytes: 0 },
@@ -357,7 +366,7 @@ test("a concurrently running script survives a periodic recovery pass", async ()
     // While it runs, plant an OWED exited journal + row for another job —
     // periodic recovery must settle it without touching the live one.
     const p2 = await makePersona("livejob-owed");
-    seedClaimed(p2.id, "j-owed", "running", RUNNER_ID);
+    await claimRunning(p2.id, "j-owed");
     plantExited(wd, p2.id, "j-owed", { value: 5, reason: "done", usage: { cpu_ms: 3 }, file_ops_pending: null });
 
     await waitFor(async () => (await jobRow(p.id, "j-live")).status === "done", 30000, "live job completes");
@@ -377,7 +386,7 @@ test("a concurrently running script survives a periodic recovery pass", async ()
 
 test("lost reply after a landed attach: identical replay lands; a divergent one would 409", async () => {
   const p = await makePersona("replay");
-  seedClaimed(p.id, "j-rep", "lost", RUNNER_ID, "now() - interval '1 hour'");
+  await claimToLost(p.id, "j-rep");
   const wd = mkdtempSync(join(tmpdir(), "sumi-rec-replay-"));
   const wire = { reason: "supervisor_restarted", detail: "wait4 lost", usage: { cpu_ms: 5 }, file_ops_pending: null };
   plantExited(wd, p.id, "j-rep", wire, "failed");
@@ -423,7 +432,7 @@ test("lost reply after a landed attach: identical replay lands; a divergent one 
 
 test("getJob failure leaves the journal eligible; delivery lands on a later pass", async () => {
   const p = await makePersona("getjob");
-  seedClaimed(p.id, "j-gj", "running", RUNNER_ID);
+  await claimRunning(p.id, "j-gj");
   const wd = mkdtempSync(join(tmpdir(), "sumi-rec-gj-"));
   plantExited(wd, p.id, "j-gj", { value: 2, reason: "done", usage: { cpu_ms: 4 }, file_ops_pending: null });
 
@@ -450,7 +459,7 @@ test("getJob failure leaves the journal eligible; delivery lands on a later pass
 
 test("no-journal lost claim: durable record first, attach lands, usage failure recovered after restart", async () => {
   const p = await makePersona("njr");
-  seedClaimed(p.id, "j-njr", "lost", RUNNER_ID, "now() - interval '1 hour'");
+  await claimToLost(p.id, "j-njr");
   const wd = mkdtempSync(join(tmpdir(), "sumi-rec-njr-"));
 
   const gate = new Gate();
@@ -510,5 +519,107 @@ test("runner identity: durable across restarts, refuses unrecoverable storage", 
     assert.equal(stableRunnerID(wd3), "explicit-runner");
   } finally {
     if (prev === undefined) delete process.env.SUMI_RUNNER_ID; else process.env.SUMI_RUNNER_ID = prev;
+  }
+});
+
+test("file effects: terminal+usage delivered while one effect is unresolved stays retryable until the ledger settles", { timeout: 60_000 }, async () => {
+  const p = await makePersona("fop");
+  // Real admission and a real durable claim.
+  await submitJob(p.id, "j-fx", {
+    code: 'export async function run(){ return "fx-done" }',
+  });
+  const { claimed } = await client.claimJobs(p.id, RUNNER_ID, 30_000, 1);
+  const job = claimed.find((j) => j.job_id === "j-fx")!;
+
+  // While the claim is live, admit a mutating op whose upstream response
+  // is destroyed after the commit — the durable ledger records 'unknown'.
+  stub.faults.dropResponse = true;
+  const wr = await fetch(`${REAL_API}/internal/core/personas/${p.id}/jobs/j-fx/files/write`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${RUNTIME}` },
+    body: JSON.stringify({ runner_id: RUNNER_ID, path: "fx.txt", data_base64: Buffer.from("x").toString("base64") }),
+  });
+  stub.faults.dropResponse = false;
+  const wrBody = await wr.json() as { op: { status: string } };
+  assert.equal(wrBody.op.status, "unknown", "upstream uncertainty journaled, not invented");
+
+  // The runner finishes while resolve attempts cannot reach the API:
+  // terminal result + measured usage land, one effect stays pending.
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-fop-"));
+  const gate = new Gate();
+  gate.rule = (m, path) => (m === "POST" && path.includes("/files/ops/") && path.endsWith("/resolve") ? "down" : "pass");
+  await gate.start();
+  const runner = new Runner({
+    api: gate.url, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 1, cgroupMode: "prlimit", log: () => {},
+  });
+  await runner.runJob(job);
+  const row1 = await jobRow(p.id, "j-fx");
+  assert.equal(row1.status, "done", "terminal result delivered despite unresolved effect");
+  const j1 = new Journal(wd).read("j-fx")!;
+  assert.equal(j1.status, "reported");
+  assert.equal(j1.usage_status, "recorded");
+  assert.equal(j1.file_ops_pending, 1, "the ledger's real count is journaled");
+  // THE F380 invariant: a delivered job with an unresolved effect is
+  // still recoverable — under the old selection it was invisible forever.
+  assert.ok(new Journal(wd).unfinished().some((j) => j.job_id === "j-fx"),
+    "unresolved effect keeps the journal eligible for retry");
+
+  // Recovery path restores: a later pass resolves the op by keyed resend —
+  // no script re-execution, no restart; the receipt proves single commit.
+  gate.rule = () => "pass";
+  await newReconciler(wd, {}, gate.url).runRecovery(new Set());
+  const j2 = new Journal(wd).read("j-fx")!;
+  assert.equal(j2.file_ops_pending, 0);
+  assert.ok(!new Journal(wd).unfinished().some((j) => j.job_id === "j-fx"), "all obligations settled");
+  const { ops, pending } = await client.listFileOps(p.id, "j-fx");
+  assert.equal(pending, 0);
+  assert.equal(ops.length, 1, "resend is the same durable op, never a fresh one");
+  assert.equal(ops[0]!.status, "settled");
+  const row2 = await jobRow(p.id, "j-fx");
+  assert.equal(row2.status, "done", "no re-execution — verdict and result untouched");
+  assert.equal((row2.result as Record<string, unknown>).value, "fx-done");
+  gate.close();
+});
+
+test("claims are bounded by free capacity — a backlog never strands owned claims", { timeout: 90_000 }, async () => {
+  const p = await makePersona("backlog-run");
+  // Four queued jobs discovered dynamically under a supervisor that can
+  // run two at once but would claim four per pass if unbounded (F382:
+  // claiming beyond free capacity left owned/running jobs with no
+  // journal until their leases expired to 'lost').
+  for (const id of ["j-c1", "j-c2", "j-c3", "j-c4"]) {
+    await submitJob(p.id, id, {
+      code: 'export async function run(){ return "ok" }',
+      limits: { cpu_seconds: 5, wall_ms: 20000, memory_mib: 64 },
+    });
+  }
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-cap-"));
+  const sup = new Supervisor({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 10_000, heartbeatMs: 300, claimLimit: 4, cgroupMode: "prlimit",
+    log: () => {},
+    discovery: new SharedDiscovery(new StateClient({ api: REAL_API, token: RUNTIME }), ["script"], 8),
+    maxConcurrent: 2, pollMs: 200, recoveryEveryMs: 60_000,
+  });
+  const running = sup.start();
+  try {
+    for (const id of ["j-c1", "j-c2", "j-c3", "j-c4"]) {
+      await waitFor(async () => (await jobRow(p.id, id)).status === "done", 60_000, `${id} executed`);
+    }
+    for (const id of ["j-c1", "j-c2", "j-c3", "j-c4"]) {
+      const row = await jobRow(p.id, id);
+      assert.equal(row.status, "done", "every admitted job ran exactly once");
+      const j = new Journal(wd).read(id);
+      assert.ok(j, `${id} has an execution journal — no owned claim left unjournaled`);
+      assert.equal(j!.status, "reported");
+    }
+  } finally {
+    sup.shutdown();
+    await running.catch(() => {});
   }
 });

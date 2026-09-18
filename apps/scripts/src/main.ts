@@ -56,8 +56,13 @@ export class Supervisor {
         this.cfg.log?.(`discovery: ${e}`);
       }
       for (const p of personas) {
-        if (this.active >= this.cfg.maxConcurrent) break;
-        const claimed = await this.runner.claimPersona(p);
+        // The claim IS the durable reservation — claiming beyond free
+        // capacity would take ownership of jobs this process cannot
+        // start, stranding them owned/running with no journal until the
+        // lease sweeps them to 'lost'. Claim only what we can run now.
+        const free = this.cfg.maxConcurrent - this.active;
+        if (free <= 0) break;
+        const claimed = await this.runner.claimPersona(p, Math.min(this.cfg.claimLimit, free));
         for (const job of claimed) {
           if (this.active >= this.cfg.maxConcurrent) break;
           this.active++;

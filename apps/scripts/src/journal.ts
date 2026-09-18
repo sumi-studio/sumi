@@ -121,7 +121,11 @@ export class Journal {
     return j;
   }
 
-  /** Journals still carrying recoverable execution work. */
+  /** Journals still carrying recoverable obligations. Reported+recorded
+   *  alone is NOT settled: admitted file effects stay retryable until the
+   *  API ledger itself reports zero pending — `file_ops_pending === null`
+   *  means the ledger has never answered (route absent or transient), and
+   *  an unverified count is not proof of zero. */
   unfinished(): JobJournal[] {
     const out: JobJournal[] = [];
     const jobsDir = join(this.dir, "jobs");
@@ -130,7 +134,7 @@ export class Journal {
       if (!name.endsWith(".json")) continue;
       try {
         const j = JSON.parse(readFileSync(join(jobsDir, name), "utf8")) as JobJournal;
-        if (j.status !== "reported" || j.usage_status !== "recorded") out.push(j);
+        if (j.status !== "reported" || j.usage_status !== "recorded" || j.file_ops_pending !== 0) out.push(j);
       } catch { /* corrupt entry: skip, never guess */ }
     }
     return out.sort((a, b) => a.created_at.localeCompare(b.created_at));

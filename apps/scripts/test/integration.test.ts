@@ -572,12 +572,16 @@ test("swept to lost: verdict preserved, pending op resolves, usage attaches", { 
   const jAfter = runner.journal.read("j-swept-lost")!;
   assert.equal(jAfter.usage_status, "recorded", "measured usage fact delivered");
 
-  // 4. The shared AttachLostOutcome route is not wired in this build —
-  //    the reconciler records that explicitly instead of pretending the
-  //    verdict accepted a rewrite.
+  // 4. The shared AttachLostOutcome route IS wired on the merged
+  //    producer: the observed outcome attaches under
+  //    result.observed_outcome WITHOUT rewriting the 'lost' verdict.
+  const attached = (after.result as Record<string, unknown>).observed_outcome as Record<string, unknown> | undefined;
+  assert.ok(attached, "observed outcome attached to the lost row");
+  assert.equal(attached.observed_status, "failed");
+  assert.equal((attached.result as Record<string, unknown>).reason, "worker_killed");
   assert.ok(
-    jAfter.notes.some((n) => n.includes("AttachLostOutcome")),
-    "journal notes the unwired shared route",
+    jAfter.notes.some((n) => n.includes("observed outcome attached")),
+    "journal notes the attach landed through the shared route",
   );
 });
 

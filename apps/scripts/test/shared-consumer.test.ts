@@ -9,24 +9,26 @@
  *   POST .../jobs/{j}/lost-outcome     — observed outcome on a lost row
  * plus ordinary claim/heartbeat/complete/usage through the same API.
  *
- * NOT a combined proof: this producer build lacks the jobfile routes
- * (kind 'script' admission and files/ops live on THIS branch only), so
- * script jobs are seeded directly into core_jobs via SQL and the
- * runner's file-op settle degrades honestly (file_ops_pending=null).
- * cgroup mode is prlimit here — the systemd scope proof is a separate
- * host gate already verified.
+ * On the merged producer every job state is produced through the real
+ * API surface — admission via POST /jobs, 'running' via the claim route,
+ * 'lost'/'cancel_requested' via short-lease expiry + the claim-tx sweep
+ * and the cancel route. No SQL seeding: the producer's own transitions
+ * are the fixture. File effects run through the real jobfiles routes
+ * against an in-process filesvc protocol stub (keyed committed-receipt
+ * idempotency). cgroup mode is prlimit here — the systemd scope proof
+ * is a separate host gate already verified.
  *
  * Env:
  *   PRODUCER_STATE_DEV_BIN   path to the built producer binary
- *   SUMI_TEST_DB_URL         dedicated fixture database
- *   PSQL_BIN                 psql for core_jobs seeding (default psql)
+ *   SUMI_TEST_DB_URL         postgres://... (a fresh randomly suffixed
+ *                            db is derived from it — per-run isolation)
  *   WORKERD_BIN              workerd binary
  *   RUNLIMITED_BIN           runlimited binary
  */
 
 import { test, before, after } from "node:test";
 import * as assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,18 +37,20 @@ import { Runner, defaultDispatcherPath } from "../src/runner.ts";
 import { Reconciler } from "../src/reconcile.ts";
 import { Journal } from "../src/journal.ts";
 import { SharedDiscovery, StateClient } from "../src/api.ts";
+import { StubFileSvc } from "./filesvc_stub.mts";
 
 const req = (k: string): string => {
   const v = process.env[k];
   if (!v) throw new Error(`${k} required`);
   return v;
 };
-const DB_URL = req("SUMI_TEST_DB_URL");
+// A fresh database per run replaces the old TRUNCATE — a random suffix,
+// not pid (container pids are constant across runs and reuse the name).
+const RUN_SUFFIX = crypto.randomUUID().slice(0, 8);
+const DB_URL = req("SUMI_TEST_DB_URL").replace(/\/[^/?]+(\?.*)?$/, `/sumi_consumer_${RUN_SUFFIX}$1`);
 const STATE_DEV_BIN = process.env.PRODUCER_STATE_DEV_BIN ?? "";
 const WORKERD_BIN = req("WORKERD_BIN");
 const RUNLIMITED_BIN = req("RUNLIMITED_BIN");
-const PSQL = process.env.PSQL_BIN ?? "psql";
-const PG_CONTAINER = process.env.PG_CONTAINER ?? ""; // seed via docker exec when set
 
 const ADMIN = "consumer-admin-token-0123456789abcdef";
 const RUNTIME = "consumer-runtime-token-0123456789abcdef";
@@ -54,9 +58,10 @@ const RUNTIME = "consumer-runtime-token-0123456789abcdef";
 // (e.g. inside a fixture container) — the test only drives its HTTP.
 const EXTERNAL_API = process.env.CONSUMER_API ?? "";
 const API = EXTERNAL_API || "http://127.0.0.1:8185";
-const RUNNER_ID = `consumer-it-${process.pid}`;
+const RUNNER_ID = `consumer-it-${RUN_SUFFIX}`;
 
 let apiProc: ReturnType<typeof spawn> | null = null;
+const stub = new StubFileSvc();
 let workDir = "";
 let client: StateClient;
 const apiLogs: string[] = [];
@@ -85,40 +90,29 @@ async function serviceGet(path: string, token = RUNTIME): Promise<{ status: numb
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
-/** Personas go through the real API; script jobs are SQL-seeded —
- *  kind 'script' admission lives on this branch, not the producer. */
+/** Personas and jobs both go through the real API. */
 async function makePersona(name: string): Promise<{ id: string; token: string }> {
   const id = uuidv7();
   const res = await adminCall("POST", "/internal/core/personas", { persona_id: id, display_name: name }) as { persona_token: string };
   return { id, token: res.persona_token };
 }
 
-// SQL_HELPER: "<bin>" runs `<bin> <SQL_DB_URL> <query>` — a tiny pgx exec
-// shim for fixture containers that have neither psql nor docker. SQL_DB_URL
-// is the URL *as reachable from the helper's network* (may differ from
-// DB_URL, which the producer uses).
-const SQL_HELPER = process.env.SQL_HELPER ?? "";
-const SQL_DB_URL = process.env.SQL_DB_URL ?? DB_URL;
-function sql(q: string): void {
-  if (SQL_HELPER) {
-    execFileSync(SQL_HELPER, [SQL_DB_URL, q]);
-  } else if (PG_CONTAINER) {
-    const db = DB_URL.split("/").pop()!.split("?")[0]!;
-    execFileSync("docker", ["exec", PG_CONTAINER, "psql", "-U", "postgres", "-d", db, "-Xq", "-c", q]);
-  } else {
-    execFileSync(PSQL, [DB_URL, "-Xq", "-c", q]);
-  }
+// Job states are produced through the producer's own transitions, never
+// SQL: admission via POST /jobs, a live claim via the claim route,
+// 'lost' via a short lease + the claim-transaction sweep.
+async function submitJob(personaID: string, jobID: string, kind: string, request: unknown): Promise<void> {
+  await adminCall("POST", `/internal/core/personas/${personaID}/jobs`, {
+    job_id: jobID, kind, request,
+  });
 }
 
-function seedJob(personaID: string, jobID: string, kind: string, request: unknown, status = "queued", extra = ""): void {
-  const req = JSON.stringify(request).replace(/'/g, "''");
-  sql(`INSERT INTO core_jobs (persona_id, job_id, kind, request, status${extra ? ", claimed_by, claim_expires_at" : ""})` +
-    ` VALUES ('${personaID}', '${jobID}', '${kind}', '${req}'::jsonb, '${status}'${extra})`);
-}
-
-function seedClaimed(personaID: string, jobID: string, status: string, runner = RUNNER_ID, expires = "now() + interval '1 hour'"): void {
-  seedJob(personaID, jobID, "script", { code: "x", input: null, limits: {} }, status,
-    `, '${runner}', ${expires}`);
+async function claimToLost(personaID: string, jobID: string): Promise<void> {
+  await submitJob(personaID, jobID, "script", { code: "x" });
+  await client.claimJobs(personaID, RUNNER_ID, 400, 4);
+  await new Promise((r) => setTimeout(r, 900));
+  await client.claimJobs(personaID, RUNNER_ID, 400, 4); // sweeps the expired claim
+  const row = await jobRow(personaID, jobID);
+  if (row.status !== "lost") throw new Error(`${jobID} not swept to lost: ${row.status}`);
 }
 
 async function jobRow(personaID: string, jobID: string): Promise<Record<string, unknown>> {
@@ -153,6 +147,7 @@ function newReconciler(dir = workDir): Reconciler {
 before(async () => {
   workDir = mkdtempSync(join(tmpdir(), "sumi-consumer-it-"));
   client = new StateClient({ api: API, token: RUNTIME });
+  const filesvcURL = await stub.start();
   if (!EXTERNAL_API) {
     if (!STATE_DEV_BIN) throw new Error("PRODUCER_STATE_DEV_BIN required when CONSUMER_API is not set");
     apiProc = spawn(STATE_DEV_BIN, [], {
@@ -163,6 +158,8 @@ before(async () => {
         SUMI_CORE_STATE_TOKEN: ADMIN,
         SUMI_CORE_RUNTIME_TOKEN: RUNTIME,
         SUMI_STATE_LISTEN: "127.0.0.1:8185",
+        SUMI_FILESVC_URL: filesvcURL,
+        SUMI_FILESVC_TOKEN: "svc-token",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -176,19 +173,17 @@ before(async () => {
       return res.status === 200;
     } catch { return false; }
   }, 15000, "producer state-dev listen");
-  // Dedicated throwaway fixture DB — start every run empty so paging/fairness
-  // assertions are deterministic across reruns.
-  sql("TRUNCATE core_jobs, core_personas CASCADE");
 });
 
 after(() => {
   apiProc?.kill();
+  stub.stop();
   try { rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
 });
 
 test("dynamic discovery: a newly queued persona script is found with no persona config", async () => {
   const p = await makePersona("dyn");
-  seedJob(p.id, "j-dyn", "script", {
+  await submitJob(p.id, "j-dyn", "script", {
     code: 'export async function run(input){ return input.n + 1; }',
     input: { n: 41 },
     limits: { cpu_seconds: 5, wall_ms: 15000, memory_mib: 64, output_bytes: 4096, log_bytes: 4096, file_calls: 0, file_bytes: 0 },
@@ -211,12 +206,14 @@ test("fair paging: a queue deeper than one page is walked, not starved", async (
   const ids: string[] = [];
   for (let i = 0; i < 3; i++) {
     const p = await makePersona(`page-${i}`);
-    seedJob(p.id, `j-p${i}`, "script", { code: "x" }, "queued");
+    await submitJob(p.id, `j-p${i}`, "script", { code: "x" });
     ids.push(p.id);
   }
   const disc = new SharedDiscovery(client, ["script"], 1); // one job per page
   const seen = new Set<string>();
-  for (let i = 0; i < 12 && seen.size < 3; i++) {   // generous: stale queued rows from reruns consume pages too
+  // Walk until THIS test's personas are all discovered — other queued
+  // personas may share the cursor space and must not end the walk early.
+  for (let i = 0; i < 24 && !ids.every((id) => seen.has(id)); i++) {
     for (const p of await disc.personas()) seen.add(p);
   }
   for (const id of ids) assert.ok(seen.has(id), `persona ${id} never discovered — starved behind the page`);
@@ -224,8 +221,8 @@ test("fair paging: a queue deeper than one page is walked, not starved", async (
 
 test("kind filter: non-script queued jobs are not discovered or claimed", async () => {
   const p = await makePersona("kinds");
-  seedJob(p.id, "j-sub", "subprocess", { argv: ["/bin/true"] }, "queued");
-  seedJob(p.id, "j-scr", "script", { code: "x" }, "queued");
+  await submitJob(p.id, "j-sub", "subprocess", { command: ["/bin/true"] });
+  await submitJob(p.id, "j-scr", "script", { code: "x" });
   const page = await client.runnableJobs(["script"], 64);
   const kinds = page.jobs.filter((j) => j.persona_id === p.id).map((j) => j.job_id);
   assert.deepEqual(kinds, ["j-scr"]);
@@ -243,7 +240,7 @@ test("persona token cannot reach cross-persona discovery", async () => {
 
 test("expired claim sweeps to lost; observed outcome attaches via the real route", async () => {
   const p = await makePersona("lost");
-  seedJob(p.id, "j-lost-x", "script", {
+  await submitJob(p.id, "j-lost-x", "script", {
     code: 'export async function run(){ await new Promise(r=>setTimeout(r,120000)); return 1; }',
     input: null,
     limits: { cpu_seconds: 120, wall_ms: 120000, memory_mib: 64, output_bytes: 4096, log_bytes: 0, file_calls: 0, file_bytes: 0 },
@@ -297,7 +294,7 @@ test("expired claim sweeps to lost; observed outcome attaches via the real route
 
 test("lost-outcome attach: divergent evidence 409, wrong claimant 403", async () => {
   const p = await makePersona("conflict");
-  seedClaimed(p.id, "j-conf", "lost", RUNNER_ID, "now() - interval '1 hour'");
+  await claimToLost(p.id, "j-conf");
   const first = await client.attachLostOutcome(p.id, "j-conf", RUNNER_ID, {
     observed_status: "failed", result: { reason: "a" }, error: "",
   });
@@ -316,7 +313,9 @@ test("lost-outcome attach: divergent evidence 409, wrong claimant 403", async ()
 
 test("attention: a running claim with no journal is deferred, then resolved via the lost sweep", async () => {
   const p = await makePersona("nojrn");
-  seedClaimed(p.id, "j-noj", "running", RUNNER_ID);
+  // A claim on a short lease — the same expiry path as a real outage.
+  await submitJob(p.id, "j-noj", "script", { code: "x" });
+  await client.claimJobs(p.id, RUNNER_ID, 400, 4);
   const wd = mkdtempSync(join(tmpdir(), "sumi-empty-wd-"));
   const res = await newReconciler(wd).run();
   // A missing journal is NOT proof the process stopped — the claim is
@@ -327,9 +326,9 @@ test("attention: a running claim with no journal is deferred, then resolved via 
   assert.ok(res.attention.seen >= 1);
   assert.ok(res.attention.pending >= 1, "deferred row reported as pending, not resolved");
 
-  // Expire the lease; the next claim call sweeps it to 'lost'.
-  sql(`UPDATE core_jobs SET claim_expires_at = now() - interval '1 second' WHERE job_id = 'j-noj'`);
-  await client.claimJobs(p.id, RUNNER_ID, 1000, 4).catch(() => null);
+  // The lease expires; the next claim call sweeps it to 'lost'.
+  await new Promise((r) => setTimeout(r, 900));
+  await client.claimJobs(p.id, RUNNER_ID, 400, 4).catch(() => null);
   row = await jobRow(p.id, "j-noj");
   assert.equal(row.status, "lost");
 
@@ -344,7 +343,9 @@ test("attention: a running claim with no journal is deferred, then resolved via 
 
 test("attention: cancel_requested claim with no journal is deferred, not declared cancelled", async () => {
   const p = await makePersona("cancel");
-  seedClaimed(p.id, "j-cxl", "cancel_requested", RUNNER_ID);
+  await submitJob(p.id, "j-cxl", "script", { code: "x" });
+  await client.claimJobs(p.id, RUNNER_ID, 30_000, 4);
+  await adminCall("POST", `/internal/core/personas/${p.id}/jobs/j-cxl/cancel`);
   await newReconciler(mkdtempSync(join(tmpdir(), "sumi-empty-wd-"))).run();
   const row = await jobRow(p.id, "j-cxl");
   assert.equal(row.status, "cancel_requested",
@@ -353,7 +354,7 @@ test("attention: cancel_requested claim with no journal is deferred, not declare
 
 test("attention: lost claim with no journal gets honest no-evidence outcome, not a fabricated verdict", async () => {
   const p = await makePersona("nojrn-lost");
-  seedClaimed(p.id, "j-nojl", "lost", RUNNER_ID, "now() - interval '1 hour'");
+  await claimToLost(p.id, "j-nojl");
   await newReconciler(mkdtempSync(join(tmpdir(), "sumi-empty-wd-"))).run();
   const row = await jobRow(p.id, "j-nojl");
   assert.equal(row.status, "lost", "verdict unchanged");

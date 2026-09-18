@@ -238,12 +238,14 @@ export class Reconciler {
     return "pending";
   }
 
-  /** Nothing durable left to deliver for this journal — reported and a
+  /** Nothing durable left to deliver for this journal — reported, a
    *  usage fact recorded (a recorded 'unknown' IS delivered; 'pending'
-   *  means the send never landed). */
+   *  means the send never landed), AND the file-effect ledger reporting
+   *  zero pending. A null count is an unanswered ledger — it stays
+   *  retryable, never treated as proof of zero. */
   private journalSettled(j: JobJournal): boolean {
     const cur = this.cfg.journal.read(j.job_id) ?? j;
-    return cur.status === "reported" && cur.usage_status !== "pending";
+    return cur.status === "reported" && cur.usage_status !== "pending" && cur.file_ops_pending === 0;
   }
 
   /** Whether the lost-outcome attach debt is durably discharged —
