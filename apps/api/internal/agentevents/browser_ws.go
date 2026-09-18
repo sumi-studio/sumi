@@ -1191,6 +1191,20 @@ func (s *BrowserServer) browserReadPump(
 				}
 				continue
 			}
+			var rejection *CommandRejectionError
+			if errors.As(err, &rejection) {
+				// Same committed outcome as HTTP: the durable receipt is a
+				// terminal rejection, so the replayed answer says rejected
+				// with the committed reason rather than a bare accepted.
+				if writeErr := write(browserCommandRejectedFrame{
+					Type:           "command_rejected",
+					IdempotencyKey: frame.IdempotencyKey,
+					RejectReason:   rejection.Reason,
+				}); writeErr != nil {
+					return writeErr
+				}
+				continue
+			}
 			return fmt.Errorf("append browser command: %w", err)
 		}
 	}

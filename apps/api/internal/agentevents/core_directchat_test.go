@@ -109,6 +109,20 @@ func (f *coreDirectChatFixture) sendMessage(t *testing.T, key, text string) Comm
 	return env
 }
 
+// queueCommand durably admits a command without dispatching it — the same
+// command-store call the adapter makes, minus the core write. It leaves the
+// command undecided so tests can stage the crash window between durable
+// append and core admission (or terminal receipt).
+func (f *coreDirectChatFixture) queueCommand(t *testing.T, key string, raw json.RawMessage) CommandEnvelope {
+	t.Helper()
+	env, _, err := f.gateway.commands.appendWithIdempotencyStatus(
+		f.ctx, f.provenance(), key, raw)
+	if err != nil {
+		t.Fatalf("queue command: %v", err)
+	}
+	return env
+}
+
 // runHostTurn simulates one core-host turn: claim the queued input under a
 // fresh writer generation and commit the journal events plus outcome —
 // exactly the calls the TypeScript host makes through the state service.
@@ -1783,27 +1797,21 @@ func TestCoreDirectChatTransferredPersonaRejectsMoved(t *testing.T) {
 
 	f.sweep(t)
 	events := durableEvents(t, f.gateway, f.pa)
-	var dispositions []map[string]any
-	for _, e := range events {
-		var ev map[string]any
-		if err := json.Unmarshal(e.Event, &ev); err != nil {
-			continue
-		}
-		if ev["type"] == "command_disposition" {
-			dispositions = append(dispositions, ev)
-		}
-	}
+	dispositions := commandDispositions(t, f.gateway, f.pa)
 	if len(dispositions) != 2 {
 		t.Fatalf("dispositions: %v", dispositions)
 	}
-	// The pre-move command's input was admitted while active — applied.
-	if dispositions[0]["command_id"] != env.CommandID || dispositions[0]["status"] != "applied" {
-		t.Fatalf("pre-move disposition: %v", dispositions[0])
+	byID := map[string]map[string]any{}
+	for _, d := range dispositions {
+		byID[d["command_id"].(string)] = d
 	}
-	if dispositions[1]["command_id"] != movedEnv.CommandID ||
-		dispositions[1]["status"] != "rejected" ||
-		dispositions[1]["reject_reason"] != string(RejectSecretaryMoved) {
-		t.Fatalf("post-move disposition: %v", dispositions[1])
+	// The pre-move command's input was admitted while active — applied.
+	if d := byID[env.CommandID]; d == nil || d["status"] != "applied" {
+		t.Fatalf("pre-move disposition: %v", byID[env.CommandID])
+	}
+	if d := byID[movedEnv.CommandID]; d == nil || d["status"] != "rejected" ||
+		d["reject_reason"] != string(RejectSecretaryMoved) {
+		t.Fatalf("post-move disposition: %v", byID[movedEnv.CommandID])
 	}
 
 	// Re-sweeping after restart must not append duplicates or retry.
@@ -1923,11 +1931,8 @@ func TestCoreDirectChatStaleProjectorCannotDoubleDispose(t *testing.T) {
 		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
 		t.Fatalf("seal persona: %v", err)
 	}
-	env, err := f.adapter.Append(f.ctx, f.provenance(), "stale-key",
+	env := f.queueCommand(t, "stale-key",
 		json.RawMessage(`{"type":"user_message","text":"stale view","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append err=%v", err)
-	}
 
 	// Sibling projector on its own gateway loads its projection state
 	// before the first projector's receipt commits.
@@ -1942,7 +1947,8 @@ func TestCoreDirectChatStaleProjectorCannotDoubleDispose(t *testing.T) {
 	}
 
 	// First projector disposes the command while sealed; the transfer then
-	// completes, so the sibling's stale state now computes secretary_moved.
+	// completes. The sibling's stale cache would compute secretary_moved,
+	// but the committed receipt is consulted first and wins.
 	f.sweep(t)
 	if _, err := f.pool.Exec(f.ctx,
 		`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, f.pa); err != nil {
@@ -2029,11 +2035,8 @@ func TestCoreDirectChatLostDedupIndexStaleProjectorCannotDoubleDispose(t *testin
 		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
 		t.Fatalf("seal persona: %v", err)
 	}
-	env, err := f.adapter.Append(f.ctx, f.provenance(), "lost-index-key",
+	env := f.queueCommand(t, "lost-index-key",
 		json.RawMessage(`{"type":"user_message","text":"stale view","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append err=%v", err)
-	}
 
 	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
 	if err != nil {
@@ -2065,13 +2068,31 @@ func TestCoreDirectChatLostDedupIndexStaleProjectorCannotDoubleDispose(t *testin
 	if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
 		t.Fatalf("CommandDispositionFor: found=%v err=%v", found, derr)
 	}
-	// The rebuilt index must carry the command-scoped preimage, not the
-	// content hash that could never refuse this append again.
+	// A genuinely new command forces a real write, rebuilding the index:
+	// the recovered preimage for the receipt that predated the loss is its
+	// command-scoped key, not a content hash. Admission commits the
+	// rejection synchronously against the rebuilt index.
+	env2, err := f.adapter.Append(f.ctx, f.provenance(), "lost-index-key-2",
+		json.RawMessage(`{"type":"user_message","text":"rebuild","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaTransferred) {
+		t.Fatalf("transferred append err=%v", err)
+	}
+	dispositions = commandDispositions(t, f.gateway, f.pa)
+	byID := map[string]map[string]any{}
+	for _, d := range dispositions {
+		byID[d["command_id"].(string)] = d
+	}
+	if len(dispositions) != 2 ||
+		byID[env2.CommandID]["reject_reason"] != string(RejectSecretaryMoved) {
+		t.Fatalf("rebuild committed unexpected dispositions: %v", dispositions)
+	}
 	idx := readDedupIndex(t, f)
 	want := commandDispositionKey(env.CommandID)
-	if len(idx)%sha256.Size != 0 || len(idx) == 0 ||
-		!bytes.Equal(idx[len(idx)-sha256.Size:], want[:]) {
-		t.Fatalf("rebuilt index does not end with the command-scoped key: %x", idx)
+	want2 := commandDispositionKey(env2.CommandID)
+	if len(idx) != 2*sha256.Size ||
+		!bytes.Equal(idx[:sha256.Size], want[:]) ||
+		!bytes.Equal(idx[sha256.Size:], want2[:]) {
+		t.Fatalf("rebuilt index lost command-scoped preimages: %x", idx)
 	}
 }
 
@@ -2085,11 +2106,8 @@ func TestCoreDirectChatLostDedupIndexSameReasonReplayRefused(t *testing.T) {
 		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
 		t.Fatalf("seal persona: %v", err)
 	}
-	env, err := f.adapter.Append(f.ctx, f.provenance(), "same-reason-key",
+	env := f.queueCommand(t, "same-reason-key",
 		json.RawMessage(`{"type":"user_message","text":"same reason","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append err=%v", err)
-	}
 
 	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
 	if err != nil {
@@ -2105,8 +2123,9 @@ func TestCoreDirectChatLostDedupIndexSameReasonReplayRefused(t *testing.T) {
 	if err := os.Remove(dedupIndexPath(f)); err != nil {
 		t.Fatalf("remove dedup index: %v", err)
 	}
-	// Authority stays sealed: the sibling recomputes the identical
-	// not_allowed receipt for the same command.
+	// Authority stays sealed: the sibling would recompute the identical
+	// not_allowed receipt, but the committed disposition is consulted
+	// first and the index-less stale cache never writes a second one.
 	if err := sibling.reconcileCommands(f.ctx, f.pa, st2); err != nil {
 		t.Fatalf("sibling reconcile: %v", err)
 	}
@@ -2130,19 +2149,13 @@ func TestCoreDirectChatTornDedupIndexStaleProjectorCannotDoubleDispose(t *testin
 		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
 		t.Fatalf("seal persona: %v", err)
 	}
-	env1, err := f.adapter.Append(f.ctx, f.provenance(), "torn-one",
+	env1 := f.queueCommand(t, "torn-one",
 		json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append 1 err=%v", err)
-	}
-	env2, err := f.adapter.Append(f.ctx, f.provenance(), "torn-two",
+	env2 := f.queueCommand(t, "torn-two",
 		json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append 2 err=%v", err)
-	}
 
 	// The sibling loads before either receipt commits, so its in-memory
-	// view is stale and only the durable dedup identity can refuse it.
+	// view is stale and only the durable disposition truth can refuse it.
 	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
 	if err != nil {
 		t.Fatalf("second gateway: %v", err)
@@ -2175,11 +2188,20 @@ func TestCoreDirectChatTornDedupIndexStaleProjectorCannotDoubleDispose(t *testin
 		t.Fatalf("sibling reconcile: %v", err)
 	}
 
+	// The stale sibling finds both committed receipts durably and writes
+	// nothing; a genuinely new command forces the write that re-covers the
+	// torn preimage and realigns the index.
+	env3, err := f.adapter.Append(f.ctx, f.provenance(), "torn-three",
+		json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
+	if !errors.Is(err, agentstate.ErrPersonaInactive) {
+		t.Fatalf("sealed append 3 err=%v", err)
+	}
+
 	dispositions := commandDispositions(t, f.gateway, f.pa)
-	if len(dispositions) != 2 {
+	if len(dispositions) != 3 {
 		t.Fatalf("torn-index stale projector committed extra dispositions: %v", dispositions)
 	}
-	for _, env := range []CommandEnvelope{env1, env2} {
+	for _, env := range []CommandEnvelope{env1, env2, env3} {
 		if _, found, derr := f.gateway.CommandDispositionFor(f.ctx, env); derr != nil || !found {
 			t.Fatalf("CommandDispositionFor %s: found=%v err=%v", env.CommandID, found, derr)
 		}
@@ -2187,12 +2209,16 @@ func TestCoreDirectChatTornDedupIndexStaleProjectorCannotDoubleDispose(t *testin
 	// The torn preimage must be re-covered by the command-scoped key and
 	// the index brought back to exactly one record per committed line.
 	idx = readDedupIndex(t, f)
-	if int64(len(idx)) != eventCount*sha256.Size {
-		t.Fatalf("index preimage count %d no longer matches %d events", len(idx)/sha256.Size, eventCount)
+	if int64(len(idx)) != int64(3)*sha256.Size {
+		t.Fatalf("index preimage count %d no longer matches %d events", len(idx)/sha256.Size, eventCount+1)
 	}
 	want := commandDispositionKey(env2.CommandID)
-	if !bytes.Equal(idx[len(idx)-sha256.Size:], want[:]) {
-		t.Fatalf("re-covered preimage is not the command-scoped key: %x", idx[len(idx)-sha256.Size:])
+	if !bytes.Equal(idx[sha256.Size:2*sha256.Size], want[:]) {
+		t.Fatalf("re-covered preimage is not the command-scoped key: %x", idx[sha256.Size:2*sha256.Size])
+	}
+	want3 := commandDispositionKey(env3.CommandID)
+	if !bytes.Equal(idx[2*sha256.Size:], want3[:]) {
+		t.Fatalf("new preimage is not the command-scoped key: %x", idx[2*sha256.Size:])
 	}
 }
 
@@ -2206,11 +2232,8 @@ func TestCoreDirectChatLegacyKeyedDispositionStillRefusesStaleProjector(t *testi
 		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, f.pa); err != nil {
 		t.Fatalf("seal persona: %v", err)
 	}
-	env, err := f.adapter.Append(f.ctx, f.provenance(), "legacy-key",
+	env := f.queueCommand(t, "legacy-key",
 		json.RawMessage(`{"type":"user_message","text":"legacy","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append err=%v", err)
-	}
 
 	gateway2, err := OpenDurableGateway(f.dir, f.gateway.commands)
 	if err != nil {
@@ -2241,6 +2264,18 @@ func TestCoreDirectChatLegacyKeyedDispositionStillRefusesStaleProjector(t *testi
 		t.Fatalf("sibling reconcile: %v", err)
 	}
 
+	// The stale sibling defers to the committed receipt; a real writer
+	// under the legacy preimage is still refused because recovery
+	// reproduces the command-scoped key from the committed line.
+	committed, err := gateway2.CommitCommandDisposition(f.ctx, env,
+		dispositionEvent(env, "rejected", string(RejectSecretaryMoved)))
+	if err != nil {
+		t.Fatalf("commit second disposition: %v", err)
+	}
+	if committed {
+		t.Fatal("legacy-keyed index allowed a second disposition")
+	}
+
 	dispositions := commandDispositions(t, f.gateway, f.pa)
 	if len(dispositions) != 1 ||
 		dispositions[0]["reject_reason"] != string(RejectNotAllowed) {
@@ -2267,11 +2302,8 @@ func TestCoreDirectChatPhantomDedupKeyDoesNotSuppressDisposition(t *testing.T) {
 	}
 	f.sweep(t)
 
-	env2, err := f.adapter.Append(f.ctx, f.provenance(), "phantom-pending",
+	env2 := f.queueCommand(t, "phantom-pending",
 		json.RawMessage(`{"type":"user_message","text":"pending","attachments":[]}`))
-	if !errors.Is(err, agentstate.ErrPersonaInactive) {
-		t.Fatalf("sealed append 2 err=%v", err)
-	}
 	// Forge the torn-write shape where a preimage outlived its event:
 	// the index holds the pending command's disposition key although no
 	// such event ever committed.

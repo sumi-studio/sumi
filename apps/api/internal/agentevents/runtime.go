@@ -1257,7 +1257,24 @@ func (g *DurableGateway) eventCatchUpScan(ctx context.Context, personalityAgentI
 // command, when one has already been committed. The scan deliberately retains
 // only the matching event: browser idempotency reconciliation must not turn a
 // lifetime event log into an unbounded in-memory disposition index.
+// A torn final record is first repaired under the exclusive event-file lock —
+// the same truncation the append path performs — then re-verified; malformed
+// complete records and non-contiguous data remain hard errors.
 func (g *DurableGateway) CommandDispositionFor(
+	ctx context.Context,
+	command CommandEnvelope,
+) (json.RawMessage, bool, error) {
+	disposition, found, err := g.commandDispositionScan(ctx, command)
+	if errors.Is(err, errTornDurableEventTail) {
+		if repairErr := g.RefreshDurableEventTail(ctx, command.PersonalityAgentID); repairErr != nil {
+			return nil, false, err
+		}
+		disposition, found, err = g.commandDispositionScan(ctx, command)
+	}
+	return disposition, found, err
+}
+
+func (g *DurableGateway) commandDispositionScan(
 	ctx context.Context,
 	command CommandEnvelope,
 ) (json.RawMessage, bool, error) {
@@ -1302,6 +1319,9 @@ func (g *DurableGateway) CommandDispositionFor(
 		if len(trimmed) != 0 {
 			var record durableEventRecord
 			if err := json.Unmarshal(trimmed, &record); err != nil {
+				if errors.Is(readErr, io.EOF) && isIncompleteJSONError(err) {
+					return nil, false, fmt.Errorf("decode durable event log for command disposition lookup: %w", errTornDurableEventTail)
+				}
 				return nil, false, fmt.Errorf("decode durable event log for command disposition lookup: %w", err)
 			}
 			if record.Seq != previous+1 {
@@ -2241,6 +2261,141 @@ func (g *DurableGateway) AppendProjectedEvents(
 		g.updateAgentSessionStateLocked(personalityAgentID, envelope.Event)
 	}
 	return nil
+}
+
+// CommitCommandDisposition durably records one command's terminal
+// disposition under the same event-file lock, dedup index, preimage
+// ordering, and torn-tail rollback as AppendProjectedEvents — but
+// deliberately without that method's single-writer gates. A disposition is
+// the caller-visible admission answer, not passive projection: the
+// hydrated runtime generation or active connection lease that blocks
+// AppendProjectedEvents is the very interaction the answer belongs to, and
+// a terminal rejection a caller already holds must be a fact the log can
+// back after a crash, a stopped reconciler, or a placement return. The
+// command receipt binds durable truth on read (command_id + seq verified
+// against the command log) and on write (the event must name the same
+// command_id its dedup key covers). A disposition already committed — by
+// the reconciler, a replayed admission, or another API process — is
+// reported committed=false so the caller answers the durable truth rather
+// than minting a second receipt. No runtime generation lock is taken: the
+// command log this receipt describes is not generation-fenced either, and
+// holding a shared permit inside an admission callback would wait on any
+// queued exclusive mutation for no correctness gain — the event-file lock
+// and the dedup index carry the integrity boundary. A commit failure
+// leaves the command undecided; callers must not report a terminal
+// rejection for an outcome that never reached the log.
+func (g *DurableGateway) CommitCommandDisposition(
+	ctx context.Context,
+	command CommandEnvelope,
+	disposition json.RawMessage,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := command.Validate(); err != nil {
+		return false, fmt.Errorf("validate command disposition commit: %w", err)
+	}
+	persisted, found, err := g.commands.GetCommand(
+		ctx,
+		command.PersonalityAgentID,
+		command.Seq,
+	)
+	if err != nil {
+		return false, fmt.Errorf("load command for disposition commit: %w", err)
+	}
+	if !found || persisted.CommandID != command.CommandID {
+		return false, errors.New("command disposition commit does not match durable command log")
+	}
+	key := commandDispositionKey(command.CommandID)
+	if dk, ok := commandDispositionDedupKey(disposition); !ok || dk != key {
+		return false, errors.New("command disposition does not name the committed command")
+	}
+	if err := lockMutexContext(ctx, &g.mu); err != nil {
+		return false, err
+	}
+	defer g.mu.Unlock()
+	state, err := g.state(ctx, command.PersonalityAgentID)
+	if err != nil {
+		return false, err
+	}
+	if state.needsResign {
+		return false, errors.New("runtime state requires exclusive integrity re-sign")
+	}
+	st := g.stateFor(command.PersonalityAgentID)
+	file, err := g.newFile(g.eventPath(command.PersonalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
+		return false, fmt.Errorf("lock durable event log for command disposition: %w", err)
+	}
+	defer func() { _ = unlockDurableFile(file) }()
+	if err := g.refreshEventTailLocked(file, st, command.PersonalityAgentID); err != nil {
+		return false, err
+	}
+	keys, index, err := g.projectedKeySet(command.PersonalityAgentID, file, st)
+	if err != nil {
+		return false, err
+	}
+	defer index.Close()
+	if _, seen := keys[key]; seen {
+		return false, nil
+	}
+	seq := st.eventSeq + 1
+	envelope := Envelope{
+		Audience:           AudienceDirectChat,
+		Seq:                &seq,
+		PersonalityAgentID: command.PersonalityAgentID,
+		Event:              disposition,
+	}
+	if err := validateEnvelope(envelope); err != nil {
+		return false, fmt.Errorf("command disposition event: %w", err)
+	}
+	line, err := json.Marshal(durableEventRecord{Seq: seq, Event: envelope})
+	if err != nil {
+		return false, err
+	}
+	// Preimage ordering: the dedup key reaches stable storage before the
+	// event it describes, so a crash between leaves a phantom index record
+	// the next load truncates — never a suppressed receipt.
+	if _, err := index.Write(key[:]); err != nil {
+		return false, fmt.Errorf("write dedup index: %w", err)
+	}
+	if err := index.Sync(); err != nil {
+		return false, fmt.Errorf("sync dedup index: %w", err)
+	}
+	preWriteOffset, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false, err
+	}
+	data := append(line, '\n')
+	written, writeErr := file.Write(data)
+	if writeErr != nil || written != len(data) {
+		var opErr error
+		if writeErr != nil {
+			opErr = fmt.Errorf("write durable event log: %w", writeErr)
+		} else {
+			opErr = fmt.Errorf("short write to durable event log: wrote %d of %d bytes", written, len(data))
+		}
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return false, rbErr
+		}
+		return false, opErr
+	}
+	if syncErr := file.Sync(); syncErr != nil {
+		opErr := fmt.Errorf("sync durable event log: %w", syncErr)
+		if rbErr := rollbackDurableFile(file, preWriteOffset, opErr); rbErr != nil {
+			return false, rbErr
+		}
+		return false, opErr
+	}
+	st.eventSeq = seq
+	st.eventSize = preWriteOffset + int64(len(data))
+	st.eventCRC = updateCRC(st.eventCRC, data)
+	foldRunMarkerLocked(st, disposition)
+	g.updateAgentSessionStateLocked(command.PersonalityAgentID, disposition)
+	return true, nil
 }
 
 func (g *DurableGateway) appendDurableEventLocked(

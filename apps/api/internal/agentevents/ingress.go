@@ -307,6 +307,36 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		var rejection *CommandRejectionError
+		if errors.As(err, &rejection) {
+			// The command's committed durable receipt is a terminal
+			// rejection — the answer reports that same outcome rather than
+			// a bare acceptance or an opaque failure.
+			if rejection.Reason == RejectUnavailable {
+				writeUnavailable(w, idempotencyKey)
+				return
+			}
+			status := http.StatusConflict
+			if rejection.Reason == RejectSecretaryMoved {
+				status = http.StatusGone
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(struct {
+				Error          string       `json:"error"`
+				IdempotencyKey string       `json:"idempotency_key"`
+				CommandID      string       `json:"command_id,omitempty"`
+				Seq            uint64       `json:"seq,omitempty"`
+				RejectReason   RejectReason `json:"reject_reason"`
+			}{
+				Error:          string(rejection.Reason),
+				IdempotencyKey: idempotencyKey,
+				CommandID:      env.CommandID,
+				Seq:            env.Seq,
+				RejectReason:   rejection.Reason,
+			})
+			return
+		}
 		http.Error(w, "command append failed", http.StatusInternalServerError)
 		return
 	}
