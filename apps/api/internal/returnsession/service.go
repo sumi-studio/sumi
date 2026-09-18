@@ -1007,7 +1007,10 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 	// the other observes.
 	switch r.status {
 	case StatusCancelled, StatusAborted, StatusExpired:
-		if err := s.revokeFileTokens(ctx, r.personaID,
+		// Session death is durable — the status never moves backward —
+		// and the predicate already names this session's own tokens, so
+		// no owner re-verification is needed ("" = unconstrained).
+		if _, err := s.revokeFileTokens(ctx, r.personaID, "",
 			`persona_id = $1 AND session_id = $2 AND status = 'active'`, sessionID); err != nil {
 			return err
 		}
@@ -1048,11 +1051,15 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 	if r.status == StatusCompleted && r.fileModeStr() == string(FileModeLocal) {
 		// The working store left Cloud under the live lineage: every
 		// Cloud storage credential dies — they are all older than the
-		// decision now governing the store. Serialized with minting on
-		// the persona lock: a mint that committed first is revoked
-		// here; a mint after this revoke refuses — this completed
-		// local session IS the newer lineage its owner-check sees.
-		if err := s.revokeFileTokens(ctx, r.personaID,
+		// decision now governing the store. The owner verdict that
+		// reached this branch is a stale read the moment it returns:
+		// a newer return can bind and mint while this call is in
+		// flight. The revocation therefore re-proves THIS session is
+		// still the owner inside the locked transaction. If a newer
+		// lineage already minted, this revoke sees its committed bind
+		// and becomes a no-op. A mint waiting for this lock can only
+		// insert its credential after this revocation has committed.
+		if _, err := s.revokeFileTokens(ctx, r.personaID, sessionID,
 			`persona_id = $1 AND status = 'active'`); err != nil {
 			return err
 		}
@@ -1079,24 +1086,52 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 // revokeFileTokens sets matching active credentials revoked under the
 // persona's file-authority lock — the same serialization MintFileCredential
 // takes, so a mint and a revocation can never interleave: whichever
-// transaction commits first decides what the other observes. The predicate
-// is a fixed fragment over persona_id ($1) plus optional session ($2) —
-// callers pass constants only, never user input.
-func (s *Service) revokeFileTokens(ctx context.Context, personaID, pred string, args ...any) error {
+// transaction commits first decides what the other observes.
+//
+// expectOwner closes the check-then-act gap a caller's earlier owner
+// resolution leaves: when it names a session, that session must still be
+// the persona's file-store owner RE-RESOLVED inside this locked
+// transaction, or the revocation is a no-op — a newer lineage that bound
+// and minted after the caller's unlocked check is protected from the
+// stale verdict. "" skips the re-verification for predicates that are
+// inherently self-scoped (a dead session retiring only its own tokens:
+// session death is durable and needs no owner check). Returns the number
+// of credentials actually revoked.
+//
+// The predicate is a fixed fragment over persona_id ($1) plus optional
+// session ($2) — callers pass constants only, never user input.
+func (s *Service) revokeFileTokens(ctx context.Context, personaID, expectOwner, pred string, args ...any) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, personaID); err != nil {
-		return err
+		return 0, err
+	}
+	if expectOwner != "" {
+		owner, err := s.fileStoreOwnerTx(ctx, tx, personaID)
+		if err != nil {
+			return 0, err
+		}
+		if owner != expectOwner {
+			// The verdict that sent this call is stale: a newer lineage
+			// owns the store now, and its credentials are none of this
+			// revocation's business. A committed no-op — not an error,
+			// because the world simply moved on.
+			return 0, tx.Commit(ctx)
+		}
 	}
 	q := `UPDATE persona_file_tokens SET status = 'revoked', resolved_at = now() WHERE ` + pred
-	if _, err := tx.Exec(ctx, q, append([]any{personaID}, args...)...); err != nil {
-		return err
+	tag, err := tx.Exec(ctx, q, append([]any{personaID}, args...)...)
+	if err != nil {
+		return 0, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // personaSessionEpochs lists every return session for a persona with
@@ -1323,11 +1358,32 @@ func (s *Service) AuthorizeFileToken(ctx context.Context, token string) (persona
 // RevokePersonaFileTokens is the owner's revocation surface: every active
 // storage credential for their secretary dies. The next file op under a
 // revoked token is refused; the files themselves are untouched.
+//
+// Exact linearization contract: the persona file-authority lock orders
+// TRANSACTIONS by lock acquisition, not requests by call-start time.
+// The revoke kills every credential that is active at the moment its
+// transaction runs — including any mint that committed before it, even
+// if that mint's request began after this one. A mint that acquires the
+// lock AFTER this revoke commits a fresh, legitimate grant regardless of
+// when its request began: owner revocation is a point-in-time kill, not
+// a ban on future mints — the owner can simply revoke again.
 func (s *Service) RevokePersonaFileTokens(ctx context.Context, owner Owner) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE persona_file_tokens
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, owner.PersonaID); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE persona_file_tokens
 		SET status = 'revoked', resolved_at = now()
 		WHERE persona_id = $1 AND status = 'active'`, owner.PersonaID)
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
