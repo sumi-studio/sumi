@@ -38,6 +38,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 	"github.com/sumi-studio/sumi/apps/api/internal/processoperations"
+	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
@@ -118,6 +119,11 @@ func run(ctx context.Context) (runErr error) {
 		// Owes activation after a committed account claim, retires staged
 		// copies of closed sessions, and promotes interrupted imports.
 		go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+	}
+	if app.returnSessions != nil {
+		// Expires unbound admission and lands ledger outcomes (seal,
+		// complete, abort) the request that owed the update lost.
+		go app.returnSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
 	}
 	if app.spawnManager != nil {
 		reaperCtx, cancelReaper := context.WithCancel(ctx)
@@ -269,6 +275,7 @@ type application struct {
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
 	transferSessions           *transfersession.Service
+	returnSessions             *returnsession.Service
 	coreDirectChat             *agentevents.CoreDirectChat
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
@@ -451,6 +458,7 @@ func newApplicationFromEnv() (*application, error) {
 	}
 	var authServer *agentevents.BrowserAuthServer
 	var secretaryTransfer *secretaryTransferMount
+	var secretaryReturn *secretaryReturnMount
 	var authEnabled bool
 	if browserAuthConfiguredFromEnv() {
 		authServer, secretaryTransfer, authEnabled, err = browserAuthServerFromEnvWithDB(
@@ -460,11 +468,19 @@ func newApplicationFromEnv() (*application, error) {
 			closeOnError()
 			return nil, fmt.Errorf("browser auth: %w", err)
 		}
+		secretaryReturn, err = secretaryReturnFromEnv(databasePool, sv, browserOrigins)
+		if err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("secretary return: %w", err)
+		}
 	}
 	if authEnabled {
 		authServer.RegisterRoutes(mux)
 		if secretaryTransfer != nil {
 			secretaryTransfer.server.RegisterRoutes(mux)
+		}
+		if secretaryReturn != nil {
+			secretaryReturn.server.RegisterRoutes(mux)
 		}
 		if database != nil {
 			newHumanProfileServer(koseki.New(database.Pool), sv, browserOrigins).RegisterRoutes(mux)
@@ -865,6 +881,10 @@ func newApplicationFromEnv() (*application, error) {
 	if secretaryTransfer != nil {
 		transferSessions = secretaryTransfer.service
 	}
+	var returnSessions *returnsession.Service
+	if secretaryReturn != nil {
+		returnSessions = secretaryReturn.service
+	}
 	if workspaceStore != nil && coreServer != nil {
 		// The secretary's Workspace invitation list/accept on the core: the
 		// delegated effects run inside the operation-claim transaction — the
@@ -905,6 +925,7 @@ func newApplicationFromEnv() (*application, error) {
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
 		transferSessions:           transferSessions,
+		returnSessions:             returnSessions,
 		coreDirectChat:             coreDirectChat,
 		publicMux:                  mux,
 		localMux:                   localMux,

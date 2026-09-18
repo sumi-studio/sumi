@@ -12,6 +12,7 @@ import {
 import {
   Check,
   ChevronRight,
+  House,
   Link2,
   LogOut,
   Monitor,
@@ -42,6 +43,7 @@ import { ParticipantAppsMenu } from "../participant/app-menu";
 import { type ThemePreference, useTheme } from "../theme/theme-provider";
 import { EnrollmentInvitations } from "./enrollment-invitations";
 import { ModelProviderSettings } from "./model-provider-settings";
+import { SecretaryReturn } from "./secretary-return";
 
 const THEME_OPTIONS: Array<{
   id: ThemePreference;
@@ -70,6 +72,7 @@ export function SettingsPopover() {
   const { authenticated, user, logout, updateProfile } = useAuth();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [returnOpen, setReturnOpen] = useState(false);
   const [invitationsOpen, setInvitationsOpen] = useState(false);
   const [canInvite, setCanInvite] = useState(false);
   useEffect(() => {
@@ -444,6 +447,17 @@ export function SettingsPopover() {
               </Button>
               <Button
                 variant="ghost"
+                className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setReturnOpen(true);
+                }}
+              >
+                <House className="size-4" />
+                秘書をローカルに戻す
+              </Button>
+              <Button
+                variant="ghost"
                 onClick={() => void handleLogout()}
                 className="w-full justify-start gap-2 px-2.5 text-popover-foreground hover:text-popover-foreground"
               >
@@ -477,6 +491,13 @@ export function SettingsPopover() {
           key={user.id}
           open={modelSettingsOpen}
           onOpenChange={setModelSettingsOpen}
+        />
+      ) : null}
+      {authenticated && user?.id ? (
+        <SecretaryReturn
+          key={`return:${user.id}`}
+          open={returnOpen}
+          onOpenChange={setReturnOpen}
         />
       ) : null}
     </>
