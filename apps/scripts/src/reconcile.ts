@@ -41,7 +41,7 @@
 
 import { StateClient, type JobRow } from "./api.ts";
 import { Journal, type JobJournal } from "./journal.ts";
-import { verifyIdentity, killVerified, findDescendant, startTicks } from "./proc.ts";
+import { verifyIdentity, killVerified, findDescendant, startTicks, groupHasComm } from "./proc.ts";
 
 export interface ReconcileConfig {
   client: StateClient;
@@ -301,18 +301,28 @@ export class Reconciler {
         // supervisor died before the workerd-pid update — kill the
         // workerd descendant first so nothing survives the wrapper.
         const workerPid = findDescendant(j.pid, "workerd");
-        if (workerPid != null) {
+        const payloadKilled = workerPid != null &&
           killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");
-        }
         killVerified(identity, "SIGKILL");
+        // The wrapper may have died while its payload was still inside
+        // the fork→exec window — invisible to the descendant walk. The
+        // detached spawn's group survives the leader, so the exec'd
+        // orphan (reparented to init) is still reachable by pgid —
+        // for a pre-ready journal pgid == spawned pid == j.pid.
+        if (!payloadKilled) this.killOrphanGroup(j);
         this.cfg.journal.update(j, { status: "reaped" });
         j.status = "reaped";
       } else {
         // Identity didn't verify — either the process exited on its own
-        // or the pid was recycled. Record the doubt, do not touch it.
+        // or the pid was recycled. A detached spawn's process group
+        // outlives its leader, though: an orphaned workerd reparented
+        // to init still carries pgrp == j.pid — the only reach left.
+        const groupKilled = this.killOrphanGroup(j);
         this.cfg.journal.update(j, {
           status: "reaped",
-          notes: [...j.notes, "identity not verified at reconcile; left untouched"],
+          notes: [...j.notes, groupKilled
+            ? "leader unverified; orphaned payload killed via surviving process group"
+            : "identity not verified at reconcile; left untouched"],
         });
         j.status = "reaped";
       }
@@ -379,6 +389,26 @@ export class Reconciler {
     } catch (e) {
       this.log(`job ${jobID}: file ops listing: ${e}`);
       return null;
+    }
+  }
+
+  /** SIGKILL the orphan's surviving process group — but only when a
+   *  live member still answers to "workerd". For a detached spawn,
+   *  pgid == the spawned (wrapper) pid recorded on a pre-ready journal,
+   *  and the group outlives its leader: an exec'd payload reparented
+   *  to init is unreachable by any descendant walk yet still carries
+   *  pgrp == j.pid. The comm check is the recycled-pgid guard: a pgid
+   *  reassigned after total group death would not contain a workerd.
+   *  For a 'running' journal j.pid IS the workerd (not a pgid) — the
+   *  pgrp match finds nothing and this is a no-op. */
+  private killOrphanGroup(j: JobJournal): boolean {
+    if (j.pid == null || !groupHasComm(j.pid, "workerd")) return false;
+    try {
+      process.kill(-j.pid, "SIGKILL");
+      this.log(`job ${j.job_id}: killed orphaned process group pgid=${j.pid}`);
+      return true;
+    } catch {
+      return false;
     }
   }
 

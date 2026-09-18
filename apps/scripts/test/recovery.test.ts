@@ -29,7 +29,7 @@
 import { test, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
@@ -40,6 +40,7 @@ import { defaultDispatcherPath, Runner } from "../src/runner.ts";
 import { Reconciler } from "../src/reconcile.ts";
 import { Journal } from "../src/journal.ts";
 import { Supervisor, stableRunnerID } from "../src/main.ts";
+import { childrenOf } from "../src/proc.ts";
 import { StubFileSvc } from "./filesvc_stub.mts";
 
 const req = (k: string): string => {
@@ -83,6 +84,37 @@ async function waitFor(fn: () => Promise<boolean> | boolean, timeoutMs: number, 
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 100));
   }
+}
+
+/** True when a pid is gone OR a zombie: kill(pid,0) reports a zombie
+ *  as "alive", but a zombie can never execute again — for the
+ *  child-dead assertions it is dead. */
+function notRunning(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    return state === "Z" || state === "X";
+  } catch {
+    return true;
+  }
+}
+
+/** Every LIVE workerd on the box — a leaked orphan reparents to init
+ *  and escapes any subtree walk; only a comm scan sees it. Zombies
+ *  (state Z/X) are excluded: they are dead, awaiting a reap that the
+ *  container's pid-1 node may never perform. */
+function workerdPids(): number[] {
+  const out: number[] = [];
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      if (readFileSync(`/proc/${name}/comm`, "utf8").trim() !== "workerd") continue;
+      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+      if (state !== "Z" && state !== "X") out.push(Number(name));
+    } catch { /* gone */ }
+  }
+  return out;
 }
 
 async function adminCall(method: string, path: string, body?: unknown): Promise<unknown> {
@@ -152,12 +184,21 @@ type GateAction = "pass" | "down" | "drop";
 class Gate {
   url = "";
   rule: (method: string, path: string) => GateAction = () => "pass";
+  /** Optional upstream delay applied to paths containing delayMatch —
+   *  simulates a slow API (stalled cancel/claim responses) while every
+   *  forwarded request still commits on the real producer. */
+  delayMs = 0;
+  delayMatch = "";
+  /** Observed request paths — lets tests wait for a specific call to
+   *  be in flight before injecting a fault (e.g. SIGTERM mid-claim). */
+  onRequest: ((method: string, path: string) => void) | null = null;
   private server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
       const path = req.url ?? "/";
       const method = req.method ?? "GET";
+      try { this.onRequest?.(method, path); } catch { /* observer only */ }
       const action = this.rule(method, path);
       if (action === "down") {
         res.writeHead(502, { "content-type": "application/json" });
@@ -165,6 +206,9 @@ class Gate {
         return;
       }
       try {
+        if (this.delayMs > 0 && path.includes(this.delayMatch)) {
+          await new Promise((r) => setTimeout(r, this.delayMs));
+        }
         const upstream = await fetch(`${REAL_API}${path}`, {
           method,
           headers: {
@@ -770,4 +814,272 @@ test("shipped entrypoint: boots on the env contract, executes a job, and SIGTERM
   } finally {
     proc.kill("SIGKILL");
   }
+});
+
+test("waitReady failure removes the launch credential — config.capnp gone on a failed launch (F390)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("ready-fail");
+  await submitJob(p.id, "j-nr", { code: 'export async function run(){ return "never" }' });
+  const { claimed } = await client.claimJobs(p.id, RUNNER_ID, 30_000, 1);
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-nr-"));
+  // /bin/false exits immediately: spawn succeeds, waitReady observes the
+  // early exit — the inner-catch path that used to bypass config cleanup.
+  const runner = new Runner({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: "/bin/false", runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 1, cgroupMode: "prlimit", log: () => {},
+  });
+  await runner.runJob(claimed[0]!);
+  const row = await jobRow(p.id, "j-nr");
+  assert.equal(row.status, "failed", "failed launch is reported honestly");
+  assert.equal((row.result as Record<string, unknown>).reason, "runner_error");
+  assert.ok(!existsSync(join(wd, "tmp", "run-j-nr", "config.capnp")),
+    "the token-bearing config is removed even when the launch never bound");
+});
+
+test("post-spawn/pre-pid-persist fault is contained: child killed, config removed, honest failed (F390/F388)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("pid-fail");
+  await submitJob(p.id, "j-pp", { code: 'export async function run(){ await new Promise(r=>setTimeout(r,30000)); return "x" }' });
+  const { claimed } = await client.claimJobs(p.id, RUNNER_ID, 30_000, 1);
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-pp-"));
+  const runner = new Runner({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 1, cgroupMode: "prlimit", log: () => {},
+  });
+  // Inject exactly the crash window: the journal write that persists the
+  // spawned pid throws — a child now exists that no journal names.
+  const orig = runner.journal.update.bind(runner.journal);
+  let injected = false;
+  runner.journal.update = ((jj: never, fields: Record<string, unknown>) => {
+    if (!injected && fields["pid"] != null) {
+      injected = true;
+      throw new Error("injected pid-persist fault");
+    }
+    return orig(jj, fields as never);
+  }) as typeof runner.journal.update;
+  await runner.runJob(claimed[0]!);
+  const row = await jobRow(p.id, "j-pp");
+  assert.equal(row.status, "failed", "the spawn-window fault reports honest failed, not a crash");
+  assert.equal((row.result as Record<string, unknown>).reason, "runner_error");
+  // The spawned child was killed via the held handle — nothing leaked,
+  // including an orphan reparented to init that a subtree walk misses.
+  await waitFor(() => workerdPids().length === 0, 5_000, "no workerd survives anywhere");
+  assert.ok(!existsSync(join(wd, "tmp", "run-j-pp", "config.capnp")),
+    "launch credential removed on the post-spawn fault path too");
+});
+
+test("shutdown is truly bounded under stalled cancels: deadline kills children, reports land (F391)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("stall");
+  for (const id of ["j-s1", "j-s2"]) {
+    await submitJob(p.id, id, {
+      code: 'export async function run(){ await new Promise(r=>setTimeout(r,60000)); return "x" }',
+      limits: { wall_ms: 120000, cpu_seconds: 120 },
+    });
+  }
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-stall-"));
+  const sup = new Supervisor({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 4, cgroupMode: "prlimit",
+    log: () => {},
+    discovery: new SharedDiscovery(new StateClient({ api: REAL_API, token: RUNTIME }), ["script"], 8),
+    maxConcurrent: 2, pollMs: 200, recoveryEveryMs: 60_000,
+    shutdownSettleMs: 800,
+  });
+  const running = sup.start();
+  try {
+    for (const id of ["j-s1", "j-s2"]) {
+      await waitFor(async () => (await jobRow(p.id, id)).status === "running", 30_000, `${id} running`);
+    }
+    // Every cancel stalls forever — the OLD code would serialize these
+    // 15s-timeout calls before the grace clock even started.
+    const clientRef = sup.runner.client as unknown as { cancelJob: (p: string, j: string) => Promise<unknown> };
+    const origCancel = clientRef.cancelJob;
+    clientRef.cancelJob = () => new Promise<unknown>(() => {});
+    const t0 = Date.now();
+    await sup.shutdown(300);
+    const elapsed = Date.now() - t0;
+    clientRef.cancelJob = origCancel;
+    assert.ok(elapsed < 5_000, `shutdown returned in ${elapsed}ms — stalled cancels must not multiply the bound`);
+    // Deadline kills: both workerd children are dead — nothing was left
+    // to "its own rlimits" (an idle sleeper would outlive us forever).
+    for (const id of ["j-s1", "j-s2"]) {
+      const j = new Journal(wd).read(id)!;
+      assert.ok(j.pid == null || notRunning(j.pid), `${id} child pid=${j.pid} is dead after the deadline kill`);
+      await waitFor(async () => {
+        const row = await jobRow(p.id, id);
+        return row.status === "failed" || row.status === "cancelled";
+      }, 15_000, `${id} reaches an honest terminal verdict`);
+      const row = await jobRow(p.id, id);
+      assert.equal(row.status, "failed", "killed-at-deadline reports failed with real evidence");
+      assert.equal((row.result as Record<string, unknown>).reason, "worker_error");
+    }
+  } finally {
+    await sup.shutdown();
+    await running.catch(() => {});
+  }
+});
+
+test("entrypoint: SIGTERM during an in-flight claim — the raced claim is accounted, never stranded (F391)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("claim-race");
+  await submitJob(p.id, "j-race", { code: 'export async function run(){ return 1 }' });
+  const gate = new Gate();
+  await gate.start();
+  gate.delayMatch = "/claim"; // every claim response is 1.5s late — the
+  gate.delayMs = 1500;        // signal lands while the claim is in flight
+  let claimsSeen = 0;
+  gate.onRequest = (method, path) => { if (method === "POST" && path.includes("/claim")) claimsSeen++; };
+  const wd = mkdtempSync(join(tmpdir(), "sumi-entry-race-"));
+  const runBin = new URL("../run.mjs", import.meta.url).pathname;
+  const proc = spawn(process.execPath, [runBin], {
+    env: {
+      ...process.env,
+      SUMI_STATE_API: gate.url, SUMI_STATE_TOKEN: RUNTIME,
+      SUMI_WORKERD_BIN: WORKERD_BIN, SUMI_RUNLIMITED_BIN: RUNLIMITED_BIN,
+      SUMI_CGROUP_MODE: "prlimit", SUMI_WORK_DIR: wd, SUMI_RUNNER_ID: RUNNER_ID,
+      SUMI_POLL_MS: "200", SUMI_HEARTBEAT_MS: "300",
+      SUMI_MAX_CONCURRENT: "2", SUMI_CLAIM_LIMIT: "4",
+      SUMI_SHUTDOWN_GRACE_MS: "3000", SUMI_SHUTDOWN_SETTLE_MS: "1000",
+      SUMI_LEASE_MS: "30000",
+    },
+  });
+  const out: string[] = [];
+  proc.stdout?.on("data", (d) => out.push(String(d)));
+  proc.stderr?.on("data", (d) => out.push(String(d)));
+  const t0 = Date.now();
+  try {
+    // Wait until the claim request is actually in flight, then signal —
+    // the delayed response lands after stop, exercising the race.
+    await waitFor(() => claimsSeen >= 1, 15_000, "claim request in flight");
+    proc.kill("SIGTERM");
+    const code = await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? -1)));
+    const elapsed = Date.now() - t0;
+    assert.equal(code, 0, `bounded shutdown exits 0; logs: ${out.join("")}`);
+    assert.ok(elapsed < 10_000, `process exited in ${elapsed}ms`);
+    // The claim resolved post-stop: the durable reservation is reported
+    // 'cancelled'/shutdown_before_start — provably never executed — not
+    // stranded 'running' until lease expiry.
+    await waitFor(async () => (await jobRow(p.id, "j-race")).status === "cancelled", 15_000,
+      "raced claim reaches cancelled");
+    const row = await jobRow(p.id, "j-race");
+    assert.equal((row.result as Record<string, unknown>).reason, "shutdown_before_start",
+      "honest verdict: claimed during shutdown, provably never executed");
+    assert.equal(workerdPids().length, 0, "no workerd ever spawned");
+  } finally {
+    proc.kill("SIGKILL");
+    gate.close();
+  }
+});
+
+test("entrypoint: short-grace SIGTERM kills the real child; restart reconcile recovers evidence (F391)", { timeout: 90_000 }, async () => {
+  const p = await makePersona("grace-kill");
+  await submitJob(p.id, "j-gk", {
+    code: 'export async function run(){ await new Promise(r=>setTimeout(r,60000)); return "never" }',
+    limits: { wall_ms: 120000, cpu_seconds: 120 },
+  });
+  const wd = mkdtempSync(join(tmpdir(), "sumi-entry-gk-"));
+  const runBin = new URL("../run.mjs", import.meta.url).pathname;
+  const env = {
+    ...process.env,
+    SUMI_STATE_API: REAL_API, SUMI_STATE_TOKEN: RUNTIME,
+    SUMI_WORKERD_BIN: WORKERD_BIN, SUMI_RUNLIMITED_BIN: RUNLIMITED_BIN,
+    SUMI_CGROUP_MODE: "prlimit", SUMI_WORK_DIR: wd, SUMI_RUNNER_ID: RUNNER_ID,
+    SUMI_POLL_MS: "200", SUMI_HEARTBEAT_MS: "300",
+    SUMI_MAX_CONCURRENT: "2", SUMI_CLAIM_LIMIT: "4",
+    SUMI_SHUTDOWN_GRACE_MS: "100", SUMI_SHUTDOWN_SETTLE_MS: "800",
+    SUMI_LEASE_MS: "5000",
+  };
+  const proc = spawn(process.execPath, [runBin], { env });
+  const out: string[] = [];
+  proc.stdout?.on("data", (d) => out.push(String(d)));
+  proc.stderr?.on("data", (d) => out.push(String(d)));
+  try {
+    await waitFor(async () => {
+      const j = new Journal(wd).read("j-gk");
+      return j != null && j.pid != null && (await jobRow(p.id, "j-gk")).status === "running";
+    }, 30_000, "j-gk claimed and running");
+    const pid = new Journal(wd).read("j-gk")!.pid!;
+    const t0 = Date.now();
+    proc.kill("SIGTERM");
+    const code = await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? -1)));
+    const elapsed = Date.now() - t0;
+    assert.equal(code, 0, `bounded shutdown exits 0; logs: ${out.join("")}`);
+    assert.ok(elapsed < 8_000, `process exited in ${elapsed}ms — grace+settle+kill, not an open drain`);
+    // THE F391 invariant: the child does not outlive the bound — wall_ms
+    // lives in the dead supervisor's drive loop; nothing else bound it.
+    assert.ok(notRunning(pid), `workerd pid=${pid} dead after deadline kill`);
+    // Honest aftermath: the drive loop's kill-observation report lands
+    // ('failed'), or the row expires to 'lost' and a restart reconcile
+    // attaches the indeterminate outcome — never a silent orphan.
+    let row = await jobRow(p.id, "j-gk");
+    if (row.status === "running" || row.status === "cancel_requested") {
+      // Report didn't land inside the settle window — restart the real
+      // entrypoint: startup reconcile + claim sweep resolves the row.
+      const proc2 = spawn(process.execPath, [runBin], { env });
+      try {
+        await waitFor(async () => {
+          const r2 = await jobRow(p.id, "j-gk");
+          return r2.status === "failed" || r2.status === "cancelled" || r2.status === "lost";
+        }, 30_000, "restart reconcile resolves the row");
+      } finally {
+        proc2.kill("SIGTERM");
+        await new Promise((r) => proc2.on("exit", r));
+      }
+      row = await jobRow(p.id, "j-gk");
+    }
+    if (row.status === "lost") {
+      assert.ok((row.result as Record<string, unknown>)?.observed_outcome,
+        "lost verdict carries the honest observed outcome");
+    } else {
+      assert.ok(row.status === "failed" || row.status === "cancelled",
+        `honest terminal verdict, got ${row.status}`);
+    }
+  } finally {
+    proc.kill("SIGKILL");
+  }
+});
+
+test("reconcile reaps an exec'd orphan via its surviving process group — the leak no descendant walk reaches (F391)", { timeout: 30_000 }, async () => {
+  const p = await makePersona("grp-reap");
+  await submitJob(p.id, "j-grp", { code: 'export async function run(){ return 1 }' });
+  const { claimed } = await client.claimJobs(p.id, RUNNER_ID, 30_000, 1);
+  assert.ok(claimed.some((j) => j.job_id === "j-grp"));
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-grp-"));
+  const runner = new Runner({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 1, cgroupMode: "prlimit", log: () => {},
+  });
+  // Construct the exact j-pp leak shape: a detached group whose LEADER
+  // dies while a member keeps running — the member reparents to init,
+  // invisible to every descendant walk, but still carries pgrp == the
+  // dead leader's pid. A sleep binary named "workerd" stands in for the
+  // payload; only its comm matters to the reaper.
+  const fakeWorkerd = join(wd, "workerd");
+  writeFileSync(fakeWorkerd, readFileSync("/bin/sleep"), { mode: 0o755 });
+  const leader = spawn("/bin/sh", ["-c", `${fakeWorkerd} 60 & exec /bin/sleep 60`], { detached: true });
+  await waitFor(() => childrenOf(leader.pid!).length > 0, 5_000, "payload forked in the group");
+  const member = childrenOf(leader.pid!)[0]!;
+  leader.kill("SIGKILL");
+  await waitFor(() => notRunning(leader.pid!), 5_000, "group leader dead");
+  assert.ok(!notRunning(member), "the orphaned payload is still running — the leak to reap");
+  // Seed the journal exactly as a pre-ready crash left it: the recorded
+  // pid is the wrapper/leader — the workerd resolution never persisted.
+  const j = runner.journal.create({
+    job_id: "j-grp", persona_id: p.id, runner_id: RUNNER_ID,
+    pid: leader.pid!, start_ticks: null, boot_id: null, unit_name: null,
+    socket_path: null, stats_path: null, cgroup_mode: "prlimit",
+    limits: {}, spec: { code_sha256: "x" }, usage_fact_id: `script:j-grp:exec`,
+  });
+  runner.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString() });
+  const rec = new Reconciler({ client, journal: runner.journal, runnerID: RUNNER_ID, log: () => {} });
+  await rec.run();
+  // THE invariant: the exec'd orphan is dead — the surviving process
+  // group was the only reach that could touch it.
+  await waitFor(() => notRunning(member), 5_000, "orphaned group member reaped via pgid");
+  assert.equal(workerdPids().length, 0, "no workerd survives anywhere");
 });

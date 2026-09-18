@@ -35,21 +35,34 @@
  *   SUMI_DISCOVERY_PAGE   runnable-route page size (default 64)
  *   SUMI_DISPATCHER_PATH  workerd dispatcher module path
  *   SUMI_RUNLIMITED_BIN   runlimited helper path
- *   SUMI_SHUTDOWN_GRACE_MS  shutdown drain bound (default 20000)
+ *   SUMI_SHUTDOWN_GRACE_MS   cancel+drain window (default 20000)
+ *   SUMI_SHUTDOWN_SETTLE_MS  post-kill report window (default 3000)
  *
- * Shutdown contract (SIGTERM/SIGINT):
- *   1. Discovery and claims stop immediately — no new reservations.
- *   2. Every in-flight job receives an honest cancel_requested through
- *      the API; its drive loop observes it within ~heartbeat and
- *      reports 'cancelled' with whatever usage was measured.
- *   3. The process waits up to SUMI_SHUTDOWN_GRACE_MS for the in-flight
- *      set to drain, then exits.
- *   4. Anything still running past the grace window is left bounded by
- *      its own rlimits/wall_ms — never silently killed mid-report and
- *      never reported on absent evidence. Its claim expires to 'lost';
- *      the next supervisor's startup reconcile reaps the orphan by
- *      verified identity and attaches the honest indeterminate outcome.
- *   5. A second signal forces immediate exit.
+ * Shutdown contract (SIGTERM/SIGINT) — a REAL wall-clock bound of
+ * about grace + settle + a sub-second local kill pass:
+ *   1. Discovery/claims stop; the pre-spawn guard refuses launches.
+ *      A claim already in flight that resolves is reported
+ *      'cancelled'/shutdown_before_start — provably never executed —
+ *      not stranded for lease expiry.
+ *   2. Every in-flight job gets cancel_requested CONCURRENTLY; its
+ *      drive loop observes it via heartbeat and reports 'cancelled'
+ *      with whatever usage was measured.
+ *   3. At the grace deadline, surviving children are killed LOCALLY —
+ *      the detached spawn's owned process group (atomic across the
+ *      fork→exec window a descendant walk cannot see) plus verified
+ *      journal identities, never a broad kill. Children are NOT left
+ *      to "their own limits": wall_ms lives in this process's drive
+ *      loop and RLIMIT_CPU does not bound an idle child's elapsed
+ *      lifetime.
+ *   4. Up to SUMI_SHUTDOWN_SETTLE_MS more for killed jobs' drive
+ *      loops to land honest reports; then the process EXITS. What
+ *      could not be reported stays in the durable journal — claims
+ *      expire to 'lost' and the next supervisor's startup reconcile
+ *      attaches the honest indeterminate outcome, idempotently.
+ *   5. Second signal = emergency: synchronous kill of every owned
+ *      child, then immediate exit(2).
+ *   6. A fatal start() error after children launched runs the same
+ *      bounded shutdown before exiting 1 — no orphan leak.
  */
 import { supervisorFromEnv } from "./src/main.ts";
 
@@ -66,11 +79,15 @@ try {
 let stopping = false;
 const onSignal = (sig) => {
   if (stopping) {
-    console.error(`[scripts] ${sig} again — forcing exit`);
+    // Emergency: still synchronous local kill of owned children —
+    // journals hold whatever evidence was written; claims resolve via
+    // lease expiry + next-supervisor reconcile. Then exit immediately.
+    console.error(`[scripts] ${sig} again — emergency exit, killing owned children`);
+    try { sup.runner.killAllOwned(); } catch { /* best effort */ }
     process.exit(2);
   }
   stopping = true;
-  console.log(`[scripts] ${sig} — stopping claims, cancelling in-flight jobs`);
+  console.log(`[scripts] ${sig} — bounded shutdown: stop claims, cancel in-flight, drain, local-kill deadline`);
   void sup.shutdown();
 };
 process.on("SIGTERM", () => onSignal("SIGTERM"));
@@ -78,7 +95,14 @@ process.on("SIGINT", () => onSignal("SIGINT"));
 
 try {
   await sup.start();
+  // start() returned — the stop flag was set by a shutdown in flight.
+  // Wait out its bounded work, then exit explicitly: leftover request/
+  // timer handles must never linger past the contract.
+  await sup.shutdown();
+  process.exit(0);
 } catch (e) {
   console.error(`[scripts] fatal: ${e instanceof Error ? e.message : e}`);
-  process.exitCode = 1;
+  // Children may already be launched — bound them before exiting.
+  try { await sup.shutdown(5_000); } catch { /* best effort */ }
+  process.exit(1);
 }

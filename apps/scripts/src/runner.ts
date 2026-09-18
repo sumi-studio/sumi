@@ -56,6 +56,14 @@ export class Runner {
   /** Jobs this live supervisor owns right now — recovery must never
    *  treat their journals as restart evidence (no reap, no re-report). */
   private activeJobs = new Set<string>();
+  /** Live spawn handles keyed by job — the shutdown path's only way to
+   *  reach a child. Registration is synchronous with spawnJob, so a
+   *  child can never exist unregistered. */
+  private liveSpawns = new Map<string, { spawned: Spawned; j: JobJournal }>();
+  /** Set by beginShutdown(): the pre-spawn guard refuses new launches.
+   *  spawn→register is synchronous, so once set no new child can appear
+   *  after a kill pass. */
+  private stopping = false;
 
   readonly cfg: RunnerConfig;
   constructor(cfg: RunnerConfig) {
@@ -122,9 +130,13 @@ export class Runner {
     // 'failed', never a process exit.
     let j: JobJournal | null = null;
     let spawned: Spawned | null = null;
-    let configPath: string | null = null;
+    const jobDir = join(this.cfg.workDir, "tmp", `run-${job.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}`);
+    // The credential file's path is deterministic — computed BEFORE
+    // writeConfig so even a partial write leaves an owned, named file
+    // the finally below can remove (F390: a throwing writeConfig used
+    // to leave configPath null and the residue untracked).
+    const configFile = join(jobDir, "config.capnp");
     try {
-      const jobDir = join(this.cfg.workDir, "tmp", `run-${job.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}`);
       mkdirSync(jobDir, { recursive: true });
       const socketPath = this.journal.socketPath(job.job_id);
       const statsPath = this.journal.statsPath(job.job_id);
@@ -146,7 +158,7 @@ export class Runner {
         usage_fact_id: usageFactID,
       });
 
-      configPath = writeConfig(jobDir, {
+      writeConfig(jobDir, {
         socketPath,
         dispatcherPath: this.cfg.dispatcherPath,
         api: this.cfg.api,
@@ -162,18 +174,33 @@ export class Runner {
         },
       });
 
+      // Shutdown began between claim and launch — the script provably
+      // never executed (spawn→register is one synchronous block, so
+      // this check cannot be bypassed by a mid-launch stop). Report the
+      // honest never-started outcome rather than stranding the claim
+      // for lease expiry.
+      if (this.stopping) {
+        this.journal.update(j, { status: "exited" });
+        await this.finish(job, "cancelled", {
+          reason: "shutdown_before_start",
+          detail: "claim admitted as supervisor shutdown began — script provably never executed",
+        }, "shutdown before start");
+        return;
+      }
+
       const unitName = this.cfg.cgroupMode === "systemd"
         ? `sumi-script-${job.job_id.replace(/[^A-Za-z0-9]/g, "-")}`
         : undefined;
 
       spawned = spawnJob({
-        configPath, socketPath, statsPath,
+        configPath: configFile, socketPath, statsPath,
         cpuSeconds: spec.limits.cpu_seconds,
         memoryMib: spec.limits.memory_mib,
         cgroupMode: this.cfg.cgroupMode,
         unitName, workerdBin: this.cfg.workerdBin,
         runlimitedBin: this.cfg.runlimitedBin,
       }, (line) => this.log(`job ${job.job_id} workerd: ${line}`));
+      this.liveSpawns.set(job.job_id, { spawned, j });
 
       this.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString(), pid: spawned.pid });
 
@@ -182,8 +209,7 @@ export class Runner {
         // workerd has read config.capnp once at startup, so the copy
         // holding the runtime token is no longer needed by anyone.
         await this.waitReady(socketPath, spawned, 30_000);
-        this.unlinkConfig(configPath, job.job_id);
-        configPath = null;
+        this.unlinkConfig(configFile, job.job_id);
         // The spawned pid is the wrapper (systemd-run or /usr/bin/time);
         // workerd is its descendant — prlimit execs it, so it is the only
         // child in prlimit mode. Record the real workerd pid + start ticks
@@ -214,15 +240,18 @@ export class Runner {
       // fails (degraded storage AND API), the claim still resolves
       // honestly by lease expiry into the attention path.
       this.log(`job ${job.job_id} preparation failed: ${e}`);
-      this.unlinkConfig(configPath, job.job_id);
       if (spawned && j) {
         try { await this.terminate(j, spawned, "unknown"); } catch { /* nothing more provable */ }
       } else if (spawned) {
-        // No journal to consult — kill the wrapper and its workerd
-        // descendant by the pid we still hold, then let the claim expire.
+        // No journal to consult — kill by the held handle. A workerd
+        // descendant gets a verified kill; anything still inside the
+        // fork→exec window is unnameable to a walk, so the owned
+        // process group is the atomic backstop (the j-pp leak).
         try {
           const workerPid = findDescendant(spawned.pid, "workerd");
-          if (workerPid != null) killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: bootID() }, "SIGKILL");
+          const killed = workerPid != null &&
+            killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: bootID() }, "SIGKILL");
+          if (!killed) spawned.killGroup();
           spawned.kill();
         } catch { /* best effort — bounded by its own rlimits */ }
       }
@@ -231,7 +260,80 @@ export class Runner {
       } catch (e2) {
         this.log(`job ${job.job_id} failure report failed too: ${e2} — claim resolves by lease expiry`);
       }
+    } finally {
+      // The launch credential leaves on EVERY path: success (the
+      // post-bind unlink already ran — ENOENT is ignored), ready
+      // failure, spawn/pid-persist fault, partial write, cancel, or a
+      // prep throw. Journals, rusage stats and run dirs stay — only
+      // the token-bearing file is removed (F390).
+      this.unlinkConfig(configFile, job.job_id);
+      if (spawned) this.liveSpawns.delete(job.job_id);
     }
+  }
+
+  /** Shutdown has begun: the pre-spawn guard in runJobInner refuses new
+   *  launches. spawn→register is synchronous, so once this is set no
+   *  new child can appear after a kill pass. Idempotent. */
+  beginShutdown(): void {
+    this.stopping = true;
+  }
+
+  /**
+   * Kill one owned child — synchronous, local-only, verified. The
+   * bounded shutdown path's deadline enforcement and the emergency
+   * exit path's only tool: SIGKILL the workerd by journal identity or
+   * verified descendant, the owned process group as the exec-window
+   * backstop, then the held wrapper handle. Never a broad kill, never
+   * a guessed pid — the liveSpawns entry exists only because this
+   * process spawned it. A child killed here unwinds its own drive
+   * loop, which reports whatever it observed; if the process exits
+   * first, the durable journal + claim expiry + reconcile carry the
+   * evidence.
+   */
+  killOwned(jobID: string): void {
+    const live = this.liveSpawns.get(jobID);
+    if (!live) return;
+    const { spawned, j } = live;
+    const boot = j.boot_id;
+    const pid = j.pid ?? spawned.pid;
+    // Verified payload kill first — a dead wrapper orphans its child to
+    // init, and the child still mid-exec (comm not yet "workerd") is
+    // invisible to any descendant walk (the j-pp leak proved both).
+    const workerPid = findDescendant(spawned.pid, "workerd");
+    let payloadKilled = false;
+    if (workerPid != null && workerPid !== pid) {
+      payloadKilled = killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: boot }, "SIGKILL");
+    }
+    if (pid !== spawned.pid && verifyIdentity({ pid, start_ticks: j.start_ticks, boot_id: boot })) {
+      payloadKilled = killVerified({ pid, start_ticks: j.start_ticks, boot_id: boot }, "SIGKILL") || payloadKilled;
+    }
+    // No payload could be verified — it is inside the fork→exec window
+    // or never bound. The process group is atomic across that window:
+    // nothing it will exec can escape.
+    if (!payloadKilled) spawned.killGroup();
+    if (alive(spawned.pid)) spawned.kill();
+  }
+
+  /** Emergency exit path: synchronously kill every child this process
+   *  owns — held spawn handles, their owned process groups, and
+   *  verified identities only. */
+  killAllOwned(): void {
+    for (const id of [...this.liveSpawns.keys()]) this.killOwned(id);
+  }
+
+  /**
+   * A claim admitted but never launched — no spawn ever happened for
+   * it, so "never executed" is provable locally (nothing else launches
+   * claimed jobs). Report the honest terminal outcome directly instead
+   * of stranding the reservation until lease expiry sweeps it to
+   * 'lost'. Goes through finish() like every other outcome: ledger
+   * settle, frozen wire payload, idempotent delivery.
+   */
+  async reportNeverStarted(job: JobRow): Promise<void> {
+    await this.finish(job, "cancelled", {
+      reason: "shutdown_before_start",
+      detail: "claim admitted as supervisor shutdown began — script provably never executed",
+    }, "shutdown before start");
   }
 
   /**
@@ -434,17 +536,32 @@ export class Runner {
     try {
       const identity = { pid: j.pid ?? spawned.pid, start_ticks: j.start_ticks, boot_id: j.boot_id };
       if (kill) {
-        if (verifyIdentity(identity)) {
-          killVerified(identity, "SIGKILL");
-        }
-        // The launcher (runlimited) exits on its own via wait4; if the
-        // recorded pid didn't verify, kill the workerd descendant of the
-        // wrapper so nothing is stranded. Give the wrapper a bounded
-        // window to record the child's wait4 stats BEFORE killing it —
-        // killing it first is the race that loses measured usage.
+        // The workerd payload dies BEFORE the wrapper: killing the
+        // wrapper first orphans the child to init, and every later
+        // findDescendant(spawned.pid) walk then sees a dead process —
+        // the orphan escapes (the j-pp leak proved this).
         const workerPid = findDescendant(spawned.pid, "workerd");
+        let payloadKilled = false;
         if (workerPid != null && workerPid !== j.pid) {
-          killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");
+          payloadKilled = killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: j.boot_id }, "SIGKILL");
+        }
+        // The recorded pid dies too — but only when it is NOT the
+        // wrapper itself: runlimited gets a bounded window to record
+        // the child's wait4 stats before it is killed — killing it
+        // first is the race that loses measured usage.
+        if (j.pid != null && j.pid !== spawned.pid && verifyIdentity(identity)) {
+          payloadKilled = killVerified(identity, "SIGKILL") || payloadKilled;
+        }
+        if (!payloadKilled) {
+          // Exec-window race: the payload is either not forked yet or
+          // still mid-exec answering to comm "runlimited" — no walk can
+          // name it. Killing only the wrapper would orphan a child that
+          // execs workerd a moment later (exactly the j-pp leak). The
+          // detached spawn's process group is atomic and owned: every
+          // future descendant dies with it. Stats are honestly lost
+          // here — no worker ever proved it bound — usage reports
+          // 'unknown', not fabricated numbers.
+          spawned.killGroup();
         }
         if (j.stats_path) {
           const deadline = Date.now() + 3000;
@@ -452,7 +569,7 @@ export class Runner {
             await this.sleep(100);
           }
         }
-        if (!verifyIdentity(identity) && alive(spawned.pid)) {
+        if (alive(spawned.pid)) {
           spawned.kill();
         }
       }

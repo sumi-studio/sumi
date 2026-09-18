@@ -54,6 +54,15 @@ export function detectCgroupMode(): "systemd" | "prlimit" {
 export interface Spawned {
   pid: number;
   kill: () => void;
+  /** SIGKILL the entire process group (detached spawn ⇒ pgid == pid).
+   *  Atomic across a descendant's fork→exec window: a child that has
+   *  not exec'd yet answers to no comm name — every descendant walk
+   *  can miss it — but it cannot escape its own group. Group members
+   *  can outlive the leader (killed wrapper ⇒ orphans stay IN the
+   *  group), so this still reaches them. ESRCH when the group is gone.
+   *  A wrong hit would need the whole group dead AND the pgid recycled
+   *  by pid wraparound inside this handle's seconds-long lifetime. */
+  killGroup: () => void;
   wait: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
@@ -83,8 +92,13 @@ export function spawnJob(input: SpawnInput, onLog: (line: string) => void): Spaw
   try { unlinkSync(input.socketPath); } catch { /* absent */ }
   try { unlinkSync(input.statsPath); } catch { /* absent */ }
 
+  // detached: the child leads a NEW process group (pgid == its pid).
+  // Everything it ever forks inherits the group — kill(-pid) reaches
+  // the whole payload atomically, including a child still inside its
+  // fork→exec window that no comm-name descendant walk can see.
   const child = cpSpawn(argv[0]!, argv.slice(1), {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
   });
   child.stdout?.on("data", (d) => onLog(String(d).trimEnd()));
   child.stderr?.on("data", (d) => onLog(String(d).trimEnd()));
@@ -97,7 +111,12 @@ export function spawnJob(input: SpawnInput, onLog: (line: string) => void): Spaw
     child.on("error", (e) => { onLog(`spawn error: ${e.message}`); resolve({ code: 127, signal: null }); });
   });
 
-  return { pid: child.pid!, kill: () => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, wait };
+  return {
+    pid: child.pid!,
+    kill: () => { try { child.kill("SIGKILL"); } catch { /* gone */ } },
+    killGroup: () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* group gone */ } },
+    wait,
+  };
 }
 
 /** Parse the runlimited JSON rusage report. */

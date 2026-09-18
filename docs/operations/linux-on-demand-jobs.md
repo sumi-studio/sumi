@@ -244,23 +244,52 @@ Optional environment:
   `SUMI_CLAIM_LIMIT` (4), `SUMI_MAX_CONCURRENT` (4),
   `SUMI_POLL_MS` (1000), `SUMI_DISCOVERY_PAGE` (64),
   `SUMI_DISPATCHER_PATH`, `SUMI_RUNLIMITED_BIN`,
-  `SUMI_SHUTDOWN_GRACE_MS` (20000)
+  `SUMI_SHUTDOWN_GRACE_MS` (20000), `SUMI_SHUTDOWN_SETTLE_MS` (3000)
 
 ### Shutdown contract (SIGTERM/SIGINT)
 
-1. Discovery and claims stop immediately — no new reservations.
-2. Every in-flight job receives `cancel_requested` through the API; its
-   drive loop observes it at the next heartbeat and reports `cancelled`
-   with whatever usage was measured.
-3. The process waits up to `SUMI_SHUTDOWN_GRACE_MS` for the in-flight
-   set to drain, then exits.
-4. Anything still running past the grace window is left bounded by its
-   own rlimits/`wall_ms` — never silently killed mid-report and never
-   reported on absent evidence. Its claim expires to `lost`; the next
-   supervisor's startup reconcile reaps the orphan by verified identity
-   and attaches the honest indeterminate outcome. Recovery is
-   idempotent on the durable journal.
-5. A second signal forces immediate exit.
+A real wall-clock bound of approximately `grace + settle + <1s` of local
+kill work — not an open-ended drain:
+
+1. Discovery and claims stop immediately. The runner's pre-spawn guard
+   refuses new launches (spawn→register is synchronous, so no child can
+   appear after the kill pass).
+2. A claim request already in flight can resolve after the stop: those
+   durable reservations are reported `cancelled` with reason
+   `shutdown_before_start` — provably never executed — rather than
+   stranded until lease expiry sweeps them to `lost`.
+3. Every in-flight job gets `cancel_requested` **concurrently** (each
+   call bounded by the client's own 15s request timeout, racing the
+   drain — stalled API calls can only consume grace, never multiply
+   it). Its drive loop observes the cancel at the next heartbeat and
+   reports `cancelled` with whatever usage was measured.
+4. At the grace deadline, surviving children are killed **locally** —
+   each spawn is `detached`, so the wrapper leads an **owned process
+   group** (`pgid == spawned pid`): `kill(-pgid)` is atomic across the
+   fork→exec window where a payload child exists but answers to no
+   `workerd` comm name — a descendant walk provably misses it there
+   and killing only the wrapper would orphan it to init (observed as
+   a real leak). Verified journal identities (boot_id + start_ticks)
+   still kill a located payload first so `runlimited` can wait4 it
+   and report measured usage; the group kill is the backstop. Never
+   broad kills or guessed pids. Children are not left to "their own
+   limits": `wall_ms` is enforced by this process's drive loop which
+   dies with the process, and `RLIMIT_CPU` bounds CPU time — an idle
+   or blocked child's elapsed lifetime is unbounded.
+5. Up to `SUMI_SHUTDOWN_SETTLE_MS` more for the killed jobs' drive
+   loops to unwind: `terminate` collects wait4 usage stats, `finish`
+   attempts the honest report (`cancelled`/`failed` + measured or
+   `unknown` usage). Past that window the supervisor returns anyway —
+   journals hold the frozen wire payloads, undelivered claims expire
+   to `lost`, and the next supervisor's startup reconcile delivers
+   the evidence idempotently. `run.mjs` then exits explicitly —
+   lingering HTTP/timer handles cannot extend the process past the
+   bound.
+6. A second signal is the emergency path: a synchronous local kill of
+   every owned child, then immediate `exit(2)`. Whatever was journaled
+   before the kill is the evidence; reconcile recovers the rest.
+7. A fatal `start()` error after children launched runs the same
+   bounded shutdown before exiting 1.
 
 ### Per-job fault containment
 
@@ -274,7 +303,11 @@ attention path.
 
 `config.capnp` carries the runtime token only to launch a worker;
 workerd reads it once at startup. The file is unlinked as soon as the
-worker binds (and on every failure/cancel path), and stale copies left
-by a dead run are swept before the first claim at startup. Journals,
-rusage stats and run dirs are kept — only the credential copy is
-removed.
+worker binds, and a `finally` over the whole launch domain removes it
+on every other path too — ready failure, spawn/pid-persist fault,
+partial write (the owned path is computed before `writeConfig` runs),
+cancel and shutdown. Stale copies left by a dead run are swept before
+the first claim at startup. Journals, rusage stats and run dirs are
+kept — only the credential copy is removed. An unlink failure is
+logged by path only (never contents); if the filesystem itself is
+broken the residue is reported, not hidden.

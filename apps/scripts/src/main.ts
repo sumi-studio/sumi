@@ -24,16 +24,28 @@ export interface SupervisorConfig extends RunnerConfig {
    *  process's active executions. Default 30s. */
   recoveryEveryMs?: number;
   /** Bounded shutdown drain: how long shutdown() waits for in-flight
-   *  jobs to report 'cancelled' before leaving them to the honest
-   *  lease-expiry/startup-reconcile path. Default 20s. */
+   *  jobs to report 'cancelled' before locally terminating the
+   *  survivors. Default 20s. */
   shutdownGraceMs?: number;
+  /** Bounded report-settle window after the deadline kill pass:
+   *  killed children's drive loops get this long to unwind and land
+   *  their honest reports before shutdown returns. Default 3s. */
+  shutdownSettleMs?: number;
 }
 
 export class Supervisor {
   readonly runner: Runner;
   private active = 0;
   private inflight = new Map<string, JobRow>();
+  /** Claims admitted during shutdown that are being reported as
+   *  never-started — tracked so the drain waits for their honest
+   *  terminal reports within the same bound. */
+  private pendingReports = new Set<string>();
+  /** Claim HTTP calls currently in flight — a resolving response is
+   *  still this supervisor's pending work during shutdown. */
+  private claimsInFlight = 0;
   private stop = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   readonly cfg: SupervisorConfig;
   constructor(cfg: SupervisorConfig) {
@@ -74,8 +86,31 @@ export class Supervisor {
         // lease sweeps them to 'lost'. Claim only what we can run now.
         const free = this.cfg.maxConcurrent - this.active;
         if (free <= 0) break;
-        const claimed = await this.runner.claimPersona(p, Math.min(this.cfg.claimLimit, free));
+        // The claim HTTP call is tracked: a response landing after stop
+        // is still this supervisor's pending work — shutdown's drain
+        // waits for it (bounded by the deadline), so every durable
+        // reservation it admits is deliberately accounted for, never
+        // silently abandoned.
+        this.claimsInFlight++;
+        let claimed: JobRow[];
+        try {
+          claimed = await this.runner.claimPersona(p, Math.min(this.cfg.claimLimit, free));
+        } finally {
+          this.claimsInFlight--;
+        }
         for (const job of claimed) {
+          // A claim request already in flight can resolve after stop:
+          // the reservation is durable and ours, so it is accounted
+          // honestly — reported 'cancelled'/shutdown_before_start
+          // (provably never executed) rather than stranded until the
+          // lease sweeps it to 'lost'.
+          if (this.stop) {
+            this.pendingReports.add(job.job_id);
+            void this.runner.reportNeverStarted(job)
+              .catch((e) => this.cfg.log?.(`shutdown: never-started report ${job.job_id}: ${e}`))
+              .finally(() => this.pendingReports.delete(job.job_id));
+            continue;
+          }
           if (this.active >= this.cfg.maxConcurrent) break;
           this.active++;
           this.inflight.set(job.job_id, job);
@@ -108,36 +143,69 @@ export class Supervisor {
   }
 
   /**
-   * Graceful stop, bounded. Claims/discovery halt at the next poll tick;
-   * every in-flight job gets an honest cancel_requested — its drive loop
-   * observes it via heartbeat (~heartbeatMs) and reports 'cancelled'
-   * with whatever usage was measured. Then this waits up to
-   * `graceMs` for the in-flight set to drain.
+   * Graceful stop with a REAL wall-clock bound: total ≈ graceMs +
+   * settleMs + a sub-second local kill pass.
    *
-   * What is NOT done, deliberately: no SIGKILL of our own children and
-   * no fake terminal report. If the grace window expires — e.g. the API
-   * is unreachable and cancels never landed — remaining workerd
-   * children are left bounded by their own rlimits/wall_ms; their
-   * claims expire to 'lost' and the next supervisor's startup reconcile
-   * reaps by verified identity and attaches the honest indeterminate
-   * outcome. Restart recovery is idempotent on the durable journal.
+   *  1. Discovery/claims halt; the runner's pre-spawn guard refuses
+   *     new launches. Claims still in flight that resolve are
+   *     accounted honestly (reportNeverStarted — provably unexecuted).
+   *  2. Cancels go to every in-flight job CONCURRENTLY — each bounded
+   *     by the client's own per-request timeout and racing the drain.
+   *     Sequential awaits would let N stalled requests spend N×timeout
+   *     before the grace clock even started.
+   *  3. Drain until the deadline: cancelled drive loops report
+   *     'cancelled' with measured usage.
+   *  4. Deadline reached: remaining children are killed LOCALLY —
+   *     each detached spawn's owned process group (atomic across the
+   *     fork→exec window a descendant walk cannot see) plus verified
+   *     journal identities, never a broad kill. Children are NOT left
+   *     to "their own rlimits": wall_ms is enforced by this process's
+   *     drive loop which dies with us, and RLIMIT_CPU bounds CPU time,
+   *     not an idle child's elapsed lifetime — an unsupervised sleeper
+   *     would outlive us forever.
+   *  5. Bounded settle window: killed jobs' drive loops unwind —
+   *     terminate() collects wait4 stats, finish() attempts the
+   *     honest report. Past this window we return anyway — journals
+   *     hold frozen wire payloads, claims expire to 'lost', and the
+   *     next supervisor's startup reconcile delivers the evidence
+   *     idempotently.
+   *
+   * Idempotent — the same in-flight promise answers every caller.
    */
-  async shutdown(graceMs = this.cfg.shutdownGraceMs ?? 20_000): Promise<void> {
+  shutdown(graceMs = this.cfg.shutdownGraceMs ?? 20_000): Promise<void> {
+    this.shutdownPromise ??= this.doShutdown(graceMs);
+    return this.shutdownPromise;
+  }
+
+  private pendingCount(): number {
+    return this.inflight.size + this.pendingReports.size + this.claimsInFlight;
+  }
+
+  private async doShutdown(graceMs: number): Promise<void> {
     this.stop = true;
-    const jobs = [...this.inflight.values()];
-    for (const job of jobs) {
-      try {
-        await this.runner.client.cancelJob(job.persona_id, job.job_id);
-      } catch (e) {
-        this.cfg.log?.(`shutdown: cancel ${job.job_id}: ${e}`);
-      }
-    }
+    this.runner.beginShutdown();
     const deadline = Date.now() + graceMs;
-    while (this.inflight.size > 0 && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
+    for (const job of this.inflight.values()) {
+      void this.runner.client.cancelJob(job.persona_id, job.job_id)
+        .catch((e) => this.cfg.log?.(`shutdown: cancel ${job.job_id}: ${e}`));
     }
-    if (this.inflight.size > 0) {
-      this.cfg.log?.(`shutdown: ${this.inflight.size} job(s) still in flight after ${graceMs}ms — left bounded by own rlimits; claims expire to 'lost' and reconcile honestly`);
+    while (this.pendingCount() > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, Math.min(100, Math.max(1, deadline - Date.now()))));
+    }
+    const remaining = [...this.inflight.keys()];
+    for (const id of remaining) {
+      try { this.runner.killOwned(id); } catch (e) { this.cfg.log?.(`shutdown: kill ${id}: ${e}`); }
+    }
+    if (remaining.length > 0) {
+      this.cfg.log?.(`shutdown: ${remaining.length} job(s) locally terminated at deadline — drive loops report honest outcomes`);
+    }
+    const settleMs = this.cfg.shutdownSettleMs ?? 3_000;
+    const settleDeadline = Date.now() + settleMs;
+    while (this.pendingCount() > 0 && Date.now() < settleDeadline) {
+      await new Promise((r) => setTimeout(r, Math.min(100, Math.max(1, settleDeadline - Date.now()))));
+    }
+    if (this.pendingCount() > 0) {
+      this.cfg.log?.(`shutdown: ${this.pendingCount()} job(s) still reporting at exit — evidence journaled; claims resolve via lease expiry + reconcile`);
     }
   }
 }
@@ -245,6 +313,7 @@ export function supervisorFromEnv(): Supervisor {
     maxConcurrent: Number(process.env.SUMI_MAX_CONCURRENT ?? 4),
     pollMs: Number(process.env.SUMI_POLL_MS ?? 1_000),
     shutdownGraceMs: Number(process.env.SUMI_SHUTDOWN_GRACE_MS ?? 20_000),
+    shutdownSettleMs: Number(process.env.SUMI_SHUTDOWN_SETTLE_MS ?? 3_000),
     cgroupMode,
     log,
     discovery,

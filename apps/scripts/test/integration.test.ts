@@ -527,10 +527,18 @@ test("swept to lost: verdict preserved, pending op resolves, usage attaches", { 
 
   // Let the lease expire, then trigger the sweep by claiming again —
   // ClaimJobs' kind-blind sweep marks the expired running claim 'lost'.
-  await new Promise((r) => setTimeout(r, 3_000));
+  // A slow first-claim response can compress the effective wait below
+  // the lease, so sweep-and-poll is retried to a deadline, not slept once.
   await submitJob("j-sweep-trigger", { code: `export async function run() { return 1 }` });
-  await client.claimJobs(persona, RUNNER_ID, 10_000, 4);
-  const lostRow = await jobRow("j-swept-lost");
+  await new Promise((r) => setTimeout(r, 500));
+  let lostRow = await jobRow("j-swept-lost");
+  const sweepDeadline = Date.now() + 10_000;
+  while (lostRow.status !== "lost") {
+    if (Date.now() > sweepDeadline) throw new Error(`j-swept-lost not swept to lost: ${lostRow.status}`);
+    await client.claimJobs(persona, RUNNER_ID, 10_000, 4);
+    await new Promise((r) => setTimeout(r, 500));
+    lostRow = await jobRow("j-swept-lost");
+  }
   assert.equal(lostRow.status, "lost", "expired claim swept to lost");
   assert.equal((lostRow.result as Record<string, unknown>).reason, "claim_expired");
 

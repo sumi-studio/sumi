@@ -84,6 +84,28 @@ export function findDescendant(rootPid: number, comm: string, maxDepth = 4): num
   return null;
 }
 
+/** True when process group `pgid` has a live member whose comm matches
+ *  — proof the group still holds a spawn's payload. This is the only
+ *  safe check before killpg on a stale pgid: a group id recycled after
+ *  the whole original group died would not contain our workerd. */
+export function groupHasComm(pgid: number, comm: string): boolean {
+  try {
+    for (const name of readdirSync("/proc")) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+        const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        // fields after comm: state(3) ppid(4) pgrp(5) — index 2 = pgrp.
+        const state = after[0];
+        if (state === "Z" || state === "X") continue;
+        if (Number(after[2]) !== pgid) continue;
+        if (commOf(Number(name)) === comm) return true;
+      } catch { /* went away mid-scan */ }
+    }
+  } catch { /* /proc unreadable */ }
+  return false;
+}
+
 export interface ProcessIdentity {
   pid: number;
   start_ticks: number | null;
