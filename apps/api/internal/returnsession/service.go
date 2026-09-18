@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,6 +53,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/portable"
 )
 
@@ -73,7 +75,30 @@ var (
 	// the authority that already moved, whatever the file answer is.
 	ErrFilePolicyUndecided = errors.New(
 		"shared-file handling on return is still an undecided product choice — no new move has begun and none is admitted until it is decided")
+	// ErrFileToken rejects a scoped storage credential: unknown, already
+	// superseded, or revoked. Its scope is never trusted from the request.
+	ErrFileToken = errors.New("file storage credential rejected")
 )
+
+// FileMode is the owner's explicit choice for where the returning
+// secretary's working file store lives after the move. It is recorded on
+// the session at create and the destination must declare it identically —
+// a mover that expects different file handling than the owner selected is
+// refused, never silently reinterpreted.
+type FileMode string
+
+const (
+	// FileModeLocal copies the Cloud workspace into the Local file store
+	// before activation; the Cloud copy is retained read-only.
+	FileModeLocal FileMode = "local"
+	// FileModeCloud keeps the Cloud store as the working store; the
+	// destination reads and writes it through a scoped storage credential.
+	FileModeCloud FileMode = "cloud"
+)
+
+func validFileMode(m string) bool {
+	return m == string(FileModeLocal) || m == string(FileModeCloud)
+}
 
 const (
 	StatusAwaitingDestination = "awaiting_destination"
@@ -120,6 +145,11 @@ const (
 	// exists so the journey is proven without standing in for the user's
 	// decision.
 	FilePolicyFixture FilePolicy = "fixture"
+	// FilePolicySelectable admits new returns with an explicit per-session
+	// file_mode chosen from Config.FileModes. It is the deployable value:
+	// the modes are implemented and selected, not defaulted — but it is
+	// only set where deployment deliberately enables them.
+	FilePolicySelectable FilePolicy = "selectable"
 )
 
 type Config struct {
@@ -132,6 +162,26 @@ type Config struct {
 	// (the zero value) refuses Create and the destination seal; any real
 	// production value is added when the user answers the file question.
 	FilePolicy FilePolicy
+	// FileModes lists the file modes a new session may select. An
+	// admitting policy with an empty list defaults to both modes; a mode
+	// outside the list is refused at create. Undecided policy refuses
+	// every new move regardless of the list.
+	FileModes []string
+}
+
+// FileStore is the file service's administrative surface the return
+// protocol needs: the persisted per-scope mutation barrier that fences
+// the Cloud workspace while a local-mode copy runs (and keeps it a
+// retained read-only copy afterwards), plus listing for preflight counts.
+// *fileaccess.Client satisfies it.
+type FileStore interface {
+	// SetScopeFrozen asserts or releases the scope's mutation barrier.
+	// ownerEpoch is the session's durable file_epoch: the service orders
+	// barrier lineage by it, so a stale session's late freeze refuses and
+	// its late unfreeze cannot clear a newer session's barrier, while a
+	// newer lineage legitimately releases an older retained one.
+	SetScopeFrozen(ctx context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error
+	List(ctx context.Context, scope, path, cursor string, limit int) (fileaccess.ListResult, error)
 }
 
 type Service struct {
@@ -139,25 +189,55 @@ type Service struct {
 	portable   *portable.Service
 	admitTTL   time.Duration
 	filePolicy FilePolicy
+	fileModes  []string
+	files      FileStore
+	logf       func(string, ...any)
 }
 
 func New(pool *pgxpool.Pool, cfg Config) *Service {
 	if cfg.AdmitTTL <= 0 {
 		cfg.AdmitTTL = DefaultAdmitTTL
 	}
+	if len(cfg.FileModes) == 0 && cfg.FilePolicy != FilePolicyUndecided {
+		cfg.FileModes = []string{string(FileModeLocal), string(FileModeCloud)}
+	}
 	return &Service{pool: pool, portable: portable.NewService(pool), admitTTL: cfg.AdmitTTL,
-		filePolicy: cfg.FilePolicy}
+		filePolicy: cfg.FilePolicy, fileModes: cfg.FileModes}
 }
+
+// SetFileStore wires the file service's administrative surface. Without
+// it, local-mode binds refuse at the seal boundary (a copy cannot be
+// fenced) and file preflight counts stay empty.
+func (s *Service) SetFileStore(f FileStore) { s.files = f }
+
+// SetLogger wires a diagnostic sink for non-fatal convergence retries.
+func (s *Service) SetLogger(f func(string, ...any)) { s.logf = f }
 
 // admitNewMove is the file-policy gate. It fires only where a new move
 // would begin — opening a session and sealing the source — and is never
 // consulted by status, download, proof reports or cancel, so a session
 // that already moved authority resolves regardless of the policy knob.
-func (s *Service) admitNewMove() error {
+// mode is the owner's explicit file selection: Create requires it — no
+// default, no records-only path for new sessions. A session recorded
+// before the choice existed (mode "") is recovery, not a new selection:
+// it keeps moving records only.
+func (s *Service) admitNewMove(mode string) error {
 	if s.filePolicy == FilePolicyUndecided {
 		return ErrFilePolicyUndecided
 	}
-	return nil
+	if mode == "" {
+		return nil
+	}
+	if !validFileMode(mode) {
+		return fmt.Errorf("%w: file_mode must be %q or %q — an explicit choice is required",
+			ErrBadRequest, FileModeLocal, FileModeCloud)
+	}
+	for _, m := range s.fileModes {
+		if m == mode {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: file_mode %q is not enabled on this deployment", ErrBadRequest, mode)
 }
 
 // Destination is the one Local placement a session serves, declared by the
@@ -172,11 +252,16 @@ type Destination struct {
 	PlacementID string `json:"placement_id"`
 	PersonaID   string `json:"persona_id"`
 	SlotState   string `json:"slot_state"`
+	// FileMode is the file handling the destination is executing. It must
+	// equal the session's recorded mode — a mover bound to different file
+	// handling than the owner selected is refused.
+	FileMode string `json:"file_mode,omitempty"`
 }
 
 func (d Destination) valid() bool {
 	return uuidv7Re.MatchString(d.PlacementID) && uuidv7Re.MatchString(d.PersonaID) &&
-		(d.SlotState == "absent" || d.SlotState == "surrendered")
+		(d.SlotState == "absent" || d.SlotState == "surrendered") &&
+		(d.FileMode == "" || validFileMode(d.FileMode))
 }
 
 func (d Destination) same(other Destination) bool {
@@ -203,8 +288,13 @@ type View struct {
 	// for a secretary that was created here.
 	SurrenderedBy string `json:"surrendered_by,omitempty"`
 	TransferKey   string `json:"transfer_key,omitempty"`
+	// FileMode is the owner's recorded file-handling choice for this
+	// session. Empty on sessions created before the choice existed —
+	// those move records only and serve no file routes.
+	FileMode string `json:"file_mode,omitempty"`
 	// StateOnly and NotIncluded state the slice explicitly: core state
-	// travels; files, jobs, connections and account state do not.
+	// travels; jobs, connections and account state do not. File handling
+	// is governed by FileMode, not by the bundle.
 	StateOnly   bool                 `json:"state_only"`
 	NotIncluded []portable.Exclusion `json:"not_included"`
 	Preflight   *Preflight           `json:"preflight,omitempty"`
@@ -232,14 +322,29 @@ type Preflight struct {
 	// one is pending — the ordinary path is to decide it here before or
 	// after the move, or cancel and return again once decided.
 	PendingApprovals int `json:"pending_approvals"`
-	// Files states the unresolved product boundary plainly: shared files
-	// are not part of this transfer and are not deleted; whether they move
-	// to Local is a product decision still open. The returned secretary's
-	// file references therefore do not become a synced workspace.
+	// PendingFileEffects counts job file operations admitted but not yet
+	// settled — writes whose upstream outcome is still unknown. The seal
+	// refuses while any exist, and a local-mode freeze additionally
+	// drains filesvc-declared effects, so a return never cuts the
+	// workspace under a write still landing. Surfaced here so the person
+	// sees why a seal is waiting rather than guessing.
+	PendingFileEffects int `json:"pending_file_effects"`
+	// Files states the session's file handling plainly, in the selected
+	// mode's own terms. It is descriptive — the mode itself is enforced
+	// by the seal, the copy and the storage credential, not by this text.
 	Files string `json:"files"`
+	// FileCount and FileBytes are the source workspace's live size when
+	// the file service is reachable: the count the copy (local) or the
+	// continued store (cloud) actually covers. Truncated says the bounded
+	// enumeration stopped early — the values are a floor, not the total.
+	FileCount          int64 `json:"file_count,omitempty"`
+	FileBytes          int64 `json:"file_bytes,omitempty"`
+	FileCountTruncated bool  `json:"file_count_truncated,omitempty"`
 }
 
-const filesNotCarried = "shared files do not move with this transfer and are not deleted; whether Cloud files come to Local is an open product decision"
+const filesNotCarried = "files do not move with this transfer and are not deleted; whether Cloud files come to Local was never decided for this session"
+const filesLocalMode = "the Cloud workspace is copied into the Local file store before the secretary activates; the Cloud copy is retained read-only — it is not a synced or managed backup, and it is never deleted automatically"
+const filesCloudMode = "files stay in the Cloud store as the working store; the Local secretary and its person keep reading and writing them through a scoped storage credential — Cloud connectivity is required"
 
 // Arrival summarizes what the destination will continue, from the sealed
 // export receipt.
@@ -260,20 +365,31 @@ type row struct {
 	dstSlot    *string
 	priorHold  *string
 	admitUntil time.Time
+	fileMode   *string
+	fileEpoch  int64
 }
 
 const rowCols = `session_id, human_id, persona_id, grant_hash, status,
 	destination_placement_id, destination_persona_id, destination_slot_state,
-	prior_transfer_id, admit_until`
+	prior_transfer_id, admit_until, file_mode, file_epoch`
 
 func scanRow(r pgx.Row) (row, error) {
 	var x row
 	err := r.Scan(&x.id, &x.humanID, &x.personaID, &x.grantHash, &x.status,
-		&x.dstPlace, &x.dstPersona, &x.dstSlot, &x.priorHold, &x.admitUntil)
+		&x.dstPlace, &x.dstPersona, &x.dstSlot, &x.priorHold, &x.admitUntil, &x.fileMode, &x.fileEpoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return x, ErrNotFound
 	}
 	return x, err
+}
+
+// fileModeStr is the session's recorded file mode ("" for sessions that
+// predate the choice — they move records only).
+func (r row) fileModeStr() string {
+	if r.fileMode == nil {
+		return ""
+	}
+	return *r.fileMode
 }
 
 func (s *Service) load(ctx context.Context, sessionID string) (row, error) {
@@ -343,12 +459,16 @@ type Created struct {
 // open session, and the owner decides from its status — a session still
 // awaiting_destination can be cancelled and recreated; a sealed one needs
 // no grant to read its status (the Local command holds it).
-func (s *Service) Create(ctx context.Context, owner Owner) (Created, string, error) {
+func (s *Service) Create(ctx context.Context, owner Owner, fileMode string) (Created, string, error) {
 	if !owner.valid() {
 		return Created{}, "", fmt.Errorf("%w: unsupported owner claims", ErrBadRequest)
 	}
-	if err := s.admitNewMove(); err != nil {
+	if err := s.admitNewMove(fileMode); err != nil {
 		return Created{}, "", err
+	}
+	if !validFileMode(fileMode) {
+		return Created{}, "", fmt.Errorf("%w: file_mode must be %q or %q — an explicit choice is required",
+			ErrBadRequest, FileModeLocal, FileModeCloud)
 	}
 	// The persona must be this account's secretary: the session will seal
 	// it, so a claim pointing at someone else's persona refuses here —
@@ -381,9 +501,9 @@ func (s *Service) Create(ctx context.Context, owner Owner) (Created, string, err
 		}
 		grant := base64.RawURLEncoding.EncodeToString(raw)
 		_, err = s.pool.Exec(ctx, `INSERT INTO return_sessions
-			(session_id, human_id, persona_id, grant_hash, status, admit_until)
-			VALUES ($1, $2, $3, $4, 'awaiting_destination', now() + $5::bigint * interval '1 millisecond')`,
-			id.String(), owner.HumanID, owner.PersonaID, hashGrant(grant), s.admitTTL.Milliseconds())
+			(session_id, human_id, persona_id, grant_hash, status, admit_until, file_mode)
+			VALUES ($1, $2, $3, $4, 'awaiting_destination', now() + $5::bigint * interval '1 millisecond', $6)`,
+			id.String(), owner.HumanID, owner.PersonaID, hashGrant(grant), s.admitTTL.Milliseconds(), fileMode)
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			var open string
@@ -430,6 +550,10 @@ func (s *Service) BindDestination(ctx context.Context, sessionID, grant string, 
 	if !dest.valid() {
 		return View{}, fmt.Errorf("%w: placement_id and persona_id must be uuidv7 and slot_state absent or surrendered", ErrBadRequest)
 	}
+	if dest.FileMode != r.fileModeStr() {
+		return View{}, fmt.Errorf("%w: this return selected file_mode %q; the destination declared %q — the mover must run the owner's selection",
+			ErrConflict, r.fileModeStr(), dest.FileMode)
+	}
 	if dest.SlotState == "surrendered" && dest.PersonaID != r.personaID {
 		return View{}, fmt.Errorf("%w: a surrendered destination slot must hold this secretary's copy (%s), it declared %s — this return would not reach the secretary it is for",
 			ErrDestBound, r.personaID, dest.PersonaID)
@@ -472,7 +596,7 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 		// The file-policy gate does not fire here: the binding is already
 		// durable state, so this continuation is recovery, not a new move.
 	} else {
-		if err := s.admitNewMove(); err != nil {
+		if err := s.admitNewMove(r.fileModeStr()); err != nil {
 			return err
 		}
 		switch r.status {
@@ -505,6 +629,25 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
+	}
+	// Local mode: fence the source workspace BEFORE the seal commits. The
+	// persisted freeze is what makes the copy's snapshot provable — after
+	// it lands, no new file mutation can be admitted (readers are
+	// unaffected); mutations admitted earlier keep settling and stay
+	// visible to the copier's verification passes. Without a file service
+	// there is no fence and no local-mode copy, so the bind refuses
+	// rather than sealing unfenced.
+	if r.fileModeStr() == string(FileModeLocal) {
+		if s.files == nil {
+			return fmt.Errorf("%w: file_mode local requires the file service, which is not configured", ErrConflict)
+		}
+		scope, err := fileaccess.ScopeForPersona(personaID)
+		if err != nil {
+			return err
+		}
+		if err := s.files.SetScopeFrozen(ctx, scope, sessionID, r.fileEpoch, "return "+sessionID, true); err != nil {
+			return fmt.Errorf("fence source file scope before seal: %w", err)
+		}
 	}
 	// The seal runs under the session row lock. That lock is the fence
 	// that makes "no export exists yet" decidable: a cancel, a reconcile
@@ -833,7 +976,361 @@ func (s *Service) Reconcile(ctx context.Context, sessionID string) error {
 			}
 		}
 	}
+	return s.convergeFileState(ctx, sessionID)
+}
+
+// convergeFileState drives the file-side consequences of the session's
+// resolved state:
+//
+//   - Storage credentials die with their session: cancelled, aborted or
+//     expired sessions revoke exactly the tokens they minted — never an
+//     unrelated session's credential. A completed local-mode move revokes
+//     every active token for the persona: the working store left Cloud,
+//     so Cloud file access ended with it.
+//   - The source scope's persisted mutation barrier is driven to its
+//     desired state for a bound local-mode move: frozen while the copy
+//     window is open (bound through completed), unfrozen when the session
+//     resolves any other way. The call is retried on every reconcile and
+//     its failures are logged, never fatal: a stuck freeze is the safe
+//     side (reads keep working; the human sees refusals until it clears)
+//     and the session's own state must stay readable for recovery.
+func (s *Service) convergeFileState(ctx context.Context, sessionID string) error {
+	r, err := s.load(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	// Tokens minted under this session die with it — session-scoped
+	// revocation can never reach another session's credential. The
+	// revocation serializes with minting on the persona lock so a
+	// mint in flight cannot land after this session's death already
+	// resolved its credentials: whichever commits first is the truth
+	// the other observes.
+	switch r.status {
+	case StatusCancelled, StatusAborted, StatusExpired:
+		if err := s.revokeFileTokens(ctx, r.personaID,
+			`persona_id = $1 AND session_id = $2 AND status = 'active'`, sessionID); err != nil {
+			return err
+		}
+	}
+	// Every other file-side mutation belongs to the current owning
+	// lineage only: the session that presently decides where this
+	// persona's working file store lives. A stale reconcile, retry or
+	// cancellation from an older session can neither refreeze a newer
+	// return's copy window, unfreeze its barrier, nor retire a newer
+	// session's storage credential.
+	owner, err := s.fileStoreOwner(ctx, r.personaID)
+	if err != nil {
+		return err
+	}
+	if owner != sessionID {
+		if owner == "" && s.files != nil {
+			// No live bound session and no completed one: whatever
+			// barrier any dead return left must not outlive it.
+			// Unfreezes are lineage-scoped, so walk this persona's
+			// sessions and let each dead one's own epoch try to clear
+			// — the store ignores a release older than the barrier's
+			// recorded lineage, and the newest dead session's release
+			// legitimately clears every barrier an earlier one left.
+			scope, serr := fileaccess.ScopeForPersona(r.personaID)
+			if serr == nil {
+				sessions, derr := s.personaSessionEpochs(ctx, r.personaID)
+				if derr == nil {
+					for _, ps := range sessions {
+						fctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+						_ = s.files.SetScopeFrozen(fctx, scope, ps.id, ps.epoch, "", false)
+						cancel()
+					}
+				}
+			}
+		}
+		return nil
+	}
+	if r.status == StatusCompleted && r.fileModeStr() == string(FileModeLocal) {
+		// The working store left Cloud under the live lineage: every
+		// Cloud storage credential dies — they are all older than the
+		// decision now governing the store. Serialized with minting on
+		// the persona lock: a mint that committed first is revoked
+		// here; a mint after this revoke refuses — this completed
+		// local session IS the newer lineage its owner-check sees.
+		if err := s.revokeFileTokens(ctx, r.personaID,
+			`persona_id = $1 AND status = 'active'`); err != nil {
+			return err
+		}
+	}
+	if s.files == nil {
+		return nil
+	}
+	scope, err := fileaccess.ScopeForPersona(r.personaID)
+	if err != nil {
+		return err
+	}
+	bound := r.dstPlace != nil
+	want := bound && r.fileModeStr() == string(FileModeLocal) &&
+		(r.status == StatusAwaitingDestination || r.status == StatusSealed ||
+			r.status == StatusCancelling || r.status == StatusCompleted)
+	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if ferr := s.files.SetScopeFrozen(fctx, scope, sessionID, r.fileEpoch, "return "+r.id, want); ferr != nil && s.logf != nil {
+		s.logf("return %s: file barrier convergence (frozen=%v) deferred: %v", r.id, want, ferr)
+	}
 	return nil
+}
+
+// revokeFileTokens sets matching active credentials revoked under the
+// persona's file-authority lock — the same serialization MintFileCredential
+// takes, so a mint and a revocation can never interleave: whichever
+// transaction commits first decides what the other observes. The predicate
+// is a fixed fragment over persona_id ($1) plus optional session ($2) —
+// callers pass constants only, never user input.
+func (s *Service) revokeFileTokens(ctx context.Context, personaID, pred string, args ...any) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, personaID); err != nil {
+		return err
+	}
+	q := `UPDATE persona_file_tokens SET status = 'revoked', resolved_at = now() WHERE ` + pred
+	if _, err := tx.Exec(ctx, q, append([]any{personaID}, args...)...); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// personaSessionEpochs lists every return session for a persona with
+// its durable file_epoch — the candidate barrier owners for a
+// dead-lineage unfreeze sweep. Bounded by the persona's own history.
+type personaSession struct {
+	id    string
+	epoch int64
+}
+
+func (s *Service) personaSessionEpochs(ctx context.Context, personaID string) ([]personaSession, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT session_id::text, file_epoch FROM return_sessions WHERE persona_id = $1`, personaID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []personaSession
+	for rows.Next() {
+		var ps personaSession
+		if err := rows.Scan(&ps.id, &ps.epoch); err != nil {
+			return nil, err
+		}
+		out = append(out, ps)
+	}
+	return out, rows.Err()
+}
+
+// fileStoreOwner resolves which return session currently owns this
+// persona's file-store decisions: the latest bound session that is still
+// live, else the latest bound session that completed (a completed
+// local-mode move keeps its retained-copy barrier until a newer live
+// return takes over), else no owner. Dead sessions never own the store —
+// and can never mutate it. Ordering is by file_epoch — the ONE durable
+// generation filesvc's barrier lineage and the credential's
+// supersession check also compare — never by timestamp, so a session
+// pair created within one clock tick can never order differently here
+// than at the barrier.
+func (s *Service) fileStoreOwner(ctx context.Context, personaID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT session_id::text FROM return_sessions
+		WHERE persona_id = $1 AND destination_bound_at IS NOT NULL
+		  AND status NOT IN ('cancelled','aborted','expired')
+		ORDER BY file_epoch DESC LIMIT 1`, personaID).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = s.pool.QueryRow(ctx, `SELECT session_id::text FROM return_sessions
+		WHERE persona_id = $1 AND destination_bound_at IS NOT NULL AND status = 'completed'
+		ORDER BY file_epoch DESC LIMIT 1`, personaID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// fileStoreOwnerTx is fileStoreOwner inside a caller's transaction —
+// the mint's owner check must serialize with the rest of its mutation.
+func (s *Service) fileStoreOwnerTx(ctx context.Context, tx pgx.Tx, personaID string) (string, error) {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT session_id::text FROM return_sessions
+		WHERE persona_id = $1 AND destination_bound_at IS NOT NULL
+		  AND status NOT IN ('cancelled','aborted','expired')
+		ORDER BY file_epoch DESC LIMIT 1`, personaID).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	err = tx.QueryRow(ctx, `SELECT session_id::text FROM return_sessions
+		WHERE persona_id = $1 AND destination_bound_at IS NOT NULL AND status = 'completed'
+		ORDER BY file_epoch DESC LIMIT 1`, personaID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// FileCredential is the scoped storage credential a cloud-mode
+// destination receives: a bearer token for exactly the persona's file
+// scope, returned exactly once — the store keeps only its hash.
+type FileCredential struct {
+	Token string `json:"file_token"`
+	Scope string `json:"scope"`
+}
+
+// MintFileCredential issues the destination's durable scoped storage
+// credential under the session's lineage. Minting is a real mutation
+// (POST): it supersedes earlier active tokens for the same
+// persona+destination — a lost response or a repeated mover step rotates
+// into a fresh token rather than borrowing an undelivered one. Tokens
+// bound to a different destination are untouched, so a stale session can
+// never rotate a later destination's credential; a session superseded by
+// a newer bound return refuses outright.
+func (s *Service) MintFileCredential(ctx context.Context, sessionID, grant string) (FileCredential, error) {
+	r, err := s.authorize(ctx, sessionID, grant)
+	if err != nil {
+		return FileCredential{}, err
+	}
+	if r.fileModeStr() != string(FileModeCloud) {
+		return FileCredential{}, fmt.Errorf("%w: this return did not select cloud file storage", ErrBadRequest)
+	}
+	scope, err := fileaccess.ScopeForPersona(r.personaID)
+	if err != nil {
+		return FileCredential{}, err
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return FileCredential{}, err
+	}
+	token := "sft_" + base64.RawURLEncoding.EncodeToString(raw)
+	// Eligibility and mutation share one transaction: the session row
+	// lock serializes the mint against a concurrent cancellation or a
+	// reconcile resolving the session, so a mint can never land under a
+	// status that would have refused it — the check is re-read under
+	// the lock, not trusted from the pre-tx authorize snapshot.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return FileCredential{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The persona's file-authority lock serializes this mint against a
+	// DIFFERENT session's mint for the same persona and against every
+	// credential revocation (session death, completed local move) —
+	// the session row lock alone could never order those.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, r.personaID); err != nil {
+		return FileCredential{}, err
+	}
+	var status string
+	var dst *string
+	if err := tx.QueryRow(ctx, `SELECT status, destination_placement_id
+		FROM return_sessions WHERE session_id = $1 FOR UPDATE`, sessionID).
+		Scan(&status, &dst); err != nil {
+		return FileCredential{}, err
+	}
+	if dst == nil {
+		return FileCredential{}, fmt.Errorf("%w: the destination is not bound yet", ErrConflict)
+	}
+	switch status {
+	case StatusSealed, StatusCompleted:
+	default:
+		return FileCredential{}, fmt.Errorf("%w: the session is %s", ErrConflict, status)
+	}
+	// The mint proceeds only while THIS session is the persona's file
+	// authority — the identical owner resolution convergeFileState and
+	// the barrier release use, ordered by file_epoch. A newer bound
+	// return owns the store now and its lineage supersedes this grant;
+	// a dead newer session owns nothing, so an older still-sealed
+	// session's grant stays legitimately mintable — that is the
+	// previous-grant-still-active case, not a revival.
+	owner, err := s.fileStoreOwnerTx(ctx, tx, r.personaID)
+	if err != nil {
+		return FileCredential{}, err
+	}
+	if owner != sessionID {
+		return FileCredential{}, fmt.Errorf("%w: a newer return superseded this session's storage grant", ErrConflict)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE persona_file_tokens
+		SET status = 'superseded', resolved_at = now()
+		WHERE persona_id = $1 AND destination_placement_id = $2 AND status = 'active'`,
+		r.personaID, *dst); err != nil {
+		return FileCredential{}, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO persona_file_tokens
+		(token_hash, persona_id, session_id, destination_placement_id, file_epoch, scope, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'active')`,
+		hashGrant(token), r.personaID, sessionID, *dst, r.fileEpoch, scope); err != nil {
+		return FileCredential{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return FileCredential{}, err
+	}
+	return FileCredential{Token: token, Scope: scope}, nil
+}
+
+// AuthorizeFileRead admits the grant holder to read the sealed source
+// workspace — the local-mode copy's enumeration/read surface. It exists
+// only for a session that selected local file handling and only while
+// sealed: the copy is the reason the grant reaches file bytes, and it
+// ends when the session resolves.
+func (s *Service) AuthorizeFileRead(ctx context.Context, sessionID, grant string) (string, error) {
+	r, err := s.authorize(ctx, sessionID, grant)
+	if err != nil {
+		return "", err
+	}
+	if r.fileModeStr() != string(FileModeLocal) {
+		return "", fmt.Errorf("%w: this return did not select local file copying", ErrBadRequest)
+	}
+	if err := s.Reconcile(ctx, sessionID); err != nil {
+		return "", err
+	}
+	r, err = s.load(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if r.status != StatusSealed {
+		return "", fmt.Errorf("%w: the session is %s; the source workspace is readable for the copy only while sealed",
+			ErrConflict, r.status)
+	}
+	return fileaccess.ScopeForPersona(r.personaID)
+}
+
+// AuthorizeFileToken resolves a presented storage credential to the
+// persona and scope it authorizes — server-side, from the stored hash.
+// The presented value is never a scope; a token cannot name a scope it
+// was not minted for.
+func (s *Service) AuthorizeFileToken(ctx context.Context, token string) (personaID, scope string, err error) {
+	if !strings.HasPrefix(token, "sft_") {
+		return "", "", ErrFileToken
+	}
+	err = s.pool.QueryRow(ctx, `SELECT persona_id::text, scope FROM persona_file_tokens
+		WHERE token_hash = $1 AND status = 'active'`, hashGrant(token)).Scan(&personaID, &scope)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrFileToken
+	}
+	return personaID, scope, err
+}
+
+// RevokePersonaFileTokens is the owner's revocation surface: every active
+// storage credential for their secretary dies. The next file op under a
+// revoked token is refused; the files themselves are untouched.
+func (s *Service) RevokePersonaFileTokens(ctx context.Context, owner Owner) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE persona_file_tokens
+		SET status = 'revoked', resolved_at = now()
+		WHERE persona_id = $1 AND status = 'active'`, owner.PersonaID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // resolveNeverSealedCancel closes a cancelling session that has no export
@@ -953,6 +1450,7 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 	v := View{
 		SessionID: r.id, TransferID: r.id, PersonaID: r.personaID, Status: r.status,
 		AdmitUntil: r.admitUntil.UTC(), SourcePlacementID: own,
+		FileMode:  r.fileModeStr(),
 		StateOnly: true, NotIncluded: portable.NotIncluded,
 	}
 	if dest, ok := r.destination(); ok && grantView {
@@ -976,14 +1474,16 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 	// deletes them.
 	var intentKind string
 	var intent json.RawMessage
-	var activeJobs, pendingApprovals int64
+	var activeJobs, pendingApprovals, pendingFileEffects int64
 	if err := s.pool.QueryRow(ctx, `SELECT model_intent,
 		(SELECT count(*) FROM core_jobs
 		  WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested')),
 		(SELECT count(*) FROM core_tool_approvals
-		  WHERE persona_id = $1 AND status = 'pending')
+		  WHERE persona_id = $1 AND status = 'pending'),
+		(SELECT count(*) FROM core_job_file_ops
+		  WHERE persona_id = $1 AND status IN ('admitted','unknown'))
 		FROM core_personas WHERE persona_id = $1`, r.personaID).
-		Scan(&intent, &activeJobs, &pendingApprovals); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		Scan(&intent, &activeJobs, &pendingApprovals, &pendingFileEffects); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return View{}, err
 	}
 	if len(intent) > 0 {
@@ -995,7 +1495,21 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 		}
 	}
 	v.Preflight = &Preflight{ActiveJobs: int(activeJobs), ModelIntentKind: intentKind,
-		PendingApprovals: int(pendingApprovals), Files: filesNotCarried}
+		PendingApprovals: int(pendingApprovals), PendingFileEffects: int(pendingFileEffects),
+		Files: filesModeText(r.fileModeStr())}
+	if s.files != nil && r.fileModeStr() != "" {
+		// Best-effort live size of the source workspace for the chooser:
+		// bounded enumeration, never a gate. An unreachable store leaves
+		// the counts empty rather than breaking the session view.
+		fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		count, bytes, trunc, ferr := s.enumerateScope(fctx, r.personaID)
+		cancel()
+		if ferr == nil {
+			v.Preflight.FileCount = count
+			v.Preflight.FileBytes = bytes
+			v.Preflight.FileCountTruncated = trunc
+		}
+	}
 	rec, err := s.portable.Status(ctx, "export", sessionID)
 	if errors.Is(err, portable.ErrTransferNotFound) {
 		return v, nil
@@ -1017,4 +1531,66 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 		}
 	}
 	return v, nil
+}
+
+// filesModeText states the session's recorded file handling in
+// user-facing terms — what the selected mode does, not a promise beyond it.
+func filesModeText(mode string) string {
+	switch mode {
+	case string(FileModeLocal):
+		return filesLocalMode
+	case string(FileModeCloud):
+		return filesCloudMode
+	default:
+		return filesNotCarried
+	}
+}
+
+// enumerateScope is the bounded preflight walk: it counts entries and
+// bytes in the persona's file scope, stopping at maxPreflightEntries.
+// Directories that vanish mid-walk (a raced delete) shorten the walk
+// rather than fail it — preflight is informational, never a gate.
+func (s *Service) enumerateScope(ctx context.Context, personaID string) (count, bytes int64, truncated bool, err error) {
+	scope, err := fileaccess.ScopeForPersona(personaID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	const maxPreflightEntries = 2000
+	dirs := []string{""}
+	for len(dirs) > 0 && count < maxPreflightEntries {
+		dir := dirs[0]
+		dirs = dirs[1:]
+		cursor := ""
+		for {
+			res, lerr := s.files.List(ctx, scope, dir, cursor, 500)
+			if lerr != nil {
+				var se *fileaccess.ServiceError
+				if errors.As(lerr, &se) && se.Code == "not_found" {
+					break // raced delete — keep walking siblings
+				}
+				return 0, 0, false, lerr
+			}
+			for _, e := range res.Entries {
+				m, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				name, _ := m["name"].(string)
+				kind, _ := m["kind"].(string)
+				count++
+				if kind == "dir" {
+					dirs = append(dirs, dir+"/"+name)
+				} else if kind == "file" {
+					if n, ok := m["size"].(float64); ok {
+						bytes += int64(n)
+					}
+				}
+			}
+			if res.NextCursor == "" || count >= maxPreflightEntries {
+				break
+			}
+			cursor = res.NextCursor
+		}
+	}
+	return count, bytes, len(dirs) > 0 || count >= maxPreflightEntries, nil
 }

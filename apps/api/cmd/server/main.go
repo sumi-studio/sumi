@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
@@ -795,6 +796,36 @@ func newApplicationFromEnv() (*application, error) {
 		browser.Files = filesClient
 		browser.RegisterFileRoutes(mux)
 		log.Print("person file routes ready (/files/*, session-scoped to canonical filesvc)")
+		if databasePool != nil {
+			// The person file surface marks the retained Cloud copy after
+			// a local-mode return: the persona's working store is wherever
+			// its latest completed return moved it.
+			browser.WorkingStore = func(ctx context.Context, personaID string) (string, error) {
+				var mode *string
+				err := databasePool.QueryRow(ctx, `SELECT file_mode FROM return_sessions
+					WHERE persona_id = $1 AND status = 'completed' AND file_mode IS NOT NULL
+					ORDER BY created_at DESC LIMIT 1`, personaID).Scan(&mode)
+				if err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						return "cloud", nil
+					}
+					return "", err
+				}
+				if mode == nil {
+					return "cloud", nil
+				}
+				return *mode, nil
+			}
+		}
+		if secretaryReturn != nil {
+			// Return file surfaces: the grant's copy-read route (local
+			// mode), the scoped-storage proxy (cloud mode) and the seal's
+			// mutation fence all reach the same canonical service.
+			secretaryReturn.service.SetFileStore(filesClient)
+			secretaryReturn.server.SetFiles(filesClient)
+			secretaryReturn.server.RegisterFileProxy(mux)
+			log.Print("secretary-return file routes ready (/api/secretary-files/* scoped-token proxy)")
+		}
 		if coreServer != nil {
 			for tool, effect := range fileaccess.FileEffects(filesClient) {
 				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {

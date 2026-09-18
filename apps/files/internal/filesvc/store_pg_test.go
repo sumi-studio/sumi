@@ -37,7 +37,7 @@ func resetTables(t *testing.T, dsn string) {
 	}
 	defer conn.Close(context.Background())
 	_, err = conn.Exec(context.Background(),
-		`TRUNCATE file_version, file_event, file_op, file_receipt;
+		`TRUNCATE file_version, file_event, file_op, file_receipt, file_freeze, file_cut;
 		 DELETE FROM store_meta;
 		 SELECT setval('file_version_seq', 1, false)`)
 	// Tables may not exist before first migrate — that's fine, the
@@ -55,7 +55,7 @@ func resetTables(t *testing.T, dsn string) {
 		}
 		defer conn.Close(context.Background())
 		if _, err := conn.Exec(context.Background(),
-			`TRUNCATE file_version, file_event, file_op, file_receipt;
+			`TRUNCATE file_version, file_event, file_op, file_receipt, file_freeze, file_cut;
 			 DELETE FROM store_meta;
 			 SELECT setval('file_version_seq', 1, false)`); err != nil {
 			t.Fatalf("reset: %v", err)
@@ -200,7 +200,7 @@ func sha(s string) string {
 
 func versionOf(t *testing.T, s *Store, scope, path string) (int64, string) {
 	t.Helper()
-	v, fp, err := s.ObservedVersion(context.Background(), scope, path)
+	v, fp, _, err := s.ObservedVersion(context.Background(), scope, path)
 	if err != nil {
 		t.Fatalf("ObservedVersion %s/%s: %v", scope, path, err)
 	}

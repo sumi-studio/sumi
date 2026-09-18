@@ -48,6 +48,12 @@ type BrowserServer struct {
 	// Files, when set, backs the /files/* person routes (RegisterFileRoutes).
 	// Nil fails those routes closed.
 	Files FileBackend
+	// WorkingStore optionally resolves where a persona's current working
+	// file store lives ("cloud" while files remain here, "local" after a
+	// local-mode return moved them). Nil leaves the routes unmarked; a
+	// lookup failure never blocks file access — the file service's own
+	// persisted barrier stays the real fence.
+	WorkingStore func(ctx context.Context, personaID string) (string, error)
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration

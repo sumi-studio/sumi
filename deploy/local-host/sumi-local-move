@@ -86,5 +86,15 @@ elif [[ -z $bin && -f $SCRIPT_DIR/../../apps/api/cmd/local-move/main.go ]]; then
 fi
 [[ -n $bin ]] || die "sumi-local-move binary not found; set SUMI_LOCAL_MOVE_BIN"
 
+# A file-inclusive return copies into the same working root the file
+# service serves: <state-home>/workspace, and a running service is
+# retargeted onto the chosen store through sumi-local itself — the
+# sibling script next to this one, or an explicit SUMI_LOCAL_CTL. The Go
+# mover takes both locations from the environment, never argv.
+ctl="${SUMI_LOCAL_CTL:-}"
+if [[ -z $ctl && -x $SCRIPT_DIR/sumi-local ]]; then
+  ctl="$SCRIPT_DIR/sumi-local"
+fi
 SUMI_LOCAL_HOME="$home" SUMI_DB_URL="$db_url" SUMI_PERSONA_ID="$persona" \
-  SUMI_LOCAL_CONFIG="$config" exec "$bin" "$@"
+  SUMI_LOCAL_CONFIG="$config" SUMI_WORKSPACE_ROOT="$home/workspace" \
+  SUMI_LOCAL_CTL="$ctl" exec "$bin" "$@"
