@@ -91,11 +91,14 @@ const DurableCommandRejectReasons = new Set([
 ]);
 
 // describeCommandRejectReason turns a wire reject_reason into a
-// sender-facing sentence. A moved secretary gets an explicit destination
-// instead of raw protocol vocabulary.
+// sender-facing sentence. A moved secretary gets a concrete answer instead
+// of raw protocol vocabulary. The wire reason carries no direction — a
+// secretary can move either way (to Cloud at registration, or back to a
+// Sumi Local install) — so the wording names what is true on both sides:
+// it moved, and this placement no longer answers.
 export function describeCommandRejectReason(reason: string): string {
   if (reason === "secretary_moved") {
-    return "This secretary moved to Sumi Cloud. Continue the conversation there.";
+    return "This secretary moved to a different Sumi placement. It no longer answers here — continue the conversation where it moved.";
   }
   return `Command rejected: ${reason}`;
 }

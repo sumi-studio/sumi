@@ -877,7 +877,7 @@ test("secretary_moved rejection keeps the text recoverable with a moved reason",
   });
   assert.equal(
     store.getState().lastError,
-    "This secretary moved to Sumi Cloud. Continue the conversation there.",
+    "This secretary moved to a different Sumi placement. It no longer answers here — continue the conversation where it moved.",
   );
   assert.deepEqual(store.getState().recoverableDrafts, [
     {

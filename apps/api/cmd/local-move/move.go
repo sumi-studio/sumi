@@ -776,6 +776,31 @@ func (m *mover) fetch(ctx context.Context, st *moveState) (transfersession.View,
 // answer returns its status and, when present, the session view.
 func (m *mover) call(ctx context.Context, method, target, grant string, body io.Reader, contentType string) (transfersession.View, int, error) {
 	var v transfersession.View
+	raw, code, err := m.callSession(ctx, method, target, grant, body, contentType)
+	if err != nil {
+		return v, code, err
+	}
+	if code < 300 {
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return v, code, fmt.Errorf("Cloud answered an unreadable session: %v", err)
+		}
+		return v, code, nil
+	}
+	var e struct {
+		Error   string                `json:"error"`
+		Session *transfersession.View `json:"session"`
+	}
+	_ = json.Unmarshal(raw, &e)
+	if e.Session != nil {
+		return *e.Session, code, nil
+	}
+	return v, code, fmt.Errorf("Cloud answered HTTP %d: %s", code, strings.TrimSpace(e.Error))
+}
+
+// callSession is the wire half of call shared with the return command: one
+// request, the grant as a bearer header, bounded waits on a silent peer.
+// It returns the raw response body; each direction decodes its own view.
+func (m *mover) callSession(ctx context.Context, method, target, grant string, body io.Reader, contentType string) ([]byte, int, error) {
 	rctx := ctx
 	if method != http.MethodPut {
 		var cancel context.CancelFunc
@@ -784,7 +809,7 @@ func (m *mover) call(ctx context.Context, method, target, grant string, body io.
 	}
 	req, err := http.NewRequestWithContext(rctx, method, target, body)
 	if err != nil {
-		return v, 0, err
+		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+grant)
 	if contentType != "" {
@@ -794,9 +819,9 @@ func (m *mover) call(ctx context.Context, method, target, grant string, body io.
 	m.answered.Store(true)
 	if err != nil {
 		if ctx.Err() != nil {
-			return v, 0, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
-		return v, 0, fmt.Errorf("%w: %v", errUnreachable, err)
+		return nil, 0, fmt.Errorf("%w: %v", errUnreachable, err)
 	}
 	defer res.Body.Close()
 	// A peer that answers the headers and then goes silent is the same
@@ -806,28 +831,15 @@ func (m *mover) call(ctx context.Context, method, target, grant string, body io.
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	silent.Stop()
 	if err != nil {
-		return v, 0, fmt.Errorf("%w: %v", errUnreachable, err)
+		return nil, 0, fmt.Errorf("%w: %v", errUnreachable, err)
 	}
 	switch {
 	case res.StatusCode >= 500:
-		return v, res.StatusCode, fmt.Errorf("%w: HTTP %d", errUnreachable, res.StatusCode)
+		return nil, res.StatusCode, fmt.Errorf("%w: HTTP %d", errUnreachable, res.StatusCode)
 	case res.StatusCode == http.StatusUnauthorized:
-		return v, res.StatusCode, errGrantRejected
-	case res.StatusCode < 300:
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return v, res.StatusCode, fmt.Errorf("Cloud answered an unreadable session: %v", err)
-		}
-		return v, res.StatusCode, nil
+		return nil, res.StatusCode, errGrantRejected
 	}
-	var e struct {
-		Error   string                `json:"error"`
-		Session *transfersession.View `json:"session"`
-	}
-	_ = json.Unmarshal(raw, &e)
-	if e.Session != nil {
-		return *e.Session, res.StatusCode, nil
-	}
-	return v, res.StatusCode, fmt.Errorf("Cloud answered HTTP %d: %s", res.StatusCode, strings.TrimSpace(e.Error))
+	return raw, res.StatusCode, nil
 }
 
 func jsonBody(v any) io.Reader {

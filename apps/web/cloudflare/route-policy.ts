@@ -36,6 +36,11 @@ export const originRoutes = Object.freeze({
     // Keep transfer API requests out of the SPA fallback. The API origin
     // returns 404 until the registrar is mounted with production auth.
     "/api/secretary-transfer/",
+    // The return namespace is mounted while the shared-file policy stays
+    // undecided: begun-session status/cancel/recovery must reach the API,
+    // and the origin itself refuses new admission. Routing is transport,
+    // not the policy decision.
+    "/api/secretary-return/",
     // Person file workspace: the API proxies these ops to the private
     // filesvc with session-derived scope; filesvc itself is never on the
     // public edge.
@@ -106,6 +111,7 @@ export const deniedRoutes = Object.freeze({
     "/workspace-invites",
     "/apps",
     "/api/secretary-transfer",
+    "/api/secretary-return",
     "/agent/ws",
     "/internal",
     "/local-control/v1",

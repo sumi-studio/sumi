@@ -964,6 +964,104 @@ test("secretary transfer calls reach the bound API origin, never the SPA", async
   assert.equal(actual, unmounted);
 });
 
+test("secretary return calls reach the bound API origin, never the SPA", async () => {
+  // The return registrar is mounted while the shared-file policy stays
+  // undecided: every registered path is API traffic to the bound origin,
+  // which answers begun-session status/cancel/recovery and refuses new
+  // admission itself. Neither the SPA fallback nor a synthetic denial may
+  // answer in the API's place.
+  for (const path of [
+    "/api/secretary-return/session",
+    "/api/secretary-return/sessions",
+    "/api/secretary-return/sessions/sess-1",
+    "/api/secretary-return/sessions/sess-1/destination",
+    "/api/secretary-return/sessions/sess-1/bundle",
+    "/api/secretary-return/sessions/sess-1/activated",
+    "/api/secretary-return/sessions/sess-1/retired",
+    "/api/secretary-return/sessions/sess-1/cancel",
+  ]) {
+    assert.equal(classifyPath(path), "origin", path);
+  }
+  // The bare namespace is not an application page, and a lookalike path
+  // outside the prefix is not API traffic either.
+  assert.equal(classifyPath("/api/secretary-return"), "deny");
+  assert.notEqual(classifyPath("/api/secretary-return-lookalike/x"), "origin");
+  // Encoded or traversal variants still resolve inside the namespace or
+  // fail closed; they never reach a different API surface as origin
+  // traffic. A traversal that escapes to the private /internal namespace
+  // is denied outright.
+  assert.equal(classifyPath("/api/secretary-return%2Fsession"), "origin");
+  assert.equal(
+    classifyPath("/api/secretary-return/../../internal/core/personas"),
+    "deny",
+  );
+
+  const refused = Response.json(
+    { error: "return admission refused", code: "file_policy_undecided" },
+    { status: 409, headers: { "Cache-Control": "no-store" } },
+  );
+  let forwarded: Request | undefined;
+  const actual = await handleRequest(
+    new Request("https://sumi.example/api/secretary-return/sessions", {
+      method: "POST",
+      headers: {
+        Cookie: "sumi_session=fixture",
+        Origin: "https://sumi.example",
+        "X-CSRF-Token": "bound",
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    }),
+    {
+      ASSETS: {
+        fetch: () => assert.fail("return API reached static assets"),
+      },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          forwarded = request;
+          return refused;
+        },
+      },
+    },
+    async () => assert.fail("return API bypassed the bound API origin"),
+  );
+  assert.equal(
+    forwarded?.url,
+    "http://sumi.example/api/secretary-return/sessions",
+  );
+  assert.equal(forwarded?.method, "POST");
+  assert.equal(forwarded?.headers.get("Cookie"), "sumi_session=fixture");
+  assert.equal(forwarded?.headers.get("Origin"), "https://sumi.example");
+  assert.equal(forwarded?.headers.get("X-CSRF-Token"), "bound");
+  // The origin's own answer — the typed policy refusal — is returned by
+  // identity rather than replaced by the SPA document.
+  assert.equal(actual, refused);
+
+  // The grant-scoped status read carries its bearer grant unchanged.
+  let statusForwarded: Request | undefined;
+  const status = Response.json({ status: "awaiting_destination" });
+  const statusActual = await handleRequest(
+    new Request("https://sumi.example/api/secretary-return/sessions/sess-1", {
+      headers: { Authorization: "Bearer grant-fixture" },
+    }),
+    {
+      ASSETS: { fetch: () => assert.fail("return API reached assets") },
+      SUMI_ORIGIN: {
+        async fetch(request) {
+          statusForwarded = request;
+          return status;
+        },
+      },
+    },
+    async () => assert.fail("return API bypassed the bound API origin"),
+  );
+  assert.equal(
+    statusForwarded?.headers.get("Authorization"),
+    "Bearer grant-fixture",
+  );
+  assert.equal(statusActual, status);
+});
+
 test("file workspace calls reach the bound API origin with contract intact", async () => {
   // Every production /files op is API traffic: the API derives the filesvc
   // scope from the session and proxies to the private service. None of these
