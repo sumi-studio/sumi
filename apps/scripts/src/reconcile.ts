@@ -167,10 +167,37 @@ export class Reconciler {
   private async reconcileAttention(row: JobRow, reapOrphans: boolean): Promise<RowOutcome> {
     const j = this.cfg.journal.read(row.job_id);
     if (j) {
-      if (!reapOrphans && (j.status === "spawned" || j.status === "running")) {
+      // An evidence-less journal — created but no result and no
+      // verifiable live process (pid null, or nothing left to signal) —
+      // carries nothing a periodic pass could endanger. On a 'lost' row
+      // it resolves now rather than waiting for the next startup pass.
+      const evidenceless = j.result == null && j.pid == null;
+      if (!reapOrphans && (j.status === "spawned" || j.status === "running")
+          && !(row.status === "lost" && evidenceless)) {
         return "pending"; // indeterminate mid-run: hands off
       }
       await this.reconcileOne(j);
+      if (row.status === "lost" && j.result == null) {
+        // Crash window between journal.create and the outcome write
+        // (or a spawn-time fault that killed the supervisor): no
+        // verifiable live process exists — but that is NOT proof
+        // nothing ran. Attach the honest indeterminate outcome, the
+        // same record the no-journal path produces. The wire payload is
+        // frozen in the journal BEFORE the attach, so a restart or a
+        // lost reply replays byte-identically.
+        const wireResult: Record<string, unknown> = {
+          reason: "runner_restart_no_evidence",
+          detail: "execution journal exists but carries no result and no verifiable live process — outcome indeterminate",
+          file_ops_pending: j.file_ops_pending ?? null,
+        };
+        this.cfg.journal.update(j, {
+          status: "exited",
+          result: { ...wireResult, terminal_status: "lost", error: "no execution evidence after restart" },
+          wire_result: wireResult,
+          notes: [...j.notes, "no outcome evidence in journal — honest indeterminate record created for lost-claim attach"],
+        });
+        await this.reportAndUsage(j, "lost", wireResult);
+      }
       // A row sitting 'lost' still owes the observed outcome until the
       // attach lands (or is permanently refused — recorded in notes).
       // reconcileOne already attempts this for 'exited'/'reaped'

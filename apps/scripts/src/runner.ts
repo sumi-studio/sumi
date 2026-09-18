@@ -9,7 +9,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as http from "node:http";
@@ -113,83 +113,174 @@ export class Runner {
       throw e;
     }
 
-    const jobDir = join(this.cfg.workDir, "tmp", `run-${job.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}`);
-    mkdirSync(jobDir, { recursive: true });
-    const socketPath = this.journal.socketPath(job.job_id);
-    const statsPath = this.journal.statsPath(job.job_id);
-    const usageFactID = `script:${job.job_id}:exec`;
-
-    const j = this.journal.create({
-      job_id: job.job_id,
-      persona_id: job.persona_id,
-      runner_id: this.cfg.runnerID,
-      pid: null,
-      start_ticks: null,
-      boot_id: bootID(),
-      unit_name: null,
-      socket_path: socketPath,
-      stats_path: statsPath,
-      cgroup_mode: this.cfg.cgroupMode,
-      limits: spec.limits as unknown as Record<string, number>,
-      spec: { code_sha256: createHash("sha256").update(spec.code).digest("hex") },
-      usage_fact_id: usageFactID,
-    });
-
-    const configPath = writeConfig(jobDir, {
-      socketPath,
-      dispatcherPath: this.cfg.dispatcherPath,
-      api: this.cfg.api,
-      token: this.cfg.token,
-      personaID: job.persona_id,
-      jobID: job.job_id,
-      runnerID: this.cfg.runnerID,
-      limits: {
-        cpu_ms: spec.limits.cpu_seconds * 1000,
-        file_calls: spec.limits.file_calls,
-        file_bytes: spec.limits.file_bytes,
-        log_bytes: spec.limits.log_bytes,
-      },
-    });
-
-    const unitName = this.cfg.cgroupMode === "systemd"
-      ? `sumi-script-${job.job_id.replace(/[^A-Za-z0-9]/g, "-")}`
-      : undefined;
-
-    const spawned = spawnJob({
-      configPath, socketPath, statsPath,
-      cpuSeconds: spec.limits.cpu_seconds,
-      memoryMib: spec.limits.memory_mib,
-      cgroupMode: this.cfg.cgroupMode,
-      unitName, workerdBin: this.cfg.workerdBin,
-      runlimitedBin: this.cfg.runlimitedBin,
-    }, (line) => this.log(`job ${job.job_id} workerd: ${line}`));
-
-    this.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString(), pid: spawned.pid });
-
+    // The whole preparation + launch section is ONE contained failure
+    // domain: mkdir, journal, config, spawn and the pid write can each
+    // fault transiently (ENOSPC/EEXIST/EROFS, a missing dispatcher, a
+    // degraded journal dir). A rejection here would escape to the
+    // supervisor's fire-and-forget call as an unhandledRejection and
+    // kill every sibling — so any throw becomes this job's honest
+    // 'failed', never a process exit.
+    let j: JobJournal | null = null;
+    let spawned: Spawned | null = null;
+    let configPath: string | null = null;
     try {
-      // Wait for the worker to accept on its unix socket.
-      await this.waitReady(socketPath, spawned, 30_000);
-      // The spawned pid is the wrapper (systemd-run or /usr/bin/time);
-      // workerd is its descendant — prlimit execs it, so it is the only
-      // child in prlimit mode. Record the real workerd pid + start ticks
-      // as the durable identity.
-      const resolved = findDescendant(spawned.pid, "workerd") ?? spawned.pid;
-      const ticks = startTicks(resolved);
-      this.journal.update(j, { status: "running", pid: resolved, start_ticks: ticks });
-      this.log(`job ${job.job_id} workerd ready pid=${resolved}`);
+      const jobDir = join(this.cfg.workDir, "tmp", `run-${job.job_id.replace(/[^A-Za-z0-9._:-]/g, "_")}`);
+      mkdirSync(jobDir, { recursive: true });
+      const socketPath = this.journal.socketPath(job.job_id);
+      const statsPath = this.journal.statsPath(job.job_id);
+      const usageFactID = `script:${job.job_id}:exec`;
 
-      const outcome = await this.drive(job, spec, j, socketPath, spawned);
-      await this.finish(job, outcome.status, outcome.result, outcome.error);
+      j = this.journal.create({
+        job_id: job.job_id,
+        persona_id: job.persona_id,
+        runner_id: this.cfg.runnerID,
+        pid: null,
+        start_ticks: null,
+        boot_id: bootID(),
+        unit_name: null,
+        socket_path: socketPath,
+        stats_path: statsPath,
+        cgroup_mode: this.cfg.cgroupMode,
+        limits: spec.limits as unknown as Record<string, number>,
+        spec: { code_sha256: createHash("sha256").update(spec.code).digest("hex") },
+        usage_fact_id: usageFactID,
+      });
+
+      configPath = writeConfig(jobDir, {
+        socketPath,
+        dispatcherPath: this.cfg.dispatcherPath,
+        api: this.cfg.api,
+        token: this.cfg.token,
+        personaID: job.persona_id,
+        jobID: job.job_id,
+        runnerID: this.cfg.runnerID,
+        limits: {
+          cpu_ms: spec.limits.cpu_seconds * 1000,
+          file_calls: spec.limits.file_calls,
+          file_bytes: spec.limits.file_bytes,
+          log_bytes: spec.limits.log_bytes,
+        },
+      });
+
+      const unitName = this.cfg.cgroupMode === "systemd"
+        ? `sumi-script-${job.job_id.replace(/[^A-Za-z0-9]/g, "-")}`
+        : undefined;
+
+      spawned = spawnJob({
+        configPath, socketPath, statsPath,
+        cpuSeconds: spec.limits.cpu_seconds,
+        memoryMib: spec.limits.memory_mib,
+        cgroupMode: this.cfg.cgroupMode,
+        unitName, workerdBin: this.cfg.workerdBin,
+        runlimitedBin: this.cfg.runlimitedBin,
+      }, (line) => this.log(`job ${job.job_id} workerd: ${line}`));
+
+      this.journal.update(j, { status: "spawned", spawned_at: new Date().toISOString(), pid: spawned.pid });
+
+      try {
+        // Wait for the worker to accept on its unix socket — by then
+        // workerd has read config.capnp once at startup, so the copy
+        // holding the runtime token is no longer needed by anyone.
+        await this.waitReady(socketPath, spawned, 30_000);
+        this.unlinkConfig(configPath, job.job_id);
+        configPath = null;
+        // The spawned pid is the wrapper (systemd-run or /usr/bin/time);
+        // workerd is its descendant — prlimit execs it, so it is the only
+        // child in prlimit mode. Record the real workerd pid + start ticks
+        // as the durable identity.
+        const resolved = findDescendant(spawned.pid, "workerd") ?? spawned.pid;
+        const ticks = startTicks(resolved);
+        this.journal.update(j, { status: "running", pid: resolved, start_ticks: ticks });
+        this.log(`job ${job.job_id} workerd ready pid=${resolved}`);
+
+        const outcome = await this.drive(job, spec, j, socketPath, spawned);
+        await this.finish(job, outcome.status, outcome.result, outcome.error);
+      } catch (e) {
+        // Dispatch/ready failure: kill the process by identity, capture
+        // whatever rusage exists, and report failed (not re-executed).
+        const exit = await this.terminate(j, spawned, "unknown");
+        const result: Record<string, unknown> = {
+          reason: "runner_error", detail: String(e),
+          usage: this.usageFromExit(exit, spec),
+        };
+        await this.finish(job, "failed", result, String(e));
+      }
     } catch (e) {
-      // Dispatch/ready failure: kill the process by identity, capture
-      // whatever rusage exists, and report failed (not re-executed).
-      const exit = await this.terminate(j, spawned, "unknown");
-      const result: Record<string, unknown> = {
-        reason: "runner_error", detail: String(e),
-        usage: this.usageFromExit(exit, spec),
-      };
-      await this.finish(job, "failed", result, String(e));
+      // Preparation/launch fault. Whatever spawnJob managed to return is
+      // killed by the handle still held — a child that exists without a
+      // persisted pid must not outlive its bookkeeping. Report only what
+      // is provable: 'failed'/runner_error, no execution claim and no
+      // usage beyond what terminate could measure. If even the report
+      // fails (degraded storage AND API), the claim still resolves
+      // honestly by lease expiry into the attention path.
+      this.log(`job ${job.job_id} preparation failed: ${e}`);
+      this.unlinkConfig(configPath, job.job_id);
+      if (spawned && j) {
+        try { await this.terminate(j, spawned, "unknown"); } catch { /* nothing more provable */ }
+      } else if (spawned) {
+        // No journal to consult — kill the wrapper and its workerd
+        // descendant by the pid we still hold, then let the claim expire.
+        try {
+          const workerPid = findDescendant(spawned.pid, "workerd");
+          if (workerPid != null) killVerified({ pid: workerPid, start_ticks: startTicks(workerPid), boot_id: bootID() }, "SIGKILL");
+          spawned.kill();
+        } catch { /* best effort — bounded by its own rlimits */ }
+      }
+      try {
+        await this.finish(job, "failed", { reason: "runner_error", detail: `preparation failed: ${String(e)}` }, String(e));
+      } catch (e2) {
+        this.log(`job ${job.job_id} failure report failed too: ${e2} — claim resolves by lease expiry`);
+      }
     }
+  }
+
+  /**
+   * workerd reads config.capnp once at startup; the file carries the
+   * cross-persona runtime token, so it is removed as soon as the worker
+   * is bound — and on every failure/cancel path. Best-effort: an
+   * unlink error is logged (path only, never file contents) and never
+   * fails the job.
+   */
+  private unlinkConfig(path: string | null, jobID: string): void {
+    if (!path) return;
+    try {
+      unlinkSync(path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.log(`job ${jobID}: config unlink failed: ${e}`);
+      }
+    }
+  }
+
+  /**
+   * Remove config.capnp copies left behind by a dead supervisor run —
+   * each holds a launch-time copy of the runtime token that no live
+   * worker needs anymore. Journals, rusage stats and job dirs are kept;
+   * only the credential file is removed. Safe to call at startup only,
+   * before any claim: this process has no in-flight launches whose
+   * worker might still be reading its config. Best-effort per file.
+   */
+  cleanStaleCredentialFiles(): number {
+    const tmp = join(this.cfg.workDir, "tmp");
+    let names: string[];
+    try {
+      names = readdirSync(tmp);
+    } catch {
+      return 0;
+    }
+    let removed = 0;
+    for (const name of names) {
+      if (!name.startsWith("run-")) continue;
+      try {
+        unlinkSync(join(tmp, name, "config.capnp"));
+        removed++;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+          this.log(`stale config cleanup ${name}: ${e}`);
+        }
+      }
+    }
+    return removed;
   }
 
   /** The monitor loop: heartbeat, cancel observation, wall timeout. */

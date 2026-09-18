@@ -109,10 +109,17 @@ async function submitJob(personaID: string, jobID: string, kind: string, request
 async function claimToLost(personaID: string, jobID: string): Promise<void> {
   await submitJob(personaID, jobID, "script", { code: "x" });
   await client.claimJobs(personaID, RUNNER_ID, 400, 4);
-  await new Promise((r) => setTimeout(r, 900));
-  await client.claimJobs(personaID, RUNNER_ID, 400, 4); // sweeps the expired claim
-  const row = await jobRow(personaID, jobID);
-  if (row.status !== "lost") throw new Error(`${jobID} not swept to lost: ${row.status}`);
+  // Each later claim pass re-attempts the sweep; retry until the lease
+  // has demonstrably expired rather than trusting one fixed sleep —
+  // HTTP latency inside a busy fixture can compress a single wait.
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 500));
+    await client.claimJobs(personaID, RUNNER_ID, 400, 4);
+    const row = await jobRow(personaID, jobID);
+    if (row.status === "lost") return;
+    if (Date.now() > deadline) throw new Error(`${jobID} not swept to lost: ${row.status}`);
+  }
 }
 
 async function jobRow(personaID: string, jobID: string): Promise<Record<string, unknown>> {
@@ -326,11 +333,12 @@ test("attention: a running claim with no journal is deferred, then resolved via 
   assert.ok(res.attention.seen >= 1);
   assert.ok(res.attention.pending >= 1, "deferred row reported as pending, not resolved");
 
-  // The lease expires; the next claim call sweeps it to 'lost'.
-  await new Promise((r) => setTimeout(r, 900));
-  await client.claimJobs(p.id, RUNNER_ID, 400, 4).catch(() => null);
-  row = await jobRow(p.id, "j-noj");
-  assert.equal(row.status, "lost");
+  // The lease expires; a later claim call sweeps it to 'lost'.
+  await waitFor(async () => {
+    await client.claimJobs(p.id, RUNNER_ID, 400, 4).catch(() => null);
+    row = await jobRow(p.id, "j-noj");
+    return row.status === "lost";
+  }, 10_000, "sweep to lost");
 
   // Now the honest no-evidence outcome attaches through the real route.
   await newReconciler(wd).run();

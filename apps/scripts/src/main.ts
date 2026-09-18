@@ -7,7 +7,7 @@
 
 import { Runner, defaultDispatcherPath, type RunnerConfig } from "./runner.ts";
 import { Reconciler } from "./reconcile.ts";
-import { ConfiguredDiscovery, SharedDiscovery, StateClient, type Discovery } from "./api.ts";
+import { ConfiguredDiscovery, SharedDiscovery, StateClient, type Discovery, type JobRow } from "./api.ts";
 import { detectCgroupMode } from "./spawn.ts";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -23,11 +23,16 @@ export interface SupervisorConfig extends RunnerConfig {
    *  Recovery delivers owed evidence only — it never touches this
    *  process's active executions. Default 30s. */
   recoveryEveryMs?: number;
+  /** Bounded shutdown drain: how long shutdown() waits for in-flight
+   *  jobs to report 'cancelled' before leaving them to the honest
+   *  lease-expiry/startup-reconcile path. Default 20s. */
+  shutdownGraceMs?: number;
 }
 
 export class Supervisor {
   readonly runner: Runner;
   private active = 0;
+  private inflight = new Map<string, JobRow>();
   private stop = false;
 
   readonly cfg: SupervisorConfig;
@@ -37,6 +42,12 @@ export class Supervisor {
   }
 
   async start(): Promise<void> {
+    // Before anything else: drop credential copies a dead run left
+    // behind. No claim exists yet, so no in-flight worker can still be
+    // reading its config — every run-*/config.capnp here is residue.
+    const cleaned = this.runner.cleanStaleCredentialFiles();
+    if (cleaned > 0) this.cfg.log?.(`startup: removed ${cleaned} stale config.capnp credential file(s)`);
+
     const rec = new Reconciler({
       client: this.runner.client,
       journal: this.runner.journal,
@@ -56,6 +67,7 @@ export class Supervisor {
         this.cfg.log?.(`discovery: ${e}`);
       }
       for (const p of personas) {
+        if (this.stop) break;
         // The claim IS the durable reservation — claiming beyond free
         // capacity would take ownership of jobs this process cannot
         // start, stranding them owned/running with no journal until the
@@ -66,7 +78,14 @@ export class Supervisor {
         for (const job of claimed) {
           if (this.active >= this.cfg.maxConcurrent) break;
           this.active++;
-          void this.runner.runJob(job).finally(() => { this.active--; });
+          this.inflight.set(job.job_id, job);
+          // Containment belt for the contained failure domain in
+          // runJobInner: even if every inner layer failed to report, a
+          // rejection here is logged, never an unhandledRejection that
+          // kills the process and every sibling with it.
+          void this.runner.runJob(job)
+            .catch((e) => this.cfg.log?.(`job ${job.job_id} runJob failed (contained): ${e}`))
+            .finally(() => { this.active--; this.inflight.delete(job.job_id); });
         }
       }
       // Periodic recovery: an API outage at startup, a lost Complete
@@ -88,8 +107,38 @@ export class Supervisor {
     }
   }
 
-  shutdown(): void {
+  /**
+   * Graceful stop, bounded. Claims/discovery halt at the next poll tick;
+   * every in-flight job gets an honest cancel_requested — its drive loop
+   * observes it via heartbeat (~heartbeatMs) and reports 'cancelled'
+   * with whatever usage was measured. Then this waits up to
+   * `graceMs` for the in-flight set to drain.
+   *
+   * What is NOT done, deliberately: no SIGKILL of our own children and
+   * no fake terminal report. If the grace window expires — e.g. the API
+   * is unreachable and cancels never landed — remaining workerd
+   * children are left bounded by their own rlimits/wall_ms; their
+   * claims expire to 'lost' and the next supervisor's startup reconcile
+   * reaps by verified identity and attaches the honest indeterminate
+   * outcome. Restart recovery is idempotent on the durable journal.
+   */
+  async shutdown(graceMs = this.cfg.shutdownGraceMs ?? 20_000): Promise<void> {
     this.stop = true;
+    const jobs = [...this.inflight.values()];
+    for (const job of jobs) {
+      try {
+        await this.runner.client.cancelJob(job.persona_id, job.job_id);
+      } catch (e) {
+        this.cfg.log?.(`shutdown: cancel ${job.job_id}: ${e}`);
+      }
+    }
+    const deadline = Date.now() + graceMs;
+    while (this.inflight.size > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.inflight.size > 0) {
+      this.cfg.log?.(`shutdown: ${this.inflight.size} job(s) still in flight after ${graceMs}ms — left bounded by own rlimits; claims expire to 'lost' and reconcile honestly`);
+    }
   }
 }
 
@@ -195,6 +244,7 @@ export function supervisorFromEnv(): Supervisor {
     claimLimit: Number(process.env.SUMI_CLAIM_LIMIT ?? 4),
     maxConcurrent: Number(process.env.SUMI_MAX_CONCURRENT ?? 4),
     pollMs: Number(process.env.SUMI_POLL_MS ?? 1_000),
+    shutdownGraceMs: Number(process.env.SUMI_SHUTDOWN_GRACE_MS ?? 20_000),
     cgroupMode,
     log,
     discovery,

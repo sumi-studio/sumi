@@ -207,3 +207,74 @@ behavior is what fences runners, not process placement.
   honest outcome instead.
 - Results carry truthful output: bounded sanitized content with explicit
   `*_truncated`/`*_unavailable` markers — never silent blanking.
+
+## Lightweight script supervisor (`kind: "script"`)
+
+The script backend is a separate long-running process, `apps/scripts`:
+
+```
+node apps/scripts/run.mjs            # Node >= 22.18 (types stripped on import)
+cd apps/scripts && pnpm run run
+```
+
+Startup is all-or-nothing: a bad environment exits non-zero with the
+named missing/invalid variable — the process never half-starts under an
+identity or config it cannot sustain.
+
+Required environment:
+
+- `SUMI_STATE_API` — state API origin (`http://host:port`)
+- `SUMI_STATE_TOKEN` — internal runtime credential (>=16 chars)
+- `SUMI_WORKERD_BIN` — path to the workerd binary
+
+Optional environment:
+
+- `SUMI_CGROUP_MODE` — `systemd` | `prlimit` (default autodetect; an
+  explicit `systemd` request fails honestly when scopes cannot launch —
+  `prlimit` bounds CPU/wall/output and the V8 heap only)
+- `SUMI_RUNNER_ID` — explicit durable identity; otherwise a random id is
+  minted and persisted under `SUMI_WORK_DIR` (`runner-id` file). Claims
+  never begin under an identity that cannot be recovered, so the
+  attention route and lost-outcome attach stay reachable across restarts.
+- `SUMI_WORK_DIR` — durable journal dir (default `~/.local/state/sumi-scripts`)
+- `SUMI_PERSONAS` — comma-separated persona filter; **local/dev only**.
+  Production discovery needs no persona list — the shared
+  `GET /internal/core/jobs/runnable` route supplies it dynamically.
+- `SUMI_LEASE_MS` (30000), `SUMI_HEARTBEAT_MS` (5000),
+  `SUMI_CLAIM_LIMIT` (4), `SUMI_MAX_CONCURRENT` (4),
+  `SUMI_POLL_MS` (1000), `SUMI_DISCOVERY_PAGE` (64),
+  `SUMI_DISPATCHER_PATH`, `SUMI_RUNLIMITED_BIN`,
+  `SUMI_SHUTDOWN_GRACE_MS` (20000)
+
+### Shutdown contract (SIGTERM/SIGINT)
+
+1. Discovery and claims stop immediately — no new reservations.
+2. Every in-flight job receives `cancel_requested` through the API; its
+   drive loop observes it at the next heartbeat and reports `cancelled`
+   with whatever usage was measured.
+3. The process waits up to `SUMI_SHUTDOWN_GRACE_MS` for the in-flight
+   set to drain, then exits.
+4. Anything still running past the grace window is left bounded by its
+   own rlimits/`wall_ms` — never silently killed mid-report and never
+   reported on absent evidence. Its claim expires to `lost`; the next
+   supervisor's startup reconcile reaps the orphan by verified identity
+   and attaches the honest indeterminate outcome. Recovery is
+   idempotent on the durable journal.
+5. A second signal forces immediate exit.
+
+### Per-job fault containment
+
+One job's preparation fault (mkdir/journal/config/spawn/pid-write) is a
+contained `failed`/`runner_error` report for that job — never a process
+exit that orphans siblings. If even the report fails (degraded storage
+and API), the claim resolves honestly by lease expiry into the
+attention path.
+
+### Credential hygiene
+
+`config.capnp` carries the runtime token only to launch a worker;
+workerd reads it once at startup. The file is unlinked as soon as the
+worker binds (and on every failure/cancel path), and stale copies left
+by a dead run are swept before the first claim at startup. Journals,
+rusage stats and run dirs are kept — only the credential copy is
+removed.

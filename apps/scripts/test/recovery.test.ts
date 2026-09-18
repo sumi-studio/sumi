@@ -29,7 +29,7 @@
 import { test, before, after } from "node:test";
 import * as assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as http from "node:http";
@@ -122,11 +122,18 @@ async function claimRunning(personaID: string, jobID: string, request: unknown =
 async function claimToLost(personaID: string, jobID: string): Promise<void> {
   await submitJob(personaID, jobID, { code: "x" });
   await client.claimJobs(personaID, RUNNER_ID, 400, 4);
-  await new Promise((r) => setTimeout(r, 900));
-  // The next claim on this persona runs the expiry sweep inside its tx.
-  await client.claimJobs(personaID, RUNNER_ID, 400, 4);
-  const row = await jobRow(personaID, jobID);
-  if (row.status !== "lost") throw new Error(`${jobID} not swept to lost: ${row.status}`);
+  // Each later claim pass runs the expiry sweep inside its tx; retry
+  // until the lease has demonstrably expired rather than trusting one
+  // fixed sleep — HTTP latency inside a busy fixture can compress a
+  // single wait below the lease.
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 500));
+    await client.claimJobs(personaID, RUNNER_ID, 400, 4);
+    const row = await jobRow(personaID, jobID);
+    if (row.status === "lost") return;
+    if (Date.now() > deadline) throw new Error(`${jobID} not swept to lost: ${row.status}`);
+  }
 }
 
 async function jobRow(personaID: string, jobID: string): Promise<Record<string, unknown>> {
@@ -377,7 +384,7 @@ test("a concurrently running script survives a periodic recovery pass", async ()
     await waitFor(async () => (await jobRow(p2.id, "j-owed")).status === "done", 15000, "owed evidence settled concurrently");
     assert.equal(pid, inFlight.pid);
   } finally {
-    sup.shutdown();
+    await sup.shutdown();
     await running.catch(() => {});
   }
 });
@@ -619,7 +626,148 @@ test("claims are bounded by free capacity — a backlog never strands owned clai
       assert.equal(j!.status, "reported");
     }
   } finally {
-    sup.shutdown();
+    await sup.shutdown();
     await running.catch(() => {});
+  }
+});
+
+
+test("lost row + evidence-less spawned journal resolves with the honest indeterminate outcome (F389)", { timeout: 30_000 }, async () => {
+  const p = await makePersona("wedge");
+  await claimToLost(p.id, "j-wedge"); // real API: claim -> lease expiry -> sweep to lost
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-wedge-"));
+  const journal = new Journal(wd);
+  // The crash-window journal shape: created between journal.create and
+  // the pid update, or left by a spawn-time fault — no result, no pid,
+  // nothing to signal.
+  journal.create({
+    job_id: "j-wedge", persona_id: p.id, runner_id: RUNNER_ID,
+    pid: null, start_ticks: null, boot_id: null, unit_name: null,
+    socket_path: "", stats_path: "", cgroup_mode: "prlimit",
+    limits: {}, spec: { code_sha256: "0".repeat(64) },
+    usage_fact_id: "script:j-wedge:exec",
+  });
+  const res = await newReconciler(wd).run();
+  const row = await jobRow(p.id, "j-wedge");
+  assert.equal(row.status, "lost", "immutable verdict untouched");
+  const outcome = (row.result as Record<string, unknown>)?.observed_outcome as Record<string, unknown> | undefined;
+  assert.ok(outcome, "honest indeterminate outcome attached — the row must not wedge in attention");
+  assert.equal((outcome.result as Record<string, unknown>).reason, "runner_restart_no_evidence");
+  const j = journal.read("j-wedge")!;
+  assert.equal(j.status, "reported", "journal settles after the attach lands");
+  assert.ok(res.attention.resolved >= 1, "attention pass resolved the row");
+  const att = await client.attentionJobs(RUNNER_ID, ["script"], 64);
+  assert.ok(!att.jobs.some((r) => r.job_id === "j-wedge"), "row left the attention set");
+});
+
+test("a single job's preparation failure is contained — sibling completes and the loop keeps claiming (F388)", { timeout: 90_000 }, async () => {
+  const p = await makePersona("contain");
+  await submitJob(p.id, "j-bad", { code: 'export async function run(){ return "never runs" }' });
+  await submitJob(p.id, "j-good", { code: 'export async function run(){ return "good-ok" }' });
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-contain-"));
+  // Occupy the per-job dir as a regular FILE — mkdirSync(run-j-bad)
+  // throws EEXIST inside runJob's preparation section: the fault that
+  // used to escape as an unhandledRejection and kill the whole
+  // supervisor process.
+  mkdirSync(join(wd, "tmp"), { recursive: true });
+  writeFileSync(join(wd, "tmp", "run-j-bad"), "occupied");
+  const sup = new Supervisor({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 4, cgroupMode: "prlimit",
+    log: () => {},
+    discovery: new SharedDiscovery(new StateClient({ api: REAL_API, token: RUNTIME }), ["script"], 8),
+    maxConcurrent: 2, pollMs: 200, recoveryEveryMs: 60_000,
+  });
+  const running = sup.start();
+  try {
+    await waitFor(async () => (await jobRow(p.id, "j-bad")).status === "failed", 30_000, "j-bad reported failed honestly");
+    const bad = await jobRow(p.id, "j-bad");
+    assert.equal((bad.result as Record<string, unknown>).reason, "runner_error",
+      "the job reports an honest preparation failure — not a process crash, not a stranded claim");
+    await waitFor(async () => (await jobRow(p.id, "j-good")).status === "done", 30_000, "sibling unaffected");
+    // The loop itself survived: work submitted afterwards is claimed
+    // and executed normally.
+    await submitJob(p.id, "j-after", { code: 'export async function run(){ return "after-ok" }' });
+    await waitFor(async () => (await jobRow(p.id, "j-after")).status === "done", 30_000, "supervisor still claiming after the failure");
+  } finally {
+    await sup.shutdown();
+    await running.catch(() => {});
+  }
+});
+
+test("config.capnp credential file is removed once the worker binds; stale copies swept at startup (F390)", { timeout: 60_000 }, async () => {
+  const p = await makePersona("cfg-clean");
+  await submitJob(p.id, "j-cfg", { code: 'export async function run(){ return "cfg-ok" }' });
+  const { claimed } = await client.claimJobs(p.id, RUNNER_ID, 30_000, 1);
+  const wd = mkdtempSync(join(tmpdir(), "sumi-rec-cfg-"));
+  const runner = new Runner({
+    api: REAL_API, token: RUNTIME, runnerID: RUNNER_ID, workDir: wd,
+    workerdBin: WORKERD_BIN, runlimitedBin: RUNLIMITED_BIN,
+    dispatcherPath: defaultDispatcherPath(),
+    leaseMs: 30_000, heartbeatMs: 300, claimLimit: 1, cgroupMode: "prlimit", log: () => {},
+  });
+  await runner.runJob(claimed[0]!);
+  assert.equal((await jobRow(p.id, "j-cfg")).status, "done");
+  assert.ok(!existsSync(join(wd, "tmp", "run-j-cfg", "config.capnp")),
+    "the runtime-token copy is removed once the worker has read it");
+
+  // Residue a dead run left behind is swept at startup — journals and
+  // stats stay, only the credential file is removed.
+  mkdirSync(join(wd, "tmp", "run-j-stale"), { recursive: true });
+  writeFileSync(join(wd, "tmp", "run-j-stale", "config.capnp"), "residue");
+  assert.equal(runner.cleanStaleCredentialFiles(), 1);
+  assert.ok(!existsSync(join(wd, "tmp", "run-j-stale", "config.capnp")));
+});
+
+test("shipped entrypoint: boots on the env contract, executes a job, and SIGTERM cancels in-flight work gracefully (F387)", { timeout: 90_000 }, async () => {
+  const p = await makePersona("entry");
+  const wd = mkdtempSync(join(tmpdir(), "sumi-entry-"));
+  const runBin = new URL("../run.mjs", import.meta.url).pathname;
+
+  // Fatal startup: missing required env exits non-zero and names it —
+  // the process never half-starts under a broken contract.
+  const badEnv: NodeJS.ProcessEnv = { ...process.env, SUMI_WORK_DIR: wd };
+  delete badEnv["SUMI_STATE_API"]; delete badEnv["SUMI_STATE_TOKEN"]; delete badEnv["SUMI_WORKERD_BIN"];
+  const miss = spawn(process.execPath, [runBin], { env: badEnv });
+  const missErr: string[] = [];
+  miss.stderr?.on("data", (d) => missErr.push(String(d)));
+  const missCode = await new Promise<number>((r) => miss.on("exit", (c) => r(c ?? -1)));
+  assert.notEqual(missCode, 0, "missing env must fail startup honestly");
+
+  // Real lifecycle through the shipped command: a fast job completes;
+  // a sleeping job is in flight when SIGTERM arrives and must end
+  // 'cancelled' — the honest cancel path, not orphaned-to-lost.
+  await submitJob(p.id, "j-fast", { code: 'export async function run(){ return "entry-ok" }' });
+  await submitJob(p.id, "j-slow", {
+    code: 'export async function run(){ await new Promise(r=>setTimeout(r,60000)); return "never" }',
+    limits: { wall_ms: 120000, cpu_seconds: 120 },
+  });
+  const proc = spawn(process.execPath, [runBin], {
+    env: {
+      ...process.env,
+      SUMI_STATE_API: REAL_API, SUMI_STATE_TOKEN: RUNTIME,
+      SUMI_WORKERD_BIN: WORKERD_BIN, SUMI_RUNLIMITED_BIN: RUNLIMITED_BIN,
+      SUMI_CGROUP_MODE: "prlimit", SUMI_WORK_DIR: wd,
+      SUMI_POLL_MS: "200", SUMI_HEARTBEAT_MS: "300",
+      SUMI_MAX_CONCURRENT: "2", SUMI_CLAIM_LIMIT: "4",
+      SUMI_SHUTDOWN_GRACE_MS: "15000", SUMI_LEASE_MS: "30000",
+    },
+  });
+  const out: string[] = [];
+  proc.stdout?.on("data", (d) => out.push(String(d)));
+  proc.stderr?.on("data", (d) => out.push(String(d)));
+  try {
+    await waitFor(async () => (await jobRow(p.id, "j-fast")).status === "done", 45_000,
+      "entrypoint discovered, claimed and executed j-fast");
+    await waitFor(async () => (await jobRow(p.id, "j-slow")).status === "running", 15_000, "j-slow in flight");
+    proc.kill("SIGTERM");
+    const code = await new Promise<number>((r) => proc.on("exit", (c) => r(c ?? -1)));
+    assert.equal(code, 0, `graceful shutdown must exit 0; logs: ${out.join("")}`);
+    const slow = await jobRow(p.id, "j-slow");
+    assert.equal(slow.status, "cancelled", "in-flight work ends by honest cancel, not orphaned-lost");
+  } finally {
+    proc.kill("SIGKILL");
   }
 });

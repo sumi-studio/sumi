@@ -80,6 +80,13 @@ export class StateClient {
     return this.call("GET", `/internal/core/personas/${personaID}/jobs/${jobID}`) as Promise<{ job: JobRow }>;
   }
 
+  /** Service-scoped cancel: a running claim becomes cancel_requested
+   *  for the owning runner to observe via heartbeat (same scope check
+   *  as claim/heartbeat — the runtime credential may cancel). */
+  cancelJob(personaID: string, jobID: string): Promise<{ job: JobRow }> {
+    return this.call("POST", `/internal/core/personas/${personaID}/jobs/${jobID}/cancel`) as Promise<{ job: JobRow }>;
+  }
+
   listFileOps(personaID: string, jobID: string, pendingOnly = false): Promise<{ ops: FileOpRow[]; pending: number }> {
     const q = pendingOnly ? "?pending=true" : "";
     return this.call("GET", `/internal/core/personas/${personaID}/jobs/${jobID}/files/ops${q}`) as Promise<{ ops: FileOpRow[]; pending: number }>;
