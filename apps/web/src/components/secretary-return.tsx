@@ -16,15 +16,17 @@ import {
   isReturnPolicyUndecided,
   loadReturnURL,
   readSecretaryReturn,
-  saveReturnURL,
   type SecretaryReturnSession,
+  saveReturnURL,
 } from "../auth/secretary-return";
 
-const OPEN_STATUSES = new Set([
-  "awaiting_destination",
-  "sealed",
-  "cancelling",
-]);
+const OPEN_STATUSES = new Set(["awaiting_destination", "sealed", "cancelling"]);
+
+// A terminal session the source can accept another return after: nothing
+// moved or the move was undone, so the secretary is still active on Cloud.
+// `completed` is excluded on purpose — authority already transferred, and
+// offering a normal restart would promise a move the source cannot make.
+const RETRYABLE_STATUSES = new Set(["aborted", "cancelled", "expired"]);
 
 function statusText(session: SecretaryReturnSession): string {
   switch (session.status) {
@@ -35,7 +37,10 @@ function statusText(session: SecretaryReturnSession): string {
     case "cancelling":
       return "キャンセルを受け付けました。ローカル側の確認が届き次第、秘書はSumi Cloudで動きを再開します。";
     case "completed":
-      return "秘書はローカルに移行し、そちらで応答しています。Sumi Cloudでは応答しません。";
+      // The transfer committed — state and answering authority live on the
+      // Local side now. It does not claim the secretary already answered
+      // there: model setup may still be pending (needs_rebinding below).
+      return "秘書の状態と応答権はローカルに移りました。Sumi Cloudでは応答しません。";
     case "aborted":
       return "移行はキャンセルされ、秘書はSumi Cloudで動いています。";
     case "cancelled":
@@ -58,7 +63,14 @@ export function SecretaryReturn({
   const [returnURL, setReturnURL] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Where the shown error came from decides when it may clear: a read
+  // error is stale the moment a read succeeds, but a mutation refusal is
+  // the answer to something the user asked for — it stays visible through
+  // automatic refreshes until the next meaningful action replaces it.
+  const [error, setError] = useState<{
+    source: "read" | "mutation";
+    message: string;
+  } | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -84,14 +96,19 @@ export function SecretaryReturn({
         setSession(next);
         const saved = next ? loadReturnURL(next.session_id) : null;
         setReturnURL(saved?.returnURL ?? null);
-        setError(null);
+        // Fresh state replaces a read failure; it never erases a mutation
+        // refusal — that is the explanation for what the user just tried.
+        setError((current) => (current?.source === "read" ? null : current));
       })
       .catch((failure: unknown) => {
         if (controller.signal.aborted) return;
         if (isReturnFeatureDisabled(failure)) {
-          setError("この環境では秘書のローカルへの移行は利用できません。");
+          setError({
+            source: "read",
+            message: "この環境では秘書のローカルへの移行は利用できません。",
+          });
         } else {
-          setError(errorMessage(failure));
+          setError({ source: "read", message: errorMessage(failure) });
         }
       })
       .finally(() => {
@@ -110,7 +127,9 @@ export function SecretaryReturn({
     const timer = setInterval(() => {
       void readSecretaryReturn()
         .then((next) => {
-          if (!controller.signal.aborted) setSession(next);
+          if (controller.signal.aborted) return;
+          setSession(next);
+          setError((current) => (current?.source === "read" ? null : current));
         })
         .catch(() => {
           // A transient read failure just waits for the next tick.
@@ -129,7 +148,7 @@ export function SecretaryReturn({
     try {
       await action();
     } catch (failure) {
-      setError(errorMessage(failure));
+      setError({ source: "mutation", message: errorMessage(failure) });
     } finally {
       setBusy(null);
     }
@@ -156,14 +175,23 @@ export function SecretaryReturn({
           // The shared-file decision is still open: no session was made
           // and nothing moved — say so rather than presenting a URL that
           // would not work.
-          setError(
-            "共有ファイルの扱いがまだ決まっていないため、新しい移行は今は開始できません。移行は開始されていません。",
-          );
+          setError({
+            source: "mutation",
+            message:
+              "共有ファイルの扱いがまだ決まっていないため、新しい移行は今は開始できません。移行は開始されていません。",
+          });
           return;
         }
         throw failure;
       }
     });
+  }
+
+  function retry() {
+    // Retrying from a terminal session drops the old tab-local grant — it
+    // names a session that can never receive a command again.
+    if (session) clearReturnURL(session.session_id);
+    start();
   }
 
   function cancel() {
@@ -179,6 +207,7 @@ export function SecretaryReturn({
 
   const waiting = session?.status === "awaiting_destination";
   const canCancel = session !== null && OPEN_STATUSES.has(session.status);
+  const canRetry = session !== null && RETRYABLE_STATUSES.has(session.status);
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -262,7 +291,10 @@ export function SecretaryReturn({
                         await navigator.clipboard.writeText(returnURL);
                         setCopied(true);
                       } catch {
-                        setError("URLを長押ししてコピーしてください。");
+                        setError({
+                          source: "mutation",
+                          message: "URLを長押ししてコピーしてください。",
+                        });
                       }
                     })();
                   }}
@@ -277,7 +309,7 @@ export function SecretaryReturn({
               ) : null}
               <p className="text-muted-foreground text-xs">
                 このURLは合言葉です。他人に見せないでください。受付は
-                {new Date(session!.admit_until).toLocaleString("ja-JP")}
+                {new Date(session?.admit_until ?? "").toLocaleString("ja-JP")}
                 までです。
               </p>
             </section>
@@ -302,6 +334,24 @@ export function SecretaryReturn({
                   <LoaderCircle className="size-4 animate-spin" />
                 ) : null}
                 移行URLを発行する
+              </Button>
+            </div>
+          ) : null}
+
+          {canRetry ? (
+            <div className="mt-6 border-border border-t pt-4">
+              <p className="text-muted-foreground text-sm leading-relaxed">
+                この移行は終了しています。もう一度移行する場合は、新しいURLを発行してください。
+              </p>
+              <Button
+                className="mt-3 min-h-10 w-full"
+                disabled={busy !== null || loading}
+                onClick={retry}
+              >
+                {busy === "create" ? (
+                  <LoaderCircle className="size-4 animate-spin" />
+                ) : null}
+                新しい移行URLを発行する
               </Button>
             </div>
           ) : null}
@@ -347,7 +397,7 @@ export function SecretaryReturn({
           {error ? (
             <div className="mt-5 space-y-2">
               <p role="alert" className="text-sm">
-                {error}
+                {error.message}
               </p>
               <Button
                 variant="outline"
