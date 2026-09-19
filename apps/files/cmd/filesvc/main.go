@@ -8,6 +8,14 @@
 //	FILESV_DB_URL         postgres DSN for version/event state (required)
 //	FILESV_TOKENS         "tok1:scopeA,scopeB;tok2:*" scope grants (required)
 //	FILESV_REQUIRE_MOUNT  "1" = refuse file ops while root is not a mountpoint
+//
+// Private immutable-capture seam (all three required together; absent
+// config leaves capture endpoints refusing with capture_unconfigured —
+// there is no live-tree fallback):
+//
+//	FILESV_CAPTURE_META_URL  postgres DSN of the JuiceFS metadata engine
+//	FILESV_CAPTURE_OBJ_KIND  object backend kind — only "file" is supported
+//	FILESV_CAPTURE_OBJ_ROOT  object-store root for the file kind
 package main
 
 import (
@@ -57,6 +65,23 @@ func main() {
 	}
 	if os.Getenv("FILESV_REQUIRE_MOUNT") == "1" {
 		svc.RequireMount()
+	}
+	// Capture is opt-in: any of the three envs set means the operator
+	// intends capture — a partial config is a startup failure, not a
+	// quietly degraded service.
+	if os.Getenv("FILESV_CAPTURE_META_URL") != "" ||
+		os.Getenv("FILESV_CAPTURE_OBJ_KIND") != "" ||
+		os.Getenv("FILESV_CAPTURE_OBJ_ROOT") != "" {
+		cs, err := filesvc.NewCaptureService(ctx, filesvc.CaptureConfig{
+			MetaDSN: os.Getenv("FILESV_CAPTURE_META_URL"),
+			ObjKind: os.Getenv("FILESV_CAPTURE_OBJ_KIND"),
+			ObjRoot: os.Getenv("FILESV_CAPTURE_OBJ_ROOT"),
+		}, store)
+		if err != nil {
+			log.Fatalf("filesvc: capture: %v", err)
+		}
+		defer cs.Close()
+		svc.SetCapture(cs)
 	}
 	svc.StartReconciler(ctx)
 	srv := &http.Server{

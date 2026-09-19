@@ -42,7 +42,13 @@ type Service struct {
 	root   *posixRoot
 	store  VersionStore
 	tokens map[string]map[string]bool // token -> allowed scopes ("*" = all)
+	cap    *CaptureService            // nil => capture endpoints refuse
 }
+
+// SetCapture wires the private immutable-capture service. Without it
+// every /v1/capture route refuses with capture_unconfigured — there is
+// no live-tree fallback path by design.
+func (s *Service) SetCapture(c *CaptureService) { s.cap = c }
 
 // RequireMount makes every file op fail with 503 while the namespace root is
 // not a live mountpoint. Without it a dead mount leaves the bare directory
@@ -155,8 +161,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 		return
 	}
-	// /v1/files/{scope}/{op}
+	// /v1/files/{scope}/{op} or /v1/capture/{id}[/{op}]
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "v1" && parts[1] == "capture" {
+		s.routeCapture(w, r, parts[2:])
+		return
+	}
 	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "files" {
 		writeErr(w, 404, "not_found", "unknown route")
 		return
@@ -228,6 +238,8 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleFreeze(w, r, scope, false)
 	case op == "cut" && r.Method == "GET":
 		s.handleCut(w, r, scope)
+	case op == "capture" && r.Method == "POST":
+		s.handleCaptureCreate(w, r, scope)
 	default:
 		writeErr(w, 404, "not_found", "unknown op or method")
 	}

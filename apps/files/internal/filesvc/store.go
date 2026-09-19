@@ -62,10 +62,10 @@ import (
 // mutations fail fast and the process re-acquires or exits rather than
 // risk an unsynchronized second writer.
 type Store struct {
-	pool         *pgxpool.Pool
-	dsn          string
-	opTimeout    time.Duration // bounds the fs-mutation phase
-	dbTimeout    time.Duration // bounds every DB call (f51: wedged PG must not hang handlers)
+	pool          *pgxpool.Pool
+	dsn           string
+	opTimeout     time.Duration // bounds the fs-mutation phase
+	dbTimeout     time.Duration // bounds every DB call (f51: wedged PG must not hang handlers)
 	drainTimeout  time.Duration // bounds the freeze's wait for admitted intents to settle
 	cutHorizon    time.Duration // minimum writer tenure before a cut may seal (bounds predecessor fs effects)
 	cutObserveGap time.Duration // gap between the seal's two manifest walks — the stability window sampled
@@ -198,17 +198,17 @@ func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
 	var b [8]byte
 	rand.Read(b[:])
 	s := &Store{
-		pool:         pool,
-		dsn:          dsn,
-		opTimeout:    30 * time.Second,
-		dbTimeout:    15 * time.Second,
+		pool:          pool,
+		dsn:           dsn,
+		opTimeout:     30 * time.Second,
+		dbTimeout:     15 * time.Second,
 		drainTimeout:  20 * time.Second,
 		cutHorizon:    deadGrace,
 		cutObserveGap: 50 * time.Millisecond,
-		owner:        "inst-" + hex.EncodeToString(b[:]),
-		rootID:       rootID,
-		done:         make(chan struct{}),
-		reconcile:    make(chan struct{}, 1),
+		owner:         "inst-" + hex.EncodeToString(b[:]),
+		rootID:        rootID,
+		done:          make(chan struct{}),
+		reconcile:     make(chan struct{}, 1),
 	}
 	// Single-writer enforcement comes first: migrate and meta binding run
 	// under the lock so concurrent startups serialize instead of racing
@@ -610,6 +610,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at   timestamptz NOT NULL DEFAULT now(),
 			PRIMARY KEY (scope, epoch)
 		);
+	`+captureDDL+`
 		CREATE INDEX IF NOT EXISTS file_op_scope ON file_op(scope, path);
 		-- At most one PENDING intent per (scope, op_key): a second declare
 		-- under the same key while the first is still in flight fails
