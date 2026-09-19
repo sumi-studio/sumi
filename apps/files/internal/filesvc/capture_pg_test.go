@@ -40,6 +40,8 @@ type capFixture struct {
 	objroot string
 	metaDSN string
 	scope   string
+	owner   string // return lineage owner asserted on every capture op
+	epoch   int64  // return lineage epoch
 	oracle  map[string][]byte // rel path -> expected bytes at capture time
 	links   map[string]string // rel path -> symlink target
 	dirs    map[string]bool
@@ -59,6 +61,7 @@ func capEnv(t *testing.T) *capFixture {
 	return &capFixture{
 		t: t, mount: mount, objroot: obj, metaDSN: meta,
 		scope:  "caps" + randHex(4),
+		owner:  "sessA", epoch: 7,
 		oracle: map[string][]byte{}, links: map[string]string{}, dirs: map[string]bool{},
 	}
 }
@@ -105,6 +108,12 @@ func (f *capFixture) newServiceVol(t *testing.T, root, metaDSN, objroot string) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The default cut horizon is deadGrace (20s): fresh test stores
+	// cannot assert a barrier until tenure elapses. Shrink it — the
+	// predecessor-effect window the horizon bounds does not exist in
+	// fixture (no prior writer ever owned these roots).
+	st.SetCutHorizon(0)
+	st.SetDrainTimeout(2 * time.Second)
 	cs, err := NewCaptureService(context.Background(), CaptureConfig{
 		MetaDSN: metaDSN, ObjKind: "file", ObjRoot: objroot,
 	}, st)
@@ -124,20 +133,28 @@ func (f *capFixture) newServiceVol(t *testing.T, root, metaDSN, objroot string) 
 	return svc, st, cs
 }
 
-func (f *capFixture) doCapture(t *testing.T, svc *Service) *captureRow {
+// doCapture asserts the fixture's barrier lineage then captures —
+// mirroring the product order (returnsession freezes, then captures).
+// expected is the scope_id binding passed on retakes ("" on first).
+func (f *capFixture) doCapture(t *testing.T, svc *Service, st *Store, expected string) *captureRow {
 	t.Helper()
-	row, err := svc.cap.Capture(context.Background(), f.scope, "sessA", 7)
+	if err := st.SetScopeFrozen(context.Background(), f.scope, f.owner, f.epoch,
+		"capture-test", true); err != nil {
+		t.Fatalf("barrier: %v", err)
+	}
+	row, err := svc.cap.Capture(context.Background(), f.scope, f.owner, f.epoch, expected)
 	if err != nil {
 		t.Fatalf("capture: %v", err)
 	}
 	return row
 }
 
-// readAll streams the whole captured file for entry seq.
+// readAll streams the whole captured file for entry seq under the
+// fixture's lineage.
 func (f *capFixture) readAll(t *testing.T, cs *CaptureService, id string, seq int64) ([]byte, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	_, err := cs.Stream(context.Background(), id, seq, 0, 0, &buf)
+	_, err := cs.Stream(context.Background(), id, f.owner, f.epoch, seq, 0, 0, &buf)
 	return buf.Bytes(), err
 }
 
@@ -146,7 +163,7 @@ func (f *capFixture) entriesByPath(t *testing.T, cs *CaptureService, id string) 
 	out := map[string]captureEntryRow{}
 	var cursor int64 = -1
 	for {
-		rows, err := cs.Entries(context.Background(), id, cursor, 500)
+		rows, err := cs.Entries(context.Background(), id, f.owner, f.epoch, cursor, 500)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -226,7 +243,7 @@ func TestCaptureComposed(t *testing.T) {
 	syncfs(t, f)
 
 	// --- capture ------------------------------------------------------
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	if row.EntryCount == 0 {
 		t.Fatal("empty manifest")
 	}
@@ -338,12 +355,30 @@ func TestCaptureHTTPEndToEnd(t *testing.T) {
 		return resp
 	}
 
-	// scoped token cannot create
-	if r := do("POST", "/v1/files/"+f.scope+"/capture?owner=sA&epoch=3", "sc"); r.StatusCode != 403 {
+	// Barrier must exist before any capture op — the lineage check
+	// refuses requests for scopes with no durable authority.
+	if err := st.SetScopeFrozen(context.Background(), f.scope, "sA", 7,
+		"capture-test", true); err != nil {
+		t.Fatalf("barrier: %v", err)
+	}
+
+	// scoped token cannot create (wildcard-only surface)
+	if r := do("POST", "/v1/files/"+f.scope+"/capture?owner=sA&epoch=7", "sc"); r.StatusCode != 403 {
+		r.Body.Close()
 		t.Fatalf("scoped create: %d want 403", r.StatusCode)
 	}
-	// wildcard creates
-	r := do("POST", "/v1/files/"+f.scope+"/capture?owner=sA&epoch=3", "adm")
+	// wildcard without lineage params → 400
+	if r := do("POST", "/v1/files/"+f.scope+"/capture", "adm"); r.StatusCode != 400 {
+		r.Body.Close()
+		t.Fatalf("create without lineage: %d want 400", r.StatusCode)
+	}
+	// stale epoch (barrier says 7) → 403
+	if r := do("POST", "/v1/files/"+f.scope+"/capture?owner=sA&epoch=3", "adm"); r.StatusCode != 403 {
+		r.Body.Close()
+		t.Fatalf("stale-epoch create: %d want 403", r.StatusCode)
+	}
+	// wildcard creates with matching lineage
+	r := do("POST", "/v1/files/"+f.scope+"/capture?owner=sA&epoch=7", "adm")
 	if r.StatusCode != 200 {
 		b, _ := io.ReadAll(r.Body)
 		t.Fatalf("create: %d %s", r.StatusCode, b)
@@ -359,16 +394,28 @@ func TestCaptureHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("bad meta %+v", meta)
 	}
 
-	// foreign-scope token cannot read manifest or bytes
-	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries", "other"); r.StatusCode != 403 {
-		t.Fatalf("cross-scope entries: %d want 403", r.StatusCode)
+	// non-wildcard tokens cannot read manifest or bytes — the whole
+	// capture surface is internal-wildcard-only, scope tokens included
+	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries?owner=sA&epoch=7", "sc"); r.StatusCode != 403 {
+		r.Body.Close()
+		t.Fatalf("scoped entries: %d want 403", r.StatusCode)
 	}
-	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/read?seq=1", "other"); r.StatusCode != 403 {
+	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/read?owner=sA&epoch=7&seq=1", "other"); r.StatusCode != 403 {
+		r.Body.Close()
 		t.Fatalf("cross-scope read: %d want 403", r.StatusCode)
+	}
+	// wildcard but wrong-generation lineage → 403 capture_stale
+	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries?owner=sA&epoch=9", "adm"); r.StatusCode != 403 {
+		r.Body.Close()
+		t.Fatalf("stale-epoch entries: %d want 403", r.StatusCode)
+	}
+	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries?owner=other&epoch=7", "adm"); r.StatusCode != 403 {
+		r.Body.Close()
+		t.Fatalf("foreign-owner entries: %d want 403", r.StatusCode)
 	}
 
 	// entries stream → find a.txt
-	r = do("GET", "/v1/capture/"+meta.CaptureID+"/entries", "sc")
+	r = do("GET", "/v1/capture/"+meta.CaptureID+"/entries?owner=sA&epoch=7", "adm")
 	var lst struct {
 		Entries []struct {
 			Seq     int64  `json:"seq"`
@@ -389,17 +436,23 @@ func TestCaptureHTTPEndToEnd(t *testing.T) {
 		t.Fatal("a.txt not in manifest stream")
 	}
 	// byte stream == baseline
-	r = do("GET", fmt.Sprintf("/v1/capture/%s/read?seq=%d", meta.CaptureID, seq), "sc")
+	r = do("GET", fmt.Sprintf("/v1/capture/%s/read?owner=sA&epoch=7&seq=%d", meta.CaptureID, seq), "adm")
 	body, _ := io.ReadAll(r.Body)
 	r.Body.Close()
 	if r.StatusCode != 200 || string(body) != "hello capture" {
 		t.Fatalf("read: %d %q", r.StatusCode, body)
 	}
-	// release → gone
-	if r := do("DELETE", "/v1/capture/"+meta.CaptureID, "adm"); r.StatusCode != 200 {
+	// release requires matching lineage → gone
+	if r := do("DELETE", "/v1/capture/"+meta.CaptureID+"?owner=sA&epoch=9", "adm"); r.StatusCode != 403 {
+		r.Body.Close()
+		t.Fatalf("stale-epoch release: %d want 403", r.StatusCode)
+	}
+	if r := do("DELETE", "/v1/capture/"+meta.CaptureID+"?owner=sA&epoch=7", "adm"); r.StatusCode != 200 {
+		r.Body.Close()
 		t.Fatalf("release: %d", r.StatusCode)
 	}
-	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries", "sc"); r.StatusCode != 410 {
+	if r := do("GET", "/v1/capture/"+meta.CaptureID+"/entries?owner=sA&epoch=7", "adm"); r.StatusCode != 410 {
+		r.Body.Close()
 		t.Fatalf("post-release entries: %d want 410", r.StatusCode)
 	}
 }
@@ -414,21 +467,21 @@ func TestCaptureNegatives(t *testing.T) {
 	defer cs.Close()
 
 	// empty/missing scope anchor
-	if _, err := cs.Capture(context.Background(), "", "s", 1); !errors.Is(err, ErrCaptureRefused) {
+	if _, err := cs.Capture(context.Background(), "", "s", 1, ""); !errors.Is(err, ErrCaptureRefused) {
 		t.Fatalf("empty scope: %v", err)
 	}
-	if _, err := cs.Capture(context.Background(), "nosuchscope"+randHex(4), "s", 1); !errors.Is(err, ErrCaptureRefused) {
+	if _, err := cs.Capture(context.Background(), "nosuchscope"+randHex(4), "s", 1, ""); !errors.Is(err, ErrCaptureRefused) {
 		t.Fatalf("missing anchor: %v", err)
 	}
 	// .trash is never a capturable scope (it lives at volume root parent=1
 	// only if present; a literal .trash scope name must not resolve)
-	if _, err := cs.Capture(context.Background(), ".trash", "s", 1); err == nil {
+	if _, err := cs.Capture(context.Background(), ".trash", "s", 1, ""); err == nil {
 		t.Fatal(".trash capture accepted")
 	}
 
 	f.wr("victim", []byte("victim-bytes"))
 	syncfs(t, f)
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	byPath := f.entriesByPath(t, cs, row.CaptureID)
 	e := byPath["victim"]
 
@@ -458,7 +511,7 @@ func TestCaptureNegatives(t *testing.T) {
 	}
 	// fresh coherent capture replaces pending (object still missing →
 	// new capture sees the live file — retake is mover-visible)
-	row2 := f.doCapture(t, svc)
+	row2 := f.doCapture(t, svc, st, "")
 	if row2.ManifestSHA == row.ManifestSHA {
 		// manifest identical is fine — retake may legitimately map the
 		// same live content; identity equality is mover-decidable.
@@ -482,10 +535,14 @@ func TestCaptureRestartSurvival(t *testing.T) {
 	f := capEnv(t)
 	root := t.TempDir()
 	svc, st, cs := f.newService(t, root)
+	defer st.Close()
+	defer cs.Close()
 	f.wr("restart.txt", []byte("durable"))
 	syncfs(t, f)
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	id, sha := row.CaptureID, row.ManifestSHA
+	// Release the writer lock before binding st2; the deferred closes
+	// above are then harmless no-ops if we fail before this point.
 	cs.Close()
 	st.Close()
 
@@ -502,7 +559,7 @@ func TestCaptureRestartSurvival(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cs2.Close()
-	meta, err := cs2.Meta(context.Background(), id)
+	meta, err := cs2.Meta(context.Background(), id, f.owner, f.epoch)
 	if err != nil {
 		t.Fatalf("restart meta: %v", err)
 	}
@@ -545,7 +602,7 @@ func TestCaptureCompactionRetention(t *testing.T) {
 	io.ReadFull(rand.Reader, base)
 	f.wr("f_c", base)
 	syncfs(t, f)
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	byPath := f.entriesByPath(t, cs, row.CaptureID)
 	e := byPath["f_c"]
 
@@ -601,7 +658,7 @@ func TestCaptureTrashZeroPending(t *testing.T) {
 	io.ReadFull(rand.Reader, base)
 	f.wr("f0", base)
 	syncfs(t, f)
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	e := f.entriesByPath(t, cs, row.CaptureID)["f0"]
 
 	p := filepath.Join(f.mount, f.scope, "f0")
@@ -622,7 +679,7 @@ func TestCaptureTrashZeroPending(t *testing.T) {
 	}
 	// A fresh coherent capture of the (mutated) live file serves again —
 	// retake is a NEW capture id, never a silent retarget of the old one.
-	row2 := f.doCapture(t, svc)
+	row2 := f.doCapture(t, svc, st, "")
 	if row2.CaptureID == row.CaptureID {
 		t.Fatal("retake reused capture id")
 	}
@@ -650,7 +707,7 @@ func TestCaptureFormatRefusal(t *testing.T) {
 	defer st.Close()
 	defer cs.Close()
 	_ = svc
-	if _, err := cs.Capture(context.Background(), f.scope, "s", 1); !errors.Is(err, ErrCaptureRefused) {
+	if _, err := cs.Capture(context.Background(), f.scope, "s", 1, ""); !errors.Is(err, ErrCaptureRefused) {
 		t.Fatalf("lz4 volume: %v want refused", err)
 	}
 }
@@ -667,7 +724,7 @@ func TestCaptureRenameRecreate(t *testing.T) {
 
 	f.wr("orig.txt", []byte("original"))
 	syncfs(t, f)
-	row1 := f.doCapture(t, svc)
+	row1 := f.doCapture(t, svc, st, "")
 
 	// rename scope out, recreate same name with different content
 	old := filepath.Join(f.mount, f.scope+".old")
@@ -679,7 +736,7 @@ func TestCaptureRenameRecreate(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(f.mount, f.scope, "recreated.txt"), []byte("new"), 0o644)
 	syncfs(t, f)
-	row2 := f.doCapture(t, svc)
+	row2 := f.doCapture(t, svc, st, "")
 
 	if row1.ScopeID == row2.ScopeID {
 		t.Fatal("rename+recreate produced identical scope_id — stale authority would validate")
@@ -709,7 +766,7 @@ func TestCaptureUnsupportedVisible(t *testing.T) {
 		t.Fatalf("mkfifo: %v", err)
 	}
 	syncfs(t, f)
-	row := f.doCapture(t, svc)
+	row := f.doCapture(t, svc, st, "")
 	byPath := f.entriesByPath(t, cs, row.CaptureID)
 	e, ok := byPath["fifo1"]
 	if !ok {

@@ -822,6 +822,7 @@ func newApplicationFromEnv() (*application, error) {
 			// mode), the scoped-storage proxy (cloud mode) and the seal's
 			// mutation fence all reach the same canonical service.
 			secretaryReturn.service.SetFileStore(filesClient)
+			secretaryReturn.service.SetCaptureStore(filesClient)
 			secretaryReturn.server.SetFiles(filesClient)
 			secretaryReturn.server.RegisterFileProxy(mux)
 			log.Print("secretary-return file routes ready (/api/secretary-files/* scoped-token proxy)")

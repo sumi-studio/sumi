@@ -28,6 +28,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,7 +41,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -49,13 +49,19 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 )
 
-// remoteEntry is one carried workspace member: a file (with its source
-// size for preflight) or a directory (kept so empty directories survive
-// the move).
+// remoteEntry is retained only as the report shape for carried counts —
+// enumeration now comes from the captured manifest, not a live walk.
 type remoteEntry struct {
 	Path string
 	Kind string // "file" | "dir"
 	Size int64
+}
+
+func moreSuffix(n, shown int) string {
+	if n > shown {
+		return fmt.Sprintf(" and %d more", n-shown)
+	}
+	return ""
 }
 
 // filesJournal is the durable copy record at <home>/return/files-<session>.json.
@@ -63,12 +69,23 @@ type remoteEntry struct {
 // exactly what was carried, verified, and displaced.
 type filesJournal struct {
 	Phase string `json:"phase"` // copying → staged → promoted | restored
+	// CaptureID/ScopeID/ManifestSHA bind this copy to the session's
+	// durable capture association — the manifest the staged blobs were
+	// read from. A different CaptureID on resume means a retake
+	// happened; the plan is rebuilt, never mixed.
+	CaptureID   string `json:"capture_id,omitempty"`
+	ScopeID     string `json:"scope_id,omitempty"`
+	ManifestSHA string `json:"manifest_sha,omitempty"`
 	// Staging is the scratch directory the blobs were streamed into,
 	// inside the workspace filesystem so promotion is a rename.
 	Staging    string                   `json:"staging_dir"`
 	Quarantine string                   `json:"quarantine_dir,omitempty"`
 	Files      map[string]*journalEntry `json:"files"`
 	Dirs       []string                 `json:"dirs"`
+	// Links are carried symlinks: raw rel path -> raw target (base64)
+	// plus placement state, journaled like files so cancellation and
+	// resume treat them identically.
+	Links      map[string]*journalLink  `json:"links,omitempty"`
 	// Collateral records every object moved aside that is not a
 	// journaled carried file — ancestors displaced to make a directory,
 	// symlinks, repeat occupants — so cancellation can restore all of
@@ -80,9 +97,23 @@ type journalEntry struct {
 	SHA256 string `json:"sha256"`
 	Bytes  int64  `json:"bytes"`
 	State  string `json:"state"` // verified → placed
+	// Seq is the manifest row the bytes were read from — the refetch
+	// address while the same capture is bound.
+	Seq int64 `json:"seq,omitempty"`
+	// Group is the capture's hardlink group: members share one fetched
+	// blob (staged as hard links, promoted as hard links).
+	Group string `json:"group,omitempty"`
 	// Quarantined records that the destination path held authored
 	// content that was moved aside rather than overwritten.
 	Quarantined bool `json:"quarantined,omitempty"`
+}
+
+type journalLink struct {
+	// TargetB64 is the raw symlink target bytes (base64) — arbitrary
+	// bytes survive, never a lossy UTF-8 convenience field.
+	TargetB64   string `json:"target_b64"`
+	State       string `json:"state"` // "" → placed
+	Quarantined bool   `json:"quarantined,omitempty"`
 }
 
 // maxReturnFiles bounds one copy's enumeration. A workspace larger than
@@ -225,17 +256,31 @@ func (r *returner) copyFilesLocal(ctx context.Context, st *returnState) error {
 			Collateral: map[string]bool{},
 		}
 	}
-	if j.Phase == "copying" {
-		if err := r.stageRemoteFiles(ctx, st, j); err != nil {
+	// The copy runs entirely inside one bound immutable capture. A lost
+	// required object or an expired manifest retakes a whole coherent
+	// snapshot and re-plans — old staging can never bleed into the new
+	// final tree. Retakes are bounded: a workspace whose captured
+	// objects keep going missing is answered pending, not looped.
+	for retakes := 0; ; retakes++ {
+		var err error
+		if j.Phase == "copying" {
+			err = r.stageCapturedFiles(ctx, st, j)
+		}
+		if err == nil && j.Phase == "staged" {
+			err = r.promoteStagedFiles(st, j)
+		}
+		if err == nil || !errors.Is(err, errCaptureLost) {
+			return err
+		}
+		if retakes >= 7 {
+			return fmt.Errorf("%w: the bound capture kept losing objects across %d retakes — "+
+				"the Cloud workspace's captured data is unavailable; retry with `sumi-local-move return-resume` "+
+				"or `sumi-local-move return-cancel`", errUnreachable, retakes)
+		}
+		if err := r.retakeCaptureAndReplan(ctx, st, j); err != nil {
 			return err
 		}
 	}
-	if j.Phase == "staged" {
-		if err := r.promoteStagedFiles(st, j); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // verifyPromotedTree rehashes every carried file at its destination and
@@ -270,6 +315,18 @@ func (r *returner) verifyPromotedTree(ctx context.Context, st *returnState, j *f
 			dirty = true
 		}
 	}
+	for p, jl := range j.Links {
+		if jl.State != "placed" {
+			dirty = true
+			continue
+		}
+		target, derr := base64.StdEncoding.DecodeString(jl.TargetB64)
+		got, lerr := os.Readlink(filepath.Join(scopeDir, p))
+		if derr != nil || lerr != nil || got != string(target) {
+			jl.State = ""
+			dirty = true
+		}
+	}
 	if dirty {
 		j.Phase = "staged"
 		if err := r.saveJournal(st, j); err != nil {
@@ -289,299 +346,6 @@ func (r *returner) verifyPromotedTree(ctx context.Context, st *returnState, j *f
 	st.FilesBytes = bytes
 	st.FilesQuarantined = quarantined
 	return r.save(st)
-}
-
-// stageRemoteFiles enumerates the frozen source workspace, checks the
-// destination has room, and streams every file to a verified staged blob.
-// A file already journaled verified survives a resume; anything else is
-// fetched fresh — a staged blob that fails its own hash is re-copied,
-// never trusted on faith.
-func (r *returner) stageRemoteFiles(ctx context.Context, st *returnState, j *filesJournal) error {
-	entries, unsupported, err := r.enumerateRemote(ctx, st)
-	if err != nil {
-		return err
-	}
-	if len(unsupported) > 0 {
-		sort.Strings(unsupported)
-		shown := unsupported
-		if len(shown) > 10 {
-			shown = shown[:10]
-		}
-		return fmt.Errorf("the Cloud workspace contains entries this copy cannot carry (not regular files or directories): %s%s — "+
-			"the return is still sealed; move or remove them on Cloud and run `sumi-local-move return-resume`, "+
-			"or `sumi-local-move return-cancel`",
-			strings.Join(shown, ", "), moreSuffix(len(unsupported), 10))
-	}
-	var total, files int64
-	for _, e := range entries {
-		switch e.Kind {
-		case "file":
-			files++
-			total += e.Size
-		case "dir":
-			j.Dirs = append(j.Dirs, e.Path)
-		}
-	}
-	if files > maxReturnFiles {
-		return fmt.Errorf("the Cloud workspace has more than %d files — too large for this return's copy; "+
-			"reduce it on Cloud or choose cloud file storage in a new return", maxReturnFiles)
-	}
-	if err := checkCapacity(r.m.wsRoot, total); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Join(j.Staging, "blobs"), 0o700); err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if e.Kind != "file" {
-			continue
-		}
-		if je, ok := j.Files[e.Path]; ok && je.State == "verified" {
-			// Resume: trust the journal only as far as the blob's own
-			// bytes prove — rehash before skipping the fetch.
-			if blobOK(filepath.Join(j.Staging, "blobs", e.Path), je) {
-				continue
-			}
-		}
-		je, err := r.fetchFile(ctx, st, e.Path, j)
-		if err != nil {
-			return err
-		}
-		j.Files[e.Path] = je
-		if err := r.saveJournal(st, j); err != nil {
-			return err
-		}
-	}
-	j.Phase = "staged"
-	return r.saveJournal(st, j)
-}
-
-func moreSuffix(n, shown int) string {
-	if n > shown {
-		return fmt.Sprintf(" and %d more", n-shown)
-	}
-	return ""
-}
-
-// enumerateRemote walks the sealed source workspace through the grant's
-// read-only file surface: one directory at a time, every page, until the
-// whole tree is seen. Symlinks and special files are collected, not
-// followed — the caller decides whether the copy can proceed.
-func (r *returner) enumerateRemote(ctx context.Context, st *returnState) (entries []remoteEntry, unsupported []string, err error) {
-	var walk func(dir string) error
-	walk = func(dir string) error {
-		cursor := ""
-		for {
-			q := url.Values{"path": {dir}, "limit": {"1000"}}
-			if cursor != "" {
-				q.Set("cursor", cursor)
-			}
-			var out struct {
-				Entries []struct {
-					Name string `json:"name"`
-					Kind string `json:"kind"`
-					Size int64  `json:"size"`
-				} `json:"entries"`
-				Next string `json:"next_cursor"`
-			}
-			if err := r.grantFileGet(ctx, st, "list", q, &out); err != nil {
-				return err
-			}
-			for _, e := range out.Entries {
-				p := e.Name
-				if dir != "" {
-					p = dir + "/" + e.Name
-				}
-				switch e.Kind {
-				case "dir":
-					entries = append(entries, remoteEntry{Path: p, Kind: "dir"})
-					if err := walk(p); err != nil {
-						return err
-					}
-				case "file":
-					entries = append(entries, remoteEntry{Path: p, Kind: "file", Size: e.Size})
-				default:
-					unsupported = append(unsupported, p+" ("+e.Kind+")")
-				}
-			}
-			if len(entries) > maxReturnFiles {
-				return fmt.Errorf("the Cloud workspace has more than %d entries — refusing to walk an unbounded tree", maxReturnFiles)
-			}
-			if out.Next == "" {
-				return nil
-			}
-			cursor = out.Next
-		}
-	}
-	err = walk("")
-	return entries, unsupported, err
-}
-
-// grantFileGet issues one read op against the return session's file
-// surface and decodes the JSON body. Transport failures map to
-// errUnreachable so the drive loop treats them as pending, never as a
-// permanent verdict.
-func (r *returner) grantFileGet(ctx context.Context, st *returnState, op string, q url.Values, out any) error {
-	u := st.SessionURL + "/files/" + op
-	if len(q) > 0 {
-		u += "?" + q.Encode()
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+st.Grant)
-	res, err := r.m.client.Do(req)
-	r.m.answered.Store(true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("%w: %v", errUnreachable, err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
-		switch {
-		case ctx.Err() != nil:
-			return ctx.Err()
-		case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
-			return fmt.Errorf("%w: Cloud answered HTTP %d for the workspace copy", errGrantRejected, res.StatusCode)
-		default:
-			return fmt.Errorf("%w: HTTP %d for file %s", errUnreachable, res.StatusCode, op)
-		}
-	}
-	return json.NewDecoder(io.LimitReader(res.Body, 32<<20)).Decode(out)
-}
-
-// fetchFile streams one source file into the staging tree and proves the
-// staged bytes: the streamed content hash must match the recorded
-// content_sha, or — when the recorded hash lags an external POSIX write —
-// a second full read must produce the same bytes. Anything else is a
-// concurrent writer, and the copy refuses rather than carry a guess.
-func (r *returner) fetchFile(ctx context.Context, st *returnState, path string, j *filesJournal) (*journalEntry, error) {
-	blob := filepath.Join(j.Staging, "blobs", path)
-	sha, n, err := r.streamFile(ctx, st, path, blob)
-	if err != nil {
-		return nil, err
-	}
-	var stt struct {
-		SHA     string `json:"content_sha"`
-		Version int64  `json:"version"`
-		Extern  bool   `json:"external_change"`
-	}
-	if err := r.grantFileGet(ctx, st, "stat", url.Values{"path": {path}}, &stt); err != nil {
-		return nil, err
-	}
-	if stt.SHA == sha && !stt.Extern {
-		return &journalEntry{SHA256: sha, Bytes: n, State: "verified"}, nil
-	}
-	// The recorded hash lags or the live file drifted from its record —
-	// read once more. Identical bytes twice is a stable content version;
-	// anything else is a writer racing the frozen scope.
-	sha2, _, err := r.streamFile(ctx, st, path, blob)
-	if err != nil {
-		return nil, err
-	}
-	if sha2 != sha {
-		return nil, fmt.Errorf("%s changed while it was being copied — a writer is still reaching the Cloud workspace; "+
-			"the return is still sealed, so it is safe to find and stop the writer and run `sumi-local-move return-resume`", path)
-	}
-	return &journalEntry{SHA256: sha, Bytes: n, State: "verified"}, nil
-}
-
-// streamFile reads one remote file into a staging blob (fsync + rename),
-// returning its SHA-256 and size. The same silent-peer bound the bundle
-// applies: bytes must keep moving or the attempt is given up, retried by
-// resume — never reported as carried.
-func (r *returner) streamFile(ctx context.Context, st *returnState, path, blob string) (string, int64, error) {
-	u := st.SessionURL + "/files/read?path=" + url.QueryEscape(path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+st.Grant)
-	res, err := r.m.client.Do(req)
-	r.m.answered.Store(true)
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", 0, ctx.Err()
-		}
-		return "", 0, fmt.Errorf("%w: %v", errUnreachable, err)
-	}
-	defer res.Body.Close()
-	body := &progress{r: res.Body}
-	body.last.Store(time.Now().UnixNano())
-	var stalled atomic.Bool
-	watch := make(chan struct{})
-	defer close(watch)
-	go func() {
-		tick := time.NewTicker(max(r.m.stall/4, 10*time.Millisecond))
-		defer tick.Stop()
-		for {
-			select {
-			case <-watch:
-				return
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				if body.done.Load() {
-					return
-				}
-				if time.Since(time.Unix(0, body.last.Load())) >= r.m.stall {
-					stalled.Store(true)
-					_ = res.Body.Close()
-					return
-				}
-			}
-		}
-	}()
-	if res.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<16))
-		switch {
-		case ctx.Err() != nil:
-			return "", 0, ctx.Err()
-		case res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden:
-			return "", 0, fmt.Errorf("%w: Cloud answered HTTP %d for %s", errGrantRejected, res.StatusCode, path)
-		default:
-			return "", 0, fmt.Errorf("%w: HTTP %d for %s", errUnreachable, res.StatusCode, path)
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(blob), 0o700); err != nil {
-		return "", 0, err
-	}
-	tmp := blob + ".part"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", 0, err
-	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), body)
-	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		switch {
-		case ctx.Err() != nil:
-			return "", 0, ctx.Err()
-		case stalled.Load():
-			return "", 0, fmt.Errorf("%w: %v for %s; resume retries the file",
-				errUnreachable, errStalled, r.m.stall)
-		default:
-			return "", 0, fmt.Errorf("%w: %v", errUnreachable, err)
-		}
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return "", 0, err
-	}
-	if err := f.Close(); err != nil {
-		return "", 0, err
-	}
-	if err := os.Rename(tmp, blob); err != nil {
-		return "", 0, err
-	}
-	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
 // blobOK rehashes a staged blob against its journal entry — the only
@@ -681,13 +445,12 @@ func (r *returner) promoteStagedFiles(st *returnState, j *filesJournal) error {
 		blob := filepath.Join(j.Staging, "blobs", p)
 		if !blobOK(blob, je) {
 			// The staged copy is gone or torn but the journal says it
-			// was carried — the source is still sealed, so refetch and
-			// re-verify rather than trust a marker.
-			nje, err := r.fetchFile(context.Background(), st, p, j)
-			if err != nil {
+			// was carried — refetch the bound capture's row and
+			// re-verify rather than trust a marker. A dead capture
+			// surfaces errCaptureLost for the caller's retake.
+			if err := r.refetchCaptured(context.Background(), st, p, je, j); err != nil {
 				return err
 			}
-			*je = *nje
 			if err := r.saveJournal(st, j); err != nil {
 				return err
 			}
@@ -700,6 +463,54 @@ func (r *returner) promoteStagedFiles(st *returnState, j *filesJournal) error {
 			return err
 		}
 		midPromote()
+	}
+	// Carried symlinks last — files are in place, so relative targets
+	// resolve. A placed link is re-verified by readlink; a foreign
+	// occupant is quarantined exactly like a file's.
+	linkPaths := make([]string, 0, len(j.Links))
+	for p := range j.Links {
+		linkPaths = append(linkPaths, p)
+	}
+	sort.Strings(linkPaths)
+	for _, p := range linkPaths {
+		jl := j.Links[p]
+		dest := filepath.Join(scopeDir, p)
+		target, derr := base64.StdEncoding.DecodeString(jl.TargetB64)
+		if derr != nil {
+			return fmt.Errorf("journaled link %s has an undecodable target", p)
+		}
+		if jl.State == "placed" {
+			if got, lerr := os.Readlink(dest); lerr == nil && got == string(target) {
+				continue
+			}
+			jl.State = "" // torn or edited — re-place
+		}
+		if err := r.ensureScopeDir(st, j, scopeDir, filepath.Dir(p)); err != nil {
+			return err
+		}
+		info, lerr := os.Lstat(dest)
+		if lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+			if got, rerr := os.Readlink(dest); rerr == nil && got == string(target) {
+				jl.State = "placed"
+				if err := r.saveJournal(st, j); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if lerr == nil {
+			if err := r.moveToQuarantine(st, j, scopeDir, p); err != nil {
+				return err
+			}
+			jl.Quarantined = true
+		}
+		if err := os.Symlink(string(target), dest); err != nil {
+			return err
+		}
+		jl.State = "placed"
+		if err := r.saveJournal(st, j); err != nil {
+			return err
+		}
 	}
 	j.Phase = "promoted"
 	if err := r.saveJournal(st, j); err != nil {
@@ -860,6 +671,35 @@ func (r *returner) restoreWorkspace(st *returnState, j *filesJournal) error {
 				delete(j.Collateral, p)
 			} else if _, qerr := os.Lstat(q); qerr == nil {
 				kept = append(kept, "the original "+p+" stayed in "+j.Quarantine+" — its path is occupied")
+			}
+		}
+	}
+	// Carried links: a placed link still pointing at its carried target
+	// is copy-product — removed like a placed file; a link whose target
+	// was changed is the operator's and stays.
+	linkPaths := make([]string, 0, len(j.Links))
+	for p := range j.Links {
+		linkPaths = append(linkPaths, p)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(linkPaths)))
+	for _, p := range linkPaths {
+		jl := j.Links[p]
+		if jl.State != "placed" {
+			continue
+		}
+		dest := filepath.Join(scopeDir, p)
+		target, derr := base64.StdEncoding.DecodeString(jl.TargetB64)
+		got, lerr := os.Readlink(dest)
+		switch {
+		case derr == nil && lerr == nil && got == string(target):
+			if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("could not remove carried link %s: %v", p, err)
+			}
+		case lerr == nil:
+			kept = append(kept, p+" (link changed since the copy — left in place)")
+		default:
+			if _, serr := os.Lstat(dest); serr == nil {
+				kept = append(kept, p+" (replaced since the copy — left in place)")
 			}
 		}
 	}

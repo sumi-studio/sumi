@@ -56,6 +56,10 @@ var (
 	// ErrCaptureGone: capture released or expired — rows may remain as
 	// evidence but reads are closed.
 	ErrCaptureGone = errors.New("capture released or expired")
+	// ErrCaptureStale: the asserted (owner, epoch) is not the scope's
+	// current durable barrier authority, or the capture row belongs to
+	// another generation. A stale lineage gains no new grant.
+	ErrCaptureStale = errors.New("stale capture lineage")
 	// ErrCaptureUnconfigured: no capture config was supplied at startup.
 	// The service refuses rather than falling back to a live-tree read.
 	ErrCaptureUnconfigured = errors.New("capture service not configured")
@@ -74,6 +78,7 @@ func supportedNodeType(t uint8) bool {
 // refused before the manifest is taken.
 type captureFormat struct {
 	VolumeUUID  string `json:"uuid"`
+	Name        string `json:"name"` // volume name — the object key prefix (Name+"/")
 	Storage     string `json:"storage"`
 	Bucket      string `json:"bucket"`
 	MetaVersion int    `json:"meta_version"`
@@ -87,6 +92,7 @@ type captureFormat struct {
 // not — the gate is on semantics, not key recognition.
 type rawFormat struct {
 	UUID         string `json:"UUID"`
+	Name         string `json:"Name"`
 	Storage      string `json:"Storage"`
 	Bucket       string `json:"Bucket"`
 	BlockSize    int    `json:"BlockSize"` // KiB
@@ -106,6 +112,9 @@ func gateFormat(f rawFormat) (captureFormat, error) {
 	if f.UUID == "" {
 		return captureFormat{}, fmt.Errorf("%w: volume format has no UUID", ErrCaptureRefused)
 	}
+	if f.Name == "" {
+		return captureFormat{}, fmt.Errorf("%w: volume format has no name", ErrCaptureRefused)
+	}
 	if f.MetaVersion != jfsMaxVersion {
 		return captureFormat{}, fmt.Errorf("%w: meta version %d unsupported", ErrCaptureRefused, f.MetaVersion)
 	}
@@ -113,17 +122,20 @@ func gateFormat(f rawFormat) (captureFormat, error) {
 		return captureFormat{}, fmt.Errorf("%w: compression %q unsupported", ErrCaptureRefused, f.Compression)
 	}
 	// EncryptAlgo is always populated by juicefs format (default
-	// aes256gcm-rsa) even on plaintext volumes; the real encryption
-	// signal is a configured key.
-	if f.EncryptKey != "" || f.KeyEncrypted {
-		return captureFormat{}, fmt.Errorf("%w: encrypted volume unsupported", ErrCaptureRefused)
+	// aes256gcm-rsa) even on plaintext volumes, and KeyEncrypted only
+	// wraps the credential fields stored in the format JSON (which this
+	// service never reads — credentials are private config). The data-
+	// block encryption signal is EncryptKey: with it set, objects are
+	// cipher text and undecodable — refuse.
+	if f.EncryptKey != "" {
+		return captureFormat{}, fmt.Errorf("%w: data-encrypted volume unsupported", ErrCaptureRefused)
 	}
 	bs := f.BlockSize * 1024
 	if f.BlockSize <= 0 || bs <= 0 || bs > maxBlockBytes {
 		return captureFormat{}, fmt.Errorf("%w: block size %d KiB unsupported", ErrCaptureRefused, f.BlockSize)
 	}
 	return captureFormat{
-		VolumeUUID: f.UUID, Storage: f.Storage, Bucket: f.Bucket,
+		VolumeUUID: f.UUID, Name: f.Name, Storage: f.Storage, Bucket: f.Bucket,
 		MetaVersion: f.MetaVersion, BlockBytes: bs,
 		HashPrefix: f.HashPrefix, TrashDays: f.TrashDays,
 	}, nil

@@ -42,6 +42,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "jfsseed" {
+		jfsSeedMain(os.Args[2:])
+		return
+	}
 	dsn := os.Getenv("JOURNEY_DSN")
 	furl := os.Getenv("JOURNEY_FILESVC_URL")
 	ftok := os.Getenv("JOURNEY_FILESVC_TOKEN")
@@ -104,6 +108,7 @@ func main() {
 		log.Fatalf("cloudjourney: filesvc client: %v", err)
 	}
 	svc.SetFileStore(files)
+	svc.SetCaptureStore(files)
 	srv, err := returnsession.NewServer(svc, proof, "http://"+listen)
 	if err != nil {
 		log.Fatalf("cloudjourney: server: %v", err)
@@ -113,6 +118,7 @@ func main() {
 	srv.RegisterRoutes(mux)
 	srv.RegisterFileProxy(mux)
 	var dropMint atomic.Bool
+	var dropCapture atomic.Bool
 	var cutAfter atomic.Int32
 	var cutKeep atomic.Int64
 	cutAfter.Store(-1)
@@ -124,11 +130,12 @@ func main() {
 			dropMint.Store(true)
 			w.WriteHeader(http.StatusNoContent)
 		})
-		// Fault arm: let <after> /files/read requests pass for real, then
-		// answer the next with the real handler's status, headers and only
-		// the first <keep> bytes of its body before the TCP connection is
-		// closed — a genuine mid-copy truncation the mover must treat as
-		// retryable transport loss, never as carried bytes.
+		// Fault arm: let <after> /files/read or /capture/read requests pass
+		// for real, then answer the next with the real handler's status,
+		// headers and only the first <keep> bytes of its body before the
+		// TCP connection is closed — a genuine mid-copy truncation the
+		// mover must treat as retryable transport loss, never as carried
+		// bytes.
 		mux.HandleFunc("POST /_journey/arm-cut-read", func(w http.ResponseWriter, r *http.Request) {
 			after, _ := strconv.Atoi(r.URL.Query().Get("after"))
 			keep, _ := strconv.Atoi(r.URL.Query().Get("keep"))
@@ -136,8 +143,21 @@ func main() {
 			cutAfter.Store(int32(after))
 			w.WriteHeader(http.StatusNoContent)
 		})
+		// Fault arm: the next POST .../capture (the binding create, NOT
+		// /capture/retake) commits server-side — the association persists
+		// — then the connection drops before the response: a real
+		// lost-capture-response the mover must recover via the persisted
+		// binding, never a second manifest.
+		mux.HandleFunc("POST /_journey/arm-drop-capture", func(w http.ResponseWriter, r *http.Request) {
+			dropCapture.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		})
 	}
+	logReq := os.Getenv("JOURNEY_LOGREQ") == "1"
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if logReq {
+			log.Printf("req %s %s", r.Method, r.URL.Path)
+		}
 		if dropMint.Load() && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/files-credential") {
 			dropMint.Store(false)
 			// Run the real handler against a sink so the mint commits
@@ -151,7 +171,22 @@ func main() {
 			}
 			return
 		}
-		if cutAfter.Load() >= 0 && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/files/read") {
+		if dropCapture.Load() && r.Method == http.MethodPost &&
+			strings.HasSuffix(r.URL.Path, "/capture") {
+			dropCapture.Store(false)
+			// The real handler commits the persisted binding, then the
+			// connection dies before the answer — identical to the
+			// lost-mint case, one layer up.
+			mux.ServeHTTP(&sinkWriter{h: http.Header{}}, r)
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+			return
+		}
+		if cutAfter.Load() >= 0 && r.Method == http.MethodGet &&
+			(strings.HasSuffix(r.URL.Path, "/files/read") || strings.HasSuffix(r.URL.Path, "/capture/read")) {
 			if cutAfter.Add(-1) < 0 {
 				cutAfter.Store(-1) // one shot — the fault is now removed
 				// The real handler runs for real (real grant auth, real

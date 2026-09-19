@@ -9,13 +9,21 @@
 //	FILESV_TOKENS         "tok1:scopeA,scopeB;tok2:*" scope grants (required)
 //	FILESV_REQUIRE_MOUNT  "1" = refuse file ops while root is not a mountpoint
 //
-// Private immutable-capture seam (all three required together; absent
-// config leaves capture endpoints refusing with capture_unconfigured —
-// there is no live-tree fallback):
+// Private immutable-capture seam (META_URL + OBJ_KIND + the kind's
+// identity config required together; absent config leaves capture
+// endpoints refusing with capture_unconfigured — there is no live-tree
+// fallback):
 //
-//	FILESV_CAPTURE_META_URL  postgres DSN of the JuiceFS metadata engine
-//	FILESV_CAPTURE_OBJ_KIND  object backend kind — only "file" is supported
-//	FILESV_CAPTURE_OBJ_ROOT  object-store root for the file kind
+//	FILESV_CAPTURE_META_URL      postgres DSN of the JuiceFS metadata engine
+//	FILESV_CAPTURE_OBJ_KIND      object backend kind: "file" or "s3"
+//	FILESV_CAPTURE_OBJ_ROOT      expected object root for kind=file (Bucket+Name)
+//	FILESV_CAPTURE_S3_ENDPOINT   scheme://host[:port] for kind=s3 (minio/s3)
+//	FILESV_CAPTURE_S3_ACCESS_KEY s3 access key (private; never logged)
+//	FILESV_CAPTURE_S3_SECRET_KEY s3 secret key (private; never logged)
+//	FILESV_CAPTURE_S3_BUCKET     expected bucket the captured format must name
+//	FILESV_CAPTURE_S3_ALIASES    optional CSV of trusted endpoint aliases
+//	FILESV_CAPTURE_S3_PREFIX     expected object prefix in the bucket ("name/")
+//	FILESV_CAPTURE_S3_REGION     SigV4 region (default us-east-1)
 package main
 
 import (
@@ -66,17 +74,27 @@ func main() {
 	if os.Getenv("FILESV_REQUIRE_MOUNT") == "1" {
 		svc.RequireMount()
 	}
-	// Capture is opt-in: any of the three envs set means the operator
-	// intends capture — a partial config is a startup failure, not a
-	// quietly degraded service.
-	if os.Getenv("FILESV_CAPTURE_META_URL") != "" ||
-		os.Getenv("FILESV_CAPTURE_OBJ_KIND") != "" ||
-		os.Getenv("FILESV_CAPTURE_OBJ_ROOT") != "" {
-		cs, err := filesvc.NewCaptureService(ctx, filesvc.CaptureConfig{
+	// Capture is opt-in: any capture env set means the operator intends
+	// capture — a partial config is a startup failure, not a quietly
+	// degraded service.
+	if captureEnvSet() {
+		cfg := filesvc.CaptureConfig{
 			MetaDSN: os.Getenv("FILESV_CAPTURE_META_URL"),
 			ObjKind: os.Getenv("FILESV_CAPTURE_OBJ_KIND"),
 			ObjRoot: os.Getenv("FILESV_CAPTURE_OBJ_ROOT"),
-		}, store)
+		}
+		if cfg.ObjKind == "s3" {
+			cfg.S3 = &filesvc.S3Config{
+				Endpoint:  os.Getenv("FILESV_CAPTURE_S3_ENDPOINT"),
+				AccessKey: os.Getenv("FILESV_CAPTURE_S3_ACCESS_KEY"),
+				SecretKey: os.Getenv("FILESV_CAPTURE_S3_SECRET_KEY"),
+				Bucket:    os.Getenv("FILESV_CAPTURE_S3_BUCKET"),
+				Prefix:    os.Getenv("FILESV_CAPTURE_S3_PREFIX"),
+				Region:    os.Getenv("FILESV_CAPTURE_S3_REGION"),
+				Aliases:   splitCSV(os.Getenv("FILESV_CAPTURE_S3_ALIASES")),
+			}
+		}
+		cs, err := filesvc.NewCaptureService(ctx, cfg, store)
 		if err != nil {
 			log.Fatalf("filesvc: capture: %v", err)
 		}
@@ -93,11 +111,40 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func envOr(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
 	}
 	return d
+}
+
+// captureEnvSet reports whether any capture env is present — partial
+// config is a startup failure inside NewCaptureService.
+func captureEnvSet() bool {
+	for _, k := range []string{
+		"FILESV_CAPTURE_META_URL", "FILESV_CAPTURE_OBJ_KIND",
+		"FILESV_CAPTURE_OBJ_ROOT", "FILESV_CAPTURE_S3_ENDPOINT",
+		"FILESV_CAPTURE_S3_ACCESS_KEY", "FILESV_CAPTURE_S3_SECRET_KEY",
+		"FILESV_CAPTURE_S3_BUCKET", "FILESV_CAPTURE_S3_PREFIX",
+	} {
+		if os.Getenv(k) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseTokens(spec string) map[string]map[string]bool {

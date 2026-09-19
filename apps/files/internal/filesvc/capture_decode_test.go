@@ -106,21 +106,19 @@ func TestResolveChunk_MiddleOverride(t *testing.T) {
 }
 
 func TestGateFormat(t *testing.T) {
-	base := rawFormat{UUID: "v1", Storage: "file", Bucket: "/b",
+	base := rawFormat{UUID: "v1", Storage: "file", Bucket: "/b", Name: "vol",
 		BlockSize: 4096, MetaVersion: 1}
 	if _, err := gateFormat(base); err != nil {
 		t.Fatalf("clean format refused: %v", err)
 	}
 	for name, mut := range map[string]func(*rawFormat){
-		"compression": func(f *rawFormat) { f.Compression = "zstd" },
-		"encrypt_key": func(f *rawFormat) { f.EncryptKey = "x" },
-		// EncryptAlgo alone is NOT a refusal: juicefs format sets it by
-		// default on plaintext volumes.
-		"key_enc":      func(f *rawFormat) { f.KeyEncrypted = true },
+		"compression":  func(f *rawFormat) { f.Compression = "zstd" },
+		"encrypt_key":  func(f *rawFormat) { f.EncryptKey = "x" },
 		"metaversion":  func(f *rawFormat) { f.MetaVersion = 2 },
 		"blocksize0":   func(f *rawFormat) { f.BlockSize = 0 },
 		"blocksizebig": func(f *rawFormat) { f.BlockSize = 64 << 10 },
 		"no_uuid":      func(f *rawFormat) { f.UUID = "" },
+		"no_name":      func(f *rawFormat) { f.Name = "" },
 	} {
 		f := base
 		mut(&f)
@@ -134,6 +132,20 @@ func TestGateFormat(t *testing.T) {
 	g, err := gateFormat(f)
 	if err != nil || !g.HashPrefix {
 		t.Fatalf("hash prefix gate: %v %+v", err, g)
+	}
+	// EncryptAlgo alone is NOT a refusal: juicefs format sets it by
+	// default on plaintext volumes.
+	f = base
+	f.EncryptAlgo = "aes256gcm-rsa"
+	if _, err := gateFormat(f); err != nil {
+		t.Fatalf("default EncryptAlgo refused: %v", err)
+	}
+	// KeyEncrypted wraps credential fields only — not a data-encryption
+	// signal; production MinIO volume has it set.
+	f = base
+	f.KeyEncrypted = true
+	if _, err := gateFormat(f); err != nil {
+		t.Fatalf("KeyEncrypted refused: %v", err)
 	}
 }
 

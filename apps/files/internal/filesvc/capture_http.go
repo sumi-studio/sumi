@@ -2,13 +2,17 @@ package filesvc
 
 // capture_http.go — the private capture seam on the storage service.
 //
-// Routes (all under the existing bearer-token auth):
+// Every capture endpoint requires the internal wildcard credential —
+// scope tokens never gain capture authority. Every request also
+// carries the caller's return lineage (owner, epoch), derived by the
+// API from the authenticated return session; filesvc verifies it
+// against the durable file_freeze barrier on each boundary:
 //
-//	POST   /v1/files/{scope}/capture?owner=&epoch=   wildcard: create
-//	GET    /v1/capture/{id}                          scope|wildcard: meta
-//	GET    /v1/capture/{id}/entries?cursor=&limit=   scope|wildcard: rows
-//	GET    /v1/capture/{id}/read?seq=&offset=&len=   scope|wildcard: bytes
-//	DELETE /v1/capture/{id}                          wildcard: release
+//	POST   /v1/files/{scope}/capture?owner=&epoch=[&expected_scope_id=]
+//	GET    /v1/capture/{id}?owner=&epoch=               meta
+//	GET    /v1/capture/{id}/entries?owner=&epoch=&cursor=&limit=
+//	GET    /v1/capture/{id}/read?owner=&epoch=&seq=&offset=&len=
+//	DELETE /v1/capture/{id}?owner=&epoch=               release
 //
 // Manifest rows carry raw names as base64 (name_b64 / path_b64) so
 // delimiter/newline/non-UTF8 names survive unambiguously; a utf-8 `name`
@@ -33,6 +37,14 @@ func (s *Service) routeCapture(w http.ResponseWriter, r *http.Request, parts []s
 			"capture service is not configured on this deployment")
 		return
 	}
+	if !s.authorizedWildcard(r) {
+		writeErr(w, 403, "forbidden", "capture requires the administrative credential")
+		return
+	}
+	owner, epoch, ok := captureLineage(w, r)
+	if !ok {
+		return
+	}
 	if len(parts) < 1 || parts[0] == "" {
 		writeErr(w, 404, "not_found", "unknown route")
 		return
@@ -47,20 +59,41 @@ func (s *Service) routeCapture(w http.ResponseWriter, r *http.Request, parts []s
 	}
 	switch {
 	case op == "" && r.Method == "GET":
-		s.handleCaptureMeta(w, r, id)
+		s.handleCaptureMeta(w, r, id, owner, epoch)
 	case op == "entries" && r.Method == "GET":
-		s.handleCaptureEntries(w, r, id)
+		s.handleCaptureEntries(w, r, id, owner, epoch)
 	case op == "read" && r.Method == "GET":
-		s.handleCaptureRead(w, r, id)
+		s.handleCaptureRead(w, r, id, owner, epoch)
 	case op == "" && r.Method == "DELETE":
-		s.handleCaptureRelease(w, r, id)
+		s.handleCaptureRelease(w, r, id, owner, epoch)
 	default:
 		writeErr(w, 404, "not_found", "unknown op or method")
 	}
 }
 
+// captureLineage parses the mandatory owner/epoch pair every capture
+// request carries. The API derives both from the authenticated return
+// session; absent or non-positive values are refused, never defaulted.
+func captureLineage(w http.ResponseWriter, r *http.Request) (string, int64, bool) {
+	q := r.URL.Query()
+	owner := q.Get("owner")
+	if owner == "" || len(owner) > 80 {
+		writeErr(w, 400, "bad_owner", "non-empty owner is required (<=80 bytes)")
+		return "", 0, false
+	}
+	v, err := strconv.ParseInt(q.Get("epoch"), 10, 64)
+	if err != nil || v <= 0 {
+		writeErr(w, 400, "bad_epoch", "positive integer epoch is required")
+		return "", 0, false
+	}
+	return owner, v, true
+}
+
 func (s *Service) mapCaptureErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrCaptureStale):
+		writeErr(w, 403, "capture_stale",
+			"lineage is not the scope's current authority")
 	case errors.Is(err, ErrCapturePending):
 		writeErr(w, 503, "capture_pending",
 			"captured objects unavailable; retake a fresh coherent manifest")
@@ -75,10 +108,9 @@ func (s *Service) mapCaptureErr(w http.ResponseWriter, err error) {
 	}
 }
 
-// handleCaptureCreate serves POST /v1/files/{scope}/capture — wildcard
-// administrative credential only, like freeze. owner/epoch carry the
-// caller's return lineage; the service records them but does not verify
-// them (that binding is returnsession's — see the integration contract).
+// handleCaptureCreate serves POST /v1/files/{scope}/capture.
+// expected_scope_id (required on retake, empty on first capture) is
+// validated inside the capture transaction against the resolved anchor.
 func (s *Service) handleCaptureCreate(w http.ResponseWriter, r *http.Request, scope string) {
 	if s.cap == nil {
 		writeErr(w, 503, "capture_unconfigured",
@@ -89,22 +121,12 @@ func (s *Service) handleCaptureCreate(w http.ResponseWriter, r *http.Request, sc
 		writeErr(w, 403, "forbidden", "capture requires the administrative credential")
 		return
 	}
-	q := r.URL.Query()
-	owner := q.Get("owner")
-	if len(owner) > 80 {
-		writeErr(w, 400, "bad_owner", "owner too long")
+	owner, epoch, ok := captureLineage(w, r)
+	if !ok {
 		return
 	}
-	var epoch int64
-	if e := q.Get("epoch"); e != "" {
-		v, err := strconv.ParseInt(e, 10, 64)
-		if err != nil || v < 0 {
-			writeErr(w, 400, "bad_epoch", "epoch must be a non-negative integer")
-			return
-		}
-		epoch = v
-	}
-	row, err := s.cap.Capture(r.Context(), scope, owner, epoch)
+	row, err := s.cap.Capture(r.Context(), scope, owner, epoch,
+		r.URL.Query().Get("expected_scope_id"))
 	if err != nil {
 		s.mapCaptureErr(w, err)
 		return
@@ -136,14 +158,10 @@ func captureMetaJSON(c *captureRow) map[string]any {
 	}
 }
 
-func (s *Service) handleCaptureMeta(w http.ResponseWriter, r *http.Request, id string) {
-	row, err := s.cap.Meta(r.Context(), id)
+func (s *Service) handleCaptureMeta(w http.ResponseWriter, r *http.Request, id, owner string, epoch int64) {
+	row, err := s.cap.Meta(r.Context(), id, owner, epoch)
 	if err != nil {
 		s.mapCaptureErr(w, err)
-		return
-	}
-	if !s.authorized(r, row.Scope) {
-		writeErr(w, 403, "forbidden", "token does not grant this capture's scope")
 		return
 	}
 	writeJSON(w, captureMetaJSON(row))
@@ -208,16 +226,7 @@ func nodeTypeName(t uint8) string {
 	}
 }
 
-func (s *Service) handleCaptureEntries(w http.ResponseWriter, r *http.Request, id string) {
-	row, err := s.cap.Meta(r.Context(), id)
-	if err != nil {
-		s.mapCaptureErr(w, err)
-		return
-	}
-	if !s.authorized(r, row.Scope) {
-		writeErr(w, 403, "forbidden", "token does not grant this capture's scope")
-		return
-	}
+func (s *Service) handleCaptureEntries(w http.ResponseWriter, r *http.Request, id, owner string, epoch int64) {
 	q := r.URL.Query()
 	// cursor -1 = from the beginning (seq 0 is the scope anchor row).
 	var cursor, limit int64 = -1, 500
@@ -234,7 +243,7 @@ func (s *Service) handleCaptureEntries(w http.ResponseWriter, r *http.Request, i
 			limit = n
 		}
 	}
-	rows, err := s.cap.Entries(r.Context(), id, cursor, limit)
+	rows, err := s.cap.Entries(r.Context(), id, owner, epoch, cursor, limit)
 	if err != nil {
 		s.mapCaptureErr(w, err)
 		return
@@ -256,16 +265,7 @@ func (s *Service) handleCaptureEntries(w http.ResponseWriter, r *http.Request, i
 // Content-Length is known up front from the manifest; a mid-stream
 // object failure after headers can only truncate — the client must
 // treat a short body as pending, matching handleRead's existing rule.
-func (s *Service) handleCaptureRead(w http.ResponseWriter, r *http.Request, id string) {
-	row, err := s.cap.Meta(r.Context(), id)
-	if err != nil {
-		s.mapCaptureErr(w, err)
-		return
-	}
-	if !s.authorized(r, row.Scope) {
-		writeErr(w, 403, "forbidden", "token does not grant this capture's scope")
-		return
-	}
+func (s *Service) handleCaptureRead(w http.ResponseWriter, r *http.Request, id, owner string, epoch int64) {
 	q := r.URL.Query()
 	seq, err := strconv.ParseInt(q.Get("seq"), 10, 64)
 	if err != nil || seq < 0 {
@@ -294,7 +294,7 @@ func (s *Service) handleCaptureRead(w http.ResponseWriter, r *http.Request, id s
 	// manifest rows; a header probe adds nothing — object availability
 	// is checked block-by-block during the stream and reported as
 	// 503 capture_pending when it fails before the first byte.
-	nr, err := s.cap.streamProbe(r.Context(), id, seq)
+	nr, err := s.cap.streamProbe(r.Context(), id, owner, epoch, seq)
 	if err != nil {
 		s.mapCaptureErr(w, err)
 		return
@@ -313,7 +313,7 @@ func (s *Service) handleCaptureRead(w http.ResponseWriter, r *http.Request, id s
 	// the stream through a header-guarded writer so an early pending
 	// error still maps to 503 rather than a truncated 200.
 	gw := &guardWriter{w: w, n: int64(want), off: int64(off)}
-	got, err := s.cap.Stream(r.Context(), id, seq, off, want, gw)
+	got, err := s.cap.Stream(r.Context(), id, owner, epoch, seq, off, want, gw)
 	if err != nil {
 		if gw.wrote {
 			return // headers sent; truncation is the signal
@@ -346,16 +346,8 @@ func (g *guardWriter) Write(p []byte) (int, error) {
 	return g.w.Write(p)
 }
 
-func (s *Service) handleCaptureRelease(w http.ResponseWriter, r *http.Request, id string) {
-	if _, err := s.cap.Meta(r.Context(), id); err != nil {
-		s.mapCaptureErr(w, err)
-		return
-	}
-	if !s.authorizedWildcard(r) {
-		writeErr(w, 403, "forbidden", "release requires the administrative credential")
-		return
-	}
-	if err := s.cap.Release(r.Context(), id); err != nil {
+func (s *Service) handleCaptureRelease(w http.ResponseWriter, r *http.Request, id, owner string, epoch int64) {
+	if err := s.cap.Release(r.Context(), id, owner, epoch); err != nil {
 		s.mapCaptureErr(w, err)
 		return
 	}

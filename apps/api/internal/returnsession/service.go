@@ -191,6 +191,7 @@ type Service struct {
 	filePolicy FilePolicy
 	fileModes  []string
 	files      FileStore
+	capture    CaptureStore
 	logf       func(string, ...any)
 }
 
@@ -209,6 +210,10 @@ func New(pool *pgxpool.Pool, cfg Config) *Service {
 // it, local-mode binds refuse at the seal boundary (a copy cannot be
 // fenced) and file preflight counts stay empty.
 func (s *Service) SetFileStore(f FileStore) { s.files = f }
+
+// SetCaptureStore wires the immutable-capture surface local-mode copies
+// bind to. Without it capture routes refuse with capture_unconfigured.
+func (s *Service) SetCaptureStore(c CaptureStore) { s.capture = c }
 
 // SetLogger wires a diagnostic sink for non-fatal convergence retries.
 func (s *Service) SetLogger(f func(string, ...any)) { s.logf = f }
@@ -1005,6 +1010,12 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 	// mint in flight cannot land after this session's death already
 	// resolved its credentials: whichever commits first is the truth
 	// the other observes.
+	switch r.status {
+	case StatusCancelled, StatusAborted, StatusExpired, StatusCompleted:
+		// A bound capture's object reservation never outlives the copy
+		// window — death or completion ends it either way.
+		s.releaseBoundCapture(ctx, sessionID)
+	}
 	switch r.status {
 	case StatusCancelled, StatusAborted, StatusExpired:
 		// Session death is durable — the status never moves backward —

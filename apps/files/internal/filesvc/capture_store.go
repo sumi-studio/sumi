@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -71,7 +72,43 @@ const captureDDL = `
 	);
 `
 
-func (s *Store) saveCapture(ctx context.Context, c *captureRow,
+// barrierAuthority is the scope's current durable authority recorded
+// in file_freeze: while a barrier stands it is (owner, owner_epoch);
+// after release the tombstone's (released_by, released_epoch) remains
+// the latest authority so a superseded lineage can never re-assert.
+// currentAuthority reads it inside tx — callers must hold the barrier
+// advisory lock appropriate to their boundary.
+func currentAuthority(ctx context.Context, tx pgx.Tx, scope string) (owner string, epoch int64, err error) {
+	var o, rb string
+	var oe, re int64
+	var released bool
+	err = tx.QueryRow(ctx, `
+		SELECT owner, owner_epoch, released_at IS NOT NULL,
+		       released_by, released_epoch
+		  FROM file_freeze WHERE scope = $1`, scope).
+		Scan(&o, &oe, &released, &rb, &re)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", 0, fmt.Errorf("%w: no durable barrier authority for scope",
+			ErrCaptureStale)
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	if released {
+		return rb, re, nil
+	}
+	return o, oe, nil
+}
+
+// saveCaptureAuthorized admits a capture: under the scope's barrier
+// advisory lock (exclusive — the same lock SetScopeFrozen takes) it
+// verifies the caller's (owner, epoch) is the current durable
+// authority, then inserts the manifest. The check and the grant commit
+// atomically: a barrier assertion either lands first (stale capture
+// refused) or waits behind this tx (capture admitted while its lineage
+// legitimately held). No DB lock is held over storage or remote calls —
+// this tx does pure row work.
+func (s *Store) saveCaptureAuthorized(ctx context.Context, c *captureRow,
 	entries []captureEntryRow, slices []captureSliceRow) error {
 	ctx, cancel := context.WithTimeout(ctx, s.dbTimeout*4)
 	defer cancel()
@@ -80,6 +117,18 @@ func (s *Store) saveCapture(ctx context.Context, c *captureRow,
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, c.Scope); err != nil {
+		return err
+	}
+	authOwner, authEpoch, err := currentAuthority(ctx, tx, c.Scope)
+	if err != nil {
+		return err
+	}
+	if authOwner != c.Owner || authEpoch != c.OwnerEpoch {
+		return fmt.Errorf("%w: %s@%d is not the scope's current authority",
+			ErrCaptureStale, c.Owner, c.OwnerEpoch)
+	}
 	fmtJSON, err := json.Marshal(c.Format)
 	if err != nil {
 		return err
@@ -257,4 +306,33 @@ func (s *Store) setCaptureStatus(ctx context.Context, id, status string) (bool, 
 			released_at = CASE WHEN $2='released' THEN now() ELSE released_at END
 		 WHERE capture_id = $1`, id, status)
 	return tag.RowsAffected() > 0, err
+}
+
+// assertCaptureLineage is the read-side lineage check: a shared
+// advisory lock on the scope's barrier key serializes this verdict
+// against an in-flight SetScopeFrozen (its exclusive lock), so the
+// observed authority is either before or after that assertion — never
+// mid-commit. (owner, epoch) must equal the CURRENT authority exactly:
+// a request carrying an older generation's lineage gains no grant.
+func (s *Store) assertCaptureLineage(ctx context.Context, scope, owner string, epoch int64) error {
+	ctx, cancel := context.WithTimeout(ctx, s.dbTimeout)
+	defer cancel()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`, scope); err != nil {
+		return err
+	}
+	authOwner, authEpoch, err := currentAuthority(ctx, tx, scope)
+	if err != nil {
+		return err
+	}
+	if authOwner != owner || authEpoch != epoch {
+		return fmt.Errorf("%w: %s@%d is not the scope's current authority",
+			ErrCaptureStale, owner, epoch)
+	}
+	return tx.Commit(ctx)
 }

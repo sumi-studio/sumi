@@ -8,6 +8,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,6 +40,81 @@ type fakeFilesvc struct {
 	frozen  map[string]bool   // scope -> frozen
 	freezes []string          // recorded fence transitions
 	failOps map[string]int    // "op:scope/path" -> remaining 503s
+	caps    map[string]*fakeCapture
+	capN    int
+}
+
+// fakeCapRow is one manifest row of a fake immutable capture — the
+// snapshot of the scope's namespace taken at create time.
+type fakeCapRow struct {
+	seq    int64
+	path   string
+	typ    string
+	sup    bool
+	data   []byte
+	length int64
+}
+
+// fakeCapture is a durable manifest binding: the rows are frozen at
+// create; reads answer the snapshot even if the store mutates.
+type fakeCapture struct {
+	id, scope, owner string
+	epoch            int64
+	scopeID, sha     string
+	rows             []fakeCapRow
+	active           bool
+}
+
+// captureManifest snapshots the scope's namespace into capture rows:
+// regular files and directories supported; extras carry their recorded
+// kind as an UNSUPPORTED type so the copy refuses them visibly.
+func (f *fakeFilesvc) captureManifest(scope string) []fakeCapRow {
+	var rows []fakeCapRow
+	for k, data := range f.files {
+		rel := strings.TrimPrefix(k, scope+"/")
+		if rel == k {
+			continue
+		}
+		length := int64(len(data))
+		if sz, ok := f.sizes[k]; ok {
+			length = sz
+		}
+		rows = append(rows, fakeCapRow{path: rel, typ: "file", sup: true, data: data, length: length})
+	}
+	for k := range f.dirs {
+		rel := strings.TrimPrefix(k, scope+"/")
+		if rel == k {
+			continue
+		}
+		rows = append(rows, fakeCapRow{path: rel, typ: "dir", sup: true})
+	}
+	for k, kind := range f.extras {
+		rel := strings.TrimPrefix(k, scope+"/")
+		if rel == k {
+			continue
+		}
+		rows = append(rows, fakeCapRow{path: rel, typ: kind, sup: false})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].path < rows[j].path })
+	for i := range rows {
+		rows[i].seq = int64(i + 1)
+	}
+	return rows
+}
+
+func fakeScopeID(scope string) string {
+	sum := sha256.Sum256([]byte("scope:" + scope))
+	return "si:" + hex.EncodeToString(sum[:16])
+}
+
+func capMeta(c *fakeCapture) map[string]any {
+	return map[string]any{
+		"capture_id": c.id, "scope": c.scope, "scope_id": c.scopeID,
+		"owner": c.owner, "owner_epoch": c.epoch, "manifest_sha": c.sha,
+		"status":     map[bool]string{true: "active", false: "released"}[c.active],
+		"entries":    len(c.rows), "unsupported": 0,
+		"created_at": "2026-01-01T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z",
+	}
 }
 
 func newFakeFilesvc(t *testing.T) *fakeFilesvc {
@@ -45,7 +122,7 @@ func newFakeFilesvc(t *testing.T) *fakeFilesvc {
 		t: t, files: map[string][]byte{},
 		dirs: map[string]bool{}, extras: map[string]string{},
 		sizes: map[string]int64{}, frozen: map[string]bool{},
-		failOps: map[string]int{}}
+		failOps: map[string]int{}, caps: map[string]*fakeCapture{}}
 }
 
 func (f *fakeFilesvc) put(scope, path, content string) {
@@ -60,8 +137,12 @@ func (f *fakeFilesvc) failNext(op, scope, path string, n int) {
 
 func (f *fakeFilesvc) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /v1/files/{scope}/{op}
+		// /v1/files/{scope}/{op} and /v1/capture/{id}[/op]
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) >= 3 && parts[0] == "v1" && parts[1] == "capture" {
+			f.serveCapture(w, r, parts[2:])
+			return
+		}
 		if len(parts) != 4 || parts[0] != "v1" || parts[1] != "files" {
 			http.Error(w, "bad path", http.StatusNotFound)
 			return
@@ -81,6 +162,32 @@ func (f *fakeFilesvc) handler() http.Handler {
 			return
 		}
 		switch op {
+		case "capture":
+			if r.Method != http.MethodPost {
+				write(405, map[string]any{"error": "method"})
+				return
+			}
+			sid := fakeScopeID(scope)
+			if es := q.Get("expected_scope_id"); es != "" && es != sid {
+				write(422, map[string]any{
+					"error": "scope anchor does not match expected scope identity",
+					"code":  "scope_changed"})
+				return
+			}
+			rows := f.captureManifest(scope)
+			h := sha256.New()
+			for _, row := range rows {
+				fmt.Fprintf(h, "%d|%s|%s|%t|%d\n", row.seq, row.path, row.typ, row.sup, row.length)
+			}
+			f.capN++
+			c := &fakeCapture{
+				id: fmt.Sprintf("cap-fake-%d", f.capN), scope: scope,
+				owner: q.Get("owner"), scopeID: sid,
+				sha: hex.EncodeToString(h.Sum(nil)), rows: rows, active: true}
+			fmt.Sscan(q.Get("epoch"), &c.epoch)
+			f.caps[c.id] = c
+			write(200, capMeta(c))
+			return
 		case "freeze", "unfreeze":
 			f.frozen[scope] = op == "freeze"
 			f.freezes = append(f.freezes, scope+"="+op)
@@ -194,6 +301,100 @@ func (f *fakeFilesvc) handler() http.Handler {
 	})
 }
 
+// serveCapture answers /v1/capture/{id}[/op]: durable manifest metadata,
+// paged entries, captured row bytes and release. Reads honour failOps
+// keyed "read:<scope>/<path>" like the live-read fixture did.
+func (f *fakeFilesvc) serveCapture(w http.ResponseWriter, r *http.Request, rest []string) {
+	write := func(code int, v any) {
+		raw, _ := json.Marshal(v)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write(raw)
+	}
+	c := f.caps[rest[0]]
+	if c == nil {
+		write(404, map[string]any{"error": "capture_not_found", "code": "capture_not_found"})
+		return
+	}
+	op := ""
+	if len(rest) > 1 {
+		op = rest[1]
+	}
+	if !c.active && op != "" {
+		write(410, map[string]any{"error": "capture_gone", "code": "capture_gone"})
+		return
+	}
+	q := r.URL.Query()
+	switch {
+	case op == "" && r.Method == http.MethodGet:
+		write(200, capMeta(c))
+	case op == "" && r.Method == http.MethodDelete:
+		c.active = false
+		write(200, map[string]any{"released": true})
+	case op == "entries" && r.Method == http.MethodGet:
+		cursor, _ := strconv.ParseInt(q.Get("cursor"), 10, 64)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		if limit < 1 {
+			limit = 500
+		}
+		var entries []map[string]any
+		var next int64
+		for _, row := range c.rows {
+			if row.seq <= cursor || len(entries) >= limit {
+				continue
+			}
+			base := row.path
+			if i := strings.LastIndexByte(base, '/'); i >= 0 {
+				base = base[i+1:]
+			}
+			entries = append(entries, map[string]any{
+				"seq": row.seq,
+				"path_b64": base64.StdEncoding.EncodeToString([]byte(row.path)),
+				"name_b64": base64.StdEncoding.EncodeToString([]byte(base)),
+				"path": row.path, "name": base,
+				"type": row.typ, "supported": row.sup,
+				"length": row.length, "mode": 0o100644,
+			})
+			next = row.seq
+		}
+		write(200, map[string]any{
+			"entries": entries, "has_more": len(entries) == limit, "next_cursor": next})
+	case op == "read" && r.Method == http.MethodGet:
+		seq, _ := strconv.ParseInt(q.Get("seq"), 10, 64)
+		var row *fakeCapRow
+		for i := range c.rows {
+			if c.rows[i].seq == seq {
+				row = &c.rows[i]
+				break
+			}
+		}
+		if row == nil || row.typ != "file" {
+			write(404, map[string]any{"error": "capture_pending", "code": "capture_pending"})
+			return
+		}
+		if n := f.failOps["read:"+c.scope+"/"+row.path]; n > 0 {
+			f.failOps["read:"+c.scope+"/"+row.path] = n - 1
+			write(503, map[string]any{"error": "fixture failure"})
+			return
+		}
+		data := row.data
+		if off, _ := strconv.ParseInt(q.Get("offset"), 10, 64); off > 0 {
+			if off >= int64(len(data)) {
+				data = nil
+			} else {
+				data = data[off:]
+			}
+		}
+		if ln, _ := strconv.ParseInt(q.Get("len"), 10, 64); ln > 0 && ln < int64(len(data)) {
+			data = data[:ln]
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write(data)
+	default:
+		http.Error(w, "bad capture op", http.StatusNotFound)
+	}
+}
+
 // wireFiles points the session service + server at a fixture file
 // service: the grant file ops, the freeze fence and the token proxy
 // all run over real HTTP against it.
@@ -206,6 +407,7 @@ func (h *retHarness) wireFiles(t *testing.T, f *fakeFilesvc) *httptest.Server {
 		t.Fatal(err)
 	}
 	h.sessions.SetFileStore(client)
+	h.sessions.SetCaptureStore(client)
 	h.server.SetFiles(client)
 	h.server.RegisterFileProxy(h.mux)
 	return fsrv

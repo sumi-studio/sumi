@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"time"
 
@@ -35,8 +36,9 @@ import (
 // there is deliberately no live-tree fallback path.
 type CaptureConfig struct {
 	MetaDSN    string        // postgres DSN of the JuiceFS metadata engine
-	ObjKind    string        // "file" only; anything else is a config refusal
-	ObjRoot    string        // object-store root for ObjKind=="file"
+	ObjKind    string        // "file" or "s3"; anything else is a config refusal
+	ObjRoot    string        // expected object root for ObjKind=="file" (Bucket+Name)
+	S3         *S3Config     // required for ObjKind=="s3"
 	TTL        time.Duration // manifest lifetime; default 24h
 	MaxEntries int64         // namespace bound; default 1_000_000
 }
@@ -45,7 +47,6 @@ type CaptureConfig struct {
 type CaptureService struct {
 	cfg     CaptureConfig
 	meta    *pgxpool.Pool
-	objs    objectStore
 	persist capturePersister
 	now     func() time.Time
 }
@@ -53,7 +54,15 @@ type CaptureService struct {
 // capturePersister is the durable-manifest surface. *Store implements it
 // against the filesvc DB; fakes can substitute for handler tests.
 type capturePersister interface {
-	saveCapture(ctx context.Context, c *captureRow, entries []captureEntryRow, slices []captureSliceRow) error
+	// saveCaptureAuthorized inserts the capture under the scope's
+	// barrier advisory lock after verifying (owner, epoch) is the
+	// current durable authority — the admission is linearized against
+	// concurrent SetScopeFrozen assertions by that lock.
+	saveCaptureAuthorized(ctx context.Context, c *captureRow, entries []captureEntryRow, slices []captureSliceRow) error
+	// assertCaptureLineage verifies (owner, epoch) is still the scope's
+	// current durable barrier authority (shared lock serializes against
+	// an in-flight barrier update). ErrCaptureStale otherwise.
+	assertCaptureLineage(ctx context.Context, scope, owner string, epoch int64) error
 	getCapture(ctx context.Context, id string) (*captureRow, error)
 	entryStream(ctx context.Context, id string, afterSeq, limit int64) ([]captureEntryRow, error)
 	getEntry(ctx context.Context, id string, seq int64) (*captureEntryRow, error)
@@ -133,12 +142,30 @@ func NewCaptureService(ctx context.Context, cfg CaptureConfig, persist capturePe
 	if cfg.MetaDSN == "" {
 		return nil, fmt.Errorf("%w: capture metadata DSN is required", ErrCaptureUnconfigured)
 	}
-	if cfg.ObjKind != "file" {
-		return nil, fmt.Errorf("%w: object store kind %q unsupported (only \"file\")",
+	switch cfg.ObjKind {
+	case "file":
+		if cfg.ObjRoot == "" {
+			return nil, fmt.Errorf("%w: object store root is required", ErrCaptureUnconfigured)
+		}
+	case "s3":
+		if cfg.S3 == nil || cfg.S3.Endpoint == "" || cfg.S3.Bucket == "" ||
+			cfg.S3.AccessKey == "" || cfg.S3.SecretKey == "" {
+			return nil, fmt.Errorf("%w: s3 object config requires endpoint, bucket and credentials",
+				ErrCaptureUnconfigured)
+		}
+		if cfg.S3.Region == "" {
+			cfg.S3.Region = "us-east-1"
+		}
+		if cfg.S3.client == nil {
+			cfg.S3.client = &http.Client{Timeout: 5 * time.Minute}
+		}
+		cfg.S3.Prefix = normalizeS3Prefix(cfg.S3.Prefix)
+		if _, err := trustedEndpoints(cfg.S3); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("%w: object store kind %q unsupported",
 			ErrCaptureUnconfigured, cfg.ObjKind)
-	}
-	if cfg.ObjRoot == "" {
-		return nil, fmt.Errorf("%w: object store root is required", ErrCaptureUnconfigured)
 	}
 	if cfg.TTL <= 0 {
 		cfg.TTL = 24 * time.Hour
@@ -152,8 +179,7 @@ func NewCaptureService(ctx context.Context, cfg CaptureConfig, persist capturePe
 	}
 	return &CaptureService{
 		cfg: cfg, meta: pool, persist: persist,
-		objs: &fileObjStore{root: cfg.ObjRoot},
-		now:  time.Now,
+		now: time.Now,
 	}, nil
 }
 
@@ -221,9 +247,24 @@ type jfsNode struct {
 // caller's lineage (owner, epoch). The whole namespace read happens in
 // one REPEATABLE READ transaction; malformed metadata or a gated
 // format fails the capture visibly — never a partial manifest.
-func (c *CaptureService) Capture(ctx context.Context, scope, owner string, epoch int64) (*captureRow, error) {
+//
+// Lineage is enforced, not echoed: owner must be non-empty and epoch
+// positive, and the durable file_freeze barrier must name exactly this
+// (owner, epoch) as current authority — the check and the manifest
+// insert commit in one transaction under the barrier's advisory lock,
+// so a barrier update either lands first (this capture refuses stale)
+// or waits (this capture was admitted while its lineage held). On
+// retake the caller passes expectedScopeID, the scope_id its bound
+// record holds; it is compared against the anchor resolved INSIDE the
+// capture transaction — a renamed-out, recreated scope resolves a
+// different inode and refuses rather than silently retargeting.
+func (c *CaptureService) Capture(ctx context.Context, scope, owner string, epoch int64, expectedScopeID string) (*captureRow, error) {
 	if scope == "" {
 		return nil, fmt.Errorf("%w: empty scope", ErrCaptureRefused)
+	}
+	if owner == "" || epoch <= 0 {
+		return nil, fmt.Errorf("%w: capture requires a non-empty owner and positive epoch",
+			ErrCaptureRefused)
 	}
 	if scope == ".trash" {
 		// The volume trash tree is never a capturable scope even though
@@ -275,6 +316,12 @@ func (c *CaptureService) Capture(ctx context.Context, scope, owner string, epoch
 	if err != nil {
 		return nil, err
 	}
+	// Object-store identity is validated at capture time too — a volume
+	// whose bucket/prefix doesn't match the private config refuses now,
+	// not at first read.
+	if _, err := c.objectStoreFor(gated); err != nil {
+		return nil, err
+	}
 
 	// --- explicit existing scope anchor ------------------------------
 	var anchorIno uint64
@@ -290,6 +337,20 @@ func (c *CaptureService) Capture(ctx context.Context, scope, owner string, epoch
 	}
 	if anchorType != jfsTypeDir {
 		return nil, fmt.Errorf("%w: scope anchor is not a directory (type %d)", ErrCaptureRefused, anchorType)
+	}
+	if expectedScopeID != "" &&
+		expectedScopeID != scopeID(gated.VolumeUUID, anchorIno) {
+		// Retake refused: the anchor inside THIS transaction is not the
+		// scope the caller bound. A recreated directory at the same name
+		// is a different scope — never silently retarget it.
+		return nil, fmt.Errorf("%w: scope anchor does not match expected scope identity",
+			ErrCaptureRefused)
+	}
+
+	// Fail fast on stale lineage before paying for the namespace walk;
+	// saveCaptureAuthorized re-checks under the barrier lock at commit.
+	if err := c.persist.assertCaptureLineage(ctx, scope, owner, epoch); err != nil {
+		return nil, err
 	}
 
 	// --- complete namespace walk (single RR snapshot) ----------------
@@ -359,7 +420,10 @@ func (c *CaptureService) Capture(ctx context.Context, scope, owner string, epoch
 		CreatedAt: now, ExpiresAt: now.Add(c.cfg.TTL),
 	}
 	row.ManifestSHA = manifestSHA(row, entries, slices)
-	if err := c.persist.saveCapture(ctx, row, entries, slices); err != nil {
+	// Admission boundary: the barrier lineage check and the manifest
+	// insert commit in one transaction under the scope's barrier
+	// advisory lock — a stale lineage can never gain a capture grant.
+	if err := c.persist.saveCaptureAuthorized(ctx, row, entries, slices); err != nil {
 		return nil, fmt.Errorf("persist capture: %w", err)
 	}
 	return row, nil
@@ -570,10 +634,13 @@ func manifestSHA(c *captureRow, entries []captureEntryRow, slices []captureSlice
 
 // --- read-side --------------------------------------------------------
 
-// live returns the capture row or maps not-found/released/expired to
-// the read-path errors. Expiry is lazy: past-expiry rows are marked and
-// answered ErrCaptureGone.
-func (c *CaptureService) live(ctx context.Context, id string) (*captureRow, error) {
+// live returns the capture row for a caller asserting (owner, epoch),
+// or maps not-found/released/expired/foreign-lineage to the read-path
+// errors. Two independent checks: the stored capture row must belong
+// to this generation (a token from another owner or epoch cannot
+// address it), and (owner, epoch) must still be the scope's current
+// durable barrier authority — a stale generation gains no new grant.
+func (c *CaptureService) live(ctx context.Context, id, owner string, epoch int64) (*captureRow, error) {
 	row, err := c.persist.getCapture(ctx, id)
 	if errors.Is(err, ErrCaptureNotFound) {
 		return nil, err
@@ -589,19 +656,26 @@ func (c *CaptureService) live(ctx context.Context, id string) (*captureRow, erro
 		c.persist.setCaptureStatus(ctx, id, captureStatusExpired)
 		return nil, ErrCaptureGone
 	}
+	if row.Owner != owner || row.OwnerEpoch != epoch {
+		return nil, fmt.Errorf("%w: capture belongs to another lineage",
+			ErrCaptureStale)
+	}
+	if err := c.persist.assertCaptureLineage(ctx, row.Scope, owner, epoch); err != nil {
+		return nil, err
+	}
 	return row, nil
 }
 
 // Meta answers the capture's identity/lifecycle for an authorized
 // caller. Opaque ids only — no inodes, slices, keys, or credentials.
-func (c *CaptureService) Meta(ctx context.Context, id string) (*captureRow, error) {
-	return c.live(ctx, id)
+func (c *CaptureService) Meta(ctx context.Context, id, owner string, epoch int64) (*captureRow, error) {
+	return c.live(ctx, id, owner, epoch)
 }
 
-// Entries streams manifest rows after cursor. Scope-bound: callers must
-// already hold scope authority (checked at the HTTP layer).
-func (c *CaptureService) Entries(ctx context.Context, id string, afterSeq, limit int64) ([]captureEntryRow, error) {
-	if _, err := c.live(ctx, id); err != nil {
+// Entries streams manifest rows after cursor. Wildcard callers only;
+// lineage is enforced by live().
+func (c *CaptureService) Entries(ctx context.Context, id, owner string, epoch int64, afterSeq, limit int64) ([]captureEntryRow, error) {
+	if _, err := c.live(ctx, id, owner, epoch); err != nil {
 		return nil, err
 	}
 	if limit <= 0 || limit > 1000 {
@@ -613,9 +687,13 @@ func (c *CaptureService) Entries(ctx context.Context, id string, afterSeq, limit
 // Stream writes the captured bytes of manifest row seq — bounded memory,
 // resolved ranges only, captured objects only. Missing/short objects
 // answer ErrCapturePending; non-file entries answer ErrCaptureRefused.
-func (c *CaptureService) Stream(ctx context.Context, id string, seq int64,
+func (c *CaptureService) Stream(ctx context.Context, id, owner string, epoch int64, seq int64,
 	off, n uint64, w io.Writer) (uint64, error) {
-	row, err := c.live(ctx, id)
+	row, err := c.live(ctx, id, owner, epoch)
+	if err != nil {
+		return 0, err
+	}
+	objs, err := c.objectStoreFor(row.Format)
 	if err != nil {
 		return 0, err
 	}
@@ -684,7 +762,7 @@ func (c *CaptureService) Stream(ctx context.Context, id string, seq int64,
 			if readEnd > want {
 				readEnd = want
 			}
-			if err := streamRange(ctx, c.objs, row.Format, seg, chunkBase, cur, readEnd-cur, w); err != nil {
+			if err := streamRange(ctx, objs, row.Format, seg, chunkBase, cur, readEnd-cur, w); err != nil {
 				return 0, err
 			}
 			cur = readEnd
@@ -698,10 +776,11 @@ func (c *CaptureService) Stream(ctx context.Context, id string, seq int64,
 	return n, nil
 }
 
-// streamProbe validates a read request before headers: capture live,
-// entry exists and is a file. Returns the entry length.
-func (c *CaptureService) streamProbe(ctx context.Context, id string, seq int64) (uint64, error) {
-	if _, err := c.live(ctx, id); err != nil {
+// streamProbe validates a read request before headers: capture live
+// under the caller's lineage, entry exists and is a file. Returns the
+// entry length.
+func (c *CaptureService) streamProbe(ctx context.Context, id, owner string, epoch int64, seq int64) (uint64, error) {
+	if _, err := c.live(ctx, id, owner, epoch); err != nil {
 		return 0, err
 	}
 	e, err := c.persist.getEntry(ctx, id, seq)
@@ -714,16 +793,25 @@ func (c *CaptureService) streamProbe(ctx context.Context, id string, seq int64) 
 	return e.Length, nil
 }
 
-// Release marks the capture released. Rows remain as evidence; reads
-// close with ErrCaptureGone. Retake is a fresh Capture — a released or
-// pending manifest never silently retargets.
-func (c *CaptureService) Release(ctx context.Context, id string) error {
+// Release marks the capture released under the caller's lineage — the
+// same ownership and current-authority checks as reads: a stale or
+// foreign generation cannot release (or even learn state from) a
+// capture it does not own. Rows remain as evidence; reads close with
+// ErrCaptureGone. Retake is a fresh Capture — a released or pending
+// manifest never silently retargets.
+func (c *CaptureService) Release(ctx context.Context, id, owner string, epoch int64) error {
 	row, err := c.persist.getCapture(ctx, id)
 	if err != nil {
 		return err
 	}
 	if row.Status == captureStatusReleased {
 		return nil // idempotent
+	}
+	if row.Owner != owner || row.OwnerEpoch != epoch {
+		return fmt.Errorf("%w: capture belongs to another lineage", ErrCaptureStale)
+	}
+	if err := c.persist.assertCaptureLineage(ctx, row.Scope, owner, epoch); err != nil {
+		return err
 	}
 	ok, err := c.persist.setCaptureStatus(ctx, id, captureStatusReleased)
 	if err != nil {

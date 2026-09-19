@@ -77,3 +77,21 @@ CREATE TABLE persona_file_tokens (
 CREATE INDEX persona_file_tokens_active
     ON persona_file_tokens (persona_id, destination_placement_id)
     WHERE status = 'active';
+
+-- Immutable-capture binding for a local-mode copy. The first successful
+-- capture persistently binds this session to one durable manifest
+-- association: scope_id is the opaque identity of the volume+anchor the
+-- capture resolved (a scope renamed out and recreated under the same
+-- name yields a different scope_id), capture_id the manifest itself,
+-- capture_manifest_sha its integrity hash. A lost create response or a
+-- mover restart re-derives THIS row instead of minting a second
+-- association; a retake replaces the triple atomically after proving the
+-- scope identity is unchanged. NULL means no capture bound yet.
+ALTER TABLE return_sessions
+    ADD COLUMN capture_id text,
+    ADD COLUMN capture_scope_id text,
+    ADD COLUMN capture_manifest_sha text;
+ALTER TABLE return_sessions
+    ADD CONSTRAINT return_sessions_capture_binding
+    CHECK ((capture_id IS NULL) = (capture_scope_id IS NULL)
+       AND (capture_id IS NULL) = (capture_manifest_sha IS NULL));

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -82,6 +83,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/cancel", s.cancel)
 	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/files-credential", s.filesCredential)
 	mux.HandleFunc("GET "+RoutePrefix+"/sessions/{session}/files/{op}", s.grantFileOp)
+	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/capture", s.captureEnsure)
+	mux.HandleFunc("GET "+RoutePrefix+"/sessions/{session}/capture", s.captureView)
+	mux.HandleFunc("DELETE "+RoutePrefix+"/sessions/{session}/capture", s.captureRelease)
+	mux.HandleFunc("POST "+RoutePrefix+"/sessions/{session}/capture/retake", s.captureRetake)
+	mux.HandleFunc("GET "+RoutePrefix+"/sessions/{session}/capture/entries", s.captureEntries)
+	mux.HandleFunc("GET "+RoutePrefix+"/sessions/{session}/capture/read", s.captureRead)
 	mux.HandleFunc("POST "+RoutePrefix+"/files/revoke", s.revokeFiles)
 }
 
@@ -363,15 +370,28 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 		code = http.StatusGone
 	case errors.Is(err, ErrConflict), errors.Is(err, ErrOpenSession),
 		errors.Is(err, ErrDestBound), errors.Is(err, ErrFilePolicyUndecided),
+		errors.Is(err, ErrScopeChanged),
 		errors.Is(err, portable.ErrTransferConflict),
 		errors.Is(err, portable.ErrPersonaExists), errors.Is(err, portable.ErrUnresolvedOperations):
 		code = http.StatusConflict
+	case errors.Is(err, ErrCaptureUnconfigured):
+		code = http.StatusServiceUnavailable
 	case errors.Is(err, ErrBadRequest), errors.Is(err, portable.ErrBadRequest), errors.Is(err, portable.ErrMissingProof):
 		code = http.StatusBadRequest
 	case errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "40P01" || pgErr.Code == "40001"):
 		code = http.StatusConflict
 	}
 	msg := err.Error()
+	// A filesvc verdict travels with its own status and message — a 422
+	// refusal or 503 pending is a real upstream answer, not an internal
+	// fault to be hidden behind 500.
+	var se *fileaccess.ServiceError
+	if errors.As(err, &se) && se.Status >= 400 && se.Status < 600 {
+		code = se.Status
+		if se.Message != "" {
+			msg = se.Message
+		}
+	}
 	if code == http.StatusInternalServerError {
 		if s.logf != nil {
 			s.logf("return session: %v", err)
@@ -497,6 +517,181 @@ func (s *Server) proxyOp(w http.ResponseWriter, r *http.Request, scope, op strin
 	}
 	defer resp.Body.Close()
 	for _, h := range []string{"Content-Type", "Content-Length", "X-File-Version", "X-External-Change"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// --- immutable capture surface --------------------------------------
+//
+// The local-mode copy binds the session to one durable manifest
+// association; owner and epoch are derived from the authorized session
+// row, never the request. Reads are bound to the persisted capture_id —
+// the grant can never name a capture.
+
+// captureEnsure is POST /capture: bind (idempotently) the session's
+// capture association. A lost response or mover restart re-POSTs and
+// gets the SAME binding — never a second manifest.
+func (s *Server) captureEnsure(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	b, err := s.svc.EnsureCapture(r.Context(), r.PathValue("session"), grant)
+	if err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+// captureView is GET /capture: the persisted association for recovery,
+// 404 while unbound.
+func (s *Server) captureView(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	b, err := s.svc.CaptureView(r.Context(), r.PathValue("session"), grant)
+	if err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+// captureRetake is POST /capture/retake with {"expected_scope_id"}: a
+// fresh coherent manifest when the bound capture loses a required
+// object. A stale expectation answers the current binding; a changed
+// scope identity is a refusal.
+func (s *Server) captureRetake(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	var body struct {
+		ExpectedScopeID string `json:"expected_scope_id"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	b, err := s.svc.RetakeCapture(r.Context(), r.PathValue("session"), grant, body.ExpectedScopeID)
+	if err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, b)
+}
+
+// captureRelease is DELETE /capture: drop the binding and free the
+// reservation. Idempotent.
+func (s *Server) captureRelease(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	if err := s.svc.ReleaseCapture(r.Context(), r.PathValue("session"), grant); err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"released": true})
+}
+
+// captureEntries proxies one manifest page of the PERSISTED binding.
+func (s *Server) captureEntries(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	if s.files == nil {
+		writeError(w, http.StatusServiceUnavailable, "file service is not configured")
+		return
+	}
+	q := r.URL.Query()
+	cursor, err := strconv.ParseInt(q.Get("cursor"), 10, 64)
+	if err != nil || cursor < -1 {
+		writeError(w, http.StatusBadRequest, "cursor must be an integer >= -1")
+		return
+	}
+	limit := 500
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 1 || n > 1000 {
+			writeError(w, http.StatusBadRequest, "limit must be 1..1000")
+			return
+		}
+		limit = int(n)
+	}
+	id, owner, epoch, err := s.svc.AuthorizeCaptureEntries(r.Context(), r.PathValue("session"), grant)
+	if err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	resp, err := s.files.CaptureEntriesRaw(r.Context(), id, owner, epoch, cursor, limit)
+	s.streamCapture(w, resp, err)
+}
+
+// captureRead proxies captured row bytes of the PERSISTED binding —
+// seq/offset/len choose a range inside the bound manifest only.
+func (s *Server) captureRead(w http.ResponseWriter, r *http.Request) {
+	grant, ok := bearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
+		return
+	}
+	if s.files == nil {
+		writeError(w, http.StatusServiceUnavailable, "file service is not configured")
+		return
+	}
+	q := r.URL.Query()
+	seq, err := strconv.ParseInt(q.Get("seq"), 10, 64)
+	if err != nil || seq < 0 {
+		writeError(w, http.StatusBadRequest, "seq is required")
+		return
+	}
+	var off, n int64
+	if v := q.Get("offset"); v != "" {
+		if off, err = strconv.ParseInt(v, 10, 64); err != nil || off < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+	}
+	if v := q.Get("len"); v != "" {
+		if n, err = strconv.ParseInt(v, 10, 64); err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "len must be a non-negative integer")
+			return
+		}
+	}
+	id, owner, epoch, err := s.svc.AuthorizeCaptureRead(r.Context(), r.PathValue("session"), grant)
+	if err != nil {
+		s.writeErr(w, err, nil)
+		return
+	}
+	resp, err := s.files.CaptureRead(r.Context(), id, owner, epoch, seq, off, n)
+	s.streamCapture(w, resp, err)
+}
+
+// streamCapture forwards the upstream capture verdict verbatim —
+// status, content headers and body — so a 503 capture_pending or a
+// truncated stream reaches the mover exactly as the service emitted it.
+func (s *Server) streamCapture(w http.ResponseWriter, resp *http.Response, err error) {
+	if err != nil {
+		if s.logf != nil {
+			s.logf("return capture proxy: %v", err)
+		}
+		writeError(w, http.StatusBadGateway, "file service unreachable; safe to retry")
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
