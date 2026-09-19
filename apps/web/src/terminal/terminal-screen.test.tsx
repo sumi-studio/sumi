@@ -166,6 +166,7 @@ function session(
     outputBytes: 0,
     outputBase: 0,
     controlHolder: "",
+    outputAttached: null,
     exitCode: null,
     exitSignal: null,
     endReason: null,

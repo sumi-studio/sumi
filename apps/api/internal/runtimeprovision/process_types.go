@@ -363,6 +363,18 @@ type ProcessOutput struct {
 	// Truncated semantics.
 	BaseOffset int64 `json:"base_offset,omitempty"`
 	Gap        bool  `json:"gap,omitempty"`
+	// Gaps carries journaled loss boundaries (journal rotation/vanish,
+	// uncertified resume) at absolute offsets >= the requested offset.
+	// Each event marks a position where emitted bytes may have been
+	// lost — the window size is genuinely unknown, so the event is a
+	// boundary, never an invented byte range.
+	Gaps []ProcessOutputGap `json:"gaps,omitempty"`
+}
+
+// ProcessOutputGap is one journaled output-loss boundary.
+type ProcessOutputGap struct {
+	At   int64  `json:"at"`
+	Note string `json:"note,omitempty"`
 }
 
 // ProcessInputRequest writes bytes to an interactive operation's

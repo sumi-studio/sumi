@@ -71,6 +71,7 @@ export function resolveTerminalWsURL({
   scope,
   sessionId,
   cursor,
+  eventCursor,
   pageOrigin,
 }: {
   apiBaseURL?: string;
@@ -78,6 +79,8 @@ export function resolveTerminalWsURL({
   scope: TerminalScope;
   sessionId: string;
   cursor: number;
+  /** Chunk-seq high-water mark of consumed loss-event markers. */
+  eventCursor?: number;
   pageOrigin?: string;
 }): URL {
   if (!pageOrigin) throw new Error("terminal page origin is unavailable");
@@ -106,6 +109,8 @@ export function resolveTerminalWsURL({
   url.searchParams.set("authority_epoch", scope.authorityEpoch);
   url.searchParams.set("session_id", sessionId);
   if (cursor > 0) url.searchParams.set("cursor", String(cursor));
+  if (eventCursor && eventCursor > 0)
+    url.searchParams.set("event_cursor", String(eventCursor));
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
 }
@@ -125,6 +130,12 @@ export class TerminalAttach {
   private socket: TerminalSocketLike | null = null;
   /** Furthest absolute output offset handed to the UI. */
   private nextCursor = 0;
+  /**
+   * Chunk-seq high-water mark of loss markers already shown. The
+   * byte cursor alone cannot express whether a zero-width boundary
+   * event was consumed, so reconnects resume this dimension too.
+   */
+  private nextEvent = 0;
   private attempts = 0;
   private ended = false;
   private detached = false;
@@ -170,6 +181,7 @@ export class TerminalAttach {
         scope,
         sessionId,
         cursor: this.nextCursor,
+        eventCursor: this.nextEvent,
         pageOrigin: globalThis.location?.origin,
       });
     } catch {
@@ -270,6 +282,15 @@ export class TerminalAttach {
           const base = Number(frame.base);
           const to = Number.isSafeInteger(frame.to) ? Number(frame.to) : null;
           if (!Number.isSafeInteger(base)) return;
+          // A durable marker carries its chunk seq so the event
+          // cursor can resume exactly past consumed boundaries —
+          // a zero-width to===base marker owns no bytes to track.
+          if (
+            Number.isSafeInteger(frame.event_seq) &&
+            (frame.event_seq as number) > this.nextEvent
+          ) {
+            this.nextEvent = frame.event_seq as number;
+          }
           events.onGap(base, to);
           if (to !== null && to > this.nextCursor) this.nextCursor = to;
           break;

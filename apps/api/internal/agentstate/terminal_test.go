@@ -401,7 +401,7 @@ func TestTerminalOutputAppendDedupAndGap(t *testing.T) {
 		sess.SessionID).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("output rows = %d err=%v, want 2 (deduped)", n, err)
 	}
-	read, err := s.ReadTerminalOutput(ctx, pa, sess.SessionID, 0, 32)
+	read, err := s.ReadTerminalOutput(ctx, pa, sess.SessionID, 0, 0, 32)
 	if err != nil {
 		t.Fatalf("read output: %v", err)
 	}

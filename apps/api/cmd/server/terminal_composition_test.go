@@ -490,7 +490,7 @@ func TestTerminalComposedRefusals(t *testing.T) {
 	// And even installing their own terminal app cannot expose the first
 	// persona's sessions: the persona comes from their own claims.
 	owner := map[string]any{
-		"kind": "participant",
+		"kind":        "participant",
 		"participant": map[string]any{"kind": "human", "human_id": otherHuman},
 	}
 	status, inst := w.request(t, "POST", "/app-installations", map[string]any{
@@ -591,8 +591,8 @@ func (g *gatedTerminalBackend) CreateTerminalSession(ctx context.Context, p, n, 
 func (g *gatedTerminalBackend) GetTerminalSession(ctx context.Context, p, s string) (agentstate.TerminalSession, error) {
 	return g.inner.GetTerminalSession(ctx, p, s)
 }
-func (g *gatedTerminalBackend) ReadTerminalOutput(ctx context.Context, p, s string, c int64, l int) (agentstate.TerminalOutputRead, error) {
-	return g.inner.ReadTerminalOutput(ctx, p, s, c, l)
+func (g *gatedTerminalBackend) ReadTerminalOutput(ctx context.Context, p, s string, c, ec int64, l int) (agentstate.TerminalOutputRead, error) {
+	return g.inner.ReadTerminalOutput(ctx, p, s, c, ec, l)
 }
 func (g *gatedTerminalBackend) SubmitTerminalInput(ctx context.Context, p, s, src, k string, pl map[string]any) (agentstate.TerminalInput, error) {
 	g.hold("SubmitTerminalInput")

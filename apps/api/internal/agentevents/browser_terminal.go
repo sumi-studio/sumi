@@ -24,7 +24,7 @@ type TerminalBackend interface {
 	ListTerminalSessions(ctx context.Context, personaID string) ([]agentstate.TerminalSession, error)
 	CreateTerminalSession(ctx context.Context, personaID, name, requestedBy, createdBy string) (agentstate.TerminalSession, error)
 	GetTerminalSession(ctx context.Context, personaID, sessionID string) (agentstate.TerminalSession, error)
-	ReadTerminalOutput(ctx context.Context, personaID, sessionID string, cursor int64, limit int) (agentstate.TerminalOutputRead, error)
+	ReadTerminalOutput(ctx context.Context, personaID, sessionID string, cursor, eventCursor int64, limit int) (agentstate.TerminalOutputRead, error)
 	SubmitTerminalInput(ctx context.Context, personaID, sessionID, source, kind string, payload map[string]any) (agentstate.TerminalInput, error)
 	ListTerminalInputs(ctx context.Context, personaID, sessionID string, afterSeq int64, limit int) ([]agentstate.TerminalInput, error)
 	SetTerminalControl(ctx context.Context, personaID, sessionID string, hold bool, lease time.Duration) (agentstate.TerminalSession, error)
@@ -255,6 +255,16 @@ func (s *BrowserServer) serveTerminalRead(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
+	// event_cursor tracks consumed zero-width loss markers by chunk
+	// seq — byte progress alone cannot express whether a boundary
+	// event at the current position was already delivered.
+	var eventCursor int64
+	if v := strings.TrimSpace(r.URL.Query().Get("event_cursor")); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &eventCursor); err != nil || eventCursor < 0 {
+			http.Error(w, "bad event_cursor", http.StatusBadRequest)
+			return
+		}
+	}
 	limit := terminalReadDefaultLimit
 	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
 		var n int64
@@ -267,14 +277,14 @@ func (s *BrowserServer) serveTerminalRead(w http.ResponseWriter, r *http.Request
 	var read agentstate.TerminalOutputRead
 	if !s.terminalAuth(w, r, func(paid string) error {
 		var err error
-		read, err = s.Terminals.ReadTerminalOutput(r.Context(), paid, sessionID, cursor, limit)
+		read, err = s.Terminals.ReadTerminalOutput(r.Context(), paid, sessionID, cursor, eventCursor, limit)
 		return err
 	}) {
 		return
 	}
 	chunks := make([]map[string]any, 0, len(read.Chunks))
 	for _, c := range read.Chunks {
-		item := map[string]any{"kind": c.Kind, "base": c.Base}
+		item := map[string]any{"kind": c.Kind, "base": c.Base, "seq": c.Seq}
 		if c.Kind == "data" {
 			item["data"] = base64.StdEncoding.EncodeToString(c.Data)
 		} else if c.GapTo != nil {
@@ -283,9 +293,11 @@ func (s *BrowserServer) serveTerminalRead(w http.ResponseWriter, r *http.Request
 		chunks = append(chunks, item)
 	}
 	writeTerminalJSON(w, map[string]any{
-		"session": s.sessionWire(r.Context(), read.Session),
-		"chunks":  chunks,
-		"cursor":  read.Cursor,
+		"session":      s.sessionWire(r.Context(), read.Session),
+		"chunks":       chunks,
+		"cursor":       read.Cursor,
+		"next_cursor":  read.NextCursor,
+		"event_cursor": read.EventCursor,
 	})
 }
 
@@ -494,6 +506,16 @@ func (s *BrowserServer) serveTerminalWS(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+	// event_cursor resumes loss-marker consumption on reconnect —
+	// the byte cursor alone cannot say which zero-width boundary
+	// events this attach already displayed.
+	var eventCursor int64
+	if v := strings.TrimSpace(r.URL.Query().Get("event_cursor")); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &eventCursor); err != nil || eventCursor < 0 {
+			http.Error(w, "bad event_cursor", http.StatusBadRequest)
+			return
+		}
+	}
 	paid := claims.PersonalityAgentID
 	// Authorize the attach and verify the session belongs to this
 	// persona before the upgrade — a rejected session cannot consume a
@@ -530,10 +552,10 @@ func (s *BrowserServer) serveTerminalWS(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		return
 	}
-	s.runTerminalSocket(conn, claims, scope, paid, session, cursor)
+	s.runTerminalSocket(conn, claims, scope, paid, session, cursor, eventCursor)
 }
 
-func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessionClaims, scope directChatScope, paid string, session agentstate.TerminalSession, cursor int64) {
+func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessionClaims, scope directChatScope, paid string, session agentstate.TerminalSession, cursor, eventCursor int64) {
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -679,7 +701,7 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 				}
 			}
 		case <-poll.C:
-			read, err := s.Terminals.ReadTerminalOutput(ctx, paid, session.SessionID, cursor, terminalReadDefaultLimit)
+			read, err := s.Terminals.ReadTerminalOutput(ctx, paid, session.SessionID, cursor, eventCursor, terminalReadDefaultLimit)
 			if err != nil {
 				if errors.Is(err, agentstate.ErrTerminalNotFound) {
 					send(map[string]any{"type": "ended", "status": "lost", "reason": "session removed"})
@@ -690,7 +712,7 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 			}
 			for _, c := range read.Chunks {
 				if c.Kind == "gap" {
-					frame := map[string]any{"type": "gap", "base": c.Base}
+					frame := map[string]any{"type": "gap", "base": c.Base, "event_seq": c.Seq}
 					if c.GapTo != nil {
 						frame["to"] = *c.GapTo
 					}
@@ -711,7 +733,11 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 			// Advance past what was emitted — read.Cursor echoes the
 			// request, NextCursor is the offset after the last chunk.
 			// Using the echo would re-send the same chunks every poll.
+			// EventCursor tracks consumed loss markers by seq — a
+			// zero-width boundary carries no bytes, so the byte cursor
+			// alone cannot consume it.
 			cursor = read.NextCursor
+			eventCursor = read.EventCursor
 			if read.Session.Status != lastStatus {
 				lastStatus = read.Session.Status
 				wire := s.sessionWire(ctx, read.Session)

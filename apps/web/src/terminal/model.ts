@@ -54,6 +54,13 @@ export interface TerminalReadResult {
   chunks: TerminalOutputChunk[];
   /** Absolute output offset the next read should resume from. */
   nextCursor: number;
+  /**
+   * Chunk-seq high-water mark of consumed loss-event markers.
+   * Zero-width boundary chunks carry no bytes, so the byte cursor
+   * alone cannot say whether one was already read — echo this back
+   * as `event_cursor` on the next read to consume each once.
+   */
+  nextEventCursor: number;
 }
 
 export interface TerminalInputReceipt {
@@ -223,7 +230,16 @@ export function parseTerminalRead(value: unknown): TerminalReadResult {
     const end = terminalChunkEnd(chunk);
     if (end > nextCursor) nextCursor = end;
   }
-  return { session, chunks, nextCursor };
+  // The server also reports next_cursor explicitly; prefer it so
+  // byte progress matches the store's own accounting exactly.
+  if (Number.isSafeInteger(value.next_cursor)) {
+    const reported = value.next_cursor as number;
+    if (reported > nextCursor) nextCursor = reported;
+  }
+  const nextEventCursor = Number.isSafeInteger(value.event_cursor)
+    ? (value.event_cursor as number)
+    : 0;
+  return { session, chunks, nextCursor, nextEventCursor };
 }
 
 export function parseTerminalInputReceipt(

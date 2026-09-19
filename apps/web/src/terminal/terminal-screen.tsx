@@ -337,6 +337,7 @@ export function TerminalSessionView({
   const [willRetry, setWillRetry] = useState(true);
   const [ended, setEnded] = useState<TerminalEndedInfo | null>(null);
   const [gapBytes, setGapBytes] = useState(0);
+  const [lossBoundaries, setLossBoundaries] = useState(0);
   const [notice, setNotice] = useState<ViewNotice | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
   const [lastAck, setLastAck] = useState<TerminalInputReceipt | null>(null);
@@ -430,6 +431,16 @@ export function TerminalSessionView({
         },
         onOutput: (_base, data) => term.write(data),
         onGap: (base, to) => {
+          if (to !== null && to === base) {
+            // Zero-width journal-loss boundary: the runtime lost an
+            // unknown amount of output at this position — name the
+            // boundary honestly instead of inventing a byte range.
+            setLossBoundaries((previous) => previous + 1);
+            term.writeln(
+              "\x1b[2;33m―― この位置で出力が失われた可能性があります（ジャーナル断絶）――\x1b[0m",
+            );
+            return;
+          }
           const missing = to !== null ? Math.max(0, to - base) : 0;
           setGapBytes((previous) => previous + missing);
           term.writeln(
@@ -663,6 +674,17 @@ export function TerminalSessionView({
           <CircleAlert className="size-3.5 shrink-0 text-amber-600" />
           出力の一部が欠落しています（約{gapBytes}バイト）。
           サーバーの保持範囲を超えた出力は復元できません。
+        </div>
+      ) : null}
+
+      {lossBoundaries > 0 ? (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-border border-b bg-amber-500/10 px-3 py-1.5 text-xs"
+        >
+          <CircleAlert className="size-3.5 shrink-0 text-amber-600" />
+          出力ジャーナルの断絶を検出しました（{lossBoundaries}
+          箇所）。その境界で失われた量は不明です。
         </div>
       ) : null}
 

@@ -155,9 +155,12 @@ export class TerminalApiClient {
     sessionId: string,
     cursor: number,
     limit?: number,
+    eventCursor?: number,
   ): Promise<TerminalReadResult> {
     const params: Record<string, string> = { session_id: sessionId };
     if (cursor > 0) params.cursor = String(cursor);
+    if (eventCursor && eventCursor > 0)
+      params.event_cursor = String(eventCursor);
     if (limit !== undefined) params.limit = String(limit);
     const body = asRecord(
       await this.request(this.scoped("/terminal/read", params)),

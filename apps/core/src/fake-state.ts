@@ -3632,6 +3632,7 @@ export class FakeState implements StateClient {
           base: t.output_base,
           cursor: t.output_base,
           next_cursor: t.output_bytes,
+          event_cursor: 0,
           gap: false,
           eof: t.status === "ended" || t.status === "lost",
           content: "",

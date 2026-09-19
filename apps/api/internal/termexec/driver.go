@@ -16,10 +16,12 @@ package termexec
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 )
@@ -134,6 +136,7 @@ type Driver struct {
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 func New(store *agentstate.Store, proc ProcessAPI, scope ScopeEnsurer, cfg Config) *Driver {
@@ -161,17 +164,111 @@ func (d *Driver) OutputAttached(ctx context.Context, personaID, sessionID string
 	return op.OutputAttached, true
 }
 
+// lockRetryInterval bounds standby polls while another process holds
+// the runner lock — a second API waits for ownership instead of
+// logging once and silently leaving the deployment with no driver.
+const lockRetryInterval = 2 * time.Second
+
+// Run is the driver's claim loop. Exactly one live process may drive
+// a RunnerID. Two fences work together:
+//
+//   - The session-scoped advisory lock is the *acquisition* fence —
+//     only one process holds it. A contending driver does not exit:
+//     it stands by and takes over when ownership frees (restart or
+//     deploy overlap), so an API is never left driverless.
+//   - Claim *incarnations* are the *delivery* fence. Each lock
+//     acquisition claims sessions under a distinct identity
+//     ("runner#uuid"). A replacement's claim bumps the epoch and
+//     re-stamps 'intended' rows in one transaction, so a stale
+//     pump's cached row can never be dequeued: every disposition,
+//     append, heartbeat, and report carries (claimed_by, epoch) and
+//     fails the moment the claim moved. A 'dequeued' row is marked
+//     'unknown' at the steal — never re-served even if the stale
+//     pump's transport write lands afterwards.
 func (d *Driver) Run(ctx context.Context) {
-	d.sweep(ctx)
+	announced := false
+	for ctx.Err() == nil {
+		lock, err := d.store.TryAcquireTerminalRunnerLock(ctx, d.cfg.RunnerID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			d.cfg.Logf("termexec: runner lock acquire: %v", err)
+		} else if lock == nil {
+			if !announced {
+				announced = true
+				d.cfg.Logf("termexec: runner %q is driven by another live process — standing by for ownership", d.cfg.RunnerID)
+			}
+		} else {
+			if announced {
+				d.cfg.Logf("termexec: runner %q ownership acquired — resuming drive", d.cfg.RunnerID)
+			}
+			announced = false
+			d.drive(ctx, lock, fmt.Sprintf("%s#%s", d.cfg.RunnerID, uuid.NewString()))
+			continue
+		}
+		t := time.NewTimer(lockRetryInterval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// drive runs one lock-holding term. Shutdown order is part of the
+// contract: the watchdog stops probing first, every pump is stopped
+// and joined, and only then is the advisory lock released — a release
+// issued while pumps still settle could hand ownership to a
+// replacement that adopts sessions the old pumps are still writing.
+func (d *Driver) drive(ctx context.Context, lock *agentstate.TerminalRunnerLock, claimID string) {
+	lctx, lcancel := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		d.watchLock(lctx, lcancel, lock)
+	}()
+	d.sweep(lctx, claimID)
 	tick := time.NewTicker(d.cfg.Interval)
 	defer tick.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-lctx.Done():
+			lcancel()
+			<-watchDone
 			d.stopAll()
+			d.wg.Wait()
+			lock.Release(context.Background())
 			return
 		case <-tick.C:
-			d.sweep(ctx)
+			d.sweep(lctx, claimID)
+		}
+	}
+}
+
+// watchLock heartbeats the advisory-lock connection. A dead connection
+// means the lock may already be held elsewhere: this driver cancels its
+// run context — pumps unwind and sweeping stops — rather than risk
+// concurrent delivery on a fence it can no longer prove it holds. The
+// incarnation claim fence is what makes the pre-detection window safe:
+// a stale pump's mutations fail the moment a successor claims.
+func (d *Driver) watchLock(ctx context.Context, cancel context.CancelFunc, lock *agentstate.TerminalRunnerLock) {
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			pc, c := context.WithTimeout(ctx, 3*time.Second)
+			alive := lock.Ping(pc)
+			c()
+			if !alive {
+				d.cfg.Logf("termexec: runner lock connection lost — stopping driver (another process may hold the lock)")
+				cancel()
+				return
+			}
 		}
 	}
 }
@@ -184,7 +281,7 @@ func (d *Driver) stopAll() {
 	}
 }
 
-func (d *Driver) sweep(ctx context.Context) {
+func (d *Driver) sweep(ctx context.Context, claimID string) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -197,34 +294,37 @@ func (d *Driver) sweep(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		d.sweepPersona(ctx, personaID)
+		d.sweepPersona(ctx, claimID, personaID)
 	}
 }
 
 // sweepPersona claims new work and resumes sessions this runner
 // already owns (a driver restart leaves 'claimed' rows whose leases
 // may still be live — resuming under the existing epoch is faster
-// than waiting out the sweep).
-func (d *Driver) sweepPersona(ctx context.Context, personaID string) {
-	claimed, _, err := d.store.ClaimTerminalSessions(ctx, personaID, d.cfg.RunnerID, d.cfg.Backend, d.cfg.Lease, d.cfg.ClaimLimit)
+// than waiting out the sweep). The claim identity is this lock
+// term's incarnation: sessions still held by a stale incarnation of
+// the same logical runner are stolen — epoch-bumped and re-stamped
+// in one transaction — which fences the predecessor's delivery.
+func (d *Driver) sweepPersona(ctx context.Context, claimID, personaID string) {
+	claimed, _, err := d.store.ClaimTerminalSessions(ctx, personaID, claimID, d.cfg.Backend, d.cfg.Lease, d.cfg.ClaimLimit)
 	if err != nil {
 		d.cfg.Logf("termexec: claim persona %s: %v", personaID, err)
 	}
 	for _, t := range claimed {
-		d.adopt(t)
+		d.adopt(t, claimID)
 	}
-	// Sessions already claimed by this runner: resume under the
+	// Sessions already claimed by this incarnation: resume under the
 	// existing epoch (the container survived our restart).
-	ours, err := d.store.OwnedTerminalSessions(ctx, personaID, d.cfg.RunnerID)
+	ours, err := d.store.OwnedTerminalSessions(ctx, personaID, claimID)
 	if err != nil {
 		return
 	}
 	for _, t := range ours {
-		d.adopt(t)
+		d.adopt(t, claimID)
 	}
 }
 
-func (d *Driver) adopt(t agentstate.TerminalSession) {
+func (d *Driver) adopt(t agentstate.TerminalSession, claimID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, ok := d.active[t.SessionID]; ok {
@@ -232,7 +332,11 @@ func (d *Driver) adopt(t agentstate.TerminalSession) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d.active[t.SessionID] = cancel
-	go d.runSession(ctx, t)
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.runSession(ctx, t, claimID)
+	}()
 }
 
 func (d *Driver) release(sessionID string) {
@@ -263,7 +367,7 @@ func (d *Driver) operationRequest(t agentstate.TerminalSession) runtimeprovision
 // runSession drives one claimed session: launch/attach the provisioner
 // op, then pump inputs → container and output → scrollback until the
 // session ends, the claim is lost, or the driver is told to stop.
-func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSession) {
+func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSession, claimID string) {
 	defer d.release(session.SessionID)
 	personaID, sessionID := session.PersonaID, session.SessionID
 	epoch := session.Epoch
@@ -287,7 +391,42 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 		}
 	}
 	var op runtimeprovision.ProcessOperation
-	{
+	if session.Status == "ending" {
+		// An adopted 'ending' session exists only to be stopped — it
+		// must never launch. Look the op up first: absent means the
+		// launch never journaled, so the tombstone cancel fence makes
+		// "never existed" a durable fact instead of starting a
+		// container just to kill it. A live op falls through to the
+		// pump's terminate path; a terminal one reports directly.
+		c, cancel := call()
+		var err error
+		op, err = d.proc.ProcessStatus(c, runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: personaID, OperationID: opID,
+		})
+		cancel()
+		if err != nil {
+			if errors.Is(err, runtimeprovision.ErrProcessNotFound) {
+				c, cancel = call()
+				op, err = d.proc.CancelProcess(c, runtimeprovision.ProcessLookupRequest{
+					PersonalityAgentID: personaID, OperationID: opID,
+					TombstoneIfAbsent: true,
+				})
+				cancel()
+				if err != nil {
+					d.cfg.Logf("termexec: session %s tombstone cancel: %v", sessionID, err)
+					return
+				}
+				d.reportTerminal(ctx, session, op, claimID)
+				return
+			}
+			d.cfg.Logf("termexec: session %s ending-op lookup: %v", sessionID, err)
+			return
+		}
+		if op.State.Terminal() {
+			d.reportTerminal(ctx, session, op, claimID)
+			return
+		}
+	} else {
 		c, cancel := call()
 		var err error
 		op, err = d.proc.StartProcess(c, d.operationRequest(session))
@@ -301,17 +440,29 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 		}
 	}
 	if op.State.Terminal() {
-		d.reportTerminal(ctx, session, op)
+		d.reportTerminal(ctx, session, op, claimID)
 		return
 	}
 	pump := &sessionPump{
 		d: d, ctx: ctx, sessionID: sessionID, personaID: personaID,
-		epoch: epoch, opID: opID, ending: session.Status == "ending",
+		claimID: claimID, epoch: epoch, opID: opID, ending: session.Status == "ending",
+	}
+	// Same-epoch adoption (a driver restart inside a live lease) can
+	// inherit 'dequeued' rows the previous pump never dispositioned.
+	// They are indeterminate — resolve them to 'unknown' now, under
+	// the live claim, before this pump starts serving new input. The
+	// incarnation claim fence makes a concurrent same-runner pump
+	// impossible; the claim check inside the call re-verifies
+	// (claimed_by, epoch) ownership.
+	if n, err := d.store.ResolveDequeuedTerminalInputs(ctx, personaID, sessionID, claimID, epoch); err != nil {
+		d.cfg.Logf("termexec: session %s dequeued resolution: %v", sessionID, err)
+	} else if n > 0 {
+		d.cfg.Logf("termexec: session %s resolved %d orphaned dequeued input(s) to unknown", sessionID, n)
 	}
 	if session.Status != "ending" {
 		// Bind the live op: the session becomes 'active'. An adopted
 		// 'ending' session skips this — it goes straight to terminate.
-		if _, err := d.store.ReportTerminalStatus(ctx, personaID, sessionID, d.cfg.RunnerID, epoch,
+		if _, err := d.store.ReportTerminalStatus(ctx, personaID, sessionID, claimID, epoch,
 			"active", "", nil, "", op.OperationID); err != nil {
 			return
 		}
@@ -328,6 +479,7 @@ type sessionPump struct {
 	ctx       context.Context
 	sessionID string
 	personaID string
+	claimID   string
 	epoch     int64
 	opID      string
 
@@ -364,7 +516,7 @@ func (p *sessionPump) step() bool {
 	if p.ticks%p.d.cfg.HeartbeatEvery == 0 {
 		c, cancel := p.call()
 		t, err := p.d.store.HeartbeatTerminalSession(c, p.personaID, p.sessionID,
-			p.d.cfg.RunnerID, p.epoch, p.d.cfg.Lease)
+			p.claimID, p.epoch, p.d.cfg.Lease)
 		cancel()
 		if err != nil {
 			if errors.Is(err, agentstate.ErrTerminalNotClaimed) {
@@ -399,7 +551,7 @@ func (p *sessionPump) step() bool {
 		p.drainOutput()
 		p.d.reportTerminal(p.ctx, agentstate.TerminalSession{
 			PersonaID: p.personaID, SessionID: p.sessionID, Epoch: p.epoch,
-		}, op)
+		}, op, p.claimID)
 		return false
 	}
 	p.unknownAt = time.Time{}
@@ -426,7 +578,7 @@ func (p *sessionPump) boundUnknown() bool {
 // work.
 func (p *sessionPump) dispatchInputs() bool {
 	c, cancel := p.call()
-	inputs, err := p.d.store.PendingTerminalInputs(c, p.personaID, p.sessionID, p.d.cfg.RunnerID, p.epoch)
+	inputs, err := p.d.store.PendingTerminalInputs(c, p.personaID, p.sessionID, p.claimID, p.epoch)
 	cancel()
 	if err != nil {
 		if errors.Is(err, agentstate.ErrTerminalNotClaimed) {
@@ -454,7 +606,7 @@ func (p *sessionPump) dispatchInputs() bool {
 func (p *sessionPump) disposition(inputID, status string, detail map[string]any) error {
 	c, cancel := p.call()
 	_, err := p.d.store.ReportTerminalInputDisposition(c, p.personaID, p.sessionID,
-		inputID, p.d.cfg.RunnerID, p.epoch, status, detail)
+		inputID, p.claimID, p.epoch, status, detail)
 	cancel()
 	return err
 }
@@ -572,10 +724,27 @@ func (p *sessionPump) drainOutput() {
 				p.cursor = out.NextOffset
 			}
 		}
+		// Journaled loss boundaries (journal rotation/vanish, uncertified
+		// resume) surface as explicit zero-width gap markers at their
+		// absolute stream position: the lost window's size is genuinely
+		// unknown, so the marker is a boundary — never an invented byte
+		// range and never silent contiguous output. Only boundaries the
+		// drain window has reached are emitted; later events return on
+		// the next read. (session_id, base, kind) dedupe makes a
+		// re-drained marker idempotent.
+		for _, ev := range out.Gaps {
+			if ev.At > p.cursor {
+				continue
+			}
+			gapTo := ev.At
+			chunks = append(chunks, agentstate.TerminalOutputChunk{
+				Kind: "gap", Base: ev.At, GapTo: &gapTo,
+			})
+		}
 		if len(chunks) > 0 {
 			c2, cancel2 := p.call()
 			_, err = p.d.store.AppendTerminalOutput(c2, p.personaID, p.sessionID,
-				p.d.cfg.RunnerID, p.epoch, chunks)
+				p.claimID, p.epoch, chunks)
 			cancel2()
 			if err != nil {
 				// Roll the cursor back: uncommitted chunks re-drain
@@ -596,6 +765,10 @@ func (p *sessionPump) terminate() {
 	c, cancel := p.call()
 	_, _ = p.d.proc.CancelProcess(c, runtimeprovision.ProcessLookupRequest{
 		PersonalityAgentID: p.personaID, OperationID: p.opID,
+		// If the op vanished between lookup and cancel, the tombstone
+		// fence makes "never existed" deterministic rather than an
+		// unresolvable not-found.
+		TombstoneIfAbsent: true,
 	})
 	cancel()
 	deadline := time.Now().Add(30 * time.Second)
@@ -609,7 +782,7 @@ func (p *sessionPump) terminate() {
 			p.drainOutput()
 			p.d.reportTerminal(p.ctx, agentstate.TerminalSession{
 				PersonaID: p.personaID, SessionID: p.sessionID, Epoch: p.epoch,
-			}, op)
+			}, op, p.claimID)
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -622,7 +795,7 @@ func (p *sessionPump) terminate() {
 // reportTerminal maps the op's terminal state to the session's honest
 // end. 'indeterminate' is 'lost', never 'ended' — the container's
 // fate is unknown and the row says so.
-func (d *Driver) reportTerminal(ctx context.Context, session agentstate.TerminalSession, op runtimeprovision.ProcessOperation) {
+func (d *Driver) reportTerminal(ctx context.Context, session agentstate.TerminalSession, op runtimeprovision.ProcessOperation, claimID string) {
 	status, reason := "ended", "shell_exit"
 	var exitCode *int
 	if op.ExitCode != nil {
@@ -665,7 +838,7 @@ func (d *Driver) reportTerminal(ctx context.Context, session agentstate.Terminal
 	}
 	c, cancel := context.WithTimeout(ctx, d.cfg.CallTimeout)
 	_, err := d.store.ReportTerminalStatus(c, session.PersonaID, session.SessionID,
-		d.cfg.RunnerID, session.Epoch, status, reason, exitCode, "", op.OperationID)
+		claimID, session.Epoch, status, reason, exitCode, "", op.OperationID)
 	cancel()
 	if err != nil {
 		d.cfg.Logf("termexec: session %s terminal report: %v", session.SessionID, err)

@@ -3,6 +3,7 @@ package agentevents
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -153,7 +154,7 @@ func (b *fakeTerminalBackend) GetTerminalSession(_ context.Context, personaID, s
 	return s, nil
 }
 
-func (b *fakeTerminalBackend) ReadTerminalOutput(_ context.Context, personaID, sessionID string, cursor int64, _ int) (agentstate.TerminalOutputRead, error) {
+func (b *fakeTerminalBackend) ReadTerminalOutput(_ context.Context, personaID, sessionID string, cursor, eventCursor int64, _ int) (agentstate.TerminalOutputRead, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.readErr != nil {
@@ -163,26 +164,33 @@ func (b *fakeTerminalBackend) ReadTerminalOutput(_ context.Context, personaID, s
 	if !ok || s.PersonaID != personaID {
 		return agentstate.TerminalOutputRead{}, agentstate.ErrTerminalNotFound
 	}
-	// Same filter as the store: only chunks extending past the cursor.
+	// Same filter as the store: chunks extending past the byte cursor,
+	// plus unconsumed zero-width loss markers (seq > eventCursor).
 	var chunks []agentstate.TerminalOutputChunk
 	next := cursor
+	nextEvent := eventCursor
 	for _, c := range b.readChunks {
 		end := c.Base + int64(len(c.Data))
 		if c.Kind == "gap" && c.GapTo != nil {
 			end = *c.GapTo
 		}
-		if end > cursor {
+		marker := c.Kind == "gap" && c.GapTo != nil && *c.GapTo == c.Base
+		if end > cursor || (marker && c.Seq > eventCursor) {
 			chunks = append(chunks, c)
+			if c.Seq > nextEvent {
+				nextEvent = c.Seq
+			}
 		}
 		if end > next {
 			next = end
 		}
 	}
 	return agentstate.TerminalOutputRead{
-		Session:    s,
-		Cursor:     cursor,
-		NextCursor: next,
-		Chunks:     chunks,
+		Session:     s,
+		Cursor:      cursor,
+		NextCursor:  next,
+		EventCursor: nextEvent,
+		Chunks:      chunks,
 	}, nil
 }
 
@@ -675,5 +683,141 @@ func TestTerminalWSAttachRefusals(t *testing.T) {
 	_, resp, err = dial(testTerminalScopeQuery+"&session_id=0198f0f4-9b72-7000-8000-00000000bb01", "https://sumi.example")
 	if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("unbound sessions attach: err=%v resp=%v", err, resp)
+	}
+}
+
+// A reader caught up at a zero-width loss boundary still receives the
+// event — gated by event_cursor, not byte progress — exactly once.
+func TestTerminalRESTLossMarkerEventCursor(t *testing.T) {
+	verifier, server, backend, _, mux := newTerminalBrowserFixture(t)
+	server.Authorizer = &denyDirectChatAuthorizer{}
+	cookie := terminalCookie(t, verifier)
+	backend.add(agentstate.TerminalSession{
+		SessionID: "0198f0f4-9b72-7000-8000-00000000bb01", PersonaID: testTerminalPersonaID,
+		Status: "active", Mode: "pty", Backend: "cloud",
+		OutputBytes: 8, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	at := int64(8)
+	backend.readChunks = []agentstate.TerminalOutputChunk{
+		{Seq: 1, Kind: "data", Base: 0, Data: []byte("caughtup")},
+		{Seq: 2, Kind: "gap", Base: at, GapTo: &at},
+	}
+	q := "?" + testTerminalScopeQuery +
+		"&session_id=0198f0f4-9b72-7000-8000-00000000bb01&cursor=8"
+
+	w := terminalDo(t, mux, cookie, http.MethodGet, "/terminal/read"+q, "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("read: %d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Cursor      int64            `json:"cursor"`
+		NextCursor  int64            `json:"next_cursor"`
+		EventCursor int64            `json:"event_cursor"`
+		Chunks      []map[string]any `json:"chunks"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var sawMarker bool
+	for _, c := range body.Chunks {
+		if c["kind"] == "gap" && c["base"] == float64(8) {
+			sawMarker = true
+		}
+	}
+	if !sawMarker {
+		t.Fatalf("loss marker at the reader's cursor was not served: %+v", body.Chunks)
+	}
+	if body.EventCursor != 2 {
+		t.Fatalf("event_cursor = %d, want 2", body.EventCursor)
+	}
+	if body.NextCursor != 8 {
+		t.Fatalf("marker moved byte cursor: next_cursor = %d", body.NextCursor)
+	}
+
+	// Echoing event_cursor consumes the marker — repeated polls never
+	// re-serve it.
+	w2 := terminalDo(t, mux, cookie, http.MethodGet,
+		"/terminal/read"+q+"&event_cursor=2", "", nil)
+	var body2 struct {
+		Chunks []map[string]any `json:"chunks"`
+	}
+	if err := json.NewDecoder(w2.Body).Decode(&body2); err != nil {
+		t.Fatalf("decode2: %v", err)
+	}
+	for _, c := range body2.Chunks {
+		if c["kind"] == "gap" {
+			t.Fatalf("consumed marker re-served: %+v", body2.Chunks)
+		}
+	}
+}
+
+// The WS pump tracks the event cursor per attach: a caught-up attach
+// sees the boundary frame once — carrying its event_seq so the client
+// can resume marker consumption on reconnect.
+func TestTerminalWSEmitsLossMarkerOnce(t *testing.T) {
+	verifier, server, backend, _, mux := newTerminalBrowserFixture(t)
+	server.AuthorizationPollInterval = time.Hour
+	cookie := terminalCookie(t, verifier)
+	backend.add(agentstate.TerminalSession{
+		SessionID: "0198f0f4-9b72-7000-8000-00000000bb01", PersonaID: testTerminalPersonaID,
+		Status: "active", Mode: "pty", Backend: "cloud",
+		OutputBytes: 8, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	at := int64(8)
+	backend.readChunks = []agentstate.TerminalOutputChunk{
+		{Seq: 1, Kind: "data", Base: 0, Data: []byte("caughtup")},
+		{Seq: 2, Kind: "gap", Base: at, GapTo: &at},
+	}
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	header := http.Header{}
+	header.Add("Cookie", cookie.String())
+	header.Add("Origin", "https://sumi.example")
+	conn, _, err := websocket.DefaultDialer.Dial(
+		strings.Replace(httpServer.URL, "http", "ws", 1)+
+			"/terminal/ws?"+testTerminalScopeQuery+
+			"&session_id=0198f0f4-9b72-7000-8000-00000000bb01&cursor=8",
+		header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	frames := make(chan map[string]any, 32)
+	go func() {
+		defer close(frames)
+		for {
+			var frame map[string]any
+			if err := conn.ReadJSON(&frame); err != nil {
+				return
+			}
+			frames <- frame
+		}
+	}()
+	var gaps []map[string]any
+	deadline := time.After(900 * time.Millisecond)
+loop:
+	for {
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				break loop
+			}
+			if frame["type"] == "gap" {
+				gaps = append(gaps, frame)
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+	// The boundary event arrives exactly once even though the byte
+	// cursor never advances past it.
+	if len(gaps) != 1 {
+		t.Fatalf("gap frames = %d, want exactly 1: %v", len(gaps), gaps)
+	}
+	if gaps[0]["base"].(float64) != 8 || gaps[0]["to"].(float64) != 8 {
+		t.Fatalf("gap frame = %v, want zero-width boundary at 8", gaps[0])
+	}
+	if gaps[0]["event_seq"].(float64) != 2 {
+		t.Fatalf("gap frame missing event_seq: %v", gaps[0])
 	}
 }

@@ -33,10 +33,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var (
@@ -438,10 +442,30 @@ func (s *Store) CloseTerminalSession(ctx context.Context, personaID, sessionID, 
 		}
 		return t, nil
 	}
-	// No live claim: nothing runs that could still be stopped.
-	// 'interrupted'/'requested'/'claimed-dead' all end here.
-	if err := s.endTerminalSessionTx(ctx, tx, &t, "ended", reason, nil, ""); err != nil {
-		return TerminalSession{}, err
+	// No live claim. 'requested' never had a runner — nothing exists to
+	// stop, so ending it is a definite fact. But 'interrupted' and
+	// dead-lease 'claimed'/'active' rows may still have a live
+	// provisioner op (claim lapse does not stop containers). Stamping
+	// 'ended' would certify a stop that never ran AND remove the
+	// session from every claimable state — the physical stop intent
+	// would be dropped for good. Instead stamp 'ending' with the claim
+	// cleared: 'ending AND claimed_by IS NULL' is claimable, so the
+	// next claim's runner re-attaches and performs the real stop.
+	if t.Status == "requested" {
+		if err := s.endTerminalSessionTx(ctx, tx, &t, "ended", reason, nil, ""); err != nil {
+			return TerminalSession{}, err
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE core_terminal_sessions
+			SET status = 'ending', claimed_by = NULL, claim_expires_at = NULL, updated_at = now()
+			WHERE persona_id = $1 AND session_id = $2`,
+			personaID, sessionID); err != nil {
+			return TerminalSession{}, dataErr(err)
+		}
+		t.Status = "ending"
+		t.ClaimedBy = ""
+		t.ClaimExpiresAt = nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return TerminalSession{}, err
@@ -462,12 +486,21 @@ func (s *Store) endTerminalSessionTx(ctx context.Context, tx pgx.Tx, t *Terminal
 	if err != nil {
 		return dataErr(err)
 	}
-	// Inputs still deliverable at end are expired, not 'unknown' —
-	// the session ended before delivery, which is a definite fact.
+	// 'intended' rows provably never left the ledger — 'expired' is a
+	// definite fact. 'dequeued' rows are indeterminate by definition:
+	// the runner may already have written the bytes before it died —
+	// the same 'unknown' the claim-bump path records, never resent.
 	if _, err := tx.Exec(ctx, `
 		UPDATE core_terminal_inputs
 		SET status = 'expired', updated_at = now()
-		WHERE session_id = $1 AND status IN ('intended', 'dequeued')`,
+		WHERE session_id = $1 AND status = 'intended'`,
+		t.SessionID); err != nil {
+		return dataErr(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE core_terminal_inputs
+		SET status = 'unknown', updated_at = now()
+		WHERE session_id = $1 AND status = 'dequeued'`,
 		t.SessionID); err != nil {
 		return dataErr(err)
 	}
@@ -512,19 +545,35 @@ func (s *Store) notifyTerminalEndedTx(ctx context.Context, tx pgx.Tx, t *Termina
 // ReadTerminalOutput serves scrollback to humans and the secretary.
 // The cursor is an absolute emitted offset: below output_base the
 // caller observes an explicit gap, never silent truncation.
+//
+// Loss-event markers are zero-width gap rows (kind='gap' with
+// gap_to = base) naming a journal-loss boundary whose lost byte
+// count is unknown. They carry no byte range, so byte progress
+// alone cannot express whether a reader has already consumed one:
+// end > cursor hides them at a caught-up cursor while end >= cursor
+// would replay them forever. The reader therefore tracks a second
+// progress dimension — eventCursor, a chunk-seq high-water mark.
+// Markers are served exactly when seq > eventCursor; the response's
+// EventCursor is echoed back on the next read to consume each
+// notification once. An omitted/zero eventCursor means a fresh
+// reader: every marker is served once, then suppressed.
 type TerminalOutputRead struct {
-	Session    TerminalSession       `json:"session"`
-	Base       int64                 `json:"base"`
-	Cursor     int64                 `json:"cursor"`
-	NextCursor int64                 `json:"next_cursor"`
-	Chunks     []TerminalOutputChunk `json:"chunks"`
-	Gap        bool                  `json:"gap"`
-	EOF        bool                  `json:"eof"`
+	Session     TerminalSession       `json:"session"`
+	Base        int64                 `json:"base"`
+	Cursor      int64                 `json:"cursor"`
+	NextCursor  int64                 `json:"next_cursor"`
+	EventCursor int64                 `json:"event_cursor"`
+	Chunks      []TerminalOutputChunk `json:"chunks"`
+	Gap         bool                  `json:"gap"`
+	EOF         bool                  `json:"eof"`
 }
 
-func (s *Store) ReadTerminalOutput(ctx context.Context, personaID, sessionID string, cursor int64, limit int) (TerminalOutputRead, error) {
+func (s *Store) ReadTerminalOutput(ctx context.Context, personaID, sessionID string, cursor, eventCursor int64, limit int) (TerminalOutputRead, error) {
 	if cursor < 0 {
 		cursor = 0
+	}
+	if eventCursor < 0 {
+		eventCursor = 0
 	}
 	if limit <= 0 || limit > 64 {
 		limit = 32
@@ -542,9 +591,12 @@ func (s *Store) ReadTerminalOutput(ctx context.Context, personaID, sessionID str
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id, seq, kind, base, gap_to, data, created_at
 		FROM core_terminal_output
-		WHERE session_id = $1::uuidv7 AND (base + COALESCE(gap_to, 0) + octet_length(data)) > $2
-		ORDER BY seq LIMIT $3`,
-		sessionID, cursor, limit+1)
+		WHERE session_id = $1::uuidv7 AND (
+			GREATEST(base + octet_length(data), COALESCE(gap_to, 0)) > $2
+			OR (kind = 'gap' AND gap_to = base AND seq > $3)
+		)
+		ORDER BY seq LIMIT $4`,
+		sessionID, cursor, eventCursor, limit+1)
 	if err != nil {
 		return TerminalOutputRead{}, dataErr(err)
 	}
@@ -562,7 +614,11 @@ func (s *Store) ReadTerminalOutput(ctx context.Context, personaID, sessionID str
 	}
 	gap := cursor < t.OutputBase
 	next := cursor
+	nextEvent := eventCursor
 	for _, c := range chunks {
+		if c.Seq > nextEvent {
+			nextEvent = c.Seq
+		}
 		end := c.Base
 		if c.Kind == "gap" && c.GapTo != nil {
 			end = *c.GapTo
@@ -576,7 +632,7 @@ func (s *Store) ReadTerminalOutput(ctx context.Context, personaID, sessionID str
 	eof := !terminalLive(t.Status) && next >= t.OutputBytes
 	return TerminalOutputRead{
 		Session: t, Base: t.OutputBase, Cursor: cursor,
-		NextCursor: next, Chunks: chunks, Gap: gap, EOF: eof,
+		NextCursor: next, EventCursor: nextEvent, Chunks: chunks, Gap: gap, EOF: eof,
 	}, nil
 }
 
@@ -588,12 +644,17 @@ func (s *Store) RunnableTerminalPersonas(ctx context.Context, runnerID, backend 
 	if limit <= 0 {
 		limit = 64
 	}
+	// The runner identity is a logical name; each lock acquisition
+	// claims under a distinct incarnation ("runner#inc"). Discovery
+	// matches the logical runner so sessions owned by any incarnation
+	// — current or stale — keep this persona runnable.
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT persona_id FROM core_terminal_sessions
 		WHERE backend = $2
 		  AND (status IN ('requested', 'interrupted')
 		       OR (status = 'ending' AND claimed_by IS NULL)
-		       OR (claimed_by = $1 AND status IN ('claimed', 'active', 'ending')))
+		       OR ((claimed_by = $1 OR claimed_by LIKE $1 || '#%')
+		           AND status IN ('claimed', 'active', 'ending')))
 		ORDER BY persona_id LIMIT $3`,
 		runnerID, backend, limit)
 	if err != nil {
@@ -635,12 +696,37 @@ func (s *Store) OwnedTerminalSessions(ctx context.Context, personaID, runnerID s
 	return out, dataErr(rows.Err())
 }
 
+// claimLogicalRunner extracts the stable runner identity from a
+// claim id. Claims are stamped "runner#incarnation" — a fresh
+// incarnation per advisory-lock acquisition — so two processes that
+// legitimately share a RunnerID across a lock handoff cannot both
+// hold delivery authority: the successor's claim bumps the epoch and
+// re-stamps 'intended' rows, which fences every stale-incarnation
+// disposition, append, heartbeat, and report.
+func claimLogicalRunner(runnerID string) string {
+	if i := strings.IndexByte(runnerID, '#'); i >= 0 {
+		return runnerID[:i]
+	}
+	return runnerID
+}
+
 // ClaimTerminalSessions is the runner's periodic call: it sweeps
 // expired claims to 'interrupted' (reclaimable — the container may
 // still be running, only our claim lapsed) and claims up to limit
 // requested/interrupted sessions, bumping each epoch so stale-epoch
 // input dispositions, output appends, and status reports all fence.
+//
+// A session still claimed by a *stale incarnation of the same
+// logical runner* is claimable by steal: the advisory lock guarantees
+// the old process lost ownership before this claimer could acquire
+// it, but its lease may not have lapsed and its pump may still be
+// draining a cached input. Stealing re-stamps every 'intended' row
+// to the new epoch and marks 'dequeued' rows 'unknown' — atomically,
+// in the same transaction — so a stale pump's cached row can never
+// gain fresh delivery authority and an indeterminate row is never
+// re-served.
 func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, backend string, lease time.Duration, limit int) (claimed []TerminalSession, interrupted []TerminalSession, err error) {
+	logical := claimLogicalRunner(runnerID)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -657,9 +743,12 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 		SELECT `+terminalSessionCols+` FROM core_terminal_sessions
 		WHERE persona_id = $1 AND backend = $2
 		  AND (status IN ('requested', 'interrupted')
-		       OR (status = 'ending' AND claimed_by IS NULL))
+		       OR (status = 'ending' AND claimed_by IS NULL)
+		       OR (claimed_by <> $4
+		           AND status IN ('claimed', 'active', 'ending')
+		           AND (claimed_by = $5 OR claimed_by LIKE $5 || '#%')))
 		ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $3`,
-		personaID, backend, limit)
+		personaID, backend, limit, runnerID, logical)
 	if err != nil {
 		return nil, nil, dataErr(err)
 	}
@@ -688,9 +777,12 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 				claim_expires_at = now() + $5::interval, updated_at = now()
 			WHERE persona_id = $1 AND session_id = $2
 			  AND (status IN ('requested', 'interrupted')
-			       OR (status = 'ending' AND claimed_by IS NULL))`,
+			       OR (status = 'ending' AND claimed_by IS NULL)
+			       OR (claimed_by <> $4
+			           AND status IN ('claimed', 'active', 'ending')
+			           AND (claimed_by = $6 OR claimed_by LIKE $6 || '#%')))`,
 			personaID, t.SessionID, epoch, runnerID,
-			fmt.Sprintf("%d milliseconds", lease.Milliseconds()))
+			fmt.Sprintf("%d milliseconds", lease.Milliseconds()), logical)
 		if err != nil {
 			return nil, nil, dataErr(err)
 		}
@@ -918,6 +1010,124 @@ func (s *Store) PendingTerminalInputs(ctx context.Context, personaID, sessionID,
 	return out, err
 }
 
+// ResolveDequeuedTerminalInputs marks this epoch's orphan 'dequeued'
+// rows 'unknown' under the live claim. A runner calls it once when it
+// adopts a session it already owns (same-epoch resume): rows the
+// previous pump left 'dequeued' are indeterminate — maybe delivered —
+// and PendingTerminalInputs correctly never re-serves them, but
+// without this sweep they would sit unresolved until the next epoch
+// bump or session end. It runs inside terminalClaimTx so it can only
+// fire while this process holds the claim; combined with the runner
+// advisory lock (one live driver per RunnerID) it cannot race a
+// still-live pump — and even if it somehow did, a later 'written'
+// disposition is refused on a row that is already 'unknown', which
+// stays honest (maybe-delivered, never resent) rather than claiming
+// non-delivery.
+func (s *Store) ResolveDequeuedTerminalInputs(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) (int64, error) {
+	var resolved int64
+	err := s.terminalClaimTx(ctx, personaID, sessionID, runnerID, epoch, func(ctx context.Context, tx pgx.Tx, t *TerminalSession) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE core_terminal_inputs
+			SET status = 'unknown', updated_at = now()
+			WHERE session_id = $1 AND session_epoch = $2 AND status = 'dequeued'`,
+			sessionID, epoch)
+		if err != nil {
+			return dataErr(err)
+		}
+		resolved = res.RowsAffected()
+		return nil
+	}, nil)
+	return resolved, err
+}
+
+// terminalRunnerLockKey derives the advisory-lock key for a runner
+// identity: one Postgres session may hold it at a time, fencing
+// driver *processes*, not just claim epochs.
+func terminalRunnerLockKey(runnerID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("sumi-terminal-runner:" + runnerID))
+	return int64(h.Sum64())
+}
+
+// TryAcquireTerminalRunnerLock attempts the session-scoped advisory
+// lock for this runner identity on a dedicated pooled connection.
+// The lock dies with the connection, so a crashed process releases
+// automatically and a restarting driver safely takes over. The
+// returned handle MUST be kept: callers should heartbeat it (a dead
+// lock connection means another process may already hold the lock —
+// continuing to pump would be the duplicate-delivery hazard this
+// fence exists to prevent) and release it on shutdown.
+func (s *Store) TryAcquireTerminalRunnerLock(ctx context.Context, runnerID string) (*TerminalRunnerLock, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var held bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, terminalRunnerLockKey(runnerID)).Scan(&held); err != nil {
+		conn.Release()
+		return nil, dataErr(err)
+	}
+	if !held {
+		conn.Release()
+		return nil, nil
+	}
+	var pid int
+	_ = conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid)
+	return &TerminalRunnerLock{conn: conn, pid: pid}, nil
+}
+
+// TerminalRunnerLock is the held advisory lock: Ping verifies the
+// connection (and therefore the lock) is still alive; Release frees
+// both. The mutex serializes Ping and Release so a shutdown never
+// releases the pool connection out from under a watchdog probe.
+type TerminalRunnerLock struct {
+	mu   sync.Mutex
+	conn *pgxpool.Conn
+	pid  int
+}
+
+// PID is the Postgres backend pid holding the lock connection,
+// recorded at acquisition — ops and tests identify the exact
+// connection to terminate without guessing from activity tables.
+func (l *TerminalRunnerLock) PID() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.pid
+}
+
+// Ping reports whether the lock connection is still alive. False
+// means the lock may already be held by another process — the caller
+// must stop driving immediately.
+func (l *TerminalRunnerLock) Ping(ctx context.Context) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn == nil {
+		return false
+	}
+	return l.conn.Ping(ctx) == nil
+}
+
+// Release frees the advisory lock and returns the connection.
+func (l *TerminalRunnerLock) Release(ctx context.Context) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.conn == nil {
+		return
+	}
+	_, _ = l.conn.Exec(ctx, `SELECT pg_advisory_unlock_all()`)
+	l.conn.Release()
+	l.conn = nil
+}
+
 // ReportTerminalInputDisposition records one input hop under the
 // claim: intended → dequeued → written | failed | unknown. A
 // disposition for a stale epoch or foreign runner is refused.
@@ -1087,9 +1297,15 @@ func (s *Store) ReportTerminalStatus(ctx context.Context, personaID, sessionID, 
 	var out TerminalSession
 	err := s.terminalClaimTx(ctx, personaID, sessionID, runnerID, epoch, func(ctx context.Context, tx pgx.Tx, t *TerminalSession) error {
 		if status == "active" {
+			// The report records the live operation id unconditionally,
+			// but a durable 'ending' can never be resurrected: a close
+			// that landed between claim and this report keeps its
+			// intent — the runner's next heartbeat observes 'ending'
+			// and terminates the op it just launched.
 			if _, err := tx.Exec(ctx, `
 				UPDATE core_terminal_sessions
-				SET status = 'active', operation_id = $3, updated_at = now()
+				SET status = CASE WHEN status = 'ending' THEN 'ending' ELSE 'active' END,
+					operation_id = $3, updated_at = now()
 				WHERE persona_id = $1 AND session_id = $2`,
 				personaID, sessionID, operationID); err != nil {
 				return dataErr(err)
@@ -1143,6 +1359,13 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 		if c, ok := request["cursor"].(float64); ok {
 			cursor = int64(c)
 		}
+		// event_cursor tracks consumed zero-width loss markers by
+		// chunk seq — the byte cursor alone cannot express whether a
+		// boundary event at the current position was already seen.
+		var eventCursor int64
+		if e, ok := request["event_cursor"].(float64); ok {
+			eventCursor = int64(e)
+		}
 		limit := 32
 		if l, ok := request["limit"].(float64); ok {
 			limit = int(l)
@@ -1168,8 +1391,11 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 		rows, err := tx.Query(ctx, `
 			SELECT session_id, seq, kind, base, gap_to, data, created_at
 			FROM core_terminal_output
-			WHERE session_id = $1::uuidv7 AND (base + COALESCE(gap_to, 0) + octet_length(data)) > $2
-			ORDER BY seq LIMIT $3`, sessionID, cursor, limit+1)
+			WHERE session_id = $1::uuidv7 AND (
+				GREATEST(base + octet_length(data), COALESCE(gap_to, 0)) > $2
+				OR (kind = 'gap' AND gap_to = base AND seq > $3)
+			)
+			ORDER BY seq LIMIT $4`, sessionID, cursor, eventCursor, limit+1)
 		if err != nil {
 			return nil, dataErr(err)
 		}
@@ -1187,7 +1413,11 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 		}
 		var text string
 		next := cursor
+		nextEvent := eventCursor
 		for _, c := range chunks {
+			if c.Seq > nextEvent {
+				nextEvent = c.Seq
+			}
 			if c.Kind == "gap" {
 				to := c.Base
 				if c.GapTo != nil {
@@ -1196,7 +1426,15 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 				if to > next {
 					next = to
 				}
-				text += fmt.Sprintf("\n[output lost: bytes %d–%d were compacted away]\n", c.Base, to)
+				if to == c.Base {
+					// A zero-width boundary is a journaled loss event
+					// (journal rotation/vanish, uncertified resume): the
+					// lost window's size is unknown, so the marker names
+					// the boundary, never an invented byte range.
+					text += fmt.Sprintf("\n[output may be missing at byte %d — journal loss boundary]\n", c.Base)
+				} else {
+					text += fmt.Sprintf("\n[output lost: bytes %d–%d were compacted away]\n", c.Base, to)
+				}
 				continue
 			}
 			end := c.Base + int64(len(c.Data))
@@ -1206,14 +1444,15 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 			text += string(c.Data)
 		}
 		return map[string]any{
-			"session":     t,
-			"base":        t.OutputBase,
-			"cursor":      cursor,
-			"next_cursor": next,
-			"gap":         cursor < t.OutputBase,
-			"eof":         !terminalLive(t.Status) && next >= t.OutputBytes,
-			"content":     text,
-			"content_b64": base64.StdEncoding.EncodeToString([]byte(text)),
+			"session":      t,
+			"base":         t.OutputBase,
+			"cursor":       cursor,
+			"next_cursor":  next,
+			"event_cursor": nextEvent,
+			"gap":          cursor < t.OutputBase,
+			"eof":          !terminalLive(t.Status) && next >= t.OutputBytes,
+			"content":      text,
+			"content_b64":  base64.StdEncoding.EncodeToString([]byte(text)),
 		}, nil
 	case "terminal.inputs":
 		// The secretary's view of the same durable ledger the person
@@ -1307,8 +1546,25 @@ func (s *Store) internalTerminalTool(ctx context.Context, tx pgx.Tx, personaID, 
 			t.Status = "ending"
 			return map[string]any{"session": t}, nil
 		}
-		if err := s.endTerminalSessionTx(ctx, tx, &t, "ended", "closed", nil, ""); err != nil {
-			return nil, err
+		// Same rule as CloseTerminalSession: only 'requested' ends
+		// outright. An 'interrupted' or dead-lease row may still have a
+		// live op — stamp 'ending' + clear the claim so a reclaiming
+		// runner performs the physical stop instead of certifying one
+		// that never ran.
+		if t.Status == "requested" {
+			if err := s.endTerminalSessionTx(ctx, tx, &t, "ended", "closed", nil, ""); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err := tx.Exec(ctx, `
+				UPDATE core_terminal_sessions
+				SET status = 'ending', claimed_by = NULL, claim_expires_at = NULL, updated_at = now()
+				WHERE persona_id = $1 AND session_id = $2`, personaID, sessionID); err != nil {
+				return nil, dataErr(err)
+			}
+			t.Status = "ending"
+			t.ClaimedBy = ""
+			t.ClaimExpiresAt = nil
 		}
 		return map[string]any{"session": t}, nil
 	}

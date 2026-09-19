@@ -652,7 +652,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "terminal.read",
     description:
-      "Read terminal output from a durable scrollback. Returns base64 chunks with absolute byte offsets plus the session status. Keep the returned cursor and pass it back to continue where you left off; a gap entry means output was compacted away before your cursor — treat the bytes as lost, not silently skipped.",
+      "Read terminal output from a durable scrollback. Returns base64 chunks with absolute byte offsets plus the session status. Keep the returned next_cursor AND event_cursor and pass both back to continue where you left off: a gap entry means output was compacted away before your cursor — treat the bytes as lost, not silently skipped — and an '[output may be missing at byte N]' marker is a journal-loss boundary whose lost size is unknown. event_cursor consumes those markers exactly once; omitting it re-reads them as a fresh reader.",
     parameters: {
       type: "object",
       properties: {
@@ -661,6 +661,12 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
           type: "integer",
           minimum: 0,
           description: "absolute output offset to read from; omit for the latest tail",
+        },
+        event_cursor: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "event_cursor from the previous read — loss markers already consumed are not repeated",
         },
         tail: {
           type: "boolean",

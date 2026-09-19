@@ -386,13 +386,26 @@ func (service *Service) ReadProcessOutput(ctx context.Context, r ProcessOutputRe
 			return ProcessOutput{}, err
 		}
 		_, total := io_.tty.stats()
-		return ProcessOutput{
+		out := ProcessOutput{
 			OperationID: r.OperationID, Stream: r.Stream, Offset: r.Offset,
 			NextOffset: next, Content: string(data),
 			EOF:        operation.State.terminal() && next >= total,
 			Truncated:  gap,
 			BaseOffset: base, Gap: gap,
-		}, nil
+		}
+		// Journaled loss boundaries (rotation, vanished journal,
+		// uncertified resume) must reach readers too — otherwise a
+		// rotation under load is a silent hole in the scrollback.
+		// Return every boundary at or ahead of the requested offset;
+		// the caller emits an explicit gap marker when its cursor
+		// reaches each one. Unknown-size loss stays a boundary, never
+		// an invented byte range.
+		if events, err := io_.tty.gapsAtOrAfter(r.Offset); err == nil {
+			for _, ev := range events {
+				out.Gaps = append(out.Gaps, ProcessOutputGap{At: ev.At, Note: ev.Note})
+			}
+		}
+		return out, nil
 	}
 	record.mu.Lock()
 	defer record.mu.Unlock()
