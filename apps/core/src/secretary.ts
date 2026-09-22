@@ -183,8 +183,9 @@ export class Secretary {
   private lease: WriterLease | null = null;
   private running = false;
   /**
-   * Model-visible tool specs, resolved once against the store's claimable
-   * set: the model is never offered a tool this state cannot execute (f99 —
+   * Model-visible tool specs, cached after successful discovery against the
+   * store's claimable set: delegated tools are only offered after discovery
+   * confirms that this state can execute them (f99 —
    * e.g. messaging.send is absent until the host registers its effect).
    */
   private specs?: ToolSpec[];
@@ -195,9 +196,11 @@ export class Secretary {
         new Set(await this.cfg.state.listTools(this.cfg.personaId)),
       );
     } catch {
-      // An older state service without the tools route: intrinsic internal
-      // tools are always claimable in Go; delegated ones stay withheld.
-      this.specs = toolSpecs();
+      // Keep intrinsic internal tools available while discovery is down,
+      // withholding unconfirmed delegated effects. Do not cache a failed
+      // lookup: the next consultation can recover without restarting this
+      // secretary's host.
+      return toolSpecs();
     }
     return this.specs;
   }
