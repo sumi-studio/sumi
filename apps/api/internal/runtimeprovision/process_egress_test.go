@@ -2,6 +2,7 @@ package runtimeprovision
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,9 +130,13 @@ func TestLaunchProcessEgressArgs(t *testing.T) {
 		"--env HTTP_PROXY=http://127.0.0.1:3128",
 		"--env https_proxy=http://127.0.0.1:3128",
 		"--env ALL_PROXY=http://127.0.0.1:3128",
-		"--env NO_PROXY=",
+		"--env NO_PROXY=localhost,127.0.0.1,::1",
+		"--env no_proxy=localhost,127.0.0.1,::1",
+		// pip --user console scripts land in /workspace/.local/bin; job
+		// egress PATH puts the user site first.
+		"--env PATH=/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin",
 		"--env KEEP_ME=yes",
-		"sumi-egress-bridge",
+		"setsid /usr/local/bin/sumi-egress-bridge",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("create args missing %q:\n%s", want, joined)
@@ -165,6 +170,10 @@ func TestLaunchProcessNoEgressUnchanged(t *testing.T) {
 	if !strings.Contains(joined, `printf '%s\n' "$1"; shift; exec "$@"`) {
 		t.Fatalf("batch payload changed without egress:\n%s", joined)
 	}
+	// No user-site PATH and no setsid bridge without egress either.
+	if strings.Contains(joined, ".local/bin") || strings.Contains(joined, "setsid") {
+		t.Fatalf("egress-only PATH/prelude leaked into unconfigured launch:\n%s", joined)
+	}
 }
 
 // Egress configured but a non-job image: no mount, no proxy env — the
@@ -186,7 +195,7 @@ func TestLaunchProcessEgressInteractive(t *testing.T) {
 	args := launchArgs(t, []string{"SUMI_JOB_EGRESS_DIR=/run/sumi/egress"}, o)
 	joined := joinedArgs(args)
 	for _, want := range []string{
-		"sumi-egress-bridge", "exec \"$@\"", "--entrypoint /bin/bash",
+		"setsid /usr/local/bin/sumi-egress-bridge", "exec \"$@\"", "--entrypoint /bin/bash",
 		"type=bind,src=/run/sumi/egress,dst=/run/sumi/egress",
 		"--interactive", "--tty",
 	} {
@@ -225,5 +234,24 @@ func TestFakeDockerShimSanity(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "sumi-abc_workspace") {
 		t.Fatalf("shim output: %s", out)
+	}
+}
+
+// The honest non-TTY surface: interactive-without-tty is rejected at
+// request validation (process_types.go), so no signal path exists for a
+// bridge to survive — there is nothing to leave orphaned.
+func TestNonTTYInteractiveRejected(t *testing.T) {
+	r := ProcessStartRequest{
+		PersonalityAgentID:    uuid.NewString(),
+		OriginatingToolCallID: "term:x",
+		Executable:            "/bin/bash",
+		Cwd:                   ".",
+		TimeoutSeconds:        60,
+		Image:                 "job",
+		Interactive:           true,
+		TTY:                   false,
+	}
+	if err := r.Validate(); !errors.Is(err, ErrInvalidProcessRequest) {
+		t.Fatalf("interactive-without-tty should be rejected, got %v", err)
 	}
 }

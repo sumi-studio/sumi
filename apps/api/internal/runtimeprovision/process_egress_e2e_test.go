@@ -22,7 +22,15 @@ import (
 // The egress proxy runs as a plain local process on the test's socket —
 // the same binary and protocol the job-egress-proxy container serves.
 
-const egressFixtureLabel = "sumi-netdeps-20260922"
+// egressFixtureLabel is the ownership label stamped on every docker
+// fixture these tests create. SUMI_TEST_EGRESS_LABEL overrides it so a
+// different run can claim its own resources.
+func egressFixtureLabel() string {
+	if l := os.Getenv("SUMI_TEST_EGRESS_LABEL"); l != "" {
+		return l
+	}
+	return "sumi-netdeps-20260922"
+}
 
 func egressE2EBackend(t *testing.T, egressDir string) (*DockerBackend, string) {
 	t.Helper()
@@ -39,7 +47,7 @@ func egressE2EBackend(t *testing.T, egressDir string) (*DockerBackend, string) {
 // so DNS and public dials resolve exactly as they do in production.
 func startEgressProxy(t *testing.T, dir string) (socketPath string) {
 	t.Helper()
-	return startEgressProxyLabelled(t, dir, egressFixtureLabel)
+	return startEgressProxyLabelled(t, dir, egressFixtureLabel())
 }
 
 func startEgressProxyLabelled(t *testing.T, dir, label string) (socketPath string) {
@@ -146,7 +154,7 @@ func egressOutput(t *testing.T, s *Service, op ProcessOperation, stream string) 
 
 func seedEgressWorkspace(t *testing.T, persona, tag string) string {
 	t.Helper()
-	return seedEgressWorkspaceLabelled(t, persona, tag, egressFixtureLabel)
+	return seedEgressWorkspaceLabelled(t, persona, tag, egressFixtureLabel())
 }
 
 func seedEgressWorkspaceLabelled(t *testing.T, persona, tag, label string) string {

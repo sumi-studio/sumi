@@ -47,6 +47,13 @@ RUN apt-get update \
 
 COPY --from=bridge /usr/local/bin/sumi-egress-bridge /usr/local/bin/sumi-egress-bridge
 
+# Login shells (the shared terminal runs `bash -l`) reset PATH in
+# /etc/profile, which would drop the egress user-site bin dir the
+# provisioner puts on the container PATH. This profile.d snippet restores
+# it — only while the egress mount is present — so `pip --user` console
+# scripts stay runnable by name across terminal sessions.
+COPY deploy/job/sumi-egress-path.sh /etc/profile.d/sumi-egress-path.sh
+
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 # No ENTRYPOINT — the provisioner supplies --entrypoint /bin/bash and the

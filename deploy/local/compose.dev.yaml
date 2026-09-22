@@ -361,7 +361,10 @@ services:
   # traffic reaches it exclusively through the bind-mounted unix socket;
   # it resolves destinations itself and refuses anything that is not a
   # public TCP :443/:80 address. No Docker socket, no secrets, no inbound
-  # listener — compromise of this container yields outbound TCP only.
+  # listener. It is the sole member of the dedicated job-egress network,
+  # separate from control-plane service peers and their Docker DNS aliases.
+  # This bridge is not an outbound firewall: public-address enforcement
+  # remains in the proxy, not a guarantee after proxy process compromise.
   job-egress-proxy:
     image: ghcr.io/sumi-studio/sumi-provisioner:${SUMI_PROVISIONER_IMAGE_TAG:-latest}
     pull_policy: always
@@ -376,6 +379,8 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
+    networks:
+      - job-egress
     volumes:
       - type: bind
         source: /run/sumi/egress
@@ -437,3 +442,6 @@ networks:
   control-plane:
     external: true
     name: sumi-control-plane
+  # Sole member: job-egress-proxy. This NAT bridge has no service peers;
+  # it does not itself filter every reachable host or private destination.
+  job-egress: {}

@@ -179,16 +179,18 @@ test("the local media server is opt-in and carries no repository credential", as
 });
 
 test("image selection follows shared build inputs and skips unrelated changes", async () => {
-  const images = ["api", "agent", "provisioner", "web", "firebase"];
+  const images = ["api", "agent", "provisioner", "job", "web", "firebase"];
   const cases = [
     ["packages/ui/src/button.tsx", ["web"]],
     ["pnpm-lock.yaml", ["web"]],
     ["package.json", ["web"]],
     ["pnpm-workspace.yaml", ["web"]],
     [".npmrc", ["web"]],
-    ["apps/api/package.json", ["api", "provisioner", "web"]],
+    // The job image compiles sumi-egress-bridge from apps/api, so api
+    // changes rebuild it too.
+    ["apps/api/package.json", ["api", "provisioner", "job", "web"]],
     ["apps/agent/package.json", ["agent", "web"]],
-    ["apps/api/internal/messaging/service.go", ["api", "provisioner"]],
+    ["apps/api/internal/messaging/service.go", ["api", "provisioner", "job"]],
     ["deploy/agent/supervisor", ["agent", "provisioner"]],
     ["apps/web/src/main.tsx", ["web"]],
     ["deploy/firebase/firebase.json", ["firebase"]],

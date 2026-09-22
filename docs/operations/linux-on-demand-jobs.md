@@ -104,7 +104,10 @@ HTTP_PROXY=http://127.0.0.1:3128
 
 - The proxy (`sumi-egress-proxy`, built into the provisioner image, run as
   the `job-egress-proxy` service) listens **only** on the unix socket — it
-  has no TCP listener, no Docker socket, and no credentials. For every
+  has no TCP listener, no Docker socket, and no credentials, and in the
+  reference compose it is the sole member of a dedicated `job-egress`
+  bridge network (NAT egress, no control-plane service peers). The bridge
+  itself is not an outbound firewall; destination checks remain in the proxy. For every
   request it resolves the destination fresh, requires every resolved
   address to satisfy `publicweb.IsPublicAddress`, and dials the validated
   IP literals — a DNS answer that turns private between requests is denied
@@ -113,8 +116,11 @@ HTTP_PROXY=http://127.0.0.1:3128
   port 80 only; redirects are returned to the client, never followed by
   the proxy. Everything else answers 403.
 - The bridge (`sumi-egress-bridge`, built into the job image) is spawned
-  by the launch wrapper and binds `127.0.0.1:3128` inside the job's own
-  netns. A job that kills it only loses its own egress.
+  by the launch wrapper under `setsid` — its own session and process
+  group, still inside the job's PID namespace. Foreground-group signals
+  (an idle-prompt Ctrl-C, the terminal's `SignalProcess` path) reach the
+  shell and its jobs but never the bridge; container teardown still reaps
+  it. A job that deliberately kills it only loses its own egress.
 - `SUMI_JOB_EGRESS_DIR` is the host directory containing `proxy.sock`.
   `api-state-init` creates it owned by the proxy uid (mode 0755); the
   socket itself is mode 0622 — connect needs write on the socket file.
@@ -127,8 +133,14 @@ HTTP_PROXY=http://127.0.0.1:3128
   and the job otherwise runs normally; workspace files are unaffected and
   nothing is retried automatically.
 - Request-supplied `*_PROXY`/`NO_PROXY` variables are dropped when egress
-  is configured — the backend owns the proxy environment. They are the
-  only env names it overrides.
+  is configured — the backend owns the proxy environment. It injects a
+  loopback-only bypass (`NO_PROXY=localhost,127.0.0.1,::1`) so a
+  job-local dev server stays reachable by ordinary tools while every
+  other destination still goes through the proxy. Egress-enabled job ops
+  also get `PATH=/workspace/.local/bin:…` — and the job image's
+  `/etc/profile.d` snippet restores it for `bash -l` login shells — so
+  `pip --user` console scripts are runnable by name in the installing
+  session and later ones.
 
 ## Job image
 
@@ -141,8 +153,10 @@ single-purpose ephemeral toolchain — there is no system Python to protect,
 and Debian's pip otherwise refuses even `--user`/`--target` installs.
 Installing into the workspace persists across environments:
 `pip install --user pkg==ver` lands in `/workspace/.local` (HOME is
-/workspace) and is importable by later jobs with no extra flags; a pinned
-`pip install --target` works the same way. Tag it with the full
+/workspace) and is importable by later jobs with no extra flags; console
+scripts land in `/workspace/.local/bin`, which egress-enabled ops put on
+PATH (including login shells via `/etc/profile.d/sumi-egress-path.sh`);
+a pinned `pip install --target` works the same way. Tag it with the full
 40-hex revision of the source that produced it; the provisioner refuses a
 tag that is not a full revision and verifies the image ID before launch.
 

@@ -104,10 +104,6 @@ func NewProxy(config Config) *Proxy {
 	if p.resolver == nil {
 		p.resolver = net.DefaultResolver
 	}
-	if p.dial == nil {
-		dialer := &net.Dialer{Timeout: p.dialTimeout}
-		p.dial = dialer.DialContext
-	}
 	if p.logf == nil {
 		p.logf = log.Printf
 	}
@@ -122,6 +118,13 @@ func NewProxy(config Config) *Proxy {
 	}
 	if config.RequestTimeout > 0 {
 		p.requestTimeout = config.RequestTimeout
+	}
+	// The dialer carries no Timeout of its own: dialPinned bounds each
+	// attempt with a p.dialTimeout context, so there is a single source
+	// for the configured value — a second dialer field would only be a
+	// stale-copy hazard (as the earlier construction-order bug showed).
+	if p.dial == nil {
+		p.dial = (&net.Dialer{}).DialContext
 	}
 	return p
 }
@@ -307,12 +310,20 @@ func (p *Proxy) tunnel(client, upstream net.Conn) {
 			if n > 0 {
 				activity.Store(time.Now().UnixNano())
 				if _, werr := dst.Write(buffer[:n]); werr != nil {
-					return
+					break
 				}
 			}
 			if err != nil {
-				return
+				break
 			}
+		}
+		// Propagate the half-close: a client that finished sending (or
+		// went away) must end the upstream's read side promptly, so the
+		// origin can flush its final bytes and the conn+slot are reclaimed
+		// without waiting out the idle reaper. Bytes the origin still
+		// sends afterwards flow back through the surviving direction.
+		if tcp, ok := dst.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
 		}
 	}
 	wg.Add(2)
@@ -355,9 +366,10 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 	outbound.RequestURI = ""
 	outbound.URL.Scheme = "http"
 	outbound.URL.Host = net.JoinHostPort(host, ForwardPort)
-	// The origin sees the authority the client asked for; the dial itself
-	// is pinned to the validated addresses below.
-	outbound.Host = r.Host
+	// The Host header names the checked destination, not whatever the
+	// client put in its header — the two can differ under a proxy request
+	// and the dial below is pinned to the validated address set.
+	outbound.Host = host
 	stripHopHeaders(outbound.Header)
 	transport := &http.Transport{
 		Proxy:                  nil,

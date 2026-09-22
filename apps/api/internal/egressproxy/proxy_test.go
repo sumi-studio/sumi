@@ -427,3 +427,109 @@ func TestBridgeSocketAbsentFailsClean(t *testing.T) {
 		t.Fatal("connection to absent socket stayed open")
 	}
 }
+
+// f417 regression: the configured dial timeout is the single bound on an
+// upstream attempt — both increases above and decreases below the 10s
+// default must take effect (the earlier build-order bug kept a hardcoded
+// 10s dialer, so an increase never applied).
+func TestDialTimeoutConfigApplied(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want time.Duration
+	}{
+		{"increase", 45 * time.Second},
+		{"decrease", 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotDeadline atomic.Int64
+			p := NewProxy(Config{
+				DialTimeout: tc.want,
+				Logf:        func(string, ...any) {},
+				Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					dl, _ := ctx.Deadline()
+					gotDeadline.Store(dl.UnixNano())
+					return nil, errors.New("stop after deadline observation")
+				},
+			})
+			start := time.Now()
+			_, _ = p.dialPinned(context.Background(), []netip.Addr{mustAddr(t, "93.184.216.34")}, "443")
+			deadline := time.Unix(0, gotDeadline.Load())
+			if deadline.IsZero() {
+				t.Fatal("dial ctx carried no deadline")
+			}
+			got := deadline.Sub(start)
+			if got < tc.want-time.Second || got > tc.want+time.Second {
+				t.Fatalf("attempt ctx bound = %v, want ≈%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// f418 regression: when the client side of a CONNECT tunnel closes its
+// write side, the upstream's read side must see EOF promptly — the origin
+// can then flush final bytes and the tunnel ends without waiting out the
+// idle reaper.
+func TestTunnelHalfClosePropagates(t *testing.T) {
+	p := NewProxy(Config{IdleTimeout: time.Minute, Logf: func(string, ...any) {}})
+	// Upstream stub: echo whatever arrives, and on client EOF send a
+	// final reply before closing — only reachable if the half-close is
+	// propagated.
+	upstreamListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstreamListener.Close()
+	upstreamSawEOF := make(chan struct{}, 1)
+	go func() {
+		conn, err := upstreamListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn) // returns when client write side closes
+		close(upstreamSawEOF)
+		_, _ = conn.Write([]byte("final-bytes"))
+	}()
+	// Client side over real TCP (half-close needs *net.TCPConn).
+	clientListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientListener.Close()
+	go func() {
+		conn, err := clientListener.Accept()
+		if err != nil {
+			return
+		}
+		upstream, err := net.Dial("tcp", upstreamListener.Addr().String())
+		if err != nil {
+			conn.Close()
+			return
+		}
+		p.tunnel(conn, upstream)
+	}()
+	user, err := net.Dial("tcp", clientListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer user.Close()
+	if _, err := user.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if tcp, ok := user.(*net.TCPConn); ok {
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-upstreamSawEOF:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client half-close never reached the upstream read side")
+	}
+	// The origin's final bytes still make it back to the client.
+	_ = user.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf, err := io.ReadAll(user)
+	if err != nil || string(buf) != "final-bytes" {
+		t.Fatalf("final upstream bytes lost: %q err=%v", buf, err)
+	}
+}

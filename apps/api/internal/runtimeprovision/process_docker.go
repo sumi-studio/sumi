@@ -101,9 +101,19 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	if o.Image == "job" {
 		egressDir = b.jobEgressDir()
 	}
+	// pip --user installs console scripts into /workspace/.local/bin
+	// (HOME=/workspace). Egress-enabled job ops put it first on PATH —
+	// the normal user-site precedence — so an installed CLI is runnable
+	// by name in the installing job and in later sessions on the same
+	// workspace. Agent ops and no-egress launches keep the old PATH
+	// byte-for-byte.
+	pathEnv := "PATH=/usr/local/bin:/usr/bin:/bin"
+	if egressDir != "" {
+		pathEnv = "PATH=/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin"
+	}
 	args := []string{"create", "--name", processContainer(o)}
 	args = append(args, labels...)
-	args = append(args, "--read-only", "--network", "none", "--user", "10002:10002", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--cpus", "1", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=33554432", "--workdir", path.Join("/workspace", o.Cwd), "--mount", mount, "--env", "PATH=/usr/local/bin:/usr/bin:/bin", "--env", "HOME=/workspace", "--env", "LANG=C.UTF-8")
+	args = append(args, "--read-only", "--network", "none", "--user", "10002:10002", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--cpus", "1", "--memory", "384m", "--memory-swap", "384m", "--pids-limit", "128", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=33554432", "--workdir", path.Join("/workspace", o.Cwd), "--mount", mount, "--env", pathEnv, "--env", "HOME=/workspace", "--env", "LANG=C.UTF-8")
 	if egressDir != "" {
 		args = append(args, "--mount", "type=bind,src="+egressDir+",dst=/run/sumi/egress")
 	}
@@ -178,17 +188,22 @@ func (b *DockerBackend) jobEgressDir() string {
 
 // jobEgressEnv is the fixed proxy environment a job container receives when
 // egress is configured. The loopback listener is spawned inside the
-// container by the launch wrapper; NO_PROXY is pinned empty so nothing
-// silently bypasses it.
+// container by the launch wrapper; NO_PROXY is pinned to a loopback-only
+// bypass list — every other destination still goes through the proxy.
 var jobEgressEnv = []string{
 	"HTTP_PROXY=http://127.0.0.1:3128",
 	"HTTPS_PROXY=http://127.0.0.1:3128",
 	"ALL_PROXY=http://127.0.0.1:3128",
-	"NO_PROXY=",
+	// NO_PROXY pins a loopback-only bypass so a job-local server
+	// (python3 -m http.server, a dev server, a local index) stays
+	// reachable without custom flags. The bypass can never widen egress:
+	// those destinations are refused by the proxy anyway, and a direct
+	// loopback connection never leaves the container's netns.
+	"NO_PROXY=localhost,127.0.0.1,::1",
 	"http_proxy=http://127.0.0.1:3128",
 	"https_proxy=http://127.0.0.1:3128",
 	"all_proxy=http://127.0.0.1:3128",
-	"no_proxy=",
+	"no_proxy=localhost,127.0.0.1,::1",
 }
 
 var jobEgressEnvNames = map[string]bool{
@@ -196,11 +211,15 @@ var jobEgressEnvNames = map[string]bool{
 }
 
 // jobEgressPrelude starts the loopback->unix-socket bridge before the real
-// argv. A missing bridge is a loud warning, not a launch failure: the job
-// still runs and its network calls fail honestly with connection refused.
-// The /dev/tcp probe confirms the listener is actually bound before the
-// workload starts, so a fast command cannot race the bridge.
-const jobEgressPrelude = `if [ -x /usr/local/bin/sumi-egress-bridge ]; then /usr/local/bin/sumi-egress-bridge & sumi_egress_n=0; while [ "$sumi_egress_n" -lt 100 ]; do if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then break; fi; sumi_egress_n=$((sumi_egress_n+1)); sleep 0.05; done; else echo 'sumi-egress: bridge unavailable; outbound network disabled' >&2; fi; `
+// argv. setsid detaches it into its own session/process group: the session
+// signal path (Ctrl-C line-discipline INT, SignalProcess foreground-group
+// delivery) must never kill it, while container teardown still reaps it
+// with the PID namespace. A missing bridge is a loud warning, not a launch
+// failure: the job still runs and its network calls fail honestly with
+// connection refused. The /dev/tcp probe confirms the listener is bound
+// before the workload starts, so a fast command cannot race the bridge;
+// the probe subshell closes its fd so nothing leaks into the exec'd argv.
+const jobEgressPrelude = `if [ -x /usr/local/bin/sumi-egress-bridge ]; then setsid /usr/local/bin/sumi-egress-bridge & sumi_egress_n=0; while [ "$sumi_egress_n" -lt 100 ]; do if (exec 3<>/dev/tcp/127.0.0.1/3128 && exec 3>&-) 2>/dev/null; then break; fi; sumi_egress_n=$((sumi_egress_n+1)); sleep 0.05; done; else echo 'sumi-egress: bridge unavailable; outbound network disabled' >&2; fi; `
 
 type cappedProcessOutput struct {
 	bytes.Buffer
