@@ -427,23 +427,186 @@ func TestRemoteToolErrorsAndInvalidOutputRemainVisible(t *testing.T) {
 	}
 }
 
+// Notifications are expendable, but what was dropped must be visible: a
+// shortened list that reads as the whole story is a quieter kind of loss.
 func TestNoisyProgressDoesNotOmitSmallPrimaryResult(t *testing.T) {
 	f := setup(t)
 	remote := mcp.NewServer(&mcp.Implementation{Name: "noisy-progress", Version: "1"}, nil)
-	remote.AddTool(&mcp.Tool{Name: "small_result", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		for i := 0; i < 16; i++ {
-			_ = r.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: r.Params.Meta["progressToken"], Progress: float64(i), Total: 16, Message: strings.Repeat("x", 8192)})
+	noisy := func(count int, text string) func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			for i := 0; i < count; i++ {
+				_ = r.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: r.Params.Meta["progressToken"], Progress: float64(i), Total: float64(count), Message: strings.Repeat("x", 8192)})
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}, StructuredContent: map[string]any{"value": "retained"}}, nil
 		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "actual small result"}}, StructuredContent: map[string]any{"value": "retained"}}, nil
-	})
+	}
+	for _, name := range []string{"small_result", "very_noisy"} {
+		remote.AddTool(&mcp.Tool{Name: name, InputSchema: map[string]any{"type": "object"}}, noisy(map[string]int{"small_result": 16, "very_noisy": 64}[name], "actual small result"))
+	}
+	remote.AddTool(&mcp.Tool{Name: "huge_result", InputSchema: map[string]any{"type": "object"}}, noisy(16, strings.Repeat("h", 120<<10)))
 	remoteHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return remote }, nil))
 	defer remoteHTTP.Close()
 	c := f.save(remoteHTTP.URL)
-	f.coreCall("mcp.call", map[string]any{"connection_id": c.ID, "name": "small_result", "arguments": map[string]any{}})
+	call := func(name string) agentstate.Job {
+		t.Helper()
+		f.child("null")
+		f.coreCall("mcp.call", map[string]any{"connection_id": c.ID, "name": name, "arguments": map[string]any{}})
+		f.tick()
+		job := f.job()
+		if raw, _ := json.Marshal(job.Result); len(raw) > resultBoundBytes {
+			t.Fatalf("%s exceeded the durable bound: %d bytes", name, len(raw))
+		}
+		return job
+	}
+	notes := func(job agentstate.Job) []any {
+		list, _ := job.Result["notifications"].([]any)
+		for _, entry := range list {
+			message, _ := entry.(map[string]any)["message"].(string)
+			if len([]rune(message)) > notificationMessageRunes+1 {
+				t.Fatalf("unbounded notification message: %d runes", len([]rune(message)))
+			}
+		}
+		return list
+	}
+
+	job := call("small_result")
+	raw, _ := json.Marshal(job.Result)
+	if job.Status != "done" || job.Result["result_omitted"] == true || !bytes.Contains(raw, []byte("retained")) || !bytes.Contains(raw, []byte("actual small result")) {
+		t.Fatalf("notifications displaced primary result: %+v", job)
+	}
+	if len(notes(job)) == 0 || job.Result["notifications_dropped"] != nil || job.Result["notifications_omitted"] != nil {
+		t.Fatalf("bounded notifications were shed anyway: %+v", job.Result)
+	}
+
+	job = call("very_noisy")
+	raw, _ = json.Marshal(job.Result)
+	if job.Status != "done" || !bytes.Contains(raw, []byte("actual small result")) {
+		t.Fatalf("very noisy call lost its primary result: %+v", job)
+	}
+	dropped, _ := job.Result["notifications_dropped"].(float64)
+	if len(notes(job)) != maxNotifications || dropped < 1 {
+		t.Fatalf("shedding at the cap is not visible: %+v", job.Result)
+	}
+
+	// Even when the primary result itself cannot be stored, what happened and
+	// what was dropped survive in its place.
+	job = call("huge_result")
+	if job.Status != "done" || job.Result["result_omitted"] != true || job.Result["dispatched"] != true || job.Result["outcome"] != "returned" {
+		t.Fatalf("oversized result lost its account of itself: %+v", job.Result)
+	}
+	dropped, _ = job.Result["notifications_dropped"].(float64)
+	if job.Result["notifications"] != nil || job.Result["notifications_omitted"] != true || dropped < 1 {
+		t.Fatalf("notifications vanished silently with the result: %+v", job.Result)
+	}
+}
+
+// jsonb cannot store a NUL. Whether a connection happens to carry a bearer
+// token, arguments or environment values says nothing about whether the
+// server's answer contains one, so the normalization cannot depend on it.
+func TestNULBytesAreNormalizedWithoutAnyConfiguredSecret(t *testing.T) {
+	f := setup(t)
+	remote := mcp.NewServer(&mcp.Implementation{Name: "nul-bytes", Version: "1"}, nil)
+	remote.AddTool(&mcp.Tool{Name: "nul_bytes", InputSchema: map[string]any{"type": "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content:           []mcp.Content{&mcp.TextContent{Text: "before\x00after"}},
+			StructuredContent: map[string]any{"nested": map[string]any{"key\x00in-map": []any{"value\x00here"}}},
+		}, nil
+	})
+	server := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return remote }, &mcp.StreamableHTTPOptions{JSONResponse: true}))
+	defer server.Close()
+	// Saved without a credential: this connection has nothing to redact.
+	c, e := f.store.Save(context.Background(), owner, "", Input{Name: "No credential fixture", Endpoint: server.URL, Enabled: true})
+	if e != nil {
+		t.Fatal(e)
+	}
+	f.coreCall("mcp.call", map[string]any{"connection_id": c.ID, "name": "nul_bytes", "arguments": map[string]any{}})
 	f.tick()
 	job := f.job()
+	if job.Status != "done" || job.Result["outcome"] != "returned" {
+		t.Fatalf("a call that really ran was recorded as a loss: %+v", job)
+	}
 	raw, _ := json.Marshal(job.Result)
-	if job.Status != "done" || job.Result["notifications_omitted"] != true || job.Result["result_omitted"] == true || !bytes.Contains(raw, []byte("retained")) || !bytes.Contains(raw, []byte("actual small result")) {
-		t.Fatalf("notifications displaced primary result: %+v", job)
+	if bytes.Contains(raw, []byte(`\u0000`)) {
+		t.Fatalf("NUL survived into the durable result: %s", raw)
+	}
+	for _, want := range []string{"before�after", "key�in-map", "value�here"} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Fatalf("%q was not normalized in place: %s", want, raw)
+		}
+	}
+}
+
+// A status read that fails is a fact about the database, never evidence that
+// the person stopped the job.
+func TestStatusReadFailureNeitherDispatchesNorCancels(t *testing.T) {
+	f := setup(t)
+	var calls atomic.Int32
+	remote := mcp.NewServer(&mcp.Implementation{Name: "slow", Version: "1"}, nil)
+	remote.AddTool(&mcp.Tool{Name: "slow", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		calls.Add(1)
+		select {
+		case <-time.After(3500 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "completed"}}}, nil
+	})
+	server := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return remote }, &mcp.StreamableHTTPOptions{JSONResponse: true}))
+	defer server.Close()
+	c := f.save(server.URL)
+	trusted := f.runner.readStatus
+	request := map[string]any{"connection_id": c.ID, "name": "slow", "arguments": map[string]any{}}
+	failure := errors.New("injected transient status read failure")
+	run := func() agentstate.Job {
+		t.Helper()
+		f.child("null")
+		f.coreCall("mcp.call", request)
+		f.tick()
+		return f.job()
+	}
+	reason := func(job agentstate.Job) string {
+		if job.Error == nil {
+			return ""
+		}
+		return *job.Error
+	}
+
+	// Before dispatch nothing has been sent, so an unreadable status refuses —
+	// and says what it is, rather than a cancellation the person never made.
+	f.runner.readStatus = func(context.Context, string, string) (string, error) { return "", failure }
+	job := run()
+	if job.Status != "failed" || job.Result["dispatched"] != false || calls.Load() != 0 || !strings.Contains(reason(job), "could not be read") {
+		t.Fatalf("unreadable status before dispatch: %+v %q", job.Result, reason(job))
+	}
+
+	// A real cancellation, read through the real store, still stops dispatch.
+	var reads atomic.Int32
+	f.runner.readStatus = func(ctx context.Context, personaID, jobID string) (string, error) {
+		if reads.Add(1) == 1 {
+			if _, e := f.core.Store().CancelJob(ctx, personaID, jobID); e != nil {
+				t.Error(e)
+			}
+		}
+		return trusted(ctx, personaID, jobID)
+	}
+	job = run()
+	if job.Status != "failed" || job.Result["dispatched"] != false || calls.Load() != 0 || !strings.Contains(reason(job), "cancelled before dispatch") {
+		t.Fatalf("cancelled before dispatch: %+v %q", job.Result, reason(job))
+	}
+
+	// Once admitted, a failing read must not cancel a healthy call.
+	reads.Store(0)
+	f.runner.readStatus = func(ctx context.Context, personaID, jobID string) (string, error) {
+		if reads.Add(1) > 1 {
+			return "", failure
+		}
+		return trusted(ctx, personaID, jobID)
+	}
+	job = run()
+	if job.Status != "done" || job.Result["outcome"] != "returned" || calls.Load() != 1 {
+		t.Fatalf("transient read failure cancelled a running call: %+v %q", job.Result, reason(job))
+	}
+	if reads.Load() < 3 {
+		t.Fatalf("the poller never read status during the call: %d", reads.Load())
 	}
 }

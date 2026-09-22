@@ -54,9 +54,23 @@ The Core exposes three delegated tools only when this backend is registered:
 
 1. `mcp.connections` returns enabled connection IDs and names for the secretary's
    bound human. It does not expose endpoints or credentials to the model.
-2. `mcp.list_tools({connection_id, cursor?})` starts a durable job to fetch one
-   page of tool descriptions and input/output JSON schemas. Its result contains
-   `tools` and `next_cursor`.
+2. `mcp.list_tools({connection_id, cursor?, names?})` starts a durable job to
+   fetch one page of tool descriptions and input/output JSON schemas. Every
+   definition in `tools` is whole: a schema is never shortened, because a
+   shortened schema invites a guessed call. A page therefore holds as many
+   whole definitions as the durable bound allows, and the rest of the result
+   says how to reach the others — `next_cursor` to pass back as `cursor`,
+   `next_names` listing what is still waiting on this page, and
+   `remaining_on_page`. Passing `names` fetches exactly those definitions
+   instead of paging to reach them (not combinable with `cursor`), reporting
+   `names_not_found`. A tool whose own definition cannot fit a page is named in
+   `tools_omitted` with its stored size and the reason; paging continues past
+   it. `page_changed` says the server's list changed under a cursor and that
+   page restarted, so a definition is re-shown rather than skipped, and
+   `scan_truncated` says a bounded scan stopped before the server's list ended.
+   In the last resort — a result that cannot be stored at all — `result_omitted`
+   is paired with `repeat_request` and no cursor, because a cursor past
+   schemas that were never delivered would skip them silently.
 3. `mcp.call({connection_id, name, arguments})` starts a durable job for one
    remote invocation. Its result contains the MCP `call_result`, including
    content, structuredContent and isError, plus `protocol_version` and outcome.
@@ -107,9 +121,22 @@ job requests, connection listings or application logs.
 - A remote operation has a 30-second context; session cleanup also has bounded
   HTTP timeouts. One worker processes one job at a time with fair persona
   rotation. Arguments are at most 32 KiB, transport bodies 2 MiB, durable results
-  60 KiB. Oversized notifications are discarded first with an explicit marker,
-  preserving a complete primary result when it fits. A primary result that is
-  itself too large is explicitly omitted; schemas are never silently shortened.
+  60 KiB. Progress and tools/list_changed events are expendable: at most 16 are
+  kept, each message is bounded, and `notifications_dropped` counts the rest.
+  If they would still displace the primary result they are discarded wholesale
+  with `notifications_omitted`. A primary result that is itself too large is
+  explicitly omitted; schemas are never silently shortened.
+- A stored result passes through one transformation: NUL replacement (jsonb
+  cannot hold a NUL) and redaction of every configured credential, argument and
+  environment value. `mcpconnections.persist` is that boundary, and it draws
+  one line. A result's own top-level keys, and the value of `next_cursor`, are
+  written by this package — the cursor from a page number, an offset and a
+  digest, never from remote bytes — and are left alone; everything beneath them
+  is the server's and is traversed in full, keys included. That is also why a
+  continuation cursor never carries the server's own cursor: doing so would
+  hand remote bytes back through a reversible encoding where redaction could
+  not see them. Discovery measures its pages *through* that same function, so
+  the size a page is decided on is the size that is stored.
 - The main API route is wired into `cmd/server`; Local uses its own
   fm-authorized configuration route and host-scoped runner in `cmd/first-model`.
   Connection credentials are not portable secretary state; moving to a

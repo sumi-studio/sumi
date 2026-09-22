@@ -77,11 +77,26 @@ func TestLocalStdioServerHelper(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
+		if args.Label == "nul-bytes" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "before\x00after"}}, StructuredContent: map[string]any{"label": args.Label, "nested": map[string]any{"key\x00in-map": "value\x00here"}}}, nil
+		}
 		if args.Label == "tool-failed" {
 			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "fixture error"}}}, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "saved " + os.Getenv("SERVER_SECRET")}}, StructuredContent: map[string]any{"label": args.Label}}, nil
 	})
+	// A Local server with an ordinary number of ordinary tools, for exercising
+	// paged discovery against a real stdio process rather than a stub.
+	if count, e := strconv.Atoi(os.Getenv("MCP_BULK_TOOLS")); e == nil && count > 0 {
+		for i := 0; i < count; i++ {
+			server.AddTool(&mcp.Tool{Name: fmt.Sprintf("bulk_%02d", i), Description: strings.Repeat("d", 1200), InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"value": map[string]any{"type": "string", "description": strings.Repeat("s", 1200)}},
+			}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "called"}}}, nil
+			})
+		}
+	}
 	_ = server.Run(context.Background(), &mcp.StdioTransport{})
 	os.Exit(0)
 }
@@ -109,6 +124,10 @@ func localJob(t *testing.T, s *Store, core *agentstate.Server, id, method string
 	if method == "call" {
 		req["name"] = "remember_label"
 		req["arguments"] = args
+	} else {
+		for key, value := range args {
+			req[key] = value
+		}
 	}
 	out, e := s.Effects()["mcp."+method].Apply(context.Background(), tx, persona, "local-mcp-test:"+uuid.NewString()+":tool:0", req)
 	if e != nil {

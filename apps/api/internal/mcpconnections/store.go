@@ -168,6 +168,9 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 				request["arguments"] = args
 			} else {
 				request["cursor"] = cursor
+				if names, ok := req["names"]; ok && names != nil {
+					request["names"] = names
+				}
 			}
 			jobID, e := agentstate.EffectJobID(idem)
 			if e != nil {
@@ -200,6 +203,9 @@ func validateRequest(method string, req map[string]any) error {
 	cursor, _ := req["cursor"].(string)
 	if len(cursor) > 2048 {
 		return fmt.Errorf("%w: cursor too long", agentstate.ErrBadRequest)
+	}
+	if method == "list_tools" {
+		return validateDiscoveryRequest(req)
 	}
 	return nil
 }

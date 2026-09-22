@@ -393,12 +393,12 @@ Example stdio configuration (use actual absolute executable/cwd paths):
 
 Saving with `enabled: true` is the standing grant. The secretary discovers
 connections using `mcp.connections`, obtains complete tool descriptions and
-schemas with `mcp.list_tools`, and invokes a discovered tool with `mcp.call`.
-The latter two return durable jobs; the real result, including
-`call_result.structuredContent`, is available through `job.status`. There is
-no further per-call approval. Tool output cannot create or modify these
-connections: only the existing persona-scoped Local `fm_` human capability
-(or existing install admin authority) can use
+schemas with `mcp.list_tools` (a page at a time, or by name), and invokes a
+discovered tool with `mcp.call`. The latter two return durable jobs; the real
+result, including `call_result.structuredContent`, is available through
+`job.status`. There is no further per-call approval. Tool output cannot
+create or modify these connections: only the existing persona-scoped Local
+`fm_` human capability (or existing install admin authority) can use
 `/fm/<persona>/mcp-connections`. Core persona tokens cannot change settings.
 
 Configuration is encrypted in PostgreSQL and bound to both `SUMI_LOCAL_ID`
@@ -419,9 +419,63 @@ model, or admin environment credentials. It runs with the Local user's normal
 permissions and the configured cwd; it is not a sandbox. The executable is
 explicit, not a shell command, and no package is downloaded automatically.
 Noisy stderr is discarded, each inbound frame is bounded to 2 MiB, and the
-operation has a 30-second deadline. Notifications can be omitted with an
-explicit marker to keep the primary result; genuinely oversized primary
-results are explicitly omitted rather than returning a partial schema.
+operation has a 30-second deadline.
+
+That environment is exactly what the child gets, which is worth checking
+against what your server expects:
+
+- **`HOME` is absent** unless you configure it. A server that resolves a
+  cache, a config file or a credential helper through `$HOME` (`npm`, `pip`,
+  `git`, many SDKs) will not find one, and may fail or silently use a
+  different location. Configure `HOME` explicitly if the server needs it.
+- **A configured `PATH` or `LANG` replaces the fixed default** rather than
+  adding to it: duplicate names resolve to the configured value. Name the
+  full search path you want, and keep in mind that the default is only
+  `/usr/local/bin:/usr/bin:/bin`, so an interpreter installed under a version
+  manager in your home directory is not on it. Prefer an absolute `command`.
+- Nothing else is inherited: not `USER`, `SHELL`, `TMPDIR`, `TERM`, proxy
+  variables, or your terminal's exported values.
+
+This is the intended minimal environment, not a sandbox boundary — it keeps
+host credentials out of a granted server, and it means the server's own
+requirements must be stated in the configuration.
+
+Both discovery and calls return bounded durable results, and a bound is
+always visible in the result rather than silently applied. `mcp.list_tools`
+returns whole tool definitions only — a schema is never shortened, because a
+shortened schema invites a guessed call. If the granted server offers more
+tools than one result can hold, the result carries a `next_cursor` to pass
+back as `cursor`, `next_names` listing what is still waiting, and
+`remaining_on_page`; passing `names` instead fetches exactly the definitions
+you already know the names of. A single tool whose own definition is larger
+than a page is named in `tools_omitted` with its size and the reason, and
+paging continues past it. `page_changed` says the server's list changed under
+a cursor and that page restarted, so a tool is re-shown rather than skipped.
+A by-name request scans the same bounded 32 pages a call does: `scan_truncated`
+says the scan stopped at that bound, so `names_not_found` means "not in what
+was scanned", not "not offered by this server".
+Progress notifications are expendable: at most 16 are kept, each message is
+bounded, and `notifications_dropped` counts the rest; if they would displace
+the primary result they are dropped wholesale with `notifications_omitted`.
+A genuinely oversized primary result is replaced by `result_omitted` — never
+by a partial schema — and the facts needed to continue (what was dispatched,
+its outcome, the cursor and the omissions) are carried through with it. For a
+discovery page that last resort withdraws the cursor and says `repeat_request`
+instead: a continuation past schemas that were never delivered would skip them
+silently.
+
+A cursor is Sumi's own — a page number, an offset and a digest of the names on
+that page — and a server's own cursor passed in its place is refused. Two
+things follow. Sumi walks the server's pagination to reach the page a cursor
+names, bounded by the same 32 pages a call's lookup walks; and nothing a server
+says travels inside a cursor, where the redaction below could not see it. That
+redaction is the other half: every stored result has NULs replaced and every
+configured credential, argument and environment value removed from it. The
+result's own field names and its cursor are written by Sumi and are left
+alone; everything inside them comes from the server and is rewritten in full.
+A short configured value is still a configured value: if your server echoes
+one back — including inside a tool's name — that is what you will see in the
+result.
 
 Local stdio uses a host-specific job kind; the Cloud MCP runner does not
 claim it, and generic job submission cannot supply executable configuration.
