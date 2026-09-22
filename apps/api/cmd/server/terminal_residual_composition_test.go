@@ -18,10 +18,12 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,15 +143,19 @@ func collectWS(t *testing.T, frames chan map[string]any, want func(map[string]an
 	}
 }
 
-func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
-	w := newComposedTerminalWorld(t)
+// startComposedJournalWorld wires the full producer→consumer seam:
+// real runtimeprovision.Service tailing a real journal file, real
+// termexec driver, real agentstate/PG, real REST/WS routes. Returns
+// the open session already claimed and active.
+func startComposedJournalWorld(t *testing.T) (w *composedTerminalWorld, journal string, scope, sessionID string, waitFor func(string, func() bool)) {
+	w = newComposedTerminalWorld(t)
 	w.serve()
 	ctx := context.Background()
 
 	// Real provisioner service: durable state dir, real process store,
 	// real superviseInteractive tailer over a real journal file.
 	dir := t.TempDir()
-	journal := filepath.Join(dir, "journal.json.log")
+	journal = filepath.Join(dir, "journal.json.log")
 	appendJournalLine(t, journal, "pre-loss\r\n")
 	backend := &journalBackend{journal: journal}
 	// The driver always requests the persona's canonical files scope;
@@ -173,7 +179,7 @@ func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
 		t.Fatalf("service: %v", err)
 	}
 	obsCtx, obsStop := context.WithCancel(ctx)
-	defer obsStop()
+	t.Cleanup(obsStop)
 	go svc.RunProcessObserver(obsCtx)
 
 	// Real driver on the real store, claiming the real session.
@@ -190,20 +196,20 @@ func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
 	dctx, dstop := context.WithCancel(ctx)
 	ddone := make(chan struct{})
 	go func() { drv.Run(dctx); close(ddone) }()
-	defer func() { dstop(); <-ddone }()
+	t.Cleanup(func() { dstop(); <-ddone })
 
 	installationID, epoch := w.installTerminal(t, nil)
-	scope := terminalScope(installationID, epoch)
+	scope = terminalScope(installationID, epoch)
 	status, opened := w.request(t, "POST", "/terminal/open?"+scope,
 		map[string]any{"name": "loss"}, w.cookie, nil)
 	if status != http.StatusOK {
 		t.Fatalf("terminal open = %d: %v", status, opened)
 	}
-	sessionID := opened["session"].(map[string]any)["session_id"].(string)
+	sessionID = opened["session"].(map[string]any)["session_id"].(string)
 
 	// The real driver claims → StartProcess → observer launches →
 	// superviseInteractive tails the real journal → REST shows active.
-	waitFor := func(what string, cond func() bool) {
+	waitFor = func(what string, cond func() bool) {
 		t.Helper()
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
@@ -231,6 +237,13 @@ func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
 		}
 		return false
 	})
+	return w, journal, scope, sessionID, waitFor
+}
+
+func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
+	w, journal, scope, sessionID, waitFor := startComposedJournalWorld(t)
+	ctx := context.Background()
+	_ = ctx
 
 	// Real journal bytes reach REST at byte cursor 0.
 	waitFor("pre-loss bytes on REST", func() bool {
@@ -338,4 +351,88 @@ func TestTerminalComposedRealJournalLossReachesConsumers(t *testing.T) {
 		return int64(read["next_cursor"].(float64)) > postEnd
 	})
 	ws.Close()
+}
+
+// TREV2-08 downstream proof: an in-place truncation of the SAME
+// journal inode (copytruncate-class) followed by regrowth past the
+// committed offset before the next poll must reach consumers as an
+// explicit loss marker plus the intact new-era bytes — the real
+// pumpJournal continuity witness, real driver, real PG, real REST/WS.
+func TestTerminalComposedInPlaceTruncationReachesConsumers(t *testing.T) {
+	w, journal, scope, sessionID, waitFor := startComposedJournalWorld(t)
+
+	// Initial bytes reach REST at cursor 0.
+	waitFor("pre-truncate bytes on REST", func() bool {
+		read := readTerminalREST(t, w, scope, sessionID, "&cursor=0")
+		for _, c := range read["chunks"].([]any) {
+			if c.(map[string]any)["kind"] == "data" {
+				return true
+			}
+		}
+		return false
+	})
+	read := readTerminalREST(t, w, scope, sessionID, "&cursor=0")
+	preEnd := int64(read["next_cursor"].(float64))
+	if preEnd <= 0 {
+		t.Fatalf("pre-truncate next_cursor = %v", read["next_cursor"])
+	}
+
+	// In-place truncation: same inode, then regrow PAST the committed
+	// offset before the next poll — size < offset is never observed.
+	if err := os.Truncate(journal, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		appendJournalLine(t, journal, "post-truncate-era\r\n")
+	}
+
+	// The caught-up reader at the loss position receives the zero-width
+	// marker AND the intact new-era bytes — no silent skip, no tear.
+	var markerSeq float64
+	waitFor("truncation marker + new-era bytes on REST", func() bool {
+		read = readTerminalREST(t, w, scope, sessionID,
+			fmt.Sprintf("&cursor=%d&event_cursor=0", preEnd))
+		chunks := read["chunks"].([]any)
+		seq, gap := hasZeroWidthGap(chunks, float64(preEnd))
+		if !gap {
+			return false
+		}
+		markerSeq = seq
+		var post string
+		for _, c := range chunks {
+			m := c.(map[string]any)
+			if m["kind"] == "data" {
+				if d, _ := m["data"].(string); d != "" {
+					raw, derr := base64.StdEncoding.DecodeString(d)
+					if derr == nil {
+						post += string(raw)
+					}
+				}
+			}
+		}
+		return strings.Count(post, "post-truncate-era\r\n") == 8
+	})
+	eventCursor := int64(read["event_cursor"].(float64))
+	if eventCursor < int64(markerSeq) {
+		t.Fatalf("event_cursor %d did not cover marker seq %v", eventCursor, markerSeq)
+	}
+
+	// Repeated poll with the consumed cursor stays quiet.
+	read = readTerminalREST(t, w, scope, sessionID,
+		fmt.Sprintf("&cursor=%d&event_cursor=%d", preEnd, eventCursor))
+	for _, c := range read["chunks"].([]any) {
+		if c.(map[string]any)["kind"] == "gap" {
+			t.Fatalf("loss marker re-served after consumption: %v", c)
+		}
+	}
+
+	// WS attach sees the durable loss frame with event_seq.
+	ws := w.dialTerminalWS(t, scope+"&cursor=0", sessionID)
+	defer ws.Close()
+	got := collectWS(t, wsFrames(ws), func(f map[string]any) bool {
+		return f["type"] == "gap" && f["base"] == float64(preEnd)
+	}, 10*time.Second)
+	if got["event_seq"].(float64) != markerSeq {
+		t.Fatalf("ws loss frame event_seq = %v, want %v", got["event_seq"], markerSeq)
+	}
 }
