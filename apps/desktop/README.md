@@ -43,14 +43,15 @@ browser.dispose();
 ```
 
 Pass only `BrowserTabPort` plus authorized tab references to an adapter. The
-runtime does **not** authenticate secretaries, map participants to profiles,
-check application permissions, or issue approvals. The host must authorize
-observations as well as actions before calling this port. Core tool registration,
-authenticated device transport, and audit integration remain unimplemented.
-Consequently this is not yet browsing available from a Sumi conversation.
-There is deliberately no network listener or generic renderer IPC to bypass that
-missing boundary. No API token, cookie getter, raw CDP, arbitrary JavaScript, or
-arbitrary selector operation is included in the caller contract.
+runtime itself does **not** authenticate secretaries or check application grants.
+The connected adapter in `src/browser/host.ts` supplies that boundary through the
+API's human-owned attachment grants and Core's durable job ledger. It exposes
+`browser.tabs`, `browser.observe` and `browser.act` to the granted secretary.
+See [connected host setup](../../docs/shared-browser-host.md) for the configured
+launch path, authentication, revocation and result-loss semantics. No API token,
+cookie getter, raw CDP, arbitrary JavaScript or arbitrary selector operation is
+included in the page/caller contract. The desktop host opens no inbound listener
+or generic renderer IPC bridge.
 
 The host chooses a stable profile ID, and the runtime creates a dedicated
 `persist:sumi-browser-<profileId>` Electron Session. That ID must identify a
@@ -125,8 +126,10 @@ The fixture's plain page is test content, not proposed product screen design.
 Verified scope is Linux/WSL under Xvfb. Same-process runtime recreation retains
 profile storage. Electron persistent storage is configured, but process-restart
 persistence has not been acceptance-tested here. Live-tab restart reattachment,
-tab/history restoration, Mac/Windows packaging/signing, remote control, desktop
-auth, bundled `apps/web` integration, and OS-specific validation remain open.
+tab/history restoration, Mac/Windows packaging/signing, desktop sign-in UI,
+bundled `apps/web` integration, and OS-specific validation remain open. The
+configured outbound API bridge now provides authenticated secretary access;
+its real-browser acceptance uses loopback and a substituted human-login proof.
 
 Relevant primary references:
 [WebContentsView](https://www.electronjs.org/docs/latest/api/web-contents-view),

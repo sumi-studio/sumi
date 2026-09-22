@@ -8,14 +8,16 @@
   },
   "exports": {
     "./browser": "./dist/browser/runtime.js",
-    "./browser-contract": "./dist/browser/contract.js"
+    "./browser-contract": "./dist/browser/contract.js",
+    "./browser-host": "./dist/browser/host.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check-types": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/contract.test.mjs",
+    "test": "pnpm build && node --test test/*.test.mjs",
     "test:browser": "pnpm build && electron test/acceptance.mjs",
-    "dev:browser": "pnpm build && electron dist/browser-dev.js"
+    "dev:browser": "pnpm build && electron dist/browser-dev.js",
+    "dev:browser:connected": "pnpm build && electron dist/browser-connected.js"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
