@@ -13,8 +13,8 @@ FIREBASE_AUTH_EMULATOR_BIND_HOST=100.116.25.99 \
 ```
 
 Compose pulls `ghcr.io/sumi-studio/sumi-firebase:latest` on every start. Set
-`SUMI_FIREBASE_IMAGE_TAG` to a Jenkins-published short commit SHA to pin a
-specific image. Authenticate with `docker login ghcr.io` first when the package
+`SUMI_FIREBASE_IMAGE_TAG` to a published short commit SHA to pin a specific
+image. Authenticate with `docker login ghcr.io` first when the package
 is private.
 
 The bind host is deliberately an exact IP address. It defaults to `127.0.0.1`

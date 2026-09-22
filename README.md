@@ -115,7 +115,7 @@ CONTEXT.md            domain glossary (Japanese)
 | Calls | LiveKit |
 | Contracts | OpenAPI, JSON Schema |
 | Monorepo and tooling | pnpm workspaces, Turborepo, Biome |
-| Build configuration | GitHub Actions workflows; a `Jenkinsfile` for building container images |
+| Build configuration | GitHub Actions workflows; local container-image builds (`scripts/operations/build-dogfood-images`, `deploy/*/Dockerfile`) |
 
 ## Development commands
 

@@ -178,64 +178,6 @@ test("the local media server is opt-in and carries no repository credential", as
   );
 });
 
-test("image selection follows shared build inputs and skips unrelated changes", async () => {
-  const images = ["api", "agent", "provisioner", "web", "firebase"];
-  const cases = [
-    ["packages/ui/src/button.tsx", ["web"]],
-    ["pnpm-lock.yaml", ["web"]],
-    ["package.json", ["web"]],
-    ["pnpm-workspace.yaml", ["web"]],
-    [".npmrc", ["web"]],
-    ["apps/api/package.json", ["api", "provisioner", "web"]],
-    ["apps/agent/package.json", ["agent", "web"]],
-    ["apps/api/internal/messaging/service.go", ["api", "provisioner"]],
-    ["deploy/agent/supervisor", ["agent", "provisioner"]],
-    ["apps/web/src/main.tsx", ["web"]],
-    ["deploy/firebase/firebase.json", ["firebase"]],
-    ["docs/local-development.md", []],
-    ["packages-old/button.tsx", []],
-    ["", []],
-    [".dockerignore", images],
-    ["Jenkinsfile", images],
-    ["scripts/operations/image-needs-build", images],
-    ["docs/example.md\npackages/ui/src/button.tsx", ["web"]],
-  ];
-  for (const [changedPaths, expected] of cases) {
-    const selected = [];
-    for (const image of images) {
-      const { stdout } = await execFileAsync(
-        "sh",
-        [
-          "-c",
-          'printf "%s\\n" "$SUMI_IMAGE_CHANGED_PATHS" | sh scripts/operations/image-needs-build "$1" "$2"',
-          "image-selection-test",
-          image,
-          `deploy/${image}/Dockerfile`,
-        ],
-        {
-          cwd: repositoryRoot,
-          env: { ...process.env, SUMI_IMAGE_CHANGED_PATHS: changedPaths },
-        },
-      );
-      assert.ok(["build\n", "skip\n"].includes(stdout), stdout);
-      if (stdout === "build\n") selected.push(image);
-    }
-    assert.deepEqual(selected, expected, changedPaths || "empty diff");
-  }
-  for (const args of [
-    [],
-    ["missing", "deploy/missing/Dockerfile"],
-    ["wrong-image", "deploy/web/Dockerfile"],
-  ]) {
-    await assert.rejects(
-      execFileAsync("sh", ["scripts/operations/image-needs-build", ...args], {
-        cwd: repositoryRoot,
-      }),
-      { code: 2 },
-    );
-  }
-});
-
 test("Compose gives runtime only the logical executor workspace address", async () => {
   const [compose, entrypoint] = await Promise.all([
     source("deploy/agent/compose.yaml"),

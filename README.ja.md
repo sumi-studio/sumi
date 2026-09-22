@@ -117,7 +117,7 @@ CONTEXT.md            ドメイン用語集
 | 通話 | LiveKit |
 | 契約 | OpenAPI、JSON Schema |
 | モノレポとツール | pnpm workspaces、Turborepo、Biome |
-| ビルド設定 | GitHub Actions の workflow。コンテナイメージをビルドするための `Jenkinsfile` |
+| ビルド設定 | GitHub Actions の workflow。コンテナイメージのローカルビルド（`scripts/operations/build-dogfood-images`、`deploy/*/Dockerfile`） |
 
 ## 開発用コマンド
 
