@@ -493,6 +493,12 @@ func (b *backend) stop(r *running) {
 func (b *backend) CancelProcess(ctx context.Context, request runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if e := ctx.Err(); e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	if b.closed {
+		return runtimeprovision.ProcessOperation{}, errors.New("Local terminal host closed")
+	}
 	r, e := b.lookup(request)
 	if errors.Is(e, runtimeprovision.ErrProcessNotFound) && request.TombstoneIfAbsent && request.PersonalityAgentID == b.cfg.PersonaID {
 		now := time.Now()
@@ -507,6 +513,44 @@ func (b *backend) CancelProcess(ctx context.Context, request runtimeprovision.Pr
 	b.stop(r)
 	return b.snapshot(r), nil
 }
+
+// ReleaseProcessTombstone is used only after the caller re-authorizes launch.
+// A launched, failed, cancelled-after-launch, or indeterminate operation is
+// execution history, not a releasable fence. Never forget it to permit replay.
+func (b *backend) ReleaseProcessTombstone(ctx context.Context, request runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if e := ctx.Err(); e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	if b.closed {
+		return runtimeprovision.ProcessOperation{}, errors.New("Local terminal host closed")
+	}
+	r, e := b.lookup(request)
+	if e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	if !r.Operation.Tombstone || r.Operation.State != runtimeprovision.ProcessCancelled || r.RequestDigest != "" || r.Operation.Executable != "" || r.Operation.StartedAt != nil || r.Operation.ExitCode != nil || r.Operation.StdoutBytes != 0 || len(r.Tail) != 0 || r.command != nil || r.terminal != nil {
+		return runtimeprovision.ProcessOperation{}, runtimeprovision.ErrConflict
+	}
+	// Hold the mutex through unlink+directory fsync. A racing start/cancel
+	// cannot interleave a new journal under this identity. On failure retain
+	// the in-memory fence; do not silently allow a same-process retry to start.
+	directory, e := os.Open(b.cfg.JournalRoot)
+	if e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	defer directory.Close()
+	if e = os.Remove(filepath.Join(b.cfg.JournalRoot, request.OperationID+".json")); e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	if e = directory.Sync(); e != nil {
+		return runtimeprovision.ProcessOperation{}, e
+	}
+	delete(b.operations, request.OperationID)
+	return b.snapshot(r), nil
+}
+
 func (b *backend) Close() error {
 	b.mu.Lock()
 	if b.closed {

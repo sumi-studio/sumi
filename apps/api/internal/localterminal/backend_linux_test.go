@@ -241,6 +241,9 @@ func TestWholeHostDeathDoesNotRelaunchOrKillSurvivor(t *testing.T) {
 	if e != nil || op.State != runtimeprovision.ProcessIndeterminate || op.Quiesced || op.OutputAttached || !strings.Contains(op.Error, "not proven stopped") {
 		t.Fatal("restart disposition", op, e)
 	}
+	if _, e := b.ReleaseProcessTombstone(context.Background(), lookup(op)); !errors.Is(e, runtimeprovision.ErrConflict) {
+		t.Fatal("host-death history released", e)
+	}
 	cancelled, e := b.CancelProcess(context.Background(), lookup(op))
 	if e != nil || cancelled.Quiesced || cancelled.State != runtimeprovision.ProcessIndeterminate {
 		t.Fatal("cancel lost shell", cancelled, e)
