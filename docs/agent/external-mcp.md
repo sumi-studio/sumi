@@ -1,10 +1,16 @@
-# Remote MCP tools
+# MCP tools
 
 The main Go API can give a person's secretary access to remote MCP tools. The
 server requires PostgreSQL, the Core state service and `SUMI_MODEL_CONNECTION_KEY`
 (the same 32-byte base64 key used to seal model credentials). MCP ciphertext has
 its own authenticated-encryption domain. With no key/Core service, the connection
 API returns unavailable and the MCP tools are not advertised.
+
+The account-free Local host separately supports HTTPS and explicitly configured
+stdio servers through `sumi-local mcp`, using its existing persona-scoped human
+capability. See [Local MCP configuration](../local-host.md). The signed-in routes
+below describe the main API; Local credentials and executable configuration stay
+with the Local installation.
 
 ## Configure a connection
 
@@ -87,7 +93,7 @@ job requests, connection listings or application logs.
 ## Bounds and present limits
 
 - Transport: Streamable HTTP, with JSON and SSE response bodies. Legacy HTTP+SSE
-  transport, stdio, remote OAuth, sampling, elicitation, roots, resources/prompts,
+  transport, Cloud stdio, remote OAuth, sampling, elicitation, roots, resources/prompts,
   MCP Apps rendering and MCP tasks are unsupported. Returned metadata remains
   data; no HTML surface is activated.
 - Official Go SDK v1.3.1 is pinned to keep the existing Go1.23 baseline. v1.4.1
@@ -101,11 +107,12 @@ job requests, connection listings or application logs.
 - A remote operation has a 30-second context; session cleanup also has bounded
   HTTP timeouts. One worker processes one job at a time with fair persona
   rotation. Arguments are at most 32 KiB, transport bodies 2 MiB, durable results
-  60 KiB. Oversized results are explicitly omitted, never silently shortened
-  into a supposedly complete result.
-- This is wired into `cmd/server`. The minimal standalone Local host state
-  service has no signed-in connection-configuration API and is not wired by this
-  slice. Connection credentials are not portable secretary state; moving to a
+  60 KiB. Oversized notifications are discarded first with an explicit marker,
+  preserving a complete primary result when it fits. A primary result that is
+  itself too large is explicitly omitted; schemas are never silently shortened.
+- The main API route is wired into `cmd/server`; Local uses its own
+  fm-authorized configuration route and host-scoped runner in `cmd/first-model`.
+  Connection credentials are not portable secretary state; moving to a
   different installation requires configuring a connection there.
 
 ## Executable acceptance
