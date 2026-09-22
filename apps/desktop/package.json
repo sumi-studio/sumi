@@ -1,0 +1,25 @@
+{
+  "name": "@sumi/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "exports": {
+    "./browser": "./dist/browser/runtime.js",
+    "./browser-contract": "./dist/browser/contract.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/contract.test.mjs",
+    "test:browser": "pnpm build && electron test/acceptance.mjs",
+    "dev:browser": "pnpm build && electron dist/browser-dev.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "electron": "44.4.3",
+    "typescript": "~6.0.3"
+  }
+}
