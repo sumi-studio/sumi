@@ -129,16 +129,13 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	}}
 	for _, method := range []string{"observe", "act"} {
 		method := method
-		effects["browser."+method] = agentstate.ToolEffect{Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
+		effects["browser."+method] = agentstate.ToolEffect{Validate: func(req map[string]any) error {
+			return validateRequest(method, req)
+		}, Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
+			if e := validateRequest(method, req); e != nil {
+				return nil, e
+			}
 			id, _ := req["attachment_id"].(string)
-			if _, e := uuid.Parse(id); e != nil {
-				return nil, fmt.Errorf("%w: attachment_id required", agentstate.ErrBadRequest)
-			}
-			if method == "act" {
-				if e := validateAction(req); e != nil {
-					return nil, e
-				}
-			}
 			var tab TabRef
 			var allow bool
 			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND b.last_seen_at>now()-interval '30 seconds' FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow)
@@ -163,6 +160,19 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	}
 	return effects
 }
+func validateRequest(method string, req map[string]any) error {
+	id, _ := req["attachment_id"].(string)
+	if _, e := uuid.Parse(id); e != nil {
+		return fmt.Errorf("%w: attachment_id required", agentstate.ErrBadRequest)
+	}
+	if method == "act" {
+		if e := validateAction(req); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 func validateAction(req map[string]any) error {
 	bad := fmt.Errorf("%w: invalid browser action or observation binding", agentstate.ErrBadRequest)
 	raw, e := json.Marshal(req)

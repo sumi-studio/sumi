@@ -129,29 +129,18 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	}}
 	for _, method := range []string{"list_tools", "call"} {
 		method := method
-		out["mcp."+method] = agentstate.ToolEffect{Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
+		out["mcp."+method] = agentstate.ToolEffect{Validate: func(req map[string]any) error {
+			return validateRequest(method, req)
+		}, Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
+			if e := validateRequest(method, req); e != nil {
+				return nil, e
+			}
 			id, _ := req["connection_id"].(string)
-			if _, e := uuid.Parse(id); e != nil {
-				return nil, fmt.Errorf("%w: connection_id required", agentstate.ErrBadRequest)
-			}
 			name, _ := req["name"].(string)
-			if method == "call" && (name == "" || len(name) > 256) {
-				return nil, fmt.Errorf("%w: tool name required", agentstate.ErrBadRequest)
-			}
-			args, ok := req["arguments"].(map[string]any)
-			if method == "call" && !ok {
-				return nil, fmt.Errorf("%w: arguments must be an object", agentstate.ErrBadRequest)
-			}
-			raw, e := json.Marshal(args)
-			if e != nil || len(raw) > 32<<10 {
-				return nil, fmt.Errorf("%w: arguments exceed 32 KiB", agentstate.ErrBadRequest)
-			}
+			args, _ := req["arguments"].(map[string]any)
 			cursor, _ := req["cursor"].(string)
-			if len(cursor) > 2048 {
-				return nil, fmt.Errorf("%w: cursor too long", agentstate.ErrBadRequest)
-			}
 			var version string
-			e = tx.QueryRow(ctx, `SELECT c.version FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND p.authority='active' AND c.connection_id=$2 AND c.enabled FOR SHARE OF c`, persona, id).Scan(&version)
+			e := tx.QueryRow(ctx, `SELECT c.version FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND p.authority='active' AND c.connection_id=$2 AND c.enabled FOR SHARE OF c`, persona, id).Scan(&version)
 			if errors.Is(e, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, ErrUnavailable)
 			}
@@ -174,4 +163,28 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 		}}
 	}
 	return out
+}
+
+func validateRequest(method string, req map[string]any) error {
+	id, _ := req["connection_id"].(string)
+	if _, e := uuid.Parse(id); e != nil {
+		return fmt.Errorf("%w: connection_id required", agentstate.ErrBadRequest)
+	}
+	name, _ := req["name"].(string)
+	if method == "call" && (name == "" || len(name) > 256) {
+		return fmt.Errorf("%w: tool name required", agentstate.ErrBadRequest)
+	}
+	args, ok := req["arguments"].(map[string]any)
+	if method == "call" && !ok {
+		return fmt.Errorf("%w: arguments must be an object", agentstate.ErrBadRequest)
+	}
+	raw, e := json.Marshal(args)
+	if e != nil || len(raw) > 32<<10 {
+		return fmt.Errorf("%w: arguments exceed 32 KiB", agentstate.ErrBadRequest)
+	}
+	cursor, _ := req["cursor"].(string)
+	if len(cursor) > 2048 {
+		return fmt.Errorf("%w: cursor too long", agentstate.ErrBadRequest)
+	}
+	return nil
 }

@@ -459,6 +459,10 @@ type TerminalFailureNoticeFunc func(ctx context.Context, tx pgx.Tx, f TerminalFa
 // best-effort (e.g. live fanout); it cannot decide or undo the committed
 // record and its failure is invisible to the caller by design.
 type ToolEffect struct {
+	// Validate checks only deterministic request shape before an elevated call
+	// asks for approval. It must not query mutable state or cause effects;
+	// authorization and other live checks still belong in Apply.
+	Validate    func(request map[string]any) error
 	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
 	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
 	// ReadOnly reports whether a completed call could not have changed
@@ -2539,7 +2543,11 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		// deterministic argument validation runs before the approval row
 		// exists, so nothing parks and no approved/unconsumed grant is
 		// stranded (repair F2). The operation records the honest failure.
-		if verr := validateToolRequest(op.Tool, op.Request); verr != nil {
+		verr := validateToolRequest(op.Tool, op.Request)
+		if effect, ok := s.effects[op.Tool]; verr == nil && ok && effect.Validate != nil {
+			verr = effect.Validate(op.Request)
+		}
+		if verr != nil {
 			if err := tx.QueryRow(ctx, `
 				UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
 				WHERE persona_id = $1 AND operation_id = $2
