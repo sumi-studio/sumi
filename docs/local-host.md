@@ -325,7 +325,9 @@ kernel terminal ioctl. Other allowed signals target the owned shell leader.
 Explicit close and the eight-hour session lifetime stop the owned shell leader
 and close its PTY; arbitrary detached descendants may survive.
 
-A full state-service process restart cannot recover a PTY descriptor. The
+Normal SIGTERM/INT shutdown stops the owned terminal shell leaders and records
+their outcomes. An abrupt state-service process death cannot recover a PTY
+descriptor. The
 journal in `<home>/terminals` preserves the accepted operation identity before
 launch, so recovery reports the old session as lost/indeterminate instead of
 launching a replacement. It never looks up or signals a PID read from disk.
@@ -343,3 +345,83 @@ working storage, the Local PTY is unavailable: the Cloud filesystem is not
 mounted as a Local directory. `doctor` states this, and terminal-session
 bootstrap returns HTTP 503 with `local_terminal_unavailable` and
 `working_store: cloud`. It does not silently create another workspace.
+
+## Configure Local MCP servers
+
+The person who owns this Local installation can grant the secretary an HTTPS
+MCP connection or a Local stdio executable without a Cloud account. Create a
+JSON configuration file with mode 0600, then use the executable CLI:
+
+```sh
+sumi-local mcp save /path/to/mcp.json       # create; prints connection metadata/id
+sumi-local mcp list                       # metadata only, never credentials
+sumi-local mcp save /path/to/mcp.json ID   # replace configuration and grant
+sumi-local mcp delete ID                  # revoke and remove
+```
+
+Example HTTPS configuration (the bearer field is optional):
+
+```json
+{"name":"My remote tools","transport":"https","endpoint":"https://tools.example.com/mcp","enabled":true,"bearerToken":"server-credential"}
+```
+
+Example stdio configuration (use actual absolute executable/cwd paths):
+
+```json
+{"name":"My Local tools","transport":"stdio","command":"/usr/bin/node","args":["/home/me/tools/server.mjs"],"cwd":"/home/me/workspace","env":{"SERVER_API_KEY":"server-credential"},"enabled":true}
+```
+
+Saving with `enabled: true` is the standing grant. The secretary discovers
+connections using `mcp.connections`, obtains complete tool descriptions and
+schemas with `mcp.list_tools`, and invokes a discovered tool with `mcp.call`.
+The latter two return durable jobs; the real result, including
+`call_result.structuredContent`, is available through `job.status`. There is
+no further per-call approval. Tool output cannot create or modify these
+connections: only the existing persona-scoped Local `fm_` human capability
+(or existing install admin authority) can use
+`/fm/<persona>/mcp-connections`. Core persona tokens cannot change settings.
+
+Configuration is encrypted in PostgreSQL and bound to both `SUMI_LOCAL_ID`
+and the configured persona. Its key is derived under a distinct domain from
+the installation's existing secret. Closing the browser or restarting normally
+does not remove it. Another Local installation or secretary cannot discover
+or use that grant. These host configurations and credentials are not portable
+Core state: another host, a changed installation ID, or a changed install
+secret requires reconfiguration. API/CLI listing returns metadata only;
+replacement therefore needs the complete configuration, including credentials.
+Keep your configuration file private or remove it after saving.
+
+Each discovery/call starts a stdio protocol server for that bounded job, using
+the official MCP SDK's newline-framed transport, and stops it when the job
+finishes. The process inherits only a fixed PATH and LANG plus explicitly
+configured environment values; it does not inherit the host's database,
+model, or admin environment credentials. It runs with the Local user's normal
+permissions and the configured cwd; it is not a sandbox. The executable is
+explicit, not a shell command, and no package is downloaded automatically.
+Noisy stderr is discarded, each inbound frame is bounded to 2 MiB, and the
+operation has a 30-second deadline. Notifications can be omitted with an
+explicit marker to keep the primary result; genuinely oversized primary
+results are explicitly omitted rather than returning a partial schema.
+
+Local stdio uses a host-specific job kind; the Cloud MCP runner does not
+claim it, and generic job submission cannot supply executable configuration.
+Cancellation, normal host SIGTERM/INT, initialization failure, and completion
+close pipes and kill the owned process group before reaping its leader. This
+retains the group's identity during cleanup rather than signaling a reused
+PID. Descendants that deliberately leave that process group remain outside
+this lifecycle boundary. SIGKILL/power loss cannot run that cleanup; Linux
+parent-death signaling stops the direct child but is not proof that all
+children stopped. No physical-quiescence claim is made.
+
+An already started server can have initialization side effects even when no
+tool call was dispatched; the result distinguishes `server_started` from
+`dispatched`. A tool mutation whose response is lost is indeterminate and is
+never automatically sent again. Interrupted claimed jobs expire to lost;
+inspect the affected external state before deliberately issuing a new call.
+Revocation prevents queued work and future dispatch using the prior grant;
+an operation already admitted is bounded and finishes before revocation
+returns. An MCP error does not end the secretary's Local terminal or delete
+its workspace files. HTTPS retains the main API's public-destination checks,
+credential handling and protocol semantics; stdio does not enable private
+HTTP destinations. OAuth, MCP Apps, macOS support and a new onboarding UI
+are not part of this interface.

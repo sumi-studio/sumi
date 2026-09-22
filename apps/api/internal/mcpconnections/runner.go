@@ -49,16 +49,16 @@ func (r *Runner) Run(ctx context.Context) {
 // Tick claims one bounded call at a time. A crash leaves a claim to expire to
 // 'lost', never queued again. Only persistence of an observed result is retried.
 func (r *Runner) Tick(ctx context.Context) error {
-	if _, e := r.Core.SweepExpiredJobs(ctx, []string{"mcp"}, 64); e != nil {
+	if _, e := r.Core.SweepExpiredJobs(ctx, []string{r.Store.jobKind()}, 64); e != nil {
 		return e
 	}
-	personas, e := r.Core.PersonasWithRunnableJobs(ctx, []string{"mcp"}, 1, r.cursor)
+	personas, e := r.Core.PersonasWithRunnableJobs(ctx, []string{r.Store.jobKind()}, 1, r.cursor)
 	if e != nil {
 		return e
 	}
 	for _, persona := range personas {
 		r.cursor = persona
-		jobs, _, e := r.Core.ClaimJobs(ctx, persona, r.ID, []string{"mcp"}, 2*time.Minute, 1, "*")
+		jobs, _, e := r.Core.ClaimJobs(ctx, persona, r.ID, []string{r.Store.jobKind()}, 2*time.Minute, 1, "*")
 		if e != nil {
 			return e
 		}
@@ -96,23 +96,25 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 		return result, "MCP authorization could not be checked"
 	}
 	defer tx.Rollback(context.Background())
-	var human, endpoint string
-	var ciphertext []byte
-	e = tx.QueryRow(ctx, `SELECT c.human_id,c.endpoint,c.credential_ciphertext FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND p.authority='active' AND c.connection_id=$2 AND c.version=$3 AND c.enabled FOR SHARE OF c,p`, job.PersonaID, job.Request["connection_id"], job.Request["version"]).Scan(&human, &endpoint, &ciphertext)
+	cfg, e := r.Store.configuration(ctx, tx, job.PersonaID, fmt.Sprint(job.Request["connection_id"]), fmt.Sprint(job.Request["version"]))
 	if e != nil {
-		return result, ErrUnavailable.Error()
+		return result, "MCP connection unavailable or permission revoked"
 	}
-	n := r.Store.aead.NonceSize()
-	if len(ciphertext) < n {
-		return result, "MCP credential unavailable"
-	}
-	aad, _ := json.Marshal([]string{"sumi.mcp.v1", human, fmt.Sprint(job.Request["connection_id"])})
-	raw, e := r.Store.aead.Open(nil, ciphertext[:n], ciphertext[n:], aad)
-	if e != nil {
-		return result, "MCP credential unavailable"
-	}
-	secret := string(raw)
-	defer clear(raw)
+	secret := cfg.BearerToken
+	defer func() {
+		result = normalize(result)
+		for _, value := range append([]string{secret}, cfg.Args...) {
+			if value != "" {
+				result = scrub(result, value).(map[string]any)
+			}
+		}
+		for _, value := range cfg.Env {
+			if value != "" {
+				result = scrub(result, value).(map[string]any)
+			}
+		}
+		result = boundResult(result)
+	}()
 	// Do not dispatch a job cancelled after it was claimed. While executing,
 	// cancellation closes the request; the outcome may still be indeterminate.
 	current, e := r.Core.GetJob(ctx, job.PersonaID, job.JobID)
@@ -139,25 +141,40 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 			}
 		}
 	}()
-	transport := &http.Transport{Proxy: nil, DisableCompression: true, MaxResponseHeaderBytes: 32 << 10, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 15 * time.Second}
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, port, e := net.SplitHostPort(address)
+	var wire mcp.Transport
+	if cfg.Transport == "stdio" {
+		if r.Store.local == nil {
+			return result, "Local MCP transport unavailable"
+		}
+		var closeProcess func()
+		wire, closeProcess, e = startStdio(ctx, cfg)
 		if e != nil {
-			return nil, e
+			return result, "Local MCP process could not start"
 		}
-		ips, e := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		if e != nil || len(ips) == 0 {
-			return nil, errors.New("MCP destination could not be resolved")
-		}
-		for _, ip := range ips {
-			if !(r.Store.allowLoopback && ip.IsLoopback()) && !publicweb.IsPublicAddress(ip) {
-				return nil, errors.New("MCP destination is not public")
+		defer closeProcess()
+		result["server_started"] = true
+	} else {
+		transport := &http.Transport{Proxy: nil, DisableCompression: true, MaxResponseHeaderBytes: 32 << 10, TLSHandshakeTimeout: 5 * time.Second, ResponseHeaderTimeout: 15 * time.Second}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, e := net.SplitHostPort(address)
+			if e != nil {
+				return nil, e
 			}
+			ips, e := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if e != nil || len(ips) == 0 {
+				return nil, errors.New("MCP destination could not be resolved")
+			}
+			for _, ip := range ips {
+				if !(r.Store.allowLoopback && ip.IsLoopback()) && !publicweb.IsPublicAddress(ip) {
+					return nil, errors.New("MCP destination is not public")
+				}
+			}
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
 		}
-		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+		defer transport.CloseIdleConnections()
+		client := &http.Client{Transport: authTransport{base: transport, token: secret}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Timeout: 30 * time.Second}
+		wire = &mcp.StreamableClientTransport{Endpoint: cfg.Endpoint, HTTPClient: client, MaxRetries: -1}
 	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: authTransport{base: transport, token: secret}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Timeout: 30 * time.Second}
 	var mu sync.Mutex
 	notes := []map[string]any{}
 	note := func(v map[string]any) {
@@ -170,9 +187,12 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 	opts := &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ToolListChangedHandler: func(context.Context, *mcp.ToolListChangedRequest) { note(map[string]any{"type": "tools/list_changed"}) }, ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
 		note(map[string]any{"type": "progress", "progress": req.Params.Progress, "total": req.Params.Total, "message": req.Params.Message})
 	}}
-	session, e := mcp.NewClient(&mcp.Implementation{Name: "sumi", Version: "1"}, opts).Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: client, MaxRetries: -1}, nil)
+	session, e := mcp.NewClient(&mcp.Implementation{Name: "sumi", Version: "1"}, opts).Connect(ctx, wire, nil)
 	if e != nil {
 		result["error_detail"] = safeError(e, secret)
+		if cfg.Transport == "stdio" {
+			return result, "Local MCP initialization failed; server startup may already have had effects"
+		}
 		return result, "MCP initialization failed (check endpoint, credential, and supported protocol)"
 	}
 	defer func() {
@@ -184,11 +204,6 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 			result["notifications"] = notes
 		}
 		mu.Unlock()
-		result = scrub(result, secret).(map[string]any)
-		b, _ := json.Marshal(result)
-		if len(b) > 60<<10 {
-			result = map[string]any{"result_omitted": true, "reason": "remote result exceeds 60 KiB", "dispatched": result["dispatched"], "outcome": result["outcome"]}
-		}
 	}()
 	result["protocol_version"] = session.InitializeResult().ProtocolVersion
 	method, _ := job.Request["method"].(string)
@@ -335,4 +350,19 @@ func safeError(e error, secret string) string {
 		s = s[:1024] + "…"
 	}
 	return s
+}
+
+// Notifications are expendable; complete schemas and primary tool results are
+// retained whenever they fit. Never truncate a schema into a different schema.
+func boundResult(result map[string]any) map[string]any {
+	b, _ := json.Marshal(result)
+	if len(b) > 60<<10 && result["notifications"] != nil {
+		delete(result, "notifications")
+		result["notifications_omitted"] = true
+		b, _ = json.Marshal(result)
+	}
+	if len(b) > 60<<10 {
+		return map[string]any{"result_omitted": true, "reason": "primary MCP result exceeds 60 KiB", "dispatched": result["dispatched"], "outcome": result["outcome"], "server_started": result["server_started"]}
+	}
+	return result
 }

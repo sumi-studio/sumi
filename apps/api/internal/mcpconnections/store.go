@@ -1,4 +1,4 @@
-// Package mcpconnections connects human-granted remote tools to durable Core jobs.
+// Package mcpconnections connects human-granted tools to durable Core jobs.
 package mcpconnections
 
 import (
@@ -23,10 +23,11 @@ var ErrInvalid = errors.New("invalid MCP connection")
 var ErrUnavailable = errors.New("MCP connection unavailable or permission revoked")
 
 type Connection struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Endpoint string `json:"endpoint"`
-	Enabled  bool   `json:"enabled"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Endpoint  string `json:"endpoint"`
+	Enabled   bool   `json:"enabled"`
+	Transport string `json:"transport,omitempty"`
 }
 type Input struct {
 	Name        string `json:"name"`
@@ -38,6 +39,7 @@ type Store struct {
 	pool          *pgxpool.Pool
 	aead          cipher.AEAD
 	allowLoopback bool
+	local         *localScope
 }
 
 func New(pool *pgxpool.Pool, key []byte) (*Store, error) {
@@ -52,12 +54,8 @@ func New(pool *pgxpool.Pool, key []byte) (*Store, error) {
 	return &Store{pool: pool, aead: a}, e
 }
 func (s *Store) Save(ctx context.Context, human, id string, in Input) (Connection, error) {
-	u, e := url.Parse(in.Endpoint)
-	if e != nil || len(in.Endpoint) > 2048 || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && !(s.allowLoopback && u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))) {
-		return Connection{}, fmt.Errorf("%w: endpoint must be HTTPS without credentials, query or fragment", ErrInvalid)
-	}
-	if strings.TrimSpace(in.Name) == "" || len(in.Name) > 120 || len(in.BearerToken) > 8192 || strings.IndexFunc(in.Name+in.BearerToken, unicode.IsControl) >= 0 || strings.ContainsAny(in.BearerToken, " \t") {
-		return Connection{}, ErrInvalid
+	if e := s.validateInput(in); e != nil {
+		return Connection{}, e
 	}
 	create := id == ""
 	if create {
@@ -81,7 +79,7 @@ func (s *Store) Save(ctx context.Context, human, id string, in Input) (Connectio
 			tagErr = ErrUnavailable
 		}
 	}
-	return Connection{id, in.Name, in.Endpoint, in.Enabled}, tagErr
+	return Connection{ID: id, Name: in.Name, Endpoint: in.Endpoint, Enabled: in.Enabled}, tagErr
 }
 func (s *Store) List(ctx context.Context, human string) ([]Connection, error) {
 	rows, e := s.pool.Query(ctx, `SELECT connection_id,name,endpoint,enabled FROM mcp_connections WHERE human_id=$1 ORDER BY name,connection_id`, human)
@@ -112,7 +110,16 @@ func (s *Store) Delete(ctx context.Context, human, id string) error {
 func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	out := map[string]agentstate.ToolEffect{}
 	out["mcp.connections"] = agentstate.ToolEffect{ReadOnly: agentstate.AlwaysReadOnly, Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
-		rows, e := tx.Query(ctx, `SELECT c.connection_id,c.name FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND c.enabled ORDER BY c.name,c.connection_id LIMIT 100`, persona)
+		var rows pgx.Rows
+		var e error
+		if s.local != nil {
+			if persona != s.local.persona {
+				return nil, ErrUnavailable
+			}
+			rows, e = tx.Query(ctx, `SELECT connection_id,name FROM local_mcp_connections WHERE host_id=$1 AND persona_id=$2 AND enabled ORDER BY name,connection_id LIMIT 100`, s.local.host, persona)
+		} else {
+			rows, e = tx.Query(ctx, `SELECT c.connection_id,c.name FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND c.enabled ORDER BY c.name,c.connection_id LIMIT 100`, persona)
+		}
 		if e != nil {
 			return nil, e
 		}
@@ -140,7 +147,15 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			args, _ := req["arguments"].(map[string]any)
 			cursor, _ := req["cursor"].(string)
 			var version string
-			e := tx.QueryRow(ctx, `SELECT c.version FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND p.authority='active' AND c.connection_id=$2 AND c.enabled FOR SHARE OF c`, persona, id).Scan(&version)
+			var e error
+			if s.local != nil {
+				if persona != s.local.persona {
+					return nil, ErrUnavailable
+				}
+				e = tx.QueryRow(ctx, `SELECT c.version FROM local_mcp_connections c JOIN core_personas p ON p.persona_id=c.persona_id WHERE c.host_id=$1 AND p.persona_id=$2 AND p.authority='active' AND c.connection_id=$3 AND c.enabled FOR SHARE OF c`, s.local.host, persona, id).Scan(&version)
+			} else {
+				e = tx.QueryRow(ctx, `SELECT c.version FROM mcp_connections c JOIN core_personas p ON p.human_id=c.human_id WHERE p.persona_id=$1 AND p.authority='active' AND c.connection_id=$2 AND c.enabled FOR SHARE OF c`, persona, id).Scan(&version)
+			}
 			if errors.Is(e, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, ErrUnavailable)
 			}
@@ -158,8 +173,8 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			if e != nil {
 				return nil, e
 			}
-			_, e = tx.Exec(ctx, `INSERT INTO core_jobs(persona_id,job_id,kind,request,status,created_by) VALUES($1,$2,'mcp',$3,'queued',$4)`, persona, jobID, request, "tool:"+idem)
-			return map[string]any{"job": map[string]any{"job_id": jobID, "kind": "mcp", "status": "queued"}}, e
+			_, e = tx.Exec(ctx, `INSERT INTO core_jobs(persona_id,job_id,kind,request,status,created_by) VALUES($1,$2,$5,$3,'queued',$4)`, persona, jobID, request, "tool:"+idem, s.jobKind())
+			return map[string]any{"job": map[string]any{"job_id": jobID, "kind": s.jobKind(), "status": "queued"}}, e
 		}}
 	}
 	return out
@@ -185,6 +200,17 @@ func validateRequest(method string, req map[string]any) error {
 	cursor, _ := req["cursor"].(string)
 	if len(cursor) > 2048 {
 		return fmt.Errorf("%w: cursor too long", agentstate.ErrBadRequest)
+	}
+	return nil
+}
+
+func (s *Store) validateInput(in Input) error {
+	u, e := url.Parse(in.Endpoint)
+	if e != nil || len(in.Endpoint) > 2048 || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && !(s.allowLoopback && u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "::1"))) {
+		return fmt.Errorf("%w: endpoint must be HTTPS without credentials, query or fragment", ErrInvalid)
+	}
+	if strings.TrimSpace(in.Name) == "" || len(in.Name) > 120 || len(in.BearerToken) > 8192 || strings.IndexFunc(in.Name+in.BearerToken, unicode.IsControl) >= 0 || strings.ContainsAny(in.BearerToken, " \t") {
+		return ErrInvalid
 	}
 	return nil
 }

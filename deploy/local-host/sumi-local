@@ -60,6 +60,7 @@ sumi-local — local install of the new Sumi core (no Sumi Cloud account)
   url                 print the browser URL (carries the fm credential)
   logs [-f]           tail service and secretary logs
   doctor              check prerequisites and configuration
+  mcp list|save|delete manage granted Local MCP connections
   pack [OUT.tar.gz]   build a redistributable bundle (no Go needed to install)
   uninstall [--purge] remove executables; keep the state home unless --purge
   version             print the source version this install was built from
@@ -1245,6 +1246,7 @@ $(log_excerpt "$fsvc_log" "$fsvc_off")"
     # actually provisioned filesvc — an unset pair leaves file routes
     # unmounted rather than pointing at nothing.
     local -a senv=(
+      "SUMI_LOCAL_ID=$SUMI_LOCAL_ID"
       "SUMI_DB_URL=$SUMI_DB_URL"
       "SUMI_CORE_STATE_TOKEN=$SUMI_CORE_STATE_TOKEN"
       "SUMI_FM_LISTEN=$SUMI_LOCAL_LISTEN"
@@ -1584,6 +1586,33 @@ cmd_say() {
     sleep 0.5
   done
   die "no reply within ${wait_s}s — the input stays queued; check '$PROG status' and '$PROG logs'"
+}
+
+cmd_mcp() {
+  load_config || die "not installed"
+  local action=${1:-list} method path file
+  shift || true
+  path="$(base_url)/fm/$SUMI_PERSONA_ID/mcp-connections"
+  case $action in
+    list) method=GET; (( $# == 0 )) || die "usage: $PROG mcp list";;
+    save)
+      (( $# == 1 || $# == 2 )) || die "usage: $PROG mcp save CONFIG.json [CONNECTION_ID]"
+      file=$1; [[ -r $file ]] || die "configuration file is unreadable"
+      method=POST
+      if (( $# == 2 )); then
+        [[ $2 =~ ^[0-9a-fA-F-]{36}$ ]] || die "invalid connection id"
+        method=PUT; path+="/$2"
+      fi;;
+    delete)
+      (( $# == 1 )) && [[ $1 =~ ^[0-9a-fA-F-]{36}$ ]] || die "usage: $PROG mcp delete CONNECTION_ID"
+      method=DELETE; path+="/$1";;
+    *) die "usage: $PROG mcp list | save CONFIG.json [CONNECTION_ID] | delete CONNECTION_ID";;
+  esac
+  local -a request=(--fail-with-body --silent --show-error --max-time 40 -X "$method"
+    -H "Authorization: Bearer $(fm_token)" -H 'Content-Type: application/json')
+  [[ $action == save ]] && request+=(--data-binary "@$file")
+  curl "${request[@]}" "$path"
+  printf '\n'
 }
 
 cmd_url() {
@@ -1955,6 +1984,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@";;
   say) shift; cmd_say "$@";;
   url) shift; cmd_url "$@";;
+  mcp) shift; cmd_mcp "$@";;
   logs) shift; cmd_logs "$@";;
   doctor) shift; cmd_doctor "$@";;
   pack) shift; cmd_pack "$@";;

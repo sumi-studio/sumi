@@ -426,3 +426,24 @@ func TestRemoteToolErrorsAndInvalidOutputRemainVisible(t *testing.T) {
 		}
 	}
 }
+
+func TestNoisyProgressDoesNotOmitSmallPrimaryResult(t *testing.T) {
+	f := setup(t)
+	remote := mcp.NewServer(&mcp.Implementation{Name: "noisy-progress", Version: "1"}, nil)
+	remote.AddTool(&mcp.Tool{Name: "small_result", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, r *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		for i := 0; i < 16; i++ {
+			_ = r.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: r.Params.Meta["progressToken"], Progress: float64(i), Total: 16, Message: strings.Repeat("x", 8192)})
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "actual small result"}}, StructuredContent: map[string]any{"value": "retained"}}, nil
+	})
+	remoteHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return remote }, nil))
+	defer remoteHTTP.Close()
+	c := f.save(remoteHTTP.URL)
+	f.coreCall("mcp.call", map[string]any{"connection_id": c.ID, "name": "small_result", "arguments": map[string]any{}})
+	f.tick()
+	job := f.job()
+	raw, _ := json.Marshal(job.Result)
+	if job.Status != "done" || job.Result["notifications_omitted"] != true || job.Result["result_omitted"] == true || !bytes.Contains(raw, []byte("retained")) || !bytes.Contains(raw, []byte("actual small result")) {
+		t.Fatalf("notifications displaced primary result: %+v", job)
+	}
+}

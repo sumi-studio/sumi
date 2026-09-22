@@ -47,8 +47,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -358,6 +360,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	stopMCP, err := wireLocalMCP(pool.Pool, core, fm, mux, personaID)
+	if err != nil {
+		log.Fatalf("Local MCP: %v", err)
+	}
+	defer stopMCP()
 	core.RegisterRoutes(mux)
 	stopTerminal, err := wireLocalTerminal(core, fm, mux, personaID, "http://"+listen)
 	if err != nil {
@@ -383,13 +390,28 @@ func main() {
 		_, _ = w.Write([]byte(uiHTML))
 	})
 
-	browserToken := fm.fmToken(personaID)
-	coreToken := core.PersonaToken(personaID)
 	log.Printf("first-model listening on http://%s", listen)
 	log.Printf("persona: %s", personaID)
-	log.Printf("browser UI: http://%s/?persona=%s&fm=%s", listen, personaID, browserToken)
-	log.Printf("core env:   SUMI_STATE_URL=http://%s SUMI_PERSONA_ID=%s SUMI_PERSONA_TOKEN=%s", listen, personaID, coreToken)
-	log.Fatal(http.ListenAndServe(listen, mux))
+	log.Print("Local installation: use sumi-local url for the credential-bearing browser URL")
+	shutdown, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	server := &http.Server{Addr: listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	ended := make(chan error, 1)
+	go func() { ended <- server.ListenAndServe() }()
+	select {
+	case err := <-ended:
+		if !errors.Is(err, http.ErrServerClosed) {
+			stopTerminal()
+			stopMCP()
+			log.Fatalf("Local HTTP server stopped: %v", err)
+		}
+	case <-shutdown.Done():
+		stopMCP() // close granted subprocesses before draining HTTP requests
+		closing, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(closing)
+	}
+	// Deferred Local runners close their owned processes before normal exit.
 }
 
 const uiHTML = `<!doctype html>
