@@ -31,7 +31,7 @@ import (
 //
 // Two boundaries hold this together, and both are about the transformation a
 // result passes through before it is stored (NUL replacement and redaction of
-// every configured value):
+// declared private values):
 //
 //   - Every size here is measured on the *transformed* copy, through persist,
 //     the same function execute persists with. A definition that fits before
@@ -40,7 +40,7 @@ import (
 //   - The continuation cursor is made only of this package's own integers and
 //     a digest. No byte of it comes from the server, which is what makes it
 //     safe to be the single value that transformation skips — a configured
-//     value as ordinary as DEBUG=1 would otherwise rewrite its prefix or its
+//     private value as short as "1" would otherwise rewrite its prefix or its
 //     base64 body into something that cannot be read back.
 const (
 	// toolPageBudget bounds the transformed tool definitions in one result.
@@ -65,7 +65,7 @@ const (
 	// which carries no payload, but the room must exist.
 	notificationHeadroom = 2 << 10
 
-	discoveryCursorPrefix = "sumi.tools.2:"
+	discoveryCursorPrefix = "sumi.tools.3:"
 	// cursorKey is the one result key whose value this package mints and the
 	// transformation skips. Named once, used by both sides of that boundary.
 	cursorKey = "next_cursor"
@@ -77,9 +77,9 @@ var ErrDiscoveryCursor = errors.New("MCP discovery cursor is not valid; repeat m
 
 // discoveryCursor resumes discovery at an exact position: Page is how many
 // upstream pages to walk past, Offset how many of that page's tools were
-// already delivered, Digest the page's tool-name sequence as observed then.
-// Digest is evidence, not authority: if the page changed, delivery restarts at
-// its beginning rather than skipping tools that moved.
+// already delivered, Digest the page's tool-name sequence as observed then, and Prefix the
+// chained digests of every preceding page. They are evidence, not authority:
+// any detected change restarts at page zero, including backward shifts.
 //
 // It deliberately holds no server-provided bytes. Carrying the server's own
 // cursor here would mean handing remote data back to the model inside a
@@ -88,6 +88,7 @@ type discoveryCursor struct {
 	Page   int    `json:"p,omitempty"`
 	Offset int    `json:"o,omitempty"`
 	Digest string `json:"d,omitempty"`
+	Prefix string `json:"h,omitempty"`
 }
 
 func encodeDiscoveryCursor(c discoveryCursor) (string, error) {
@@ -116,7 +117,7 @@ func decodeDiscoveryCursor(s string) (discoveryCursor, error) {
 		return discoveryCursor{}, ErrDiscoveryCursor
 	}
 	var c discoveryCursor
-	if json.Unmarshal(raw, &c) != nil || c.Page < 0 || c.Page >= discoveryScanPages || c.Offset < 0 || len(c.Digest) > 32 {
+	if json.Unmarshal(raw, &c) != nil || c.Page < 0 || c.Page >= discoveryScanPages || c.Offset < 0 || len(c.Digest) > 32 || len(c.Prefix) > 32 || (c.Page > 0 && c.Prefix == "") || (c.Offset > 0 && c.Digest == "") {
 		return discoveryCursor{}, ErrDiscoveryCursor
 	}
 	return c, nil
@@ -130,6 +131,51 @@ func pageDigest(tools []*mcp.Tool) string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)[:6])
+}
+
+// extendPrefix fingerprints the walked name sequence and page boundaries.
+// No upstream cursor or recoverable remote content enters the model's cursor.
+func extendPrefix(prefix, digest string) string {
+	h := sha256.Sum256([]byte(prefix + ":" + digest))
+	return hex.EncodeToString(h[:16])
+}
+
+// definitionProtected checks parsed strings and keys, not JSON escape bytes.
+// A redacted definition is not the server's complete callable definition.
+func definitionProtected(tool *mcp.Tool, secrets []string) bool {
+	raw, e := json.Marshal(tool)
+	if e != nil {
+		return true
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return true
+	}
+	return containsProtected(v, secrets)
+}
+
+func containsProtected(v any, secrets []string) bool {
+	switch x := v.(type) {
+	case string:
+		for _, secret := range secrets {
+			if secret != "" && strings.Contains(x, secret) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, value := range x {
+			if containsProtected(key, secrets) || containsProtected(value, secrets) {
+				return true
+			}
+		}
+	case []any:
+		for _, value := range x {
+			if containsProtected(value, secrets) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // selectedNames reads an already validated `names` request field.
@@ -224,6 +270,17 @@ func packTools(tools []*mcp.Tool, secrets []string) pagePlan {
 	used := 0
 	for _, tool := range tools {
 		size := persistedToolSize(tool, secrets)
+		if definitionProtected(tool, secrets) {
+			if len(plan.omitted) >= maxOmittedPerPage {
+				break
+			}
+			plan.omitted = append(plan.omitted, map[string]any{
+				"name": safeToolName(tool.Name, secrets), "bytes": size,
+				"reason": "definition contains a protected configuration value; unavailable until the server definition or private-value configuration is corrected",
+			})
+			plan.consumed++
+			continue
+		}
 		// The same accounting as the packing test below, so the first tool of a
 		// page either fits or is recorded as indivisible. A tool that satisfied
 		// neither would consume nothing and hand back the cursor it arrived
@@ -233,7 +290,7 @@ func packTools(tools []*mcp.Tool, secrets []string) pagePlan {
 				break
 			}
 			plan.omitted = append(plan.omitted, map[string]any{
-				"name":  boundName(tool.Name),
+				"name":  safeToolName(tool.Name, secrets),
 				"bytes": size,
 				"reason": fmt.Sprintf(
 					"this tool's complete definition needs %d bytes once stored, past the %d KiB discovery page; Sumi will not shorten a schema. Call it only with arguments the server documents elsewhere.",
@@ -252,6 +309,12 @@ func packTools(tools []*mcp.Tool, secrets []string) pagePlan {
 	return plan
 }
 
+// Scrub before truncating: a long name may put a private value across the
+// truncation boundary. A shortened credential must not be exposed either.
+func safeToolName(name string, secrets []string) string {
+	return boundName(scrub(name, secrets).(string))
+}
+
 func boundName(name string) string {
 	if len(name) > 256 {
 		return name[:256]
@@ -262,14 +325,17 @@ func boundName(name string) string {
 // nextNames lists what is still waiting on this upstream page, bounded by
 // count and bytes. Names let the secretary decide whether to page on or ask
 // for exact definitions with `names`; they are never a substitute for a schema.
-func nextNames(tools []*mcp.Tool) ([]string, bool) {
+func nextNames(tools []*mcp.Tool, secrets []string) ([]string, bool) {
 	out := []string{}
 	bytes := 0
 	for _, tool := range tools {
+		if definitionProtected(tool, secrets) {
+			continue
+		}
 		if len(out) >= maxNextNames || bytes+len(tool.Name)+3 > maxNextNamesBytes {
 			return out, true
 		}
-		out = append(out, boundName(tool.Name))
+		out = append(out, safeToolName(tool.Name, secrets))
 		bytes += len(tool.Name) + 3
 	}
 	return out, false
@@ -285,31 +351,33 @@ func listPage(ctx context.Context, session *mcp.ClientSession, cursor string, re
 	return list, ""
 }
 
-// pageAt walks the server's own pagination to the page this cursor names.
-// Walking costs one request per page and is bounded like the call path's
-// lookup; in exchange, a cursor never has to carry the server's bytes. If the
-// list has since shrunk past that page, the last page is returned — its digest
-// will not match, which is reported as a changed page rather than a silent gap.
-func pageAt(ctx context.Context, session *mcp.ClientSession, page int, result map[string]any, secrets []string) (*mcp.ListToolsResult, string) {
+// pageAt re-walks at most 32 upstream pages, retaining only the first and
+// target pages. Prefix detects changes anywhere before the target, including
+// a tool sliding backward across a consumed page boundary. This is detection
+// between observations, not a snapshot of a concurrently changing server.
+func pageAt(ctx context.Context, session *mcp.ClientSession, page int, result map[string]any, secrets []string) (list, first *mcp.ListToolsResult, prefix, problem string) {
 	cursor := ""
 	seen := map[string]bool{}
-	for index := 0; ; index++ {
-		list, problem := listPage(ctx, session, cursor, result, secrets)
+	for index := 0; index <= page; index++ {
+		list, problem = listPage(ctx, session, cursor, result, secrets)
 		if problem != "" {
-			return nil, problem
+			return
+		}
+		if index == 0 {
+			first = list
 		}
 		if index == page || list.NextCursor == "" {
-			return list, ""
-		}
-		if index+1 >= discoveryScanPages {
-			return list, ""
+			return
 		}
 		if seen[list.NextCursor] {
-			return nil, "MCP tools/list returned a repeated cursor"
+			problem = "MCP tools/list returned a repeated cursor"
+			return
 		}
+		prefix = extendPrefix(prefix, pageDigest(list.Tools))
 		cursor = list.NextCursor
 		seen[cursor] = true
 	}
+	return
 }
 
 // discoverTools fills result with one bounded page of complete definitions.
@@ -322,35 +390,35 @@ func discoverTools(ctx context.Context, session *mcp.ClientSession, request map[
 	if e != nil {
 		return e.Error()
 	}
-	list, problem := pageAt(ctx, session, c.Page, result, secrets)
+	list, first, prefix, problem := pageAt(ctx, session, c.Page, result, secrets)
 	if problem != "" {
 		return problem
 	}
 	digest := pageDigest(list.Tools)
-	offset := c.Offset
-	if c.Digest != "" && c.Digest != digest {
-		// The server's page is not the one this cursor measured. Resume at its
-		// beginning: re-showing a definition costs a page, losing one hides a
-		// tool the secretary was told to expect.
-		offset = 0
+	if c.Prefix != prefix || (c.Digest != "" && c.Digest != digest) {
+		// Starting at only the target page could still strand a tool that
+		// moved into an earlier consumed page. Re-show from the first page.
+		list, c, prefix = first, discoveryCursor{}, ""
+		digest = pageDigest(list.Tools)
 		result["page_changed"] = true
 	}
+	offset := c.Offset
 	if offset > len(list.Tools) {
 		offset = len(list.Tools)
 	}
-	return fitPage(result, list, c.Page, offset, digest, secrets)
+	return fitPage(result, list, c.Page, offset, digest, prefix, secrets)
 }
 
 // fitPage settles the page and its continuation together, so the cursor can
 // only ever advance past tools this result actually delivered or named. The
 // byte budget gets close; this check is what makes the decision correspond to
 // the durable bytes.
-func fitPage(result map[string]any, list *mcp.ListToolsResult, page, offset int, digest string, secrets []string) string {
+func fitPage(result map[string]any, list *mcp.ListToolsResult, page, offset int, digest, prefix string, secrets []string) string {
 	rest := list.Tools[offset:]
 	plan := packTools(rest, secrets)
 	withNames := true
 	for {
-		if problem := applyPage(result, list, page, offset, digest, plan, withNames); problem != "" {
+		if problem := applyPage(result, list, page, offset, digest, prefix, plan, withNames, secrets); problem != "" {
 			return problem
 		}
 		if persistedSize(result, secrets) <= resultBoundBytes-notificationHeadroom {
@@ -370,7 +438,7 @@ func fitPage(result map[string]any, list *mcp.ListToolsResult, page, offset int,
 
 // applyPage renders one candidate page. Everything it can set it also clears,
 // so a smaller candidate never inherits a larger one's metadata.
-func applyPage(result map[string]any, list *mcp.ListToolsResult, page, offset int, digest string, plan pagePlan, withNames bool) string {
+func applyPage(result map[string]any, list *mcp.ListToolsResult, page, offset int, digest, prefix string, plan pagePlan, withNames bool, secrets []string) string {
 	for _, key := range []string{"tools_omitted", "remaining_on_page", "next_names", "next_names_truncated", "scan_truncated"} {
 		delete(result, key)
 	}
@@ -381,7 +449,7 @@ func applyPage(result map[string]any, list *mcp.ListToolsResult, page, offset in
 	rest := list.Tools[offset+plan.consumed:]
 	switch {
 	case len(rest) > 0:
-		next, e := encodeDiscoveryCursor(discoveryCursor{Page: page, Offset: offset + plan.consumed, Digest: digest})
+		next, e := encodeDiscoveryCursor(discoveryCursor{Page: page, Offset: offset + plan.consumed, Digest: digest, Prefix: prefix})
 		if e != nil {
 			result[cursorKey] = ""
 			return e.Error()
@@ -389,7 +457,7 @@ func applyPage(result map[string]any, list *mcp.ListToolsResult, page, offset in
 		result[cursorKey] = next
 		result["remaining_on_page"] = len(rest)
 		if withNames {
-			waiting, truncated := nextNames(rest)
+			waiting, truncated := nextNames(rest, secrets)
 			result["next_names"] = waiting
 			if truncated {
 				result["next_names_truncated"] = true
@@ -398,7 +466,7 @@ func applyPage(result map[string]any, list *mcp.ListToolsResult, page, offset in
 	case list.NextCursor == "":
 		result[cursorKey] = ""
 	case page+1 < discoveryScanPages:
-		next, e := encodeDiscoveryCursor(discoveryCursor{Page: page + 1})
+		next, e := encodeDiscoveryCursor(discoveryCursor{Page: page + 1, Prefix: extendPrefix(prefix, digest)})
 		if e != nil {
 			result[cursorKey] = ""
 			return e.Error()
@@ -457,7 +525,7 @@ func discoverByName(ctx context.Context, session *mcp.ClientSession, names []str
 		if tool := found[name]; tool != nil {
 			ordered = append(ordered, tool)
 		} else {
-			missing = append(missing, boundName(name))
+			missing = append(missing, safeToolName(name, secrets))
 		}
 	}
 	result[cursorKey] = ""
@@ -474,7 +542,7 @@ func discoverByName(ctx context.Context, session *mcp.ClientSession, names []str
 				break
 			}
 			omitted = append(omitted, map[string]any{
-				"name":   boundName(tool.Name),
+				"name":   safeToolName(tool.Name, secrets),
 				"reason": "did not fit in this discovery page; request it again with fewer names",
 			})
 		}

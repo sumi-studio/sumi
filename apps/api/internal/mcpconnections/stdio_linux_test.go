@@ -81,10 +81,23 @@ func TestLocalStdioServerHelper(t *testing.T) {
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "before\x00after"}}, StructuredContent: map[string]any{"label": args.Label, "nested": map[string]any{"key\x00in-map": "value\x00here"}}}, nil
 		}
 		if args.Label == "tool-failed" {
-			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "fixture error"}}}, nil
+			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "fixture error " + os.Getenv("SERVER_SECRET")}}}, nil
+		}
+		if os.Getenv("MCP_ECHO_ARGS") == "yes" {
+			message := strings.Join(os.Args[1:], " ") + " " + os.Getenv("SERVER_SECRET") + " DEBUG=" + os.Getenv("DEBUG")
+			_ = r.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: r.Params.Meta["progressToken"], Progress: 1, Total: 1, Message: message})
+			if args.Label == "protocol-error" {
+				return nil, fmt.Errorf("%s", message)
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: message}}, StructuredContent: map[string]any{"label": args.Label}}, nil
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "saved " + os.Getenv("SERVER_SECRET")}}, StructuredContent: map[string]any{"label": args.Label}}, nil
 	})
+	if os.Getenv("MCP_PROTECTED_TOOL") == "yes" {
+		server.AddTool(&mcp.Tool{Name: "private_" + os.Getenv("SERVER_SECRET"), InputSchema: map[string]any{"type": "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{}, nil
+		})
+	}
 	// A Local server with an ordinary number of ordinary tools, for exercising
 	// paged discovery against a real stdio process rather than a stub.
 	if count, e := strconv.Atoi(os.Getenv("MCP_BULK_TOOLS")); e == nil && count > 0 {
@@ -110,7 +123,7 @@ func localTestStore(t *testing.T) (*Store, *agentstate.Server, LocalInput) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	cfg := LocalInput{Name: "Local server", Transport: "stdio", Enabled: true, Command: os.Args[0], Args: []string{"-test.run=^TestLocalStdioServerHelper$"}, Cwd: t.TempDir(), Env: map[string]string{"SUMI_MCP_STDIO_HELPER": "yes", "SERVER_SECRET": "local-secret-sentinel"}}
+	cfg := LocalInput{Name: "Local server", Transport: "stdio", Enabled: true, Command: os.Args[0], Args: []string{"-test.run=^TestLocalStdioServerHelper$"}, Cwd: t.TempDir(), Env: map[string]string{"SUMI_MCP_STDIO_HELPER": "yes", "SERVER_SECRET": "local-secret-sentinel"}, PrivateEnv: []string{"SERVER_SECRET"}}
 	return s, f.core, cfg
 }
 func localJob(t *testing.T, s *Store, core *agentstate.Server, id, method string, args map[string]any) agentstate.Job {

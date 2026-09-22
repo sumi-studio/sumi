@@ -129,7 +129,7 @@ func TestLocalMCPActualBinaryCLISecretaryAndStdio(t *testing.T) {
 	if e := os.MkdirAll(cwd, 0700); e != nil {
 		t.Fatal(e)
 	}
-	cfg := mcpconnections.LocalInput{Name: "Real Local stdio", Transport: "stdio", Enabled: true, Command: child, Args: []string{"-test.run=^TestLocalStdioServerHelper$"}, Cwd: cwd, Env: map[string]string{"SUMI_MCP_STDIO_HELPER": "yes", "SERVER_SECRET": "local-binary-private-secret"}}
+	cfg := mcpconnections.LocalInput{Name: "Real Local stdio", Transport: "stdio", Enabled: true, Command: child, Args: []string{"-test.run=^TestLocalStdioServerHelper$"}, Cwd: cwd, Env: map[string]string{"SUMI_MCP_STDIO_HELPER": "yes", "SERVER_SECRET": "local-binary-private-secret", "DEBUG": "1", "PATH": "/usr/bin:/bin", "MCP_BULK_TOOLS": "2"}, PrivateEnv: []string{"SERVER_SECRET"}}
 	raw, _ := json.Marshal(cfg)
 	configFile := filepath.Join(root, "mcp.json")
 	os.WriteFile(configFile, raw, 0600)
@@ -212,7 +212,7 @@ func TestLocalMCPActualBinaryCLISecretaryAndStdio(t *testing.T) {
 	var schema map[string]any
 	for _, tool := range listedJob.Result["tools"].([]any) {
 		candidate := tool.(map[string]any)
-		if strings.Contains(out, candidate["name"].(string)) {
+		if candidate["name"] == "remember_label" && strings.Contains(out, candidate["name"].(string)) {
 			name = candidate["name"].(string)
 			schema = candidate
 			break
@@ -229,6 +229,27 @@ func TestLocalMCPActualBinaryCLISecretaryAndStdio(t *testing.T) {
 	out = coreCall("job.status", map[string]any{"job_id": invoked.JobID})
 	if !strings.Contains(out, "structuredContent") || !strings.Contains(out, "from-actual-secretary") || !strings.Contains(out, "[redacted]") {
 		t.Fatal("structured result not usable by Core", out)
+	}
+	// The secretary uses the name delivered with ordinary DEBUG=1, not a raw
+	// upstream name hidden from it. Its schema and protocol must stay intact.
+	bulkName := ""
+	for _, tool := range listedJob.Result["tools"].([]any) {
+		definition := tool.(map[string]any)
+		if definition["name"] == "bulk_01" {
+			bulkName = definition["name"].(string)
+			input := definition["inputSchema"].(map[string]any)
+			if input["type"] != "object" {
+				t.Fatal("ordinary env changed schema", input)
+			}
+		}
+	}
+	if bulkName == "" || listedJob.Result["protocol_version"] != "2025-06-18" {
+		t.Fatal("ordinary env corrupted discovery", listedJob.Result)
+	}
+	coreCall("mcp.call", map[string]any{"connection_id": discovered, "name": bulkName, "arguments": map[string]any{"value": "ordinary-value"}})
+	bulkJob := waitJob()
+	if bulkJob.Status != "done" || bulkJob.Result["outcome"] != "returned" {
+		t.Fatal("delivered bulk name failed", bulkJob)
 	}
 	// One failed MCP call leaves the same Local terminal and previous files usable.
 	coreCall("terminal.open", map[string]any{"name": "MCP failure isolation"})
@@ -311,7 +332,7 @@ func TestLocalMCPActualBinaryCLISecretaryAndStdio(t *testing.T) {
 	}
 	cliCall("delete", metadata.ID)
 	var leak bool
-	if e = pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM core_jobs WHERE request::text LIKE $1 OR result::text LIKE $1)`, "%local-binary-private-secret%").Scan(&leak); e != nil || leak {
+	if e = pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM core_jobs WHERE request::text LIKE $1 OR result::text LIKE $1 OR error LIKE $1)`, "%local-binary-private-secret%").Scan(&leak); e != nil || leak {
 		t.Fatal("credential in jobs", e)
 	}
 	stop()

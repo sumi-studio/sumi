@@ -8,22 +8,12 @@ import (
 	"testing"
 )
 
-// An ordinary Local configuration carries short values. `DEBUG=1` is not a
-// credential, but every configured value is a redaction target, so the
-// traversal that removes credentials also rewrites any string containing "1".
-// A continuation cursor must survive that: if the cursor this package minted
-// does not come back intact, every page after the first is unreachable.
-//
-// Note what this deliberately does not assert. Under DEBUG=1 the remote tool
-// *names* come back rewritten too ("bulk_01" is delivered as
-// "bulk_0[redacted]"), which is the product's existing redaction policy, not
-// something discovery decides — see evidence/short-configured-value-corrupts-
-// remote-names.log and the limits section of HANDBACK.md. This test therefore
-// counts complete definitions and their integrity, which is what paging owns.
+// Ordinary configuration must preserve identifiers, schema vocabulary, and
+// protocol metadata, including when those strings contain short values.
 func TestLocalStdioDiscoveryCursorSurvivesOrdinaryConfiguredValues(t *testing.T) {
 	// Several ordinary values, because which characters a cursor happens to
 	// contain must not be what keeps discovery working.
-	for _, value := range []string{"1", "2", "yes"} {
+	for _, value := range []string{"1", "2", "yes", "object", "string"} {
 		t.Run("DEBUG="+value, func(t *testing.T) { discoveryUnderConfiguredValue(t, value) })
 	}
 }
@@ -33,6 +23,7 @@ func discoveryUnderConfiguredValue(t *testing.T, value string) {
 	ctx := context.Background()
 	cfg.Env["MCP_BULK_TOOLS"] = "30"
 	cfg.Env["DEBUG"] = value
+	cfg.Env["PATH"] = "/usr/bin:/bin"
 	c, e := s.SaveLocal(ctx, "", cfg)
 	if e != nil {
 		t.Fatal(e)
@@ -56,6 +47,9 @@ func discoveryUnderConfiguredValue(t *testing.T, value string) {
 		if job.Status != "done" || job.Result["result_omitted"] == true {
 			t.Fatalf("page %d against a real Local server: %s %+v", page, job.Status, job.Result)
 		}
+		if job.Result["protocol_version"] != "2025-06-18" {
+			t.Fatalf("protocol version changed: %v", job.Result["protocol_version"])
+		}
 		tools, ok := job.Result["tools"].([]any)
 		if !ok {
 			t.Fatalf("page %d delivered no tools: %+v", page, job.Result)
@@ -68,6 +62,11 @@ func discoveryUnderConfiguredValue(t *testing.T, value string) {
 				continue
 			}
 			bulk++
+			input := tool["inputSchema"].(map[string]any)
+			property := input["properties"].(map[string]any)["value"].(map[string]any)
+			if input["type"] != "object" || property["type"] != "string" {
+				t.Fatalf("schema changed: %v", input)
+			}
 			if description, _ := tool["description"].(string); len(description) != 1200 {
 				t.Fatalf("%s was shortened to %d bytes", name, len(description))
 			}
@@ -92,4 +91,16 @@ func discoveryUnderConfiguredValue(t *testing.T, value string) {
 			t.Fatalf("%s delivered %d times", name, count)
 		}
 	}
+	if seen["bulk_01"] != 1 {
+		t.Fatalf("ordinary config changed bulk_01: %v", seen)
+	}
+	job := localCallJob(t, s, core, c.ID, "bulk_01", map[string]any{"value": "x"})
+	if e := runner.Tick(ctx); e != nil {
+		t.Fatal(e)
+	}
+	job, _ = core.Store().GetJob(ctx, persona, job.JobID)
+	if job.Status != "done" {
+		t.Fatalf("delivered name not callable: %+v", job)
+	}
+
 }

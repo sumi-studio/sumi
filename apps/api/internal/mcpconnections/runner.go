@@ -110,15 +110,9 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 		return result, "MCP connection unavailable or permission revoked"
 	}
 	secret := cfg.BearerToken
-	// Every configured value that must never be persisted, in one list. The
-	// traversal that removes them also normalizes NUL, which jsonb cannot
-	// store — that normalization is unconditional, because whether a
-	// connection happens to carry a bearer, arguments or environment values
-	// says nothing about whether the server's answer contains a NUL.
-	secrets := append([]string{secret}, cfg.Args...)
-	for _, value := range cfg.Env {
-		secrets = append(secrets, value)
-	}
+	// Redaction is explicit for stdio config; bearer credentials are always
+	// private. NUL normalization remains unconditional, even without secrets.
+	secrets := cfg.protectedValues()
 	defer func() {
 		result = persist(normalize(result), secrets)
 		result = boundResult(result)
@@ -208,7 +202,7 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 		dropped++
 	}
 	opts := &mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), ToolListChangedHandler: func(context.Context, *mcp.ToolListChangedRequest) { note(map[string]any{"type": "tools/list_changed"}) }, ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
-		note(map[string]any{"type": "progress", "progress": req.Params.Progress, "total": req.Params.Total, "message": boundRunes(req.Params.Message, notificationMessageRunes)})
+		note(map[string]any{"type": "progress", "progress": req.Params.Progress, "total": req.Params.Total, "message": boundRunes(scrub(req.Params.Message, secrets).(string), notificationMessageRunes)})
 	}}
 	session, e := mcp.NewClient(&mcp.Implementation{Name: "sumi", Version: "1"}, opts).Connect(ctx, wire, nil)
 	if e != nil {
@@ -269,6 +263,9 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 	if found == nil {
 		return result, "MCP tool not found in bounded discovery (32 pages)"
 	}
+	if definitionProtected(found, secrets) {
+		return result, "MCP tool definition contains a protected configuration value; unavailable until the server definition or private-value configuration is corrected"
+	}
 	if e := validateSchema(found.InputSchema, job.Request["arguments"]); e != nil {
 		return result, "MCP arguments do not satisfy the remote input schema, or schema is unsupported"
 	}
@@ -327,9 +324,8 @@ func normalize(v map[string]any) map[string]any {
 // the server's, and is traversed in full, keys included, because a NUL or a
 // credential can sit in a remote key just as easily as in a remote value.
 //
-// Without that line an ordinary configured value rewrites the result itself: a
-// short DEBUG value turns "next_cursor" into a cursor that cannot be read back
-// and "call_result" into a key no reader is looking for.
+// Without that line a short explicitly private value could rewrite Sumi's
+// own result shape or make its continuation unreadable.
 func persist(result map[string]any, secrets []string) map[string]any {
 	out := map[string]any{}
 	for key, value := range result {

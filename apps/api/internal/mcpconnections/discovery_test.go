@@ -264,7 +264,7 @@ func TestDiscoveryRequestShapeIsRejectedBeforeParking(t *testing.T) {
 		"negative offset":        {"connection_id": c.ID, "cursor": corrupt},
 		"empty names":            {"connection_id": c.ID, "names": []any{}},
 		"repeated name":          {"connection_id": c.ID, "names": []any{"a", "a"}},
-		"names and cursor":       {"connection_id": c.ID, "names": []any{"a"}, "cursor": mustCursor(t, discoveryCursor{Page: 1})},
+		"names and cursor":       {"connection_id": c.ID, "names": []any{"a"}, "cursor": mustCursor(t, discoveryCursor{Page: 1, Prefix: "abc"})},
 		"name of the wrong type": {"connection_id": c.ID, "names": []any{7}},
 		"overlong name":          {"connection_id": c.ID, "names": []any{strings.Repeat("n", 257)}},
 		// A cursor is this package's own. A server's cursor, or anything else
@@ -280,7 +280,7 @@ func TestDiscoveryRequestShapeIsRejectedBeforeParking(t *testing.T) {
 	for label, request := range map[string]map[string]any{
 		"no cursor":       {"connection_id": c.ID},
 		"selected names":  {"connection_id": c.ID, "names": []any{"only"}},
-		"our own cursor":  {"connection_id": c.ID, "cursor": mustCursor(t, discoveryCursor{Page: 1, Offset: 3, Digest: "abc"})},
+		"our own cursor":  {"connection_id": c.ID, "cursor": mustCursor(t, discoveryCursor{Page: 1, Offset: 3, Digest: "abc", Prefix: "def"})},
 		"absent selector": {"connection_id": c.ID, "names": nil},
 	} {
 		if e := effect.Validate(request); e != nil {
@@ -309,7 +309,7 @@ func mustCursor(t *testing.T, c discoveryCursor) string {
 }
 
 func TestDiscoveryCursorRoundTripAndBounds(t *testing.T) {
-	for _, c := range []discoveryCursor{{}, {Page: 5}, {Offset: 9}, {Page: 31, Offset: 9, Digest: "0123456789ab"}} {
+	for _, c := range []discoveryCursor{{}, {Page: 5, Prefix: "abc"}, {Offset: 9, Digest: "abc"}, {Page: 31, Offset: 9, Digest: "0123456789ab", Prefix: "def"}} {
 		text := mustCursor(t, c)
 		back, e := decodeDiscoveryCursor(text)
 		if e != nil || back != c {
@@ -321,7 +321,7 @@ func TestDiscoveryCursorRoundTripAndBounds(t *testing.T) {
 	}
 	// A cursor holds no remote bytes at all: nothing a server says can ride
 	// inside it past redaction, which is what lets the traversal skip it.
-	text := mustCursor(t, discoveryCursor{Page: 3, Offset: 7, Digest: "0123456789ab"})
+	text := mustCursor(t, discoveryCursor{Page: 3, Offset: 7, Digest: "0123456789ab", Prefix: "def"})
 	raw, e := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(text, discoveryCursorPrefix))
 	if e != nil {
 		t.Fatal(e)
@@ -331,7 +331,7 @@ func TestDiscoveryCursorRoundTripAndBounds(t *testing.T) {
 		t.Fatal(e)
 	}
 	for key := range fields {
-		if key != "p" && key != "o" && key != "d" {
+		if key != "p" && key != "o" && key != "d" && key != "h" {
 			t.Fatalf("cursor carries %q, which this package does not mint", key)
 		}
 	}

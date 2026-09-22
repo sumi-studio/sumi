@@ -27,6 +27,7 @@ func TestLocalStdioNULResultWithoutConfiguredSecrets(t *testing.T) {
 		t.Fatal(e)
 	}
 	cfg.Command, cfg.Args, cfg.Env = shim, nil, nil
+	cfg.PrivateEnv, cfg.PrivateArgs = nil, nil
 	c, e := s.SaveLocal(ctx, "", cfg)
 	if e != nil {
 		t.Fatal(e)

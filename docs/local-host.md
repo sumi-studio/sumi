@@ -388,8 +388,21 @@ Example HTTPS configuration (the bearer field is optional):
 Example stdio configuration (use actual absolute executable/cwd paths):
 
 ```json
-{"name":"My Local tools","transport":"stdio","command":"/usr/bin/node","args":["/home/me/tools/server.mjs"],"cwd":"/home/me/workspace","env":{"SERVER_API_KEY":"server-credential"},"enabled":true}
+{"name":"My Local tools","transport":"stdio","command":"/usr/bin/node","args":["/home/me/tools/server.mjs"],"cwd":"/home/me/workspace","env":{"SERVER_API_KEY":"server-credential","DEBUG":"1"},"privateEnv":["SERVER_API_KEY"],"enabled":true}
 ```
+
+`bearerToken` is always private. For stdio, `privateEnv` lists the names of
+configured environment variables whose values must be scrubbed from server
+responses. `privateArgs` lists zero-based argument indexes to protect; for
+example, `"args":["server.mjs","--token","server-credential"],"privateArgs":[2]`.
+Unknown environment names, duplicate selectors, and out-of-range indexes are
+rejected. These selectors are stdio-only. Protection matches each selected
+value literally, not a parsed part of an argument: pass a credential as its own
+argument when using `privateArgs`. No secret detection is inferred from names,
+lengths, paths, or flag syntax. Mark private values when saving configuration.
+Ordinary arguments and environment values such as `DEBUG=1` and `PATH` do not
+rewrite tool names, schema vocabulary, or protocol metadata. All configuration
+remains encrypted and absent from configuration listings regardless of marking.
 
 Saving with `enabled: true` is the standing grant. The secretary discovers
 connections using `mcp.connections`, obtains complete tool descriptions and
@@ -450,7 +463,8 @@ back as `cursor`, `next_names` listing what is still waiting, and
 you already know the names of. A single tool whose own definition is larger
 than a page is named in `tools_omitted` with its size and the reason, and
 paging continues past it. `page_changed` says the server's list changed under
-a cursor and that page restarted, so a tool is re-shown rather than skipped.
+a cursor and discovery restarted at page zero, so tools may be re-shown.
+This includes an unseen tool moving backward into an already consumed page.
 A by-name request scans the same bounded 32 pages a call does: `scan_truncated`
 says the scan stopped at that bound, so `names_not_found` means "not in what
 was scanned", not "not offered by this server".
@@ -464,18 +478,28 @@ discovery page that last resort withdraws the cursor and says `repeat_request`
 instead: a continuation past schemas that were never delivered would skip them
 silently.
 
-A cursor is Sumi's own — a page number, an offset and a digest of the names on
-that page — and a server's own cursor passed in its place is refused. Two
-things follow. Sumi walks the server's pagination to reach the page a cursor
-names, bounded by the same 32 pages a call's lookup walks; and nothing a server
-says travels inside a cursor, where the redaction below could not see it. That
-redaction is the other half: every stored result has NULs replaced and every
-configured credential, argument and environment value removed from it. The
-result's own field names and its cursor are written by Sumi and are left
-alone; everything inside them comes from the server and is rewritten in full.
-A short configured value is still a configured value: if your server echoes
-one back — including inside a tool's name — that is what you will see in the
-result.
+A cursor is Sumi's own — a page number, an offset, a digest of that page's
+names, and a chained digest of every earlier page's names. A server's own
+cursor passed in its place is refused. Sumi re-walks at most 32 upstream pages
+within the operation deadline, comparing the observed names and boundaries.
+Detected changes restart at page zero with `page_changed: true`. This is not
+an atomic snapshot: changes during a single walk or schema-only changes with
+unchanged names are not detected, and a continually changing server may require
+fresh discovery. No reversible upstream cursor or server content is embedded
+in a Sumi cursor. Cursors from older implementations are refused; start again
+without a cursor.
+
+Every stored result has NULs replaced and literal occurrences of bearer tokens
+and explicitly selected private values removed, including in keys, errors and
+progress notifications. Values are scrubbed before shortening displayed names
+and progress text. Sumi's own result field names and minted cursor are left
+alone. If any part of a tool definition contains a protected value, that tool
+is omitted from `tools` and listed in `tools_omitted` with an unavailable reason
+and a scrubbed display name. That name is not a callable alias. Calls to such
+tools are refused before dispatch; fix the server definition or the private
+marking before using them. Protection can deliberately make a definition
+unavailable even when the collision is only in its description. Secret values
+transformed or encoded by the server are not automatically recognized.
 
 Local stdio uses a host-specific job kind; the Cloud MCP runner does not
 claim it, and generic job submission cannot supply executable configuration.

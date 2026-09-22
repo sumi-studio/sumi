@@ -101,23 +101,21 @@ func asList(v any) []any {
 	return list
 }
 
-// The page and its continuation are settled together. When the page's own
-// metadata is what pushes the stored result over the bound, the convenience
-// part goes first — never the schemas, and never by letting the cursor run
-// ahead of what was delivered.
-func TestDiscoverySettlesPageAndContinuationTogether(t *testing.T) {
+// Even many secret-bearing names must be explicitly accounted for in bounded
+// omission pages. They cannot be offered as redacted callable definitions,
+// and the continuation must neither skip nor stall on them.
+func TestDiscoverySecretBearingNamesAreOmittedAndPagingContinues(t *testing.T) {
 	f := setup(t)
 	remote := mcp.NewServer(&mcp.Implementation{Name: "wide-names", Version: "1"}, nil)
 	call := func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "called"}}}, nil
 	}
-	// Names that expand under redaction: cheap to list, expensive once stored.
+	// Names expand under redaction and exceed the display-name bound.
 	want := map[string]int{}
-	// Enough tools left over that the waiting-name list is itself substantial
-	// once every name in it expands.
+	// Count the safe stable prefix, not a hypothetical callable alias.
 	for i := 0; i < 60; i++ {
 		name := fmt.Sprintf("t%02d_%s", i, strings.Repeat("ab", 100))
-		want[name] = 0
+		want[fmt.Sprintf("t%02d", i)] = 0
 		remote.AddTool(&mcp.Tool{Name: name, Description: strings.Repeat("d", 1000), InputSchema: map[string]any{"type": "object"}}, call)
 	}
 	server := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return remote }, &mcp.StreamableHTTPOptions{JSONResponse: true}))
@@ -125,7 +123,6 @@ func TestDiscoverySettlesPageAndContinuationTogether(t *testing.T) {
 	c := f.saveToken(server.URL, "ab")
 
 	cursor := ""
-	dropped := false
 	for page := 1; ; page++ {
 		if page > 12 {
 			t.Fatal("discovery did not terminate")
@@ -138,16 +135,19 @@ func TestDiscoverySettlesPageAndContinuationTogether(t *testing.T) {
 		if raw, _ := json.Marshal(result); len(raw) > resultBoundBytes {
 			t.Fatalf("page %d stored %d bytes", page, len(raw))
 		}
-		if result["result_omitted"] == true || result["tools_omitted"] != nil {
+		if result["result_omitted"] == true {
 			t.Fatalf("page %d dropped schemas that fit: %+v", page, result)
 		}
-		for _, entry := range result["tools"].([]any) {
-			tool, _ := entry.(map[string]any)
-			name, _ := tool["name"].(string)
-			if description, _ := tool["description"].(string); len(description) != 1000 {
-				t.Fatalf("%q was shortened to %d bytes", name, len(description))
+		if len(result["tools"].([]any)) != 0 {
+			t.Fatal("secret-bearing names offered as callable tools")
+		}
+		for _, entry := range asList(result["tools_omitted"]) {
+			omission := entry.(map[string]any)
+			name := omission["name"].(string)
+			if !strings.Contains(omission["reason"].(string), "protected") {
+				t.Fatal(omission)
 			}
-			want[strings.ReplaceAll(name, "[redacted]", "ab")]++
+			want[strings.SplitN(name, "_", 2)[0]]++
 		}
 		cursor, _ = result["next_cursor"].(string)
 		if cursor == "" {
@@ -156,18 +156,11 @@ func TestDiscoverySettlesPageAndContinuationTogether(t *testing.T) {
 		if result["remaining_on_page"] == nil {
 			t.Fatalf("page %d continues without saying how much is left: %+v", page, result)
 		}
-		if result["next_names"] == nil {
-			dropped = true
-		}
 	}
 	for name, delivered := range want {
 		if delivered != 1 {
-			t.Fatalf("a definition was delivered %d times; the continuation did not match the page", delivered)
-			_ = name
+			t.Fatalf("%s was accounted for %d times; the continuation did not match the page", name, delivered)
 		}
-	}
-	if !dropped {
-		t.Fatal("the waiting-name list never yielded, so this fixture no longer crosses the boundary it was built for")
 	}
 }
 
@@ -207,7 +200,7 @@ func TestOversizedDiscoveryResultWithdrawsItsContinuation(t *testing.T) {
 // shape and its minted cursor come back untouched, while the very same
 // characters in remote content are still transformed.
 func TestPersistKeepsThisPackagesOwnShapeAndCursor(t *testing.T) {
-	cursor := mustCursor(t, discoveryCursor{Page: 2, Offset: 17, Digest: "8e31258425a1"})
+	cursor := mustCursor(t, discoveryCursor{Page: 2, Offset: 17, Digest: "8e31258425a1", Prefix: "def"})
 	for _, secret := range append(strings.Split("sumi.tools2eyJ_", ""), "sumi.tools", "eyJ", cursor) {
 		out := persist(map[string]any{
 			cursorKey:     cursor,

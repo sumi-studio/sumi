@@ -65,8 +65,11 @@ The Core exposes three delegated tools only when this backend is registered:
    instead of paging to reach them (not combinable with `cursor`), reporting
    `names_not_found`. A tool whose own definition cannot fit a page is named in
    `tools_omitted` with its stored size and the reason; paging continues past
-   it. `page_changed` says the server's list changed under a cursor and that
-   page restarted, so a definition is re-shown rather than skipped, and
+   it. A definition containing a bearer token or declared private Local value
+   is also omitted as unavailable, never offered as a mangled callable schema.
+   `page_changed` says the server's list changed under a cursor and that
+   discovery restarted at page zero (including changes in earlier consumed
+   pages), so definitions may be re-shown, and
    `scan_truncated` says a bounded scan stopped before the server's list ended.
    In the last resort — a result that cannot be stored at all — `result_omitted`
    is paired with `repeat_request` and no cursor, because a cursor past
@@ -127,16 +130,32 @@ job requests, connection listings or application logs.
   with `notifications_omitted`. A primary result that is itself too large is
   explicitly omitted; schemas are never silently shortened.
 - A stored result passes through one transformation: NUL replacement (jsonb
-  cannot hold a NUL) and redaction of every configured credential, argument and
-  environment value. `mcpconnections.persist` is that boundary, and it draws
+  cannot hold a NUL) and redaction of bearer tokens and explicitly selected
+  private Local argument/environment values. Ordinary config is not a secret.
+  Local `privateEnv` selects environment names and `privateArgs` selects
+  zero-based argument indexes; see the Local configuration contract.
+  `mcpconnections.persist` is that boundary, and it draws
   one line. A result's own top-level keys, and the value of `next_cursor`, are
   written by this package — the cursor from a page number, an offset and a
-  digest, never from remote bytes — and are left alone; everything beneath them
+  digest of names on that page and all earlier pages, never from remote bytes —
+  and are left alone; everything beneath them
   is the server's and is traversed in full, keys included. That is also why a
   continuation cursor never carries the server's own cursor: doing so would
   hand remote bytes back through a reversible encoding where redaction could
   not see them. Discovery measures its pages *through* that same function, so
   the size a page is decided on is the size that is stored.
+- Continuations detect changes in page name sequences and boundaries while
+  re-walking at most 32 pages within the job deadline, restarting at page zero
+  with `page_changed`. They are not snapshots: concurrent changes within one
+  walk or schema-only changes can escape detection. A continually changing
+  list may need a fresh discovery request. Old cursor formats are refused;
+  restart without a cursor.
+- A definition containing a protected value anywhere (including descriptions
+  or schema keys) is unavailable. Its omission has a scrubbed display name,
+  not a callable alias, and calls are refused before dispatch. Correct the
+  server definition or configuration marking before using it. Literal secret
+  echoes in results, errors and progress are scrubbed; transformed/encoded
+  secrets are not automatically recognized.
 - The main API route is wired into `cmd/server`; Local uses its own
   fm-authorized configuration route and host-scoped runner in `cmd/first-model`.
   Connection credentials are not portable secretary state; moving to a

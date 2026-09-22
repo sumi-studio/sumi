@@ -28,6 +28,8 @@ type LocalInput struct {
 	Args        []string          `json:"args,omitempty"`
 	Cwd         string            `json:"cwd,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
+	PrivateEnv  []string          `json:"privateEnv,omitempty"`
+	PrivateArgs []int             `json:"privateArgs,omitempty"`
 }
 
 type localScope struct{ host, persona string }
@@ -71,7 +73,7 @@ func (s *Store) SaveLocal(ctx context.Context, id string, in LocalInput) (Connec
 		if e := s.validateInput(Input{Name: in.Name, Endpoint: in.Endpoint, BearerToken: in.BearerToken}); e != nil {
 			return Connection{}, e
 		}
-		if in.Command != "" || len(in.Args) > 0 || in.Cwd != "" || len(in.Env) > 0 {
+		if in.Command != "" || len(in.Args) > 0 || in.Cwd != "" || len(in.Env) > 0 || len(in.PrivateEnv) > 0 || len(in.PrivateArgs) > 0 {
 			return Connection{}, ErrInvalid
 		}
 	case "stdio":
@@ -86,6 +88,20 @@ func (s *Store) SaveLocal(ctx context.Context, id string, in LocalInput) (Connec
 			if !envName.MatchString(k) || strings.ContainsRune(v, 0) {
 				return Connection{}, ErrInvalid
 			}
+		}
+		privateEnv := map[string]bool{}
+		for _, key := range in.PrivateEnv {
+			if _, exists := in.Env[key]; !exists || privateEnv[key] {
+				return Connection{}, ErrInvalid
+			}
+			privateEnv[key] = true
+		}
+		privateArgs := map[int]bool{}
+		for _, index := range in.PrivateArgs {
+			if index < 0 || index >= len(in.Args) || privateArgs[index] {
+				return Connection{}, ErrInvalid
+			}
+			privateArgs[index] = true
 		}
 		for _, v := range append([]string{in.Command, in.Cwd}, in.Args...) {
 			if strings.ContainsRune(v, 0) {
@@ -192,4 +208,20 @@ func (s *Store) configuration(ctx context.Context, tx pgx.Tx, persona, id, versi
 		cfg.BearerToken = string(raw)
 	}
 	return cfg, e
+}
+
+// protectedValues selects only deliberately private values. Configuration is
+// always encrypted, but ordinary flags, paths and environment values must not
+// rewrite a server's tool identifiers or schema vocabulary.
+func (cfg LocalInput) protectedValues() []string {
+	values := []string{cfg.BearerToken}
+	for _, key := range cfg.PrivateEnv {
+		values = append(values, cfg.Env[key])
+	}
+	for _, index := range cfg.PrivateArgs {
+		if index >= 0 && index < len(cfg.Args) {
+			values = append(values, cfg.Args[index])
+		}
+	}
+	return values
 }
