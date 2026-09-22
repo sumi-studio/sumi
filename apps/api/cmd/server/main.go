@@ -35,6 +35,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/jobexec"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/mcpconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
@@ -114,6 +115,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startJobExec()
+	app.startMCP()
 	app.startTermExec()
 	app.startChatGPTActivation()
 	app.startRuntimeRecovery()
@@ -280,6 +282,7 @@ type application struct {
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
 	jobExec                    *jobexec.Driver
+	mcpRunner                  *mcpconnections.Runner
 	termExec                   *termexec.Driver
 	transferSessions           *transfersession.Service
 	returnSessions             *returnsession.Service
@@ -841,6 +844,11 @@ func newApplicationFromEnv() (*application, error) {
 			log.Print("core file tools ready (file.* effects scoped to the claiming persona; job file capability armed)")
 		}
 	}
+	mcpRunner, err := wireMCP(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
 	// Cloud Linux jobs: subprocess-kind core_jobs run on the root
 	// provisioner's durable process service, bind-mounted to the persona's
 	// canonical files scope. Opt-in; a partial configuration is a startup
@@ -1026,6 +1034,7 @@ func newApplicationFromEnv() (*application, error) {
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
 		jobExec:                    jobExec,
+		mcpRunner:                  mcpRunner,
 		termExec:                   termExec,
 		transferSessions:           transferSessions,
 		returnSessions:             returnSessions,
