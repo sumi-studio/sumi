@@ -1010,10 +1010,13 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 	// mint in flight cannot land after this session's death already
 	// resolved its credentials: whichever commits first is the truth
 	// the other observes.
-	switch r.status {
-	case StatusCancelled, StatusAborted, StatusExpired, StatusCompleted:
+	if r.status != StatusAwaitingDestination && r.status != StatusSealed {
 		// A bound capture's object reservation never outlives the copy
-		// window — death or completion ends it either way.
+		// window: it exists only while the session is sealed. Cancelling
+		// can never re-enter sealed, so the binding releases now rather
+		// than waiting on the destination's proof; terminal states end
+		// it either way. The clear is serialized + CAS'd inside
+		// releaseBoundCapture and keeps the durable scope anchor.
 		s.releaseBoundCapture(ctx, sessionID)
 	}
 	switch r.status {

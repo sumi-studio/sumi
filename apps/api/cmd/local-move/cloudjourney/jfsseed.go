@@ -143,8 +143,8 @@ func (s *seeder) initSchema(ctx context.Context) error {
 		}
 	}
 	format := map[string]any{
-		"UUID": "fixture-vol-0000-0000-000000000001",
-		"Name": filepath.Base(s.objroot),
+		"UUID":    "fixture-vol-0000-0000-000000000001",
+		"Name":    filepath.Base(s.objroot),
 		"Storage": "file", "Bucket": filepath.Dir(s.objroot), "BlockSize": 4096,
 		"Compression": "none", "HashPrefix": false, "TrashDays": 0,
 		"MetaVersion": 1,

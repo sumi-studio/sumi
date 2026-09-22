@@ -42,6 +42,13 @@ type fakeFilesvc struct {
 	failOps map[string]int    // "op:scope/path" -> remaining 503s
 	caps    map[string]*fakeCapture
 	capN    int
+	// Capture access hooks — the test fires a concurrent valid retake
+	// (or a mutation) mid-plan/mid-copy to prove reads stay bound to
+	// the capture the mover planned.
+	entriesCalls int
+	readCalls    int
+	onEntries    func(call int)
+	onRead       func(call int, seq int64)
 }
 
 // fakeCapRow is one manifest row of a fake immutable capture — the
@@ -111,8 +118,8 @@ func capMeta(c *fakeCapture) map[string]any {
 	return map[string]any{
 		"capture_id": c.id, "scope": c.scope, "scope_id": c.scopeID,
 		"owner": c.owner, "owner_epoch": c.epoch, "manifest_sha": c.sha,
-		"status":     map[bool]string{true: "active", false: "released"}[c.active],
-		"entries":    len(c.rows), "unsupported": 0,
+		"status":  map[bool]string{true: "active", false: "released"}[c.active],
+		"entries": len(c.rows), "unsupported": 0,
 		"created_at": "2026-01-01T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z",
 	}
 }
@@ -332,6 +339,10 @@ func (f *fakeFilesvc) serveCapture(w http.ResponseWriter, r *http.Request, rest 
 		c.active = false
 		write(200, map[string]any{"released": true})
 	case op == "entries" && r.Method == http.MethodGet:
+		f.entriesCalls++
+		if f.onEntries != nil {
+			f.onEntries(f.entriesCalls)
+		}
 		cursor, _ := strconv.ParseInt(q.Get("cursor"), 10, 64)
 		limit, _ := strconv.Atoi(q.Get("limit"))
 		if limit < 1 {
@@ -348,10 +359,10 @@ func (f *fakeFilesvc) serveCapture(w http.ResponseWriter, r *http.Request, rest 
 				base = base[i+1:]
 			}
 			entries = append(entries, map[string]any{
-				"seq": row.seq,
+				"seq":      row.seq,
 				"path_b64": base64.StdEncoding.EncodeToString([]byte(row.path)),
 				"name_b64": base64.StdEncoding.EncodeToString([]byte(base)),
-				"path": row.path, "name": base,
+				"path":     row.path, "name": base,
 				"type": row.typ, "supported": row.sup,
 				"length": row.length, "mode": 0o100644,
 			})
@@ -361,6 +372,10 @@ func (f *fakeFilesvc) serveCapture(w http.ResponseWriter, r *http.Request, rest 
 			"entries": entries, "has_more": len(entries) == limit, "next_cursor": next})
 	case op == "read" && r.Method == http.MethodGet:
 		seq, _ := strconv.ParseInt(q.Get("seq"), 10, 64)
+		f.readCalls++
+		if f.onRead != nil {
+			f.onRead(f.readCalls, seq)
+		}
 		var row *fakeCapRow
 		for i := range c.rows {
 			if c.rows[i].seq == seq {
@@ -1191,5 +1206,171 @@ func TestReturnResumeOwnerCancelUnreadableJournalStaysRecoverable(t *testing.T) 
 	q, _ := filepath.Glob(filepath.Join(ws, ".sumi-return-quarantine-*", "keep.txt"))
 	if len(q) != 1 {
 		t.Fatalf("quarantined authored bytes lost: %v", q)
+	}
+}
+
+// --- durable binding: concurrent retake vs the mover's plan -----------------
+
+// CAPINT-01: a valid retake lands between two manifest pages. The
+// mover's plan was built on C1; the association is now C2 — the next
+// page request must refuse (capture_replaced), the mover must abandon
+// C1's manifest and re-plan the WHOLE tree against C2. The destination
+// must equal exactly one manifest: the retaken one.
+func TestReturnLocalRetakeBetweenManifestPages(t *testing.T) {
+	h := setupReturn(t)
+	f := newFakeFilesvc(t)
+	h.wireFiles(t, f)
+	scope, _ := fileaccess.ScopeForPersona(h.pid)
+	f.put(scope, "a.txt", "AAAA")
+	f.put(scope, "b.txt", "bee")
+	f.put(scope, "d.txt", "doomed")
+	ws := t.TempDir()
+	config := writeConfig(t, h.home, h.slot)
+	t.Setenv("SUMI_LOCAL_MOVE_CAPTURE_PAGE", "1") // one row per page
+
+	sessID, returnURL := h.newReturnMode("local")
+	grant := strings.SplitN(returnURL, "#grant=", 2)[1]
+
+	// Another valid grant request retakes after the first manifest page
+	// is served — and the store has already changed under C1.
+	fired := false
+	f.onEntries = func(call int) {
+		if call != 1 || fired {
+			return
+		}
+		fired = true
+		f.files[scope+"/a.txt"] = []byte("BBBB") // same length, new bytes
+		delete(f.files, scope+"/b.txt")
+		f.files[scope+"/c.txt"] = []byte("cee") // renamed b->c
+		delete(f.files, scope+"/d.txt")         // deleted
+		b, err := h.sessions.CaptureView(h.ctx, sessID, grant)
+		if err != nil {
+			t.Errorf("view binding: %v", err)
+			return
+		}
+		if _, err := h.sessions.RetakeCapture(h.ctx, sessID, grant, b.ScopeID, b.CaptureID); err != nil {
+			t.Errorf("concurrent retake: %v", err)
+		}
+	}
+
+	m, out := h.mover()
+	m.wsRoot = ws
+	code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false)
+	if code != exitDone {
+		t.Fatalf("return: %d\n%s", code, out)
+	}
+	if !fired {
+		t.Fatal("the concurrent retake never fired")
+	}
+	if f.capN != 2 {
+		t.Fatalf("expected ensure+retake only, got %d captures", f.capN)
+	}
+	// The destination equals the retaken manifest exactly: a.txt has
+	// the NEW bytes, c.txt exists, b.txt and d.txt do not.
+	got, err := os.ReadFile(filepath.Join(ws, scope, "a.txt"))
+	if err != nil || string(got) != "BBBB" {
+		t.Fatalf("a.txt %q %v — old manifest bytes leaked through", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(ws, scope, "c.txt")); err != nil || string(got) != "cee" {
+		t.Fatalf("c.txt %q %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(ws, scope, "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dead manifest path b.txt survived: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(ws, scope, "d.txt")); !os.IsNotExist(err) {
+		t.Fatalf("deleted path d.txt survived: %v", err)
+	}
+}
+
+// CAPINT-01: a valid retake lands between two captured-row reads whose
+// seq and length are unchanged across manifests — only bytes and names
+// moved. Same-seq/same-length is NOT proof: the reader's plan is dead,
+// it must replan the whole tree, and the destination must equal the
+// replacement manifest.
+func TestReturnLocalRetakeBetweenSameSeqReads(t *testing.T) {
+	h := setupReturn(t)
+	f := newFakeFilesvc(t)
+	h.wireFiles(t, f)
+	scope, _ := fileaccess.ScopeForPersona(h.pid)
+	f.put(scope, "a.txt", "AAAA") // seq1: same position, same length
+	f.put(scope, "b.txt", "x")    // seq2: renamed to c.txt in C2
+	ws := t.TempDir()
+	config := writeConfig(t, h.home, h.slot)
+
+	sessID, returnURL := h.newReturnMode("local")
+	grant := strings.SplitN(returnURL, "#grant=", 2)[1]
+
+	fired := false
+	f.onRead = func(call int, seq int64) {
+		if call != 1 || fired {
+			return
+		}
+		fired = true
+		f.files[scope+"/a.txt"] = []byte("BBBB") // same 4 bytes, new content
+		delete(f.files, scope+"/b.txt")
+		f.files[scope+"/c.txt"] = []byte("y")
+		b, err := h.sessions.CaptureView(h.ctx, sessID, grant)
+		if err != nil {
+			t.Errorf("view binding: %v", err)
+			return
+		}
+		if _, err := h.sessions.RetakeCapture(h.ctx, sessID, grant, b.ScopeID, b.CaptureID); err != nil {
+			t.Errorf("concurrent retake: %v", err)
+		}
+	}
+
+	m, out := h.mover()
+	m.wsRoot = ws
+	code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false)
+	if code != exitDone {
+		t.Fatalf("return: %d\n%s", code, out)
+	}
+	if !fired {
+		t.Fatal("the concurrent retake never fired")
+	}
+	got, err := os.ReadFile(filepath.Join(ws, scope, "a.txt"))
+	if err != nil || string(got) != "BBBB" {
+		t.Fatalf("a.txt %q %v — mixed manifests accepted", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(ws, scope, "c.txt")); err != nil || string(got) != "y" {
+		t.Fatalf("c.txt %q %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(ws, scope, "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("b.txt leaked from the dead manifest: %v", err)
+	}
+}
+
+// A rel path whose bytes are not valid UTF-8 is a legal POSIX name and
+// arrives intact in the manifest's base64 fields — the journal must
+// carry it across save/load byte-exactly, or a resumed copy would
+// rename the file to U+FFFD garbage.
+func TestFilesJournalRawPathRoundTrip(t *testing.T) {
+	raw := "dir/raw-n\xe4me.txt"
+	j := &filesJournal{
+		Phase: "staged", Staging: "/x/staging",
+		Files:      map[string]*journalEntry{raw: {SHA256: "aa", Bytes: 3, State: "verified"}},
+		Dirs:       []string{"dir", "dir/raw-n\xe4me-dir"},
+		Links:      map[string]*journalLink{raw + "-link": {TargetB64: "eA==", State: "placed"}},
+		Collateral: map[string]bool{raw + "-old": true},
+	}
+	buf, err := json.MarshalIndent(j, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back filesJournal
+	if err := json.Unmarshal(buf, &back); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := back.Files[raw]; !ok {
+		t.Fatalf("file key lost: %s", buf)
+	}
+	if back.Dirs[1] != "dir/raw-n\xe4me-dir" {
+		t.Fatalf("dir lost: %q", back.Dirs)
+	}
+	if _, ok := back.Links[raw+"-link"]; !ok {
+		t.Fatalf("link key lost: %s", buf)
+	}
+	if !back.Collateral[raw+"-old"] {
+		t.Fatalf("collateral lost: %s", buf)
 	}
 }

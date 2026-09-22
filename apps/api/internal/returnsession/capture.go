@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
@@ -42,6 +43,29 @@ type CaptureBinding struct {
 // recreated. The copy can never be coherent; the session stays sealed
 // for an operator decision, not a silent rebind.
 var ErrScopeChanged = errors.New("the Cloud workspace's scope identity changed since the copy bound its capture")
+
+// ErrCaptureReplaced means the caller pinned a capture identity that is
+// no longer the persisted association — another authorized retake (or a
+// lost-response retry) moved the binding. The caller must re-sync its
+// whole plan from the current binding before accepting any more bytes;
+// nothing it fetched against the stale manifest may be trusted.
+var ErrCaptureReplaced = errors.New("the bound capture changed — replan against the current association")
+
+// captureGone reports whether a GetCapture failure proves the capture is
+// genuinely gone — released or expired (410) or unknown (404). Any other
+// failure (transport, 5xx, denial) says nothing about the capture's
+// life: treating those as "gone" would replace a healthy durable
+// association on a transient fault.
+func captureGone(err error) bool {
+	var se *fileaccess.ServiceError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.Status == http.StatusGone || se.Status == http.StatusNotFound {
+		return true
+	}
+	return se.Code == "capture_gone" || se.Code == "capture_not_found"
+}
 
 // CaptureStore is the filesvc capture surface returnsession needs —
 // *fileaccess.Client satisfies it.
@@ -88,28 +112,38 @@ func (s *Service) captureSession(ctx context.Context, sessionID, grant string) (
 	return r, nil
 }
 
-// scanBinding reads the persisted triple from a row cursor — all three
-// columns are nullable (NULL while unbound).
-func scanBinding(row pgx.Row) (*CaptureBinding, error) {
-	var b CaptureBinding
+// scanCaptureRow reads the persisted columns from a row cursor: anchor
+// is the session's durable scope expectation (set on first bind, kept
+// after release), b is the live association (nil while unbound). All
+// three columns are nullable.
+func scanCaptureRow(row pgx.Row) (anchor string, b *CaptureBinding, err error) {
 	var sid, cid, msha *string
 	if err := row.Scan(&sid, &cid, &msha); err != nil {
-		return nil, err
+		return "", nil, err
+	}
+	if sid != nil {
+		anchor = *sid
 	}
 	if cid == nil {
-		return nil, nil
+		return anchor, nil, nil
 	}
-	b.ScopeID, b.CaptureID, b.ManifestSHA = *sid, *cid, *msha
-	return &b, nil
+	return anchor, &CaptureBinding{ScopeID: anchor, CaptureID: *cid, ManifestSHA: *msha}, nil
+}
+
+// loadCaptureRow reads the persisted anchor + association (binding nil
+// while unbound).
+func (s *Service) loadCaptureRow(ctx context.Context, sessionID string) (string, *CaptureBinding, error) {
+	anchor, b, err := scanCaptureRow(s.pool.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
+		FROM return_sessions WHERE session_id = $1`, sessionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, ErrNotFound
+	}
+	return anchor, b, err
 }
 
 // loadBinding reads the persisted triple (nil when unbound).
 func (s *Service) loadBinding(ctx context.Context, sessionID string) (*CaptureBinding, error) {
-	b, err := scanBinding(s.pool.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
-		FROM return_sessions WHERE session_id = $1`, sessionID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
+	_, b, err := s.loadCaptureRow(ctx, sessionID)
 	return b, err
 }
 
@@ -137,22 +171,25 @@ func (s *Service) EnsureCapture(ctx context.Context, sessionID, grant string) (*
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, r.personaID); err != nil {
 		return nil, err
 	}
-	existing, err := scanBinding(tx.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
+	anchor, existing, err := scanCaptureRow(tx.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
 		FROM return_sessions WHERE session_id = $1 FOR UPDATE`, sessionID))
 	if err != nil {
 		return nil, err
 	}
-	var b CaptureBinding
 	if existing != nil {
-		b = *existing
-		// A persisted binding is the answer unless the capture is gone
-		// server-side (released/expired) — then the SAME session, owner
-		// and epoch mint a replacement under the same lock.
-		if _, err := s.capture.GetCapture(ctx, b.CaptureID, sessionID, r.fileEpoch); err == nil {
+		// A persisted binding is the answer unless the capture is
+		// genuinely gone server-side (released/expired/unknown) — then
+		// the SAME session, owner and epoch mint a replacement under
+		// the same lock. A transport fault, 5xx or denial proves
+		// nothing about the capture's life: propagate it and keep the
+		// association rather than minting over a healthy one.
+		if _, err := s.capture.GetCapture(ctx, existing.CaptureID, sessionID, r.fileEpoch); err == nil {
 			if err := tx.Commit(ctx); err != nil {
 				return nil, err
 			}
-			return &b, nil
+			return existing, nil
+		} else if !captureGone(err) {
+			return nil, err
 		}
 	}
 	// Only the persona's current file authority may bind a capture — a
@@ -165,14 +202,18 @@ func (s *Service) EnsureCapture(ctx context.Context, sessionID, grant string) (*
 	if owner != sessionID {
 		return nil, fmt.Errorf("%w: a newer return superseded this session's storage authority", ErrConflict)
 	}
-	meta, err := s.capture.CreateCapture(ctx, scope, sessionID, r.fileEpoch, expectedScope(b))
+	// The durable anchor is the expectation on every create — first
+	// bind or re-bind after release/expiry alike — so a changed scope
+	// identity refuses inside the capture transaction instead of
+	// silently attaching a new tree.
+	meta, err := s.capture.CreateCapture(ctx, scope, sessionID, r.fileEpoch, anchor)
 	if err != nil {
 		return nil, err
 	}
-	if existing != nil && b.ScopeID != "" && meta.ScopeID != b.ScopeID {
-		// The expired binding's anchor no longer resolves — recreating
-		// under it would silently switch trees. Refuse; the new capture
-		// is released and the stale binding left for the operator.
+	if anchor != "" && meta.ScopeID != anchor {
+		// The anchor no longer resolves — recreating under it would
+		// silently switch trees. Refuse; the new capture is released
+		// and the stale binding left for the operator.
 		_ = s.capture.ReleaseCapture(ctx, meta.CaptureID, sessionID, r.fileEpoch)
 		return nil, ErrScopeChanged
 	}
@@ -209,10 +250,15 @@ func (s *Service) CaptureView(ctx context.Context, sessionID, grant string) (*Ca
 }
 
 // captureAuth is the read-path authorization: the grant's sealed
-// local-mode session must hold a persisted binding, and the returned
-// triple is that binding plus the session's durable lineage — never a
-// caller-supplied capture id, owner or epoch.
-func (s *Service) captureAuth(ctx context.Context, sessionID, grant string) (string, string, int64, error) {
+// local-mode session must hold a persisted binding, and expected is a
+// mandatory precondition on THAT binding — the capture identity the
+// caller planned its tree against. A mismatched expectation is
+// ErrCaptureReplaced: the association moved under the reader (a retake
+// or a recovered lost response), so the bytes it would fetch no longer
+// belong to its manifest. expected can never mint authority: it must
+// equal the persisted association, so it can only refuse, never reach
+// a foreign capture.
+func (s *Service) captureAuth(ctx context.Context, sessionID, grant, expected string) (string, string, int64, error) {
 	r, err := s.captureSession(ctx, sessionID, grant)
 	if err != nil {
 		return "", "", 0, err
@@ -224,20 +270,27 @@ func (s *Service) captureAuth(ctx context.Context, sessionID, grant string) (str
 	if b == nil {
 		return "", "", 0, fmt.Errorf("%w: no capture is bound yet", ErrConflict)
 	}
+	if expected == "" {
+		return "", "", 0, fmt.Errorf("%w: expected capture identity is required", ErrBadRequest)
+	}
+	if expected != b.CaptureID {
+		return "", "", 0, ErrCaptureReplaced
+	}
 	return b.CaptureID, sessionID, r.fileEpoch, nil
 }
 
 // AuthorizeCaptureEntries resolves the capture id and lineage the grant
-// may page.
-func (s *Service) AuthorizeCaptureEntries(ctx context.Context, sessionID, grant string) (string, string, int64, error) {
-	return s.captureAuth(ctx, sessionID, grant)
+// may page — expected pins the caller's planned manifest.
+func (s *Service) AuthorizeCaptureEntries(ctx context.Context, sessionID, grant, expected string) (string, string, int64, error) {
+	return s.captureAuth(ctx, sessionID, grant, expected)
 }
 
 // AuthorizeCaptureRead resolves the capture id and lineage a row read
 // binds to. seq/offset/len are caller-chosen ranges INSIDE the bound
-// manifest — they can never reach another capture's bytes.
-func (s *Service) AuthorizeCaptureRead(ctx context.Context, sessionID, grant string) (string, string, int64, error) {
-	return s.captureAuth(ctx, sessionID, grant)
+// manifest — they can never reach another capture's bytes, and the
+// expected precondition keeps them pinned to the caller's own manifest.
+func (s *Service) AuthorizeCaptureRead(ctx context.Context, sessionID, grant, expected string) (string, string, int64, error) {
+	return s.captureAuth(ctx, sessionID, grant, expected)
 }
 
 // RetakeCapture mints a fresh coherent manifest when the bound capture
@@ -248,7 +301,7 @@ func (s *Service) AuthorizeCaptureRead(ctx context.Context, sessionID, grant str
 // resolved scope identity differs. The checkpointed filesvc has no
 // expected_scope_id parameter yet, so the identity compare happens here
 // on the metadata the service resolved inside its own transaction.
-func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedScopeID string) (*CaptureBinding, error) {
+func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedScopeID, expectedCaptureID string) (*CaptureBinding, error) {
 	r, err := s.captureSession(ctx, sessionID, grant)
 	if err != nil {
 		return nil, err
@@ -266,7 +319,7 @@ func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedS
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, r.personaID); err != nil {
 		return nil, err
 	}
-	existing, err := scanBinding(tx.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
+	_, existing, err := scanCaptureRow(tx.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
 		FROM return_sessions WHERE session_id = $1 FOR UPDATE`, sessionID))
 	if err != nil {
 		return nil, err
@@ -275,9 +328,21 @@ func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedS
 		return nil, fmt.Errorf("%w: no capture is bound yet — bind before retaking", ErrConflict)
 	}
 	b := *existing
+	if expectedCaptureID != b.CaptureID {
+		// The caller's planned capture is no longer the association —
+		// a retake already committed (this is the lost-response retry)
+		// or a fresher binding won the race. The current binding IS the
+		// answer the lost response carried: return it with Retaken so
+		// the caller abandons its stale staging, and mint nothing.
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		b.Retaken = true
+		return &b, nil
+	}
 	if expectedScopeID == "" || expectedScopeID != b.ScopeID {
-		// The caller's notion is stale (a lost earlier retake answer):
-		// the current binding is the truth it must re-sync to.
+		// The caller's scope notion is stale: the current binding is
+		// the truth it must re-sync to.
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -298,11 +363,19 @@ func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedS
 		_ = s.capture.ReleaseCapture(ctx, meta.CaptureID, sessionID, r.fileEpoch)
 		return nil, ErrScopeChanged
 	}
-	if _, err := tx.Exec(ctx, `UPDATE return_sessions
+	res, err := tx.Exec(ctx, `UPDATE return_sessions
 		SET capture_id = $2, capture_manifest_sha = $3
-		WHERE session_id = $1`, sessionID, meta.CaptureID, meta.ManifestSHA); err != nil {
+		WHERE session_id = $1 AND capture_id = $4`, sessionID, meta.CaptureID, meta.ManifestSHA, b.CaptureID)
+	if err != nil {
 		_ = s.capture.ReleaseCapture(ctx, meta.CaptureID, sessionID, r.fileEpoch)
 		return nil, err
+	}
+	if res.RowsAffected() == 0 {
+		// The association moved between the read and the write — the
+		// persona lock makes this unreachable in practice; the CAS is
+		// the proof it stays impossible.
+		_ = s.capture.ReleaseCapture(ctx, meta.CaptureID, sessionID, r.fileEpoch)
+		return nil, ErrCaptureReplaced
 	}
 	if err := tx.Commit(ctx); err != nil {
 		_ = s.capture.ReleaseCapture(ctx, meta.CaptureID, sessionID, r.fileEpoch)
@@ -321,8 +394,14 @@ func (s *Service) RetakeCapture(ctx context.Context, sessionID, grant, expectedS
 }
 
 // ReleaseCapture drops the persisted association and frees the capture.
-// Idempotent — an unbound session answers success.
-func (s *Service) ReleaseCapture(ctx context.Context, sessionID, grant string) error {
+// Idempotent — an unbound session answers success. The clear is
+// serialized under the same persona lock every binding mutation takes,
+// compare-and-swapped on the capture identity read inside the lock, and
+// preconditioned on the caller's expected_capture_id when it is sent —
+// so a delayed release minted against an older association can never
+// clear a newer binding. The durable scope anchor (capture_scope_id)
+// stays: the next bind must still satisfy the original tree's identity.
+func (s *Service) ReleaseCapture(ctx context.Context, sessionID, grant, expectedCaptureID string) error {
 	r, err := s.authorize(ctx, sessionID, grant)
 	if err != nil {
 		return err
@@ -330,16 +409,38 @@ func (s *Service) ReleaseCapture(ctx context.Context, sessionID, grant string) e
 	if r.fileModeStr() != string(FileModeLocal) {
 		return fmt.Errorf("%w: this return did not select local file copying", ErrBadRequest)
 	}
-	b, err := s.loadBinding(ctx, sessionID)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE return_sessions
-		SET capture_id = NULL, capture_scope_id = NULL, capture_manifest_sha = NULL
-		WHERE session_id = $1`, sessionID); err != nil {
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, r.personaID); err != nil {
 		return err
 	}
-	if b != nil && s.capture != nil {
+	_, b, err := scanCaptureRow(tx.QueryRow(ctx, `SELECT capture_scope_id, capture_id, capture_manifest_sha
+		FROM return_sessions WHERE session_id = $1 FOR UPDATE`, sessionID))
+	if err != nil {
+		return err
+	}
+	if b == nil {
+		return tx.Commit(ctx)
+	}
+	if expectedCaptureID != "" && expectedCaptureID != b.CaptureID {
+		// The release was issued against an older association — the
+		// binding has since moved; leave it and the anchor alone.
+		return ErrCaptureReplaced
+	}
+	res, err := tx.Exec(ctx, `UPDATE return_sessions
+		SET capture_id = NULL, capture_manifest_sha = NULL
+		WHERE session_id = $1 AND capture_id = $2`, sessionID, b.CaptureID)
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.capture != nil && res.RowsAffected() > 0 {
 		_ = s.capture.ReleaseCapture(ctx, b.CaptureID, sessionID, r.fileEpoch)
 	}
 	return nil
@@ -347,24 +448,47 @@ func (s *Service) ReleaseCapture(ctx context.Context, sessionID, grant string) e
 
 // releaseBoundCapture clears any binding when the session resolves — the
 // copy window is over, so the manifest's object reservation must not
-// outlive it. Best-effort: a filesvc outage leaves a reservation that
-// expires on its own; the binding row is always cleared.
+// outlive it. Serialized under the persona lock and CAS'd on the
+// capture identity read inside it, so a stale cleanup can never clear a
+// replacement binding; the durable scope anchor stays. Best-effort: a
+// filesvc outage leaves a reservation that expires on its own.
 func (s *Service) releaseBoundCapture(ctx context.Context, sessionID string) {
 	if s.capture == nil {
 		return
 	}
-	var cid *string
-	var epoch int64
-	if err := s.pool.QueryRow(ctx, `SELECT capture_id, file_epoch FROM return_sessions
-		WHERE session_id = $1`, sessionID).Scan(&cid, &epoch); err != nil || cid == nil {
+	var personaID string
+	if err := s.pool.QueryRow(ctx, `SELECT persona_id FROM return_sessions
+		WHERE session_id = $1`, sessionID).Scan(&personaID); err != nil {
 		return
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE return_sessions
-		SET capture_id = NULL, capture_scope_id = NULL, capture_manifest_sha = NULL
-		WHERE session_id = $1`, sessionID); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, personaID); err != nil {
+		return
+	}
+	var cid *string
+	var epoch int64
+	if err := tx.QueryRow(ctx, `SELECT capture_id, file_epoch FROM return_sessions
+		WHERE session_id = $1 FOR UPDATE`, sessionID).Scan(&cid, &epoch); err != nil {
+		return
+	}
+	if cid == nil {
+		_ = tx.Commit(ctx)
+		return
+	}
+	if _, err := tx.Exec(ctx, `UPDATE return_sessions
+		SET capture_id = NULL, capture_manifest_sha = NULL
+		WHERE session_id = $1 AND capture_id = $2`, sessionID, *cid); err != nil {
 		if s.logf != nil {
 			s.logf("return %s: clear capture binding: %v", sessionID, err)
 		}
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return
 	}
 	if err := s.capture.ReleaseCapture(ctx, *cid, sessionID, epoch); err != nil && s.logf != nil {

@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,12 @@ var errCaptureLost = errors.New("the bound capture needs retaking")
 // binding — the anchor was renamed out and recreated. The copy refuses:
 // no new capture can name the same tree.
 var errCaptureScope = errors.New("the Cloud workspace's scope identity changed during the copy")
+
+// errCaptureReplaced means the persisted association moved to a
+// different capture while the mover was planning or reading — the
+// planned manifest is dead; the whole tree must be re-planned against
+// the current binding before another byte is accepted.
+var errCaptureReplaced = errors.New("the bound capture association changed")
 
 // capBinding mirrors the session's persisted capture association.
 type capBinding struct {
@@ -125,6 +132,13 @@ func (r *returner) captureCall(ctx context.Context, st *returnState, method, pat
 	case res.StatusCode == http.StatusConflict &&
 		strings.Contains(msg, "scope identity changed"):
 		return nil, res.StatusCode, fmt.Errorf("%w: %s", errCaptureScope, msg)
+	case res.StatusCode == http.StatusConflict && eb.Code == "capture_replaced":
+		return nil, res.StatusCode, fmt.Errorf("%w: %s", errCaptureReplaced, msg)
+	case res.StatusCode == http.StatusConflict:
+		// A binding conflict the mover cannot name (e.g. the
+		// association was released mid-copy) still means the plan it
+		// holds is not the association — replan before more bytes.
+		return nil, res.StatusCode, fmt.Errorf("%w: %s", errCaptureReplaced, msg)
 	case res.StatusCode >= 500:
 		return nil, res.StatusCode, fmt.Errorf("%w: %s", errUnreachable, msg)
 	default:
@@ -146,10 +160,14 @@ func (r *returner) captureEnsure(ctx context.Context, st *returnState) (*capBind
 }
 
 // captureRetake asks for a fresh coherent manifest under the same scope
-// identity. The response is the authoritative binding — retaken or not.
-func (r *returner) captureRetake(ctx context.Context, st *returnState, expectedScopeID string) (*capBinding, error) {
+// identity. expectedScopeID stays constant across normal retakes; the
+// planned captureID lets the service recognise a retry whose response
+// was lost — it answers the current binding instead of minting again.
+// The response is the authoritative binding — retaken or not.
+func (r *returner) captureRetake(ctx context.Context, st *returnState, expectedScopeID, expectedCaptureID string) (*capBinding, error) {
 	raw, _, err := r.captureCall(ctx, st, http.MethodPost, "/capture/retake",
-		strings.NewReader(fmt.Sprintf(`{"expected_scope_id":%q}`, expectedScopeID)))
+		strings.NewReader(fmt.Sprintf(`{"expected_scope_id":%q,"expected_capture_id":%q}`,
+			expectedScopeID, expectedCaptureID)))
 	if err != nil {
 		return nil, err
 	}
@@ -161,13 +179,28 @@ func (r *returner) captureRetake(ctx context.Context, st *returnState, expectedS
 }
 
 // captureRelease drops the association — best-effort at copy completion.
-func (r *returner) captureRelease(ctx context.Context, st *returnState) {
-	_, _, _ = r.captureCall(ctx, st, http.MethodDelete, "/capture", nil)
+// The release names the binding it is cleaning up so a delayed answer
+// can never clear a newer replacement.
+func (r *returner) captureRelease(ctx context.Context, st *returnState, captureID string) {
+	q := url.Values{"expected_capture_id": {captureID}}
+	_, _, _ = r.captureCall(ctx, st, http.MethodDelete, "/capture?"+q.Encode(), nil)
 }
 
-// captureEntries fetches one manifest page of the bound capture.
-func (r *returner) captureEntries(ctx context.Context, st *returnState, cursor int64) (*capPage, error) {
-	q := url.Values{"cursor": {fmt.Sprint(cursor)}, "limit": {"1000"}}
+// capturePageLimit bounds one manifest page; the env knob lets journeys
+// force mid-page association changes without giant trees.
+func capturePageLimit() int {
+	if v, err := strconv.Atoi(os.Getenv("SUMI_LOCAL_MOVE_CAPTURE_PAGE")); err == nil && v > 0 {
+		return v
+	}
+	return 1000
+}
+
+// captureEntries fetches one manifest page of the PLANNED capture —
+// expected pins the association the mover's plan is built on, so a
+// concurrent retake is refused before any foreign-manifest rows land.
+func (r *returner) captureEntries(ctx context.Context, st *returnState, expected string, cursor int64) (*capPage, error) {
+	q := url.Values{"cursor": {fmt.Sprint(cursor)}, "limit": {fmt.Sprint(capturePageLimit())},
+		"expected_capture_id": {expected}}
 	raw, _, err := r.captureCall(ctx, st, http.MethodGet, "/capture/entries?"+q.Encode(), nil)
 	if err != nil {
 		return nil, err
@@ -184,8 +217,9 @@ func (r *returner) captureEntries(ctx context.Context, st *returnState, cursor i
 // count must equal the manifest length — a truncated or oversized body
 // is never carried. Non-200 statuses classify through captureCall's
 // rules: capture_pending/gone mean the association is dead.
-func (r *returner) captureReadRow(ctx context.Context, st *returnState, seq int64, blob string, wantLen int64) (string, int64, error) {
-	u := fmt.Sprintf("%s/capture/read?seq=%d&len=%d", st.SessionURL, seq, wantLen)
+func (r *returner) captureReadRow(ctx context.Context, st *returnState, seq int64, blob string, wantLen int64, expected string) (string, int64, error) {
+	u := fmt.Sprintf("%s/capture/read?seq=%d&len=%d&expected_capture_id=%s",
+		st.SessionURL, seq, wantLen, url.QueryEscape(expected))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", 0, err
@@ -242,6 +276,10 @@ func (r *returner) captureReadRow(ctx context.Context, st *returnState, seq int6
 		case res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound ||
 			eb.Code == "capture_gone" || eb.Code == "capture_not_found" || eb.Code == "capture_pending":
 			return "", 0, fmt.Errorf("%w: %s", errCaptureLost, msg)
+		case res.StatusCode == http.StatusConflict && eb.Code == "capture_replaced":
+			return "", 0, fmt.Errorf("%w: %s", errCaptureReplaced, msg)
+		case res.StatusCode == http.StatusConflict:
+			return "", 0, fmt.Errorf("%w: %s", errCaptureReplaced, msg)
 		default:
 			return "", 0, fmt.Errorf("%w: %s", errUnreachable, msg)
 		}
@@ -294,10 +332,10 @@ func (r *returner) captureReadRow(ctx context.Context, st *returnState, seq int6
 // manifestPlan is the decoded, validated manifest: the complete
 // workspace tree the copy must reproduce, keyed by raw byte paths.
 type manifestPlan struct {
-	files map[string]*planFile // raw rel path -> file
-	dirs  []string             // raw rel paths, ordered
-	links map[string][]byte    // raw rel path -> raw symlink target
-	groups map[string][]string // link_group -> member paths
+	files       map[string]*planFile // raw rel path -> file
+	dirs        []string             // raw rel paths, ordered
+	links       map[string][]byte    // raw rel path -> raw symlink target
+	groups      map[string][]string  // link_group -> member paths
 	unsupported []string
 }
 
@@ -331,14 +369,14 @@ func safeCarryPath(p []byte) (string, error) {
 // loadManifest pages the whole bound manifest into a validated plan.
 // Unsupported entries are collected, not dropped — the caller fails
 // visibly on any of them.
-func (r *returner) loadManifest(ctx context.Context, st *returnState) (*manifestPlan, error) {
+func (r *returner) loadManifest(ctx context.Context, st *returnState, expected string) (*manifestPlan, error) {
 	pl := &manifestPlan{
 		files: map[string]*planFile{}, links: map[string][]byte{},
 		groups: map[string][]string{},
 	}
 	var cursor int64 = -1
 	for {
-		page, err := r.captureEntries(ctx, st, cursor)
+		page, err := r.captureEntries(ctx, st, expected, cursor)
 		if err != nil {
 			return nil, err
 		}
@@ -461,7 +499,7 @@ func (r *returner) stageCapturedFiles(ctx context.Context, st *returnState, j *f
 			}
 			continue
 		}
-		sha, n, err := r.captureReadRow(ctx, st, je.Seq, blob, je.Bytes)
+		sha, n, err := r.captureReadRow(ctx, st, je.Seq, blob, je.Bytes, j.CaptureID)
 		if err != nil {
 			return err
 		}
@@ -517,7 +555,7 @@ func (r *returner) replanForBinding(ctx context.Context, st *returnState, j *fil
 		j.Staging = stagingDirFor(r.m.wsRoot, st.SessionID, b.CaptureID)
 	}
 	j.CaptureID, j.ScopeID, j.ManifestSHA = b.CaptureID, b.ScopeID, b.ManifestSHA
-	pl, err := r.loadManifest(ctx, st)
+	pl, err := r.loadManifest(ctx, st, j.CaptureID)
 	if err != nil {
 		return err
 	}
@@ -562,7 +600,7 @@ func (r *returner) replanForBinding(ctx context.Context, st *returnState, j *fil
 				// compare hashes before trusting placed bytes across
 				// the snapshot boundary.
 				blob := filepath.Join(j.Staging, "blobs", p)
-				sha, _, rerr := r.captureReadRow(ctx, st, pf.seq, blob, pf.length)
+				sha, _, rerr := r.captureReadRow(ctx, st, pf.seq, blob, pf.length, j.CaptureID)
 				if rerr != nil {
 					return rerr
 				}
@@ -627,6 +665,37 @@ func (r *returner) replanForBinding(ctx context.Context, st *returnState, j *fil
 			_ = os.Remove(p) // empty only — a filled dir stays
 		}
 	}
+	// Regress the phase when the replan left work undone — an entry
+	// reset to unplaced, a link to re-place, a carried dir missing.
+	// "copying" is the safe restart: staging re-proves intact blobs
+	// per entry and keeps hardlink groups on one inode, which the
+	// promote path's per-entry refetch could not.
+	needsWork := false
+	for _, je := range j.Files {
+		if je.State != "placed" {
+			needsWork = true
+			break
+		}
+	}
+	if !needsWork {
+		for _, jl := range j.Links {
+			if jl.State != "placed" {
+				needsWork = true
+				break
+			}
+		}
+	}
+	if !needsWork {
+		for _, d := range j.Dirs {
+			if fi, serr := os.Stat(filepath.Join(scopeDir, d)); serr != nil || !fi.IsDir() {
+				needsWork = true
+				break
+			}
+		}
+	}
+	if needsWork {
+		j.Phase = "copying"
+	}
 	return r.saveJournal(st, j)
 }
 
@@ -634,7 +703,7 @@ func (r *returner) replanForBinding(ctx context.Context, st *returnState, j *fil
 // under the persisted scope identity, then replans. A scope-identity
 // change is terminal for the copy.
 func (r *returner) retakeCaptureAndReplan(ctx context.Context, st *returnState, j *filesJournal) error {
-	b, err := r.captureRetake(ctx, st, j.ScopeID)
+	b, err := r.captureRetake(ctx, st, j.ScopeID, j.CaptureID)
 	if err != nil {
 		return err
 	}
@@ -655,7 +724,7 @@ func (r *returner) retakeCaptureAndReplan(ctx context.Context, st *returnState, 
 // the promote path's repair for a torn or missing staged copy.
 func (r *returner) refetchCaptured(ctx context.Context, st *returnState, p string, je *journalEntry, j *filesJournal) error {
 	blob := filepath.Join(j.Staging, "blobs", p)
-	sha, n, err := r.captureReadRow(ctx, st, je.Seq, blob, je.Bytes)
+	sha, n, err := r.captureReadRow(ctx, st, je.Seq, blob, je.Bytes, j.CaptureID)
 	if err != nil {
 		return err
 	}

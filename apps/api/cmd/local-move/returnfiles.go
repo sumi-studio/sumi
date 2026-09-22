@@ -85,7 +85,7 @@ type filesJournal struct {
 	// Links are carried symlinks: raw rel path -> raw target (base64)
 	// plus placement state, journaled like files so cancellation and
 	// resume treat them identically.
-	Links      map[string]*journalLink  `json:"links,omitempty"`
+	Links map[string]*journalLink `json:"links,omitempty"`
 	// Collateral records every object moved aside that is not a
 	// journaled carried file — ancestors displaced to make a directory,
 	// symlinks, repeat occupants — so cancellation can restore all of
@@ -114,6 +114,118 @@ type journalLink struct {
 	TargetB64   string `json:"target_b64"`
 	State       string `json:"state"` // "" → placed
 	Quarantined bool   `json:"quarantined,omitempty"`
+}
+
+// filesJournalWire is the journal's on-disk shape. Rel paths are raw
+// POSIX byte names — they cannot cross JSON as strings because
+// encoding/json replaces invalid UTF-8 with U+FFFD, which would
+// silently rename a carried file (a non-UTF-8 name is legal on the
+// source filesystem and arrives intact in the manifest's base64
+// fields). Every path — file/link/collateral map keys and the dirs
+// list — is therefore base64 on disk. journal_encoding marks the
+// format so a journal written before the encoding existed still
+// decodes literally (its keys could only ever be UTF-8-safe anyway).
+type filesJournalWire struct {
+	Phase       string                   `json:"phase"`
+	CaptureID   string                   `json:"capture_id,omitempty"`
+	ScopeID     string                   `json:"scope_id,omitempty"`
+	ManifestSHA string                   `json:"manifest_sha,omitempty"`
+	Encoding    string                   `json:"journal_encoding"`
+	Staging     string                   `json:"staging_dir"`
+	Quarantine  string                   `json:"quarantine_dir,omitempty"`
+	Files       map[string]*journalEntry `json:"files"`
+	Dirs        []string                 `json:"dirs"`
+	Links       map[string]*journalLink  `json:"links,omitempty"`
+	Collateral  map[string]bool          `json:"collateral,omitempty"`
+}
+
+const journalEncodingPathB64 = "path-b64"
+
+func (j *filesJournal) MarshalJSON() ([]byte, error) {
+	w := filesJournalWire{
+		Phase: j.Phase, CaptureID: j.CaptureID, ScopeID: j.ScopeID,
+		ManifestSHA: j.ManifestSHA, Encoding: journalEncodingPathB64,
+		Staging: j.Staging, Quarantine: j.Quarantine,
+		Files: make(map[string]*journalEntry, len(j.Files)),
+		Dirs:  make([]string, 0, len(j.Dirs)),
+	}
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	for p, je := range j.Files {
+		w.Files[b64(p)] = je
+	}
+	for _, d := range j.Dirs {
+		w.Dirs = append(w.Dirs, b64(d))
+	}
+	if len(j.Links) > 0 {
+		w.Links = make(map[string]*journalLink, len(j.Links))
+		for p, jl := range j.Links {
+			w.Links[b64(p)] = jl
+		}
+	}
+	if len(j.Collateral) > 0 {
+		w.Collateral = make(map[string]bool, len(j.Collateral))
+		for p, v := range j.Collateral {
+			w.Collateral[b64(p)] = v
+		}
+	}
+	return json.Marshal(w)
+}
+
+func (j *filesJournal) UnmarshalJSON(raw []byte) error {
+	var w filesJournalWire
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return err
+	}
+	enc := w.Encoding == journalEncodingPathB64
+	dec := func(s string) (string, error) {
+		if !enc {
+			return s, nil
+		}
+		b, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return "", fmt.Errorf("journal path %q is not %s", s, journalEncodingPathB64)
+		}
+		return string(b), nil
+	}
+	j.Phase, j.CaptureID, j.ScopeID = w.Phase, w.CaptureID, w.ScopeID
+	j.ManifestSHA, j.Staging, j.Quarantine = w.ManifestSHA, w.Staging, w.Quarantine
+	j.Files = make(map[string]*journalEntry, len(w.Files))
+	for k, v := range w.Files {
+		p, err := dec(k)
+		if err != nil {
+			return err
+		}
+		j.Files[p] = v
+	}
+	j.Dirs = nil
+	for _, d := range w.Dirs {
+		p, err := dec(d)
+		if err != nil {
+			return err
+		}
+		j.Dirs = append(j.Dirs, p)
+	}
+	for k, v := range w.Links {
+		p, err := dec(k)
+		if err != nil {
+			return err
+		}
+		if j.Links == nil {
+			j.Links = map[string]*journalLink{}
+		}
+		j.Links[p] = v
+	}
+	for k, v := range w.Collateral {
+		p, err := dec(k)
+		if err != nil {
+			return err
+		}
+		if j.Collateral == nil {
+			j.Collateral = map[string]bool{}
+		}
+		j.Collateral[p] = v
+	}
+	return nil
 }
 
 // maxReturnFiles bounds one copy's enumeration. A workspace larger than
@@ -236,7 +348,22 @@ func (r *returner) copyFilesLocal(ctx context.Context, st *returnState) error {
 		return nil // already activated — the workspace is live, not evidence
 	}
 	if j != nil && (j.Phase == "promoted" || st.FilesDone) {
-		return r.verifyPromotedTree(ctx, st, j)
+		if err = r.verifyPromotedTree(ctx, st, j); err == nil {
+			// The copy is proven — release the association under the
+			// identity this mover planned so a delayed answer can
+			// never clear a replacement binding.
+			r.captureRelease(ctx, st, j.CaptureID)
+			return nil
+		}
+		// A re-verify that needs bytes the released binding no longer
+		// serves (a torn or edited destination after the first proof)
+		// falls into the bounded replan loop: the source is still
+		// sealed, so a fresh capture under the durable anchor names
+		// the same tree and repair re-proves against it. Anything
+		// else is a real failure.
+		if !errors.Is(err, errCaptureReplaced) && !errors.Is(err, errCaptureLost) {
+			return err
+		}
 	}
 	if st.FilesDone && j == nil {
 		// State says done but the journal that proves it is gone —
@@ -261,15 +388,48 @@ func (r *returner) copyFilesLocal(ctx context.Context, st *returnState) error {
 	// snapshot and re-plans — old staging can never bleed into the new
 	// final tree. Retakes are bounded: a workspace whose captured
 	// objects keep going missing is answered pending, not looped.
-	for retakes := 0; ; retakes++ {
-		var err error
-		if j.Phase == "copying" {
+	// A replaced association (a concurrent retake won, or a delayed
+	// release answered) abandons the planned manifest outright — the
+	// next pass re-ensures and replans against the current binding
+	// before another byte is accepted; that too is bounded.
+	for retakes, replans := 0, 0; ; {
+		if err == nil && j.Phase == "copying" {
 			err = r.stageCapturedFiles(ctx, st, j)
 		}
 		if err == nil && j.Phase == "staged" {
 			err = r.promoteStagedFiles(st, j)
 		}
-		if err == nil || !errors.Is(err, errCaptureLost) {
+		if err == nil {
+			r.captureRelease(ctx, st, j.CaptureID)
+			return nil
+		}
+		if errors.Is(err, errCaptureReplaced) {
+			if replans >= 8 {
+				return fmt.Errorf("%w: the bound association changed across %d replans — "+
+					"concurrent capture operations are racing this copy; retry with "+
+					"`sumi-local-move return-resume` or `sumi-local-move return-cancel`",
+					errUnreachable, replans)
+			}
+			replans++
+			// Re-establish what the persisted association actually is
+			// — a concurrent retake won, a delayed release cleared the
+			// old capture, or the binding is gone entirely (a re-verify
+			// after the first proof released it). Ensure re-binds under
+			// the same durable scope anchor; a changed identity replans
+			// the whole tree before another byte is accepted.
+			b, berr := r.captureEnsure(ctx, st)
+			if berr != nil {
+				return berr
+			}
+			if b.CaptureID != j.CaptureID || b.ManifestSHA != j.ManifestSHA {
+				if rerr := r.replanForBinding(ctx, st, j, b); rerr != nil {
+					return rerr
+				}
+			}
+			err = nil
+			continue
+		}
+		if !errors.Is(err, errCaptureLost) {
 			return err
 		}
 		if retakes >= 7 {
@@ -277,9 +437,11 @@ func (r *returner) copyFilesLocal(ctx context.Context, st *returnState) error {
 				"the Cloud workspace's captured data is unavailable; retry with `sumi-local-move return-resume` "+
 				"or `sumi-local-move return-cancel`", errUnreachable, retakes)
 		}
-		if err := r.retakeCaptureAndReplan(ctx, st, j); err != nil {
-			return err
+		retakes++
+		if rerr := r.retakeCaptureAndReplan(ctx, st, j); rerr != nil {
+			return rerr
 		}
+		err = nil
 	}
 }
 

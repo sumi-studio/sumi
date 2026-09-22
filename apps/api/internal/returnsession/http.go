@@ -370,7 +370,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 		code = http.StatusGone
 	case errors.Is(err, ErrConflict), errors.Is(err, ErrOpenSession),
 		errors.Is(err, ErrDestBound), errors.Is(err, ErrFilePolicyUndecided),
-		errors.Is(err, ErrScopeChanged),
+		errors.Is(err, ErrScopeChanged), errors.Is(err, ErrCaptureReplaced),
 		errors.Is(err, portable.ErrTransferConflict),
 		errors.Is(err, portable.ErrPersonaExists), errors.Is(err, portable.ErrUnresolvedOperations):
 		code = http.StatusConflict
@@ -399,6 +399,9 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 		msg = "internal error"
 	}
 	body := map[string]any{"error": msg}
+	if errors.Is(err, ErrCaptureReplaced) {
+		body["code"] = "capture_replaced"
+	}
 	if errors.Is(err, ErrFilePolicyUndecided) {
 		// A machine-readable marker: the web client renders the undecided
 		// file-policy state from this instead of matching message text.
@@ -576,12 +579,13 @@ func (s *Server) captureRetake(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ExpectedScopeID string `json:"expected_scope_id"`
+		ExpectedScopeID   string `json:"expected_scope_id"`
+		ExpectedCaptureID string `json:"expected_capture_id"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	b, err := s.svc.RetakeCapture(r.Context(), r.PathValue("session"), grant, body.ExpectedScopeID)
+	b, err := s.svc.RetakeCapture(r.Context(), r.PathValue("session"), grant, body.ExpectedScopeID, body.ExpectedCaptureID)
 	if err != nil {
 		s.writeErr(w, err, nil)
 		return
@@ -597,7 +601,8 @@ func (s *Server) captureRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, ErrGrant.Error())
 		return
 	}
-	if err := s.svc.ReleaseCapture(r.Context(), r.PathValue("session"), grant); err != nil {
+	if err := s.svc.ReleaseCapture(r.Context(), r.PathValue("session"), grant,
+		r.URL.Query().Get("expected_capture_id")); err != nil {
 		s.writeErr(w, err, nil)
 		return
 	}
@@ -630,7 +635,8 @@ func (s *Server) captureEntries(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = int(n)
 	}
-	id, owner, epoch, err := s.svc.AuthorizeCaptureEntries(r.Context(), r.PathValue("session"), grant)
+	id, owner, epoch, err := s.svc.AuthorizeCaptureEntries(r.Context(), r.PathValue("session"), grant,
+		q.Get("expected_capture_id"))
 	if err != nil {
 		s.writeErr(w, err, nil)
 		return
@@ -670,7 +676,8 @@ func (s *Server) captureRead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	id, owner, epoch, err := s.svc.AuthorizeCaptureRead(r.Context(), r.PathValue("session"), grant)
+	id, owner, epoch, err := s.svc.AuthorizeCaptureRead(r.Context(), r.PathValue("session"), grant,
+		q.Get("expected_capture_id"))
 	if err != nil {
 		s.writeErr(w, err, nil)
 		return

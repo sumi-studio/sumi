@@ -85,13 +85,16 @@ CREATE INDEX persona_file_tokens_active
 -- name yields a different scope_id), capture_id the manifest itself,
 -- capture_manifest_sha its integrity hash. A lost create response or a
 -- mover restart re-derives THIS row instead of minting a second
--- association; a retake replaces the triple atomically after proving the
--- scope identity is unchanged. NULL means no capture bound yet.
+-- association; a retake replaces capture_id+manifest_sha atomically
+-- after proving the scope identity is unchanged. capture_scope_id is
+-- the session's durable anchor: it persists even while capture_id is
+-- NULL (between release and a re-bind), so a late cleanup can never
+-- drop the scope expectation the next bind must satisfy.
 ALTER TABLE return_sessions
     ADD COLUMN capture_id text,
     ADD COLUMN capture_scope_id text,
     ADD COLUMN capture_manifest_sha text;
 ALTER TABLE return_sessions
     ADD CONSTRAINT return_sessions_capture_binding
-    CHECK ((capture_id IS NULL) = (capture_scope_id IS NULL)
-       AND (capture_id IS NULL) = (capture_manifest_sha IS NULL));
+    CHECK ((capture_id IS NULL) = (capture_manifest_sha IS NULL)
+       AND (capture_id IS NULL OR capture_scope_id IS NOT NULL));
