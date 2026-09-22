@@ -73,6 +73,10 @@ export function SecretaryReturn({
   } | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  // The file-handling choice is explicit: nothing is preselected, and the
+  // create action refuses to run until the owner picks where the
+  // secretary's working files live after the move.
+  const [fileMode, setFileMode] = useState<"local" | "cloud" | null>(null);
   const [revision, setRevision] = useState(0);
   const lifetime = useRef<AbortController | null>(null);
   const readVersion = useRef(0);
@@ -155,13 +159,18 @@ export function SecretaryReturn({
   }
 
   function start() {
+    if (fileMode === null) return;
+    const mode = fileMode;
     void run("create", async () => {
       try {
-        const created = await createSecretaryReturn();
+        const created = await createSecretaryReturn(mode);
         setSession(created.session);
         setReturnURL(created.return_url);
         saveReturnURL(created.session.session_id, created.return_url);
         setCopied(false);
+        // The choice is per session: it does not carry into the next
+        // issue as a silent default.
+        setFileMode(null);
       } catch (failure) {
         // A 409 carries the open session so a lost return-URL answer still
         // recovers its status; the grant itself is never repeated.
@@ -205,6 +214,46 @@ export function SecretaryReturn({
     });
   }
 
+  // The file-handling picker — rendered wherever a new session can be
+  // issued (first issue and retry from a terminal session alike): a new
+  // session always wants a fresh explicit choice, never the old one
+  // silently re-applied.
+  const fileModePicker = (
+    <fieldset className="space-y-2">
+      <legend className="text-sm">ファイルの置き場所を選んでください</legend>
+      <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-border p-3 has-checked:border-foreground/40 has-checked:bg-muted/50">
+        <input
+          type="radio"
+          name="return-file-mode"
+          className="mt-1"
+          checked={fileMode === "local"}
+          onChange={() => setFileMode("local")}
+        />
+        <span className="text-sm leading-relaxed">
+          <span className="font-medium">ファイルをローカルに持ってくる</span>
+          <span className="block text-muted-foreground text-xs">
+            Cloudのワークスペースをコピーしてローカルで使います。Cloud側のコピーは読み取り専用で残ります（同期やバックアップではありません）。
+          </span>
+        </span>
+      </label>
+      <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-border p-3 has-checked:border-foreground/40 has-checked:bg-muted/50">
+        <input
+          type="radio"
+          name="return-file-mode"
+          className="mt-1"
+          checked={fileMode === "cloud"}
+          onChange={() => setFileMode("cloud")}
+        />
+        <span className="text-sm leading-relaxed">
+          <span className="font-medium">ファイルはCloudに残す</span>
+          <span className="block text-muted-foreground text-xs">
+            ローカルの秘書とあなたは同じCloudのワークスペースを読み書きします。大きなファイルを移さずに済みますが、ファイル操作には接続が必要です。
+          </span>
+        </span>
+      </label>
+    </fieldset>
+  );
+
   const waiting = session?.status === "awaiting_destination";
   const canCancel = session !== null && OPEN_STATUSES.has(session.status);
   const canRetry = session !== null && RETRYABLE_STATUSES.has(session.status);
@@ -239,6 +288,16 @@ export function SecretaryReturn({
                   needs_rebinding として応答を待ちます）。
                 </p>
               ) : null}
+              {session.status === "completed" && session.file_mode === "local" ? (
+                <p className="mt-3 text-muted-foreground text-xs leading-relaxed">
+                  ファイルはローカルのワークスペースに移りました。Cloudに残っているコピーは読み取り専用です。同期やバックアップではありません。
+                </p>
+              ) : null}
+              {session.status === "completed" && session.file_mode === "cloud" ? (
+                <p className="mt-3 text-muted-foreground text-xs leading-relaxed">
+                  ファイルはCloudに残っています。ローカルの秘書とあなたは同じCloudのワークスペースを使います。
+                </p>
+              ) : null}
               {session.preflight && OPEN_STATUSES.has(session.status) ? (
                 <div className="mt-4 rounded-xl border border-border p-4">
                   <p className="text-muted-foreground text-xs">移行前の状態</p>
@@ -248,6 +307,12 @@ export function SecretaryReturn({
                       <li>
                         承認待ちの操作が{session.preflight.pending_approvals}
                         件引き継がれます。新しいローカルではあなたへの結び付きがないため、ここで決めるまでローカル側は起動できません（移行を進めるか、決めてからやり直してください）。
+                      </li>
+                    ) : null}
+                    {(session.preflight.pending_file_effects ?? 0) > 0 ? (
+                      <li>
+                        処理中のファイル操作が{session.preflight.pending_file_effects}
+                        件あります。完了が確認できるまで移行は封印されません。
                       </li>
                     ) : null}
                     {session.preflight.model_intent_kind ? (
@@ -323,11 +388,12 @@ export function SecretaryReturn({
           {!session ? (
             <div className="mt-5 space-y-3">
               <p className="text-muted-foreground text-sm leading-relaxed">
-                移行しても秘書は同じ個体のままです。送り出した元のローカルにも、新しいローカルにも戻せます。ローカル側のファイルやジョブはこの移行では移動しません。
+                移行しても秘書は同じ個体のままです。送り出した元のローカルにも、新しいローカルにも戻せます。
               </p>
+              {fileModePicker}
               <Button
                 className="min-h-10 w-full"
-                disabled={busy !== null || loading}
+                disabled={busy !== null || loading || fileMode === null}
                 onClick={start}
               >
                 {busy === "create" ? (
@@ -343,9 +409,10 @@ export function SecretaryReturn({
               <p className="text-muted-foreground text-sm leading-relaxed">
                 この移行は終了しています。もう一度移行する場合は、新しいURLを発行してください。
               </p>
+              <div className="mt-3">{fileModePicker}</div>
               <Button
                 className="mt-3 min-h-10 w-full"
-                disabled={busy !== null || loading}
+                disabled={busy !== null || loading || fileMode === null}
                 onClick={retry}
               >
                 {busy === "create" ? (

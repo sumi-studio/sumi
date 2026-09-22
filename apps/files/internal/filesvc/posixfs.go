@@ -41,11 +41,32 @@ type posixRoot struct {
 	// syscall — used to inject a lost reply: the effect applied (or
 	// not) while the call reports a transport-class error.
 	xchFn func(oldfd int, old string, newfd int, newName string) error
+
+	// fence, when non-nil, is consulted at every public-path landing.
+	// The service wires it to the store's deposition state so a process
+	// that lost the writer lock stops mutating the tree even mid-
+	// composite — the surviving intent is settled by the successor's
+	// disk verdict like any other interrupted effect.
+	fence func() error
+}
+
+// landing is the deposition gate consulted immediately before every
+// public-path mutation. A fenced landing returns ErrUnavailable — a
+// non-definitive error, so the intent survives and the reconciler's
+// disk verdict settles what actually happened.
+func (p *posixRoot) landing() error {
+	if p.fence != nil {
+		return p.fence()
+	}
+	return nil
 }
 
 // exchange swaps two names atomically (RENAME_EXCHANGE). Isolated
 // behind a helper so tests can inject the lost-reply outcome.
 func (p *posixRoot) exchange(oldfd int, old string, newfd int, newName string) error {
+	if err := p.landing(); err != nil {
+		return err
+	}
 	if p.xchFn != nil {
 		return p.xchFn(oldfd, old, newfd, newName)
 	}
@@ -1262,6 +1283,78 @@ func (v *rootView) Stat(scope, path string) (FileInfo, error) {
 	return v.p.statFrom(v.rfd, scope, path)
 }
 
+// lstatFrom lstats beneath a pinned root fd — statFrom's sibling that
+// never follows the final component. The cut manifest uses it so a
+// symlink records itself (kind + target) rather than the object it
+// resolves to.
+func (p *posixRoot) lstatFrom(rfd *os.File, scope, path string) (FileInfo, error) {
+	sfd, err := scopeDirFrom(rfd, scope, false)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	defer sfd.Close()
+	rel, err := relPath(path)
+	if err != nil {
+		return FileInfo{}, err
+	}
+	f := sfd
+	if rel != "" {
+		f, err = openBeneath(sfd, rel, unix.O_PATH|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return FileInfo{}, err
+		}
+		defer f.Close()
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return FileInfo{}, mapPathErr(err)
+	}
+	oid, cls, nlink := p.fileIdentity(f)
+	return FileInfo{Kind: kindOf(st.Mode()), Size: st.Size(),
+		MtimeNS: st.ModTime().UnixNano(), Fingerprint: fingerprint(st),
+		DevIno: devIno(st), Oid: oid, oidCls: cls, Nlink: nlink}, nil
+}
+
+// readlinkFrom reads a symlink's target beneath the pinned root — the
+// link's own content, which the manifest needs to identify it fully.
+func (p *posixRoot) readlinkFrom(rfd *os.File, scope, path string) (string, error) {
+	sfd, err := scopeDirFrom(rfd, scope, false)
+	if err != nil {
+		return "", err
+	}
+	defer sfd.Close()
+	rel, err := relPath(path)
+	if err != nil {
+		return "", err
+	}
+	if rel == "" {
+		return "", ErrNotDir
+	}
+	dir, name := splitRel(rel)
+	dfd := sfd
+	if dir != "" {
+		dfd, err = openDirBeneath(sfd, dir, false)
+		if err != nil {
+			return "", err
+		}
+		defer dfd.Close()
+	}
+	buf := make([]byte, unix.PathMax)
+	n, err := unix.Readlinkat(int(dfd.Fd()), name, buf)
+	if err != nil {
+		return "", mapPathErr(err)
+	}
+	return string(buf[:n]), nil
+}
+
+func (v *rootView) Lstat(scope, path string) (FileInfo, error) {
+	return v.p.lstatFrom(v.rfd, scope, path)
+}
+
+func (v *rootView) Readlink(scope, path string) (string, error) {
+	return v.p.readlinkFrom(v.rfd, scope, path)
+}
+
 func (v *rootView) Hash(scope, path string) (string, error) {
 	return v.p.hashFrom(v.rfd, scope, path)
 }
@@ -1300,6 +1393,9 @@ func (v *rootView) MoveStaged(scope, from, to string) error {
 		return err
 	}
 	defer tpfd.Close()
+	if err := v.p.landing(); err != nil {
+		return err
+	}
 	if err := unix.Renameat2(int(fpfd.Fd()), fromName,
 		int(tpfd.Fd()), toName, unix.RENAME_NOREPLACE); err != nil {
 		return mapPathErr(err)
@@ -1408,6 +1504,9 @@ func (v *rootView) EnsureDir(scope, dir string) error {
 	if rel == "" {
 		return nil
 	}
+	if err := v.p.landing(); err != nil {
+		return err
+	}
 	dfd, err := openDirBeneath(sfd, rel, true)
 	if err != nil {
 		return err
@@ -1444,6 +1543,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	if err := checkReserved(path); err != nil {
 		return FileInfo{}, false, err
 	}
+	if err := p.landing(); err != nil {
+		return FileInfo{}, false, err
+	}
 	rel, err := relPath(path)
 	if err != nil {
 		return FileInfo{}, false, err
@@ -1457,6 +1559,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	}
 	defer sfd.Close()
 	dirRel, name := splitRel(rel)
+	if err := p.landing(); err != nil {
+		return FileInfo{}, false, err
+	}
 	pfd, err := openDirBeneath(sfd, dirRel, true)
 	if err != nil {
 		return FileInfo{}, false, err
@@ -1581,6 +1686,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		return info, true, nil
 	}
 	if exclusive {
+		if perr := p.landing(); perr != nil {
+			return fail(perr)
+		}
 		if err := unix.Linkat(int(pfd.Fd()), tmp, int(pfd.Fd()), name, 0); err != nil {
 			return fail(mapPublishErr(err, exclusive))
 		}
@@ -1590,6 +1698,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		// Declared-empty destination: publish non-destructively. An
 		// occupant that arrived after declare is never displaced into
 		// our private name — the write fails honest-conflict instead.
+		if perr := p.landing(); perr != nil {
+			return fail(perr)
+		}
 		it.njAct("pub", rel)
 		err = unix.Renameat2(int(pfd.Fd()), tmp, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 		if p.faultHook != nil {
@@ -1617,6 +1728,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// the displaced object — a crash between syscall and record leaves
 	// the act declared-but-unresulted, which the reconciler reads as
 	// outcome-unknown, never "definitively absent".
+	if perr := p.landing(); perr != nil {
+		return fail(perr)
+	}
 	it.njAct("xch", rel)
 	err = p.exchange(int(pfd.Fd()), tmp, int(pfd.Fd()), name)
 	if p.faultHook != nil {
@@ -1632,6 +1746,9 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 		if expectFP != "" {
 			// The object the intent expected to displace is gone.
 			return fail(ErrExternalChange)
+		}
+		if ferr := p.landing(); ferr != nil {
+			return fail(ferr)
 		}
 		if perr := unix.Renameat2(int(pfd.Fd()), tmp,
 			int(pfd.Fd()), name, unix.RENAME_NOREPLACE); perr != nil {
@@ -1677,6 +1794,10 @@ func (p *posixRoot) atomicWrite(scope, path string, content []byte, exclusive bo
 	// Declare the undo before its exchanges can repopulate the slot:
 	// journal.act re-opens res in the same write, so every crash window
 	// reads outcome-unknown for the act in flight.
+	if ferr := p.landing(); ferr != nil {
+		// The exchange already committed; report landed-but-unobserved.
+		return FileInfo{}, true, ferr
+	}
 	it.njAct("und", rel)
 	uerr := undoDisplaced(pfd, pfd, tmp, name,
 		func(t3 string) bool { return t3 == our3 })
@@ -1823,6 +1944,9 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 		// Destination expected absent at declare (or create-only
 		// requested): NOREPLACE makes the move fail rather than
 		// overwrite an object that appeared after the declare.
+		if err := p.landing(); err != nil {
+			return FileInfo{}, false, err
+		}
 		if err := unix.Renameat2(int(srcPfd.Fd()), srcName,
 			int(dstPfd.Fd()), dstName, unix.RENAME_NOREPLACE); err != nil {
 			return FileInfo{}, false, mapPublishErr(err, true)
@@ -1845,6 +1969,11 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// non-destructive (NOREPLACE); a name claimed meanwhile leaves it
 	// parked under the private name for the reconciler.
 	restoreSrc := func(fail error) (FileInfo, bool, error) {
+		if ferr := p.landing(); ferr != nil {
+			// Fenced mid-composite: the staged source stays parked at
+			// the private name for the reconciler to settle.
+			return FileInfo{}, false, fmt.Errorf("%w: %w", ferr, errUndoParked)
+		}
 		rerr := unix.Renameat2(int(srcPfd.Fd()), stage,
 			int(srcPfd.Fd()), srcName, unix.RENAME_NOREPLACE)
 		syncDir(srcPfd)
@@ -1860,6 +1989,9 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// 1. Capture the source beneath the declared private name — the act
 	// is recorded before the syscall can populate the name, so a crash
 	// leaves a declared-unresulted record, never an unowned object.
+	if err := p.landing(); err != nil {
+		return FileInfo{}, false, err
+	}
 	it.njAct("cap", relFrom)
 	if err := unix.Renameat2(int(srcPfd.Fd()), srcName,
 		int(srcPfd.Fd()), stage, unix.RENAME_NOREPLACE); err != nil {
@@ -1893,6 +2025,11 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// 3. Exchange the private name with the destination — recorded
 	// before the syscall can populate the name with the displaced
 	// object.
+	if ferr := p.landing(); ferr != nil {
+		// The source is captured at the private name; a fenced landing
+		// leaves it parked for the reconciler.
+		return FileInfo{}, false, fmt.Errorf("%w: %w", ferr, errUndoParked)
+	}
 	it.njAct("xch", relTo)
 	err = p.exchange(int(srcPfd.Fd()), stage,
 		int(dstPfd.Fd()), dstName)
@@ -1972,6 +2109,10 @@ func (p *posixRoot) rename(scope, from, to string, noReplace bool, it intent) (F
 	// then restore the source to `from`. Never unlinks foreign bytes.
 	// Declared before it can repopulate the slot: journal.act re-opens
 	// res in the same write, so every crash window reads outcome-unknown.
+	if ferr := p.landing(); ferr != nil {
+		// The exchange already committed; report landed-but-unobserved.
+		return FileInfo{}, true, ferr
+	}
 	it.njAct("und", relTo)
 	uerr := undoDisplaced(srcPfd, dstPfd, stage, dstName,
 		func(t3 string) bool { return t3 == src3 })
@@ -2014,6 +2155,9 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 	if rel == "" {
 		return false, ErrNotDir // removing the scope root itself is not an op
 	}
+	if err := p.landing(); err != nil {
+		return false, err
+	}
 	sfd, err := p.scopeDir(scope, false)
 	if err != nil {
 		return false, err
@@ -2034,6 +2178,9 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 	// the act is journaled before the syscall can populate it. A
 	// leftover parked object occupying the name refuses the op rather
 	// than clobber recovery bytes.
+	if err := p.landing(); err != nil {
+		return false, err
+	}
 	it.njAct("cap", rel)
 	err = unix.Renameat2(int(pfd.Fd()), name, int(pfd.Fd()), stage, unix.RENAME_NOREPLACE)
 	switch {
@@ -2051,6 +2198,9 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 	st3, _, _, serr := fp3at(pfd, stage)
 	if serr != nil {
 		// Captured but unobservable — put it back before reporting.
+		if ferr := p.landing(); ferr != nil {
+			return true, ferr
+		}
 		rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 		if rerr != nil {
 			return false, fmt.Errorf("%w: %w", serr, errUndoParked)
@@ -2082,6 +2232,9 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 			// already verified (st3 == dstFP), so this is the declared
 			// object itself, not a divergence: restore it whole and
 			// report dir_not_empty rather than external_change.
+			if ferr := p.landing(); ferr != nil {
+				return true, ferr
+			}
 			rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 			switch {
 			case rerr == nil:
@@ -2101,6 +2254,9 @@ func (p *posixRoot) remove(scope, path string, it intent) (bool, error) {
 	// Captured object is not what the intent declared — put it back. A
 	// racing writer's object occupying the name keeps it; the captured
 	// object stays parked at the private name for recovery.
+	if ferr := p.landing(); ferr != nil {
+		return true, ferr
+	}
 	rerr := unix.Renameat2(int(pfd.Fd()), stage, int(pfd.Fd()), name, unix.RENAME_NOREPLACE)
 	switch {
 	case rerr == nil:
@@ -2124,11 +2280,17 @@ func (p *posixRoot) mkdir(scope, path string) (FileInfo, bool, error) {
 	if err != nil {
 		return FileInfo{}, false, err
 	}
+	if err := p.landing(); err != nil {
+		return FileInfo{}, false, err
+	}
 	sfd, err := p.scopeDir(scope, true)
 	if err != nil {
 		return FileInfo{}, false, err
 	}
 	defer sfd.Close()
+	if err := p.landing(); err != nil {
+		return FileInfo{}, false, err
+	}
 	pfd, err := openDirBeneath(sfd, rel, true)
 	if err != nil {
 		return FileInfo{}, false, err

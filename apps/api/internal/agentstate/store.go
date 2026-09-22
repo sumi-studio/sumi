@@ -381,6 +381,14 @@ type Store struct {
 	// separate local-runner processes, so 'local'/unstamped work is never
 	// refused here. Set at wiring time; not synchronized.
 	jobBackendAvailable map[string]bool
+	// defaultTerminalBackend stamps new terminal sessions. "cloud" is
+	// set only after the termexec driver is verified ready; sessions
+	// for a backend with no live runner are refused at create rather
+	// than left to queue forever.
+	defaultTerminalBackend string
+	// terminalBackendAvailable names terminal backends a verified live
+	// runner claims. Set at wiring time; not synchronized.
+	terminalBackendAvailable map[string]bool
 }
 
 // SetDefaultJobBackend configures the backend stamped onto job submissions
@@ -405,6 +413,34 @@ func (s *Store) SetJobBackendAvailable(backend string) {
 		s.jobBackendAvailable = map[string]bool{}
 	}
 	s.jobBackendAvailable[backend] = true
+}
+
+// SetDefaultTerminalBackend configures the backend stamped onto new
+// terminal sessions. A default is a name, not a service guarantee —
+// wiring must separately call SetTerminalBackendAvailable for the
+// backend a live runner actually claims; otherwise sessions stamped
+// with the default are refused at admission (ErrTerminalBackend)
+// instead of queueing forever for a runner that does not exist.
+func (s *Store) SetDefaultTerminalBackend(backend string) {
+	s.defaultTerminalBackend = backend
+}
+
+// SetTerminalBackendAvailable declares that a live runner claims the
+// named terminal backend's sessions.
+func (s *Store) SetTerminalBackendAvailable(backend string) {
+	if s.terminalBackendAvailable == nil {
+		s.terminalBackendAvailable = map[string]bool{}
+	}
+	s.terminalBackendAvailable[backend] = true
+}
+
+// terminalBackendDefault is the backend stamped onto new terminal sessions
+// — the same fallback createTerminalSessionTx uses for admission.
+func (s *Store) terminalBackendDefault() string {
+	if s.defaultTerminalBackend != "" {
+		return s.defaultTerminalBackend
+	}
+	return "local"
 }
 
 // TerminalFailure carries the resolved input/turn identity and the recorded
@@ -432,6 +468,10 @@ type TerminalFailureNoticeFunc func(ctx context.Context, tx pgx.Tx, f TerminalFa
 // best-effort (e.g. live fanout); it cannot decide or undo the committed
 // record and its failure is invisible to the caller by design.
 type ToolEffect struct {
+	// Validate checks only deterministic request shape before an elevated call
+	// asks for approval. It must not query mutable state or cause effects;
+	// authorization and other live checks still belong in Apply.
+	Validate    func(request map[string]any) error
 	Apply       func(ctx context.Context, tx pgx.Tx, personaID, idempotencyKey string, request map[string]any) (map[string]any, error)
 	AfterCommit func(ctx context.Context, personaID string, request, response map[string]any)
 	// ReadOnly reports whether a completed call could not have changed
@@ -482,14 +522,21 @@ func (s *Store) claimableTool(tool string) bool {
 // built-in internal tools plus each registered delegated effect. The core
 // advertises exactly this set to the model: a tool absent here (e.g.
 // messaging.send on a store with no Messaging integration wired) must not
-// be offered, since its claim could only fail as unknown.
+// be offered, since its claim could only fail as unknown. The terminal
+// tools are likewise withheld while no runner claims the default backend —
+// terminal.open could only fail as ErrTerminalBackend.
 func (s *Store) ClaimableTools() []string {
 	// effects is fixed at wiring time (RegisterEffect is pre-serve only).
 	tools := make([]string, 0, len(toolAuthority)+len(s.effects))
+	terminalServed := s.terminalBackendAvailable[s.terminalBackendDefault()]
 	for name, info := range toolAuthority {
-		if info.internal {
-			tools = append(tools, name)
+		if !info.internal {
+			continue
 		}
+		if strings.HasPrefix(name, "terminal.") && !terminalServed {
+			continue
+		}
+		tools = append(tools, name)
 	}
 	for name := range s.effects {
 		tools = append(tools, name)
@@ -2134,6 +2181,10 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		resp, err := s.internalJobTool(ctx, tx, personaID, turnID, inputID, tool, callIndex, request)
 		return resp, resp != nil, err
 	}
+	if strings.HasPrefix(tool, "terminal.") {
+		resp, err := s.internalTerminalTool(ctx, tx, personaID, tool, request)
+		return resp, resp != nil, err
+	}
 	switch tool {
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
@@ -2508,7 +2559,11 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		// deterministic argument validation runs before the approval row
 		// exists, so nothing parks and no approved/unconsumed grant is
 		// stranded (repair F2). The operation records the honest failure.
-		if verr := validateToolRequest(op.Tool, op.Request); verr != nil {
+		verr := validateToolRequest(op.Tool, op.Request)
+		if effect, ok := s.effects[op.Tool]; verr == nil && ok && effect.Validate != nil {
+			verr = effect.Validate(op.Request)
+		}
+		if verr != nil {
 			if err := tx.QueryRow(ctx, `
 				UPDATE core_operations SET status = 'failed', response = $3, completed_at = now()
 				WHERE persona_id = $1 AND operation_id = $2

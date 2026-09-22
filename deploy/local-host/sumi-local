@@ -60,6 +60,7 @@ sumi-local — local install of the new Sumi core (no Sumi Cloud account)
   url                 print the browser URL (carries the fm credential)
   logs [-f]           tail service and secretary logs
   doctor              check prerequisites and configuration
+  mcp list|save|delete manage granted Local MCP connections
   pack [OUT.tar.gz]   build a redistributable bundle (no Go needed to install)
   uninstall [--purge] remove executables; keep the state home unless --purge
   version             print the source version this install was built from
@@ -229,6 +230,11 @@ load_config() {
   else
     [[ -n ${SUMI_DB_URL:-} ]] || { info "config incomplete: missing SUMI_DB_URL"; return 1; }
   fi
+  # The local file service is opt-in per install: a config written
+  # before it existed simply has no SUMI_FILES_TOKEN and `start` skips
+  # the filesvc process — file routes stay unmounted rather than
+  # half-configured.
+  : "${SUMI_FILES_LISTEN:=127.0.0.1:8781}"
   # The config records the prefix it was installed with. An explicit
   # SUMI_LOCAL_PREFIX env still selects the install; a mismatch means the
   # caller pointed home and prefix at different installs — destructive
@@ -259,6 +265,7 @@ load_config() {
 RUN_DIR() { printf '%s/run' "$HOME_DIR"; }
 LOG_DIR() { printf '%s/log' "$HOME_DIR"; }
 SERVICE_BIN() { printf '%s/bin/sumi-local-service' "$PREFIX"; }
+FILESV_BIN() { printf '%s/bin/sumi-local-filesvc' "$PREFIX"; }
 CORE_ENTRY() { printf '%s/core/host/local.ts' "$PREFIX"; }
 # Written by install; durable ownership evidence for the state home that
 # survives config.env loss and records the install id for recovery.
@@ -507,6 +514,7 @@ kill_anchored() {
 # the state service plus each core host entry under $PREFIX/core/host/.
 stop_own_procs() {
   kill_anchored "$(SERVICE_BIN)" "$1"
+  kill_anchored "$(FILESV_BIN)" "$1"
   local h
   for h in "$PREFIX"/core/host/*.ts; do
     [[ -e $h ]] && kill_anchored "$h" "$1"
@@ -530,6 +538,7 @@ prefix_proven() {
 anchored_pids() {
   local root=$1 h
   proc_pids_for "$root/bin/sumi-local-service"
+  proc_pids_for "$root/bin/sumi-local-filesvc"
   for h in "$root"/core/host/*.ts; do
     [[ -e $h ]] && proc_pids_for "$h"
   done
@@ -697,9 +706,12 @@ cmd_install() {
     || die "this install has processes still running anchored on ${oldpref:-$prefix} (pids: $live) — stop it first: $PROG stop"
   # A regular file at the shim path is authored content — never overwrite
   # it. A symlink elsewhere is repointed with a note (reversible).
-  local shim_dst="$HOME/.local/bin/sumi-local"
-  [[ ! -e $shim_dst || -L $shim_dst ]] \
-    || die "$shim_dst exists and is not a symlink — refusing to overwrite it; move it aside and re-run install"
+  local shim_dst shim_name
+  for shim_name in sumi-local sumi-local-move; do
+    shim_dst="$HOME/.local/bin/$shim_name"
+    [[ ! -e $shim_dst || -L $shim_dst ]] \
+      || die "$shim_dst exists and is not a symlink — refusing to overwrite it; move it aside and re-run install"
+  done
   mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
   # Serialize the claim/payload/config writes with start/stop/uninstall of
@@ -738,22 +750,41 @@ cmd_install() {
 
   # --- payloads -------------------------------------------------------------
   if [[ -n $PACK_ROOT ]]; then
+    [[ -x $PACK_ROOT/bin/sumi-local-move && -x $PACK_ROOT/libexec/sumi-local-move-bin ]] \
+      || die "pack is missing the move/return command — use a complete current Local pack"
+    [[ -f $PACK_ROOT/terminal/index.html ]] || die "pack is missing the shared terminal screen — use a complete current Local pack"
+    rm -rf "$prefix/terminal"; cp -r "$PACK_ROOT/terminal" "$prefix/terminal"
     cp "$PACK_ROOT/libexec/sumi-local-service" "$prefix/bin/sumi-local-service"
+    cp "$PACK_ROOT/libexec/sumi-local-move-bin" "$prefix/bin/sumi-local-move-bin"
+    cp "$PACK_ROOT/bin/sumi-local-move" "$prefix/bin/sumi-local-move"
+    # A pack built before the file service existed simply lacks the
+    # payload — the install then runs without file routes.
+    [[ -f $PACK_ROOT/libexec/sumi-local-filesvc ]] \
+      && cp "$PACK_ROOT/libexec/sumi-local-filesvc" "$prefix/bin/sumi-local-filesvc"
     rm -rf "$prefix/core"; cp -r "$PACK_ROOT/core" "$prefix/core"
     cp "$PACK_ROOT/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$PACK_ROOT/config.example.env" "$prefix/config.example.env"
-    cp "$PACK_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
+    cp "$PACK_ROOT/docs/local-host.md" "$PACK_ROOT/docs/local-cloud-move.md" \
+      "$PACK_ROOT/docs/cloud-local-return.md" "$prefix/docs/"
     [[ -f $PACK_ROOT/VERSION ]] && cp "$PACK_ROOT/VERSION" "$prefix/VERSION"
     info "installed payloads from pack at $PACK_ROOT"
   elif [[ -n $REPO_ROOT ]]; then
     command -v go >/dev/null || die "go toolchain required to build from a source checkout (or install from a pack)"
+    info "building the shared Local terminal screen…"
+    "$SCRIPT_DIR/build-terminal" "$prefix/terminal"
     info "building sumi-local-service…"
     (cd "$REPO_ROOT/apps/api" && go build -buildvcs=false -o "$prefix/bin/sumi-local-service" ./cmd/first-model)
+    info "building sumi-local-move…"
+    (cd "$REPO_ROOT/apps/api" && go build -buildvcs=false -o "$prefix/bin/sumi-local-move-bin" ./cmd/local-move)
+    cp "$SCRIPT_DIR/sumi-local-move" "$prefix/bin/sumi-local-move"
+    info "building sumi-local-filesvc…"
+    (cd "$REPO_ROOT/apps/files" && go build -buildvcs=false -o "$prefix/bin/sumi-local-filesvc" ./cmd/filesvc)
     rm -rf "$prefix/core"; mkdir -p "$prefix/core"
     cp -r "$REPO_ROOT/apps/core/src/." "$prefix/core/"
     cp "$SCRIPT_DIR/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$SCRIPT_DIR/config.example.env" "$prefix/config.example.env"
-    cp "$REPO_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
+    cp "$REPO_ROOT/docs/local-host.md" "$REPO_ROOT/docs/local-cloud-move.md" \
+      "$REPO_ROOT/docs/cloud-local-return.md" "$prefix/docs/"
     (cd "$REPO_ROOT" && { git rev-parse HEAD 2>/dev/null || echo source; } | sed 's/^/source /' >"$prefix/VERSION")
     info "built payloads from $REPO_ROOT"
   elif [[ -n $PREFIX_DIR && $(canon "$PREFIX_DIR") == "$prefix" ]]; then
@@ -761,7 +792,8 @@ cmd_install() {
   else
     die "cannot locate payloads — run from a source checkout or an extracted pack"
   fi
-  chmod +x "$prefix/bin/sumi-local-service"
+  chmod +x "$prefix/bin/sumi-local-service" "$prefix/bin/sumi-local-move" "$prefix/bin/sumi-local-move-bin"
+  [[ -f $prefix/bin/sumi-local-filesvc ]] && chmod +x "$prefix/bin/sumi-local-filesvc"
 
   # this script itself is the CLI payload (skip when we already are it)
   local self_dst
@@ -788,6 +820,17 @@ cmd_install() {
       info "recorded prefix updated to $prefix (install moved)"
     elif [[ -z $cur_pref ]]; then
       printf 'SUMI_LOCAL_INSTALLED_PREFIX=%s\n' "$(shq "$prefix")" >>"$cfg"
+    fi
+    # Backfill the file-service keys a pre-filesvc config never had:
+    # identity, database and secrets stay untouched, and the append is
+    # the same KEY='value' data-only shape the installer writes. Only
+    # when the payload exists — a pack without it leaves files
+    # unconfigured rather than pointing at a missing binary.
+    if [[ -f $prefix/bin/sumi-local-filesvc ]] \
+       && [[ -z $(config_val "$cfg" SUMI_FILES_TOKEN || true) ]]; then
+      { printf 'SUMI_FILES_TOKEN=%s\n' "$(shq "$(openssl rand -hex 24)")"
+        printf 'SUMI_FILES_LISTEN=%s\n' "$(shq "127.0.0.1:8781")"; } >>"$cfg"
+      info "added the local file service credential to $cfg (workspaces live under $home/workspace/<persona>)"
     fi
   else
     local token persona iid
@@ -846,6 +889,11 @@ cmd_install() {
       printf 'SUMI_CORE_STATE_TOKEN=%s\n' "$(shq "$token")"
       printf 'SUMI_PERSONA_ID=%s\n' "$(shq "$persona")"
       printf 'SUMI_PERSONA_NAME=%s\n\n' "$(shq "${pname:-Sumi}")"
+      printf '# Local file service (filesvc): the install'"'"'s own working file\n'
+      printf '# store — persona workspaces live under <home>/workspace/<persona>.\n'
+      printf '# The token is the service'"'"'s internal credential (wildcard scope).\n'
+      printf 'SUMI_FILES_TOKEN=%s\n' "$(shq "$(openssl rand -hex 24)")"
+      printf 'SUMI_FILES_LISTEN=%s\n\n' "$(shq "127.0.0.1:8781")"
       printf '# Model connection — see docs/local-host.md. mock echoes inputs and\n'
       printf '# needs no credential; openai targets an OpenAI-compatible endpoint.\n'
       printf 'SUMI_MODEL_PROVIDER=%s\n' "$(shq "${mprovider:-mock}")"
@@ -870,18 +918,20 @@ cmd_install() {
   # repoint earlier would hand the user's command entry to an install
   # that never completed — possibly over a still-working one.
   mkdir -p "$HOME/.local/bin"
-  local shim_dst="$HOME/.local/bin/sumi-local"
-  if [[ -e $shim_dst || -L $shim_dst ]] \
-     && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/sumi-local" ]]; then
-    info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
-  fi
-  ln -sf "$prefix/bin/sumi-local" "$shim_dst"
+  for shim_name in sumi-local sumi-local-move; do
+    shim_dst="$HOME/.local/bin/$shim_name"
+    if [[ -e $shim_dst || -L $shim_dst ]] \
+       && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/$shim_name" ]]; then
+      info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
+    fi
+    ln -sf "$prefix/bin/$shim_name" "$shim_dst"
+  done
 
   cat <<EOF
 [$PROG] installed.
   executables : $prefix
   state home  : $home  (identity, secrets, logs — survives uninstall)
-  CLI         : $HOME/.local/bin/sumi-local -> $prefix/bin/sumi-local
+  CLI         : $HOME/.local/bin/{sumi-local,sumi-local-move} -> $prefix/bin/
 Next: edit $cfg for your model connection, then: $PROG start
 EOF
   # Non-default paths are not discoverable by later invocations — print the
@@ -1069,6 +1119,68 @@ cmd_start() {
     db_probe || die "database unreachable — fix SUMI_DB_URL in $CONFIG"
   fi
 
+  # --- local file service (filesvc) ----------------------------------------
+  # The install's own working file store: persona workspaces live under
+  # $HOME_DIR/workspace/<persona>, the same root the core hosts see as
+  # SUMI_WORKSPACE_ROOT. Opt-in per install — a config without
+  # SUMI_FILES_TOKEN (written before files existed, or a pack without the
+  # payload) skips this block and the file routes stay unmounted.
+  local files_running=0
+  if [[ -n ${SUMI_FILES_TOKEN:-} && -x $(FILESV_BIN) ]]; then
+    [[ $SUMI_FILES_LISTEN =~ ^(127\.[0-9]+\.[0-9]+\.[0-9]+|localhost):([0-9]+)$ ]] \
+      || die "SUMI_FILES_LISTEN must be 127.x.x.x:port or localhost:port (got '$SUMI_FILES_LISTEN')"
+    mkdir -p "$HOME_DIR/workspace"
+    if pid_alive "$(RUN_DIR)/filesvc.pid" "$(FILESV_BIN)"; then
+      if curl -sf --max-time 2 "http://$SUMI_FILES_LISTEN/healthz" >/dev/null 2>&1; then
+        info "file service already running (pid $(pid_num "$(RUN_DIR)/filesvc.pid"))"
+        files_running=1
+      else
+        info "file service pid alive but unhealthy — restarting it"
+        kill_pid "$(RUN_DIR)/filesvc.pid" 10 "$(FILESV_BIN)"
+      fi
+    fi
+    if ! pid_alive "$(RUN_DIR)/filesvc.pid" "$(FILESV_BIN)"; then
+      rm -f "$(RUN_DIR)/filesvc.pid"
+      # Same ownership discipline as the state service's orphan sweep:
+      # an anchored process is provably ours only while the prefix
+      # marker names this install.
+      prefix_proven "$SUMI_LOCAL_ID" && kill_anchored "$(FILESV_BIN)" 5
+      info "starting file service on http://$SUMI_FILES_LISTEN …"
+      local fsvc_log fsvc_off fhrc=0
+      fsvc_log="$(LOG_DIR)/filesvc.log"; fsvc_off="$(log_size "$fsvc_log")"
+      (
+        exec 9>&-
+        exec nohup env \
+          "FILESV_LISTEN=$SUMI_FILES_LISTEN" \
+          "FILESV_ROOT=$HOME_DIR/workspace" \
+          "FILESV_DB_URL=$SUMI_DB_URL" \
+          "FILESV_TOKENS=$SUMI_FILES_TOKEN:*" \
+          "$(FILESV_BIN)"
+      ) >>"$fsvc_log" 2>&1 &
+      write_pid "$(RUN_DIR)/filesvc.pid" "$!" \
+        || die "could not record file service pid identity"
+      local fdeadline=$((SECONDS + 20)) fpid fst
+      read -r fpid fst <"$(RUN_DIR)/filesvc.pid" 2>/dev/null || fhrc=2
+      while ((fhrc == 0 && SECONDS < fdeadline)); do
+        if curl -sf --max-time 2 "http://$SUMI_FILES_LISTEN/healthz" >/dev/null 2>&1; then
+          files_running=1; break
+        fi
+        proc_running "$fpid" "$fst" || { fhrc=2; break; }
+        sleep 0.3
+      done
+      ((files_running)) || fhrc=1
+      if ((fhrc)); then
+        kill_pid "$(RUN_DIR)/filesvc.pid" 5 "$(FILESV_BIN)"
+        die "file service $( ((fhrc == 2)) && echo "exited during startup" || echo "did not answer /healthz within 20s") — $fsvc_log since this start:
+$(log_excerpt "$fsvc_log" "$fsvc_off")"
+      fi
+    else
+      files_running=1
+    fi
+  elif [[ -n ${SUMI_FILES_TOKEN:-} ]]; then
+    info "note: SUMI_FILES_TOKEN is set but $(FILESV_BIN) is missing — file routes stay unmounted (re-run: $PROG install)"
+  fi
+
   # --- state service -------------------------------------------------------
   # The service gets its DB URL once at spawn. A managed container publishes
   # a NEW ephemeral port on every restart, so a service that outlived its
@@ -1076,12 +1188,32 @@ cmd_start() {
   # elsewhere) holds a dead address forever — compare and restart it.
   local db_url_file; db_url_file="$(RUN_DIR)/db-url"
   local live_url=""; [[ -f $db_url_file ]] && live_url="$(cat "$db_url_file")"
+  # The service learns its file service at spawn: files-env records what
+  # the running service was started with, so a store retarget (a
+  # cloud-mode return writing SUMI_FILESVC_*) or filesvc appearing (or
+  # disappearing) across restarts retargets the service like a changed
+  # DB URL — a running service never silently lacks a file store that
+  # now exists, and never silently keeps one the config moved away from.
+  local files_env_file files_env_want=none
+  files_env_file="$(RUN_DIR)/files-env"
+  # The marker names the store, not just the mode: two cloud-mode
+  # configurations with different endpoints or credentials must still
+  # retarget the running service, so the wanted value fingerprints the
+  # actual URL+token pair rather than recording the bare word "cloud".
+  if [[ -n ${SUMI_FILESVC_URL:-} && -n ${SUMI_FILESVC_TOKEN:-} ]]; then
+    files_env_want="cloud:$(printf '%s' "$SUMI_FILESVC_URL"$'\n'"$SUMI_FILESVC_TOKEN" | sha256sum | cut -c1-12)"
+  elif ((files_running)); then
+    files_env_want="local:$(printf '%s' "http://$SUMI_FILES_LISTEN"$'\n'"$SUMI_FILES_TOKEN" | sha256sum | cut -c1-12)"
+  fi
+  local live_files_env=""; [[ -f $files_env_file ]] && live_files_env="$(cat "$files_env_file")"
   if pid_alive "$(RUN_DIR)/service.pid" "$(SERVICE_BIN)"; then
-    if [[ $live_url == "$SUMI_DB_URL" ]] && svc_health; then
+    if [[ $live_url == "$SUMI_DB_URL" && $live_files_env == "$files_env_want" ]] && svc_health; then
       info "state service already running (pid $(pid_num "$(RUN_DIR)/service.pid"))"
     else
       if [[ $live_url != "$SUMI_DB_URL" ]]; then
         info "database endpoint changed — restarting state service"
+      elif [[ $live_files_env != "$files_env_want" ]]; then
+        info "file service provisioning changed — restarting state service"
       else
         info "state service pid alive but unhealthy — restarting it"
       fi
@@ -1107,6 +1239,10 @@ cmd_start() {
       if [[ -n $adopted ]] && write_pid "$(RUN_DIR)/service.pid" "$adopted"; then
         info "state service already running (pid $adopted) — adopted via anchored process; this home shares the install"
         printf '%s' "$SUMI_DB_URL" >"$db_url_file"
+        # An adopted process's spawn env is unknown — leaving files-env
+        # unrecorded makes the next start restart it into the right env
+        # rather than trusting a marker we did not earn.
+        rm -f "$files_env_file"
       else
         adopted=""
       fi
@@ -1124,15 +1260,31 @@ cmd_start() {
     info "starting state service on $(base_url)…"
     local svc_log svc_log_off hrc=0
     svc_log="$(LOG_DIR)/service.log"; svc_log_off="$(log_size "$svc_log")"
+    # The file service env reaches the service only when this install
+    # actually provisioned filesvc — an unset pair leaves file routes
+    # unmounted rather than pointing at nothing.
+    local -a senv=(
+      "SUMI_LOCAL_TERMINAL_ASSETS=$PREFIX/terminal"
+      "SUMI_LOCAL_ID=$SUMI_LOCAL_ID"
+      "SUMI_DB_URL=$SUMI_DB_URL"
+      "SUMI_CORE_STATE_TOKEN=$SUMI_CORE_STATE_TOKEN"
+      "SUMI_FM_LISTEN=$SUMI_LOCAL_LISTEN"
+      "SUMI_FM_PERSONA_ID=$SUMI_PERSONA_ID"
+      "SUMI_FM_PERSONA_NAME=$SUMI_PERSONA_NAME"
+    )
+    # An explicit SUMI_FILESVC_URL/TOKEN pair in the config (written by a
+    # cloud-mode return) is the secretary's chosen working store and wins
+    # over the local derivation; otherwise a running local filesvc is it.
+    case $files_env_want in
+      cloud:*)
+        senv+=("SUMI_LOCAL_WORKING_STORE=cloud" "SUMI_FILESVC_URL=$SUMI_FILESVC_URL" "SUMI_FILESVC_TOKEN=$SUMI_FILESVC_TOKEN");;
+      local:*)
+        senv+=("SUMI_LOCAL_WORKING_STORE=local" "SUMI_FILESVC_URL=http://$SUMI_FILES_LISTEN" "SUMI_FILESVC_TOKEN=$SUMI_FILES_TOKEN"
+          "SUMI_WORKSPACE_ROOT=$HOME_DIR/workspace" "SUMI_LOCAL_TERMINAL_ROOT=$HOME_DIR/terminals");;
+    esac
     (
       exec 9>&-  # daemons must not inherit the operation lock
-      exec nohup env \
-        "SUMI_DB_URL=$SUMI_DB_URL" \
-        "SUMI_CORE_STATE_TOKEN=$SUMI_CORE_STATE_TOKEN" \
-        "SUMI_FM_LISTEN=$SUMI_LOCAL_LISTEN" \
-        "SUMI_FM_PERSONA_ID=$SUMI_PERSONA_ID" \
-        "SUMI_FM_PERSONA_NAME=$SUMI_PERSONA_NAME" \
-        "$(SERVICE_BIN)"
+      exec nohup env "${senv[@]}" "$(SERVICE_BIN)"
     ) >>"$(LOG_DIR)/service.log" 2>&1 &
     write_pid "$(RUN_DIR)/service.pid" "$!" \
       || die "could not record service pid identity"
@@ -1143,6 +1295,7 @@ cmd_start() {
 $(log_excerpt "$svc_log" "$svc_log_off")"
     fi
     printf '%s' "$SUMI_DB_URL" >"$db_url_file"
+    printf '%s' "$files_env_want" >"$files_env_file"
   fi
 
   # Verify the derived persona token actually authorizes before trusting it
@@ -1228,6 +1381,7 @@ EOF
 pid_pat() { # pidfile-path → absolute cmdline substring
   case "$(basename "$1" .pid)" in
     service) printf '%s/bin/sumi-local-service' "$PREFIX";;
+    filesvc) printf '%s/bin/sumi-local-filesvc' "$PREFIX";;
     *) printf '%s/core/host/%s.ts' "$PREFIX" "$(basename "$1" .pid)";;
   esac
 }
@@ -1453,6 +1607,33 @@ cmd_say() {
   die "no reply within ${wait_s}s — the input stays queued; check '$PROG status' and '$PROG logs'"
 }
 
+cmd_mcp() {
+  load_config || die "not installed"
+  local action=${1:-list} method path file
+  shift || true
+  path="$(base_url)/fm/$SUMI_PERSONA_ID/mcp-connections"
+  case $action in
+    list) method=GET; (( $# == 0 )) || die "usage: $PROG mcp list";;
+    save)
+      (( $# == 1 || $# == 2 )) || die "usage: $PROG mcp save CONFIG.json [CONNECTION_ID]"
+      file=$1; [[ -r $file ]] || die "configuration file is unreadable"
+      method=POST
+      if (( $# == 2 )); then
+        [[ $2 =~ ^[0-9a-fA-F-]{36}$ ]] || die "invalid connection id"
+        method=PUT; path+="/$2"
+      fi;;
+    delete)
+      (( $# == 1 )) && [[ $1 =~ ^[0-9a-fA-F-]{36}$ ]] || die "usage: $PROG mcp delete CONNECTION_ID"
+      method=DELETE; path+="/$1";;
+    *) die "usage: $PROG mcp list | save CONFIG.json [CONNECTION_ID] | delete CONNECTION_ID";;
+  esac
+  local -a request=(--fail-with-body --silent --show-error --max-time 40 -X "$method"
+    -H "Authorization: Bearer $(fm_token)" -H 'Content-Type: application/json')
+  [[ $action == save ]] && request+=(--data-binary "@$file")
+  curl "${request[@]}" "$path"
+  printf '\n'
+}
+
 cmd_url() {
   load_config || die "not installed, or config unreadable ($CONFIG)"
   printf '%s/?persona=%s&fm=%s\n' "$(base_url)" "$SUMI_PERSONA_ID" "$(fm_token)"
@@ -1497,6 +1678,35 @@ cmd_doctor() {
     || bad "config.env mode $(stat -c %a "$CONFIG") (want 0600)"
   [[ -x $(SERVICE_BIN) ]] && ok "service binary" || bad "missing $(SERVICE_BIN)"
   [[ -f $(CORE_ENTRY) ]] && ok "core payload" || bad "missing $(CORE_ENTRY)"
+  if [[ -n ${SUMI_FILESVC_URL:-} && -n ${SUMI_FILESVC_TOKEN:-} ]]; then
+    printf '  info  Local terminal unavailable: Cloud working storage is not mounted locally\n'
+  else
+    [[ -x /bin/bash && -c /dev/ptmx ]] && ok "Local shared terminal (Linux PTY, persistent Local workspace)" \
+      || bad "Local terminal requires /bin/bash and /dev/ptmx"
+    # A journal record the service cannot validate disables only the
+    # terminal — the rest of the service still starts. Surface that state
+    # here so a refused terminal is diagnosable without reading service logs.
+    local troot="$HOME_DIR/terminals"
+    if [[ -d $troot ]] && compgen -G "$troot/*.json" >/dev/null && command -v node >/dev/null; then
+      node - "$troot" "$SUMI_PERSONA_ID" >/dev/null 2>&1 <<'NODE' \
+        && ok "Local terminal journal validates" \
+        || bad "Local terminal journal invalid — the terminal stays disabled (service still starts, records preserved under $troot); restore a valid record retaining each operation's identity and uncertain-execution history, then restart"
+const fs = require("fs"), path = require("path");
+const [root, persona] = process.argv.slice(2);
+for (const name of fs.readdirSync(root)) {
+  if (!name.endsWith(".json")) continue;
+  const rec = JSON.parse(fs.readFileSync(path.join(root, name), "utf8"));
+  const op = (rec && rec.operation) || {};
+  if (op.personality_agent_id !== persona) throw name + " persona";
+  if (name !== op.operation_id + ".json") throw name + " id";
+  const tail = Buffer.from(rec.tail || "", "base64").length;
+  const base = op.stdout_base ?? 0;
+  if (!(base >= 0) || !(op.stdout_bytes >= base) || op.stdout_bytes - base !== tail)
+    throw name + " tail";
+}
+NODE
+    fi
+  fi
   check_listen && ok "listen $SUMI_LOCAL_LISTEN" || bad "listen address"
   ((CONFIG_PREFIX_MISMATCH)) \
     && bad "SUMI_LOCAL_PREFIX=$PREFIX ≠ recorded prefix $SUMI_LOCAL_INSTALLED_PREFIX"
@@ -1523,25 +1733,45 @@ cmd_pack() {
   chmod +x "$stage/sumi-local/bin/sumi-local"
   if [[ -n $REPO_ROOT ]]; then
     command -v go >/dev/null || die "pack from a source checkout needs the go toolchain"
+    info "building the shared Local terminal screen…"
+    "$SCRIPT_DIR/build-terminal" "$stage/sumi-local/terminal"
     info "building linux/amd64 binary…"
     (cd "$REPO_ROOT/apps/api" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
       -o "$stage/sumi-local/libexec/sumi-local-service" ./cmd/first-model)
+    info "building linux/amd64 move/return command…"
+    (cd "$REPO_ROOT/apps/api" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+      -o "$stage/sumi-local/libexec/sumi-local-move-bin" ./cmd/local-move)
+    cp "$SCRIPT_DIR/sumi-local-move" "$stage/sumi-local/bin/sumi-local-move"
+    info "building linux/amd64 file service…"
+    (cd "$REPO_ROOT/apps/files" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+      -o "$stage/sumi-local/libexec/sumi-local-filesvc" ./cmd/filesvc)
     cp -r "$REPO_ROOT/apps/core/src/." "$stage/sumi-local/core/"
     cp "$SCRIPT_DIR/compose.pg.yaml" "$stage/sumi-local/"
     cp "$SCRIPT_DIR/config.example.env" "$stage/sumi-local/"
-    cp "$REPO_ROOT/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null || true
+    cp "$REPO_ROOT/docs/local-host.md" "$REPO_ROOT/docs/local-cloud-move.md" \
+      "$REPO_ROOT/docs/cloud-local-return.md" "$stage/sumi-local/docs/"
     (cd "$REPO_ROOT" && { git rev-parse HEAD 2>/dev/null || echo source; }) \
       | sed 's/^/source /' >"$stage/sumi-local/VERSION"
   else
     local from="${PACK_ROOT:-$PREFIX_DIR}"
     [[ -n $from ]] || die "pack needs a source checkout, a pack, or an install"
+    [[ -f $from/terminal/index.html ]] || die "source pack/install is missing terminal assets"
+    cp -r "$from/terminal" "$stage/sumi-local/terminal"
     cp "$from/libexec/sumi-local-service" "$stage/sumi-local/libexec/" 2>/dev/null \
       || cp "$from/bin/sumi-local-service" "$stage/sumi-local/libexec/"
+    # The file service payload is optional in older packs — carry it when
+    # present; installs from a pack without it keep file routes unmounted.
+    cp "$from/libexec/sumi-local-filesvc" "$stage/sumi-local/libexec/" 2>/dev/null \
+      || cp "$from/bin/sumi-local-filesvc" "$stage/sumi-local/libexec/" 2>/dev/null \
+      || true
+    cp "$from/bin/sumi-local-move" "$stage/sumi-local/bin/"
+    cp "$from/libexec/sumi-local-move-bin" "$stage/sumi-local/libexec/" 2>/dev/null \
+      || cp "$from/bin/sumi-local-move-bin" "$stage/sumi-local/libexec/"
     cp -r "$from/core/." "$stage/sumi-local/core/"
     cp "$from/compose.pg.yaml" "$stage/sumi-local/" 2>/dev/null || true
     cp "$from/config.example.env" "$stage/sumi-local/" 2>/dev/null || true
-    cp "$from/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null \
-      || cp "$from/local-host.md" "$stage/sumi-local/docs/local-host.md" 2>/dev/null || true
+    cp "$from/docs/local-host.md" "$from/docs/local-cloud-move.md" \
+      "$from/docs/cloud-local-return.md" "$stage/sumi-local/docs/"
     [[ -f $from/VERSION ]] && cp "$from/VERSION" "$stage/sumi-local/VERSION"
   fi
   tar -czf "$out" -C "$stage" sumi-local
@@ -1762,7 +1992,7 @@ cmd_uninstall() {
     # remove only our payload entries, then rmdir — foreign files a user
     # dropped into the prefix are never ours to delete
     local e leftover
-    for e in bin core docs compose.pg.yaml config.example.env VERSION \
+    for e in bin core terminal docs compose.pg.yaml config.example.env VERSION \
              .sumi-local-prefix; do
       rm -rf "$PREFIX/$e"
     done
@@ -1776,8 +2006,11 @@ cmd_uninstall() {
         || info "removed $PROG payloads under $PREFIX"
     fi
   fi
-  local shim="$HOME/.local/bin/sumi-local"
-  [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/sumi-local" ]] && rm -f "$shim"
+  local shim shim_name
+  for shim_name in sumi-local sumi-local-move; do
+    shim="$HOME/.local/bin/$shim_name"
+    [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/$shim_name" ]] && rm -f "$shim"
+  done
   # truthful survivors report: processes still anchored on this prefix, or
   # a listener still holding the port, must be named rather than implied gone
   local left; left="$(proc_pids_under "$PREFIX")"
@@ -1808,6 +2041,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@";;
   say) shift; cmd_say "$@";;
   url) shift; cmd_url "$@";;
+  mcp) shift; cmd_mcp "$@";;
   logs) shift; cmd_logs "$@";;
   doctor) shift; cmd_doctor "$@";;
   pack) shift; cmd_pack "$@";;

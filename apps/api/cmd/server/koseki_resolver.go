@@ -94,6 +94,33 @@ func (a *directChatAuthorizer) AuthorizeDirectChat(
 	installationID string,
 	authorityEpoch int64,
 ) error {
+	return a.authorizeAppInstallation(ctx, humanID, personalityAgentID, installationID, authorityEpoch, "direct-chat")
+}
+
+// AuthorizeTerminal implements agentevents.TerminalAuthorizer against the
+// same composite boundary, bound to the participant-owned 'terminal'
+// AppInstallation the browser presents. It deliberately shares every check
+// with direct chat — Current Employer, exact enabled installation ID, exact
+// authority epoch — while refusing to accept a 'direct-chat' installation:
+// the app ID is fixed by the caller's boundary, never by the request.
+func (a *directChatAuthorizer) AuthorizeTerminal(
+	ctx context.Context,
+	humanID,
+	personalityAgentID,
+	installationID string,
+	authorityEpoch int64,
+) error {
+	return a.authorizeAppInstallation(ctx, humanID, personalityAgentID, installationID, authorityEpoch, applicationapps.TerminalAppID)
+}
+
+func (a *directChatAuthorizer) authorizeAppInstallation(
+	ctx context.Context,
+	humanID,
+	personalityAgentID,
+	installationID string,
+	authorityEpoch int64,
+	appID string,
+) error {
 	if a == nil || a.pool == nil || a.koseki == nil || a.apps == nil {
 		return agentevents.ErrDirectChatAuthorizationUnavailable
 	}
@@ -114,13 +141,13 @@ func (a *directChatAuthorizer) AuthorizeDirectChat(
 		installationID,
 		authorityEpoch,
 		applicationapps.ParticipantOwner(participant.Human(humanID)),
-		"direct-chat",
+		appID,
 	); err != nil {
 		if errors.Is(err, applicationapps.ErrInstallationNotFound) ||
 			errors.Is(err, applicationapps.ErrAppDisabled) {
 			return agentevents.ErrDirectChatAuthorizationDenied
 		}
-		return fmt.Errorf("%w: require direct-chat installation: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)
+		return fmt.Errorf("%w: require %s installation: %v", agentevents.ErrDirectChatAuthorizationUnavailable, appID, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("%w: commit composite authority: %v", agentevents.ErrDirectChatAuthorizationUnavailable, err)

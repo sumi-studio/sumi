@@ -372,4 +372,25 @@ var placementLocalTables = map[string]string{
 	"usage_facts":        "accounting history for spend under this placement's funding principals; usage/budget records are not core state",
 	"usage_reservations": "live admission holds; reconcile locally on lease loss",
 	"core_budget_waits":  "placement-local resume index for budget-parked inputs; seal requeues the input — funding does not travel",
+	// A terminal session is claim-epoch-fenced authority over one runtime
+	// process of this placement — the same class of placement-local
+	// execution authority as the writer lease and job claims above. A
+	// return's writer-cut gate refuses a seal while a live claim holds
+	// and tombstone-cancels every other session's operation before it
+	// commits, so nothing in flight crosses and no writer resumes on the
+	// destination. The session row — and with it the input and output
+	// ledgers that cascade from it — stays on the source as the record of
+	// what ran here; the continuing secretary's durable history travels
+	// through the carried journal, not through placement-bound processes.
+	"core_terminal_sessions": "claim-fenced runtime execution authority; the return seal refuses or quiesces live writers, and session/input/output history stays with the placement that ran it",
+	// A tab attachment is one standing grant to one live, browser-owned
+	// tab incarnation: its host_token_hash is a credential minted by and
+	// for this placement's host routes. Credentials never travel — a
+	// destination must mint its own attachment for its own tabs.
+	"browser_tab_attachments": "host-scoped grant and credential for a live tab incarnation on this placement; credentials are never carried",
+	// Local MCP grants bind one install's host to secrets and endpoint
+	// configuration held as ciphertext; the migration that creates the
+	// table declares this material is not portable core state. A
+	// destination re-grants under its own host, so the rows stay local.
+	"local_mcp_connections": "host-bound MCP grant secrets and configuration of this install; never carried",
 }

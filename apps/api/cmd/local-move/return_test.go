@@ -116,7 +116,7 @@ func (h *retHarness) mover() (*mover, *bytes.Buffer) {
 func (h *retHarness) newReturn() (sessionID, returnURL string) {
 	h.t.Helper()
 	req, err := http.NewRequestWithContext(h.ctx, http.MethodPost,
-		h.srv.URL+"/api/secretary-return/sessions", nil)
+		h.srv.URL+"/api/secretary-return/sessions", strings.NewReader(`{"file_mode":"cloud"}`))
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -510,7 +510,7 @@ func TestReturnRefusedWhileFilePolicyUndecided(t *testing.T) {
 	// it from a GATED server: the production Config{}.
 	created, _, err := h.sessions.Create(h.ctx, returnsession.Owner{
 		HumanID: h.human, PersonaID: h.pid,
-	})
+	}, "cloud")
 	if err != nil {
 		t.Fatal(err)
 	}

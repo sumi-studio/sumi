@@ -32,8 +32,10 @@ crashes, and reinstalls.
     `deploy/local-host/compose.pg.yaml`, scoped per install (see below).
     Not a shared system service — `restart: "no"`, started/stopped by
     `sumi-local`.
-- Go toolchain only when installing from a source checkout. Packs carry a
-  prebuilt binary; installing a pack does not need Go.
+- Source installs and source pack builds need Go plus the workspace frontend
+  dependencies (`pnpm install --frozen-lockfile` at the repository root). Packs
+  carry prebuilt binaries and shared terminal assets; installing a pack needs
+  neither Go, pnpm, nor a frontend build.
 
 ## Quick start
 
@@ -49,7 +51,7 @@ sumi-local uninstall            # removes executables, keeps your data
 sumi-local uninstall --purge    # also deletes the state home (+ managed PG data)
 ```
 
-Installing drops a `sumi-local` shim in `~/.local/bin` once the install
+Installing drops `sumi-local` and `sumi-local-move` shims in `~/.local/bin` once the install
 completes. A failed install (for example, no database configured) leaves
 an existing shim pointing at the previous install and its half-written
 payload removable by `uninstall`.
@@ -259,13 +261,20 @@ from the environment without editing `config.env` — see
 ## Distribution
 
 ```sh
-sumi-local pack out.tar.gz   # from a source checkout (needs Go once)
+sumi-local pack out.tar.gz   # source build: Go + installed frontend dependencies
 tar -xzf out.tar.gz && cd sumi-local && bin/sumi-local install
 ```
 
-A pack contains the prebuilt linux/amd64 service binary, the `core/`
-TypeScript payload, this CLI, compose file, and docs. Installing a pack
-needs no Go, no repository.
+A pack contains the prebuilt linux/amd64 state service, file service and
+move/return command, the `core/` TypeScript payload, both CLIs, compose file,
+and docs. Installing a pack needs no Go and no repository; Node and the other
+Linux requirements above still apply. `sumi-local-move` is installed alongside
+`sumi-local` and gets its own `~/.local/bin` shim. It reads the same
+`SUMI_LOCAL_HOME` and configuration, so custom installs use the same environment
+printed by the installer. `sumi-local-move return-status` checks that install;
+`return` reads a Cloud return URL from stdin. See
+[Cloud→Local return](cloud-local-return.md) for admission, file choice and recovery.
+The pack is not a macOS application and does not bundle the Electron browser host.
 
 ## Known limits / not yet
 
@@ -288,3 +297,276 @@ scheduled wake → restart persistence → SIGKILL mid-turn recovery →
 OpenAI-stub provider → uninstall/reinstall identity → pack-install →
 purge. `deploy/local-host/test/stub-model.mjs` is the OpenAI-compatible
 stub it uses.
+
+## Shared Local terminal
+
+On Linux/WSL, the state service runs genuine PTY shells in
+`<home>/workspace/<persona-id>`, the same Local working files served by
+filesvc. Human terminal input and the secretary's `terminal.*` tools use
+one session, one input ledger, and one output stream. A failing command
+leaves the interactive shell and previous files available. Opening another
+session uses the same directory; closing a session does not delete files.
+These are ordinary processes with the Local user's permissions, not a
+sandbox. The initial cwd is confined to the persona workspace; shell commands
+retain the user's normal filesystem/network access. Service secrets are not
+inherited into the shell environment.
+
+The existing terminal attachment protocol is mounted at `/terminal/*`.
+To attach from the existing terminal client, first POST
+`/fm/<persona-id>/terminal-session` with the install's `fm_` bearer capability
+(the same scope as its local chat surface). The result supplies
+`installation_id`, `authority_epoch`, and `terminal_base`; pass the first two
+as query parameters to the existing terminal routes. The response sets a
+random 256-bit `sumi_session` cookie, scoped to `/terminal`, HttpOnly,
+SameSite=Strict, expiring in one hour. Only its SHA-256 hash is stored in
+memory. The configured loopback HTTP origin is the only permitted browser
+origin; a Core persona bearer cannot mint this browser cookie. Expiry is
+checked for requests and while attached, and host restart invalidates cookies.
+The HTTP loopback host does not set Secure. No additional terminal screen
+or per-command approval step is introduced.
+
+Disconnecting the browser or restarting only the terminal driver leaves the
+PTY running. A driver reclaim changes its claim epoch and reattaches to that
+same shell. An input whose delivery response was lost is recorded as unknown
+and is not sent again automatically. Resize changes the actual PTY dimensions;
+INT, QUIT and TSTP target its current foreground process group through the
+kernel terminal ioctl. Other allowed signals target the owned shell leader.
+Explicit close and the eight-hour session lifetime stop the owned shell leader
+and close its PTY; arbitrary detached descendants may survive.
+
+Normal SIGTERM/INT shutdown stops the owned terminal shell leaders and records
+their outcomes. An abrupt state-service process death cannot recover a PTY
+descriptor. The
+journal in `<home>/terminals` preserves the accepted operation identity before
+launch, so recovery reports the old session as lost/indeterminate instead of
+launching a replacement. It never looks up or signals a PID read from disk.
+A shell that ignores hangup and detaches its stdio can physically survive:
+**lost does not mean stopped**. Opening a new terminal is an explicit new
+session and retains the same workspace files. Already collected Core
+scrollback remains; output not collected before the host died may be lost.
+Backend scrollback retains a bounded 256 KiB tail with explicit skipped-output
+boundaries. Journals remain until the install data is purged.
+
+If any record in the journal cannot be validated at startup — malformed JSON,
+a record written for a different persona, a filename that does not match its
+recorded operation, or an inconsistent retained-output bound — the record may
+hide a live shell, so the whole Local terminal capability stays disabled for
+that run rather than risk a duplicate. The refusal is terminal-only: the
+state service, Core, saved MCP connections, and file access all start
+normally, and the secretary is not offered `terminal.*` tools. Validation of
+every record completes before any retained marker is rewritten, so all
+journal bytes — including the rejected record — are preserved untouched;
+nothing is deleted, quarantined, or reset, and no uncertain operation gains
+permission to relaunch. `terminal-session` bootstrap returns HTTP 503 with
+`local_terminal_unavailable` and `reason: journal_invalid`. `doctor` reports
+the invalid journal the same way: terminal disabled, service still starts,
+records preserved. Recovery is a repair that retains history: restore a
+valid record for the same operation identity under `<home>/terminals` — for
+example from a backup of the install state home — keeping its
+uncertain-execution record, then restart; the restored operation is reported
+indeterminate, never relaunched. If a record's history cannot be
+re-established, the terminal stays unavailable.
+
+The Local launcher provides `SUMI_WORKSPACE_ROOT` and
+`SUMI_LOCAL_TERMINAL_ROOT` to the state service when Local filesvc is the
+working store. For a Cloud-to-Local return that deliberately keeps Cloud
+working storage, the Local PTY is unavailable: the Cloud filesystem is not
+mounted as a Local directory. `doctor` states this, and terminal-session
+bootstrap returns HTTP 503 with `local_terminal_unavailable` and
+`working_store: cloud`. It does not silently create another workspace.
+
+## Open the shared Local terminal
+
+Open the current `sumi-local url` in a browser on the Linux/WSL Local host,
+then choose **ターミナルを開く**. The same-origin `/local-terminal/` page renders
+the existing shared terminal application: create or select a session, type
+commands, and see the same PTY output that the secretary reads and writes.
+Closing the page detaches the viewer; it does not close the session. Use the
+screen's explicit close operation to end a session.
+
+The entry uses the Local capability already held by that origin's chat/files
+page to obtain the existing one-hour HttpOnly terminal cookie and persona
+binding. No Cloud account or fabricated participant installation is needed.
+It renews the binding before expiry, after definite HTTP authentication refusal,
+and after an authorization-related WebSocket close. Ambiguous input outcomes
+are not automatically replayed. A restarted host can be reattached through the
+same entry; an abruptly lost PTY remains lost rather than being relaunched.
+A missing/changed Local capability requires opening the current `sumi-local url`
+again. The page displays backend unavailability, including Cloud working storage
+and invalid terminal journals, with a retry action.
+
+The CLI installs prebuilt assets into `<prefix>/terminal` and sets
+`SUMI_LOCAL_TERMINAL_ASSETS` when starting the service. Source maintainers can
+build them separately with `deploy/local-host/build-terminal /absolute/output`
+and set that environment variable for a directly launched first-model process.
+Archive recipients need no frontend toolchain. This is the Linux Local entry;
+it retains the loopback and same-origin transport rules and does not establish
+remote Mac access or a native Mac package.
+
+## Configure Local MCP servers
+
+The person who owns this Local installation can grant the secretary an HTTPS
+MCP connection or a Local stdio executable without a Cloud account. Create a
+JSON configuration file with mode 0600, then use the executable CLI:
+
+```sh
+sumi-local mcp save /path/to/mcp.json       # create; prints connection metadata/id
+sumi-local mcp list                       # metadata only, never credentials
+sumi-local mcp save /path/to/mcp.json ID   # replace configuration and grant
+sumi-local mcp delete ID                  # revoke and remove
+```
+
+Example HTTPS configuration (the bearer field is optional):
+
+```json
+{"name":"My remote tools","transport":"https","endpoint":"https://tools.example.com/mcp","enabled":true,"bearerToken":"server-credential"}
+```
+
+Example stdio configuration (use actual absolute executable/cwd paths):
+
+```json
+{"name":"My Local tools","transport":"stdio","command":"/usr/bin/node","args":["/home/me/tools/server.mjs"],"cwd":"/home/me/workspace","env":{"SERVER_API_KEY":"server-credential","DEBUG":"1"},"privateEnv":["SERVER_API_KEY"],"enabled":true}
+```
+
+`bearerToken` is always private. For stdio, `privateEnv` lists the names of
+configured environment variables whose values must be scrubbed from server
+responses. `privateArgs` lists zero-based argument indexes to protect; for
+example, `"args":["server.mjs","--token","server-credential"],"privateArgs":[2]`.
+Unknown environment names, duplicate selectors, and out-of-range indexes are
+rejected. These selectors are stdio-only. Protection matches each selected
+value literally, not a parsed part of an argument: pass a credential as its own
+argument when using `privateArgs`. No secret detection is inferred from names,
+lengths, paths, or flag syntax. Mark private values when saving configuration.
+Ordinary arguments and environment values such as `DEBUG=1` and `PATH` do not
+rewrite tool names, schema vocabulary, or protocol metadata. All configuration
+remains encrypted and absent from configuration listings regardless of marking.
+
+Saving with `enabled: true` is the standing grant. The secretary discovers
+connections using `mcp.connections`, obtains complete tool descriptions and
+schemas with `mcp.list_tools` (a page at a time, or by name), and invokes a
+discovered tool with `mcp.call`. The latter two return durable jobs; the real
+result, including `call_result.structuredContent`, is available through
+`job.status`. There is no further per-call approval. Tool output cannot
+create or modify these connections: only the existing persona-scoped Local
+`fm_` human capability (or existing install admin authority) can use
+`/fm/<persona>/mcp-connections`. Core persona tokens cannot change settings.
+
+Configuration is encrypted in PostgreSQL and bound to both `SUMI_LOCAL_ID`
+and the configured persona. Its key is derived under a distinct domain from
+the installation's existing secret. Closing the browser or restarting normally
+does not remove it. Another Local installation or secretary cannot discover
+or use that grant. These host configurations and credentials are not portable
+Core state: another host, a changed installation ID, or a changed install
+secret requires reconfiguration. API/CLI listing returns metadata only;
+replacement therefore needs the complete configuration, including credentials.
+Keep your configuration file private or remove it after saving.
+
+Each discovery/call starts a stdio protocol server for that bounded job, using
+the official MCP SDK's newline-framed transport, and stops it when the job
+finishes. The process inherits only a fixed PATH and LANG plus explicitly
+configured environment values; it does not inherit the host's database,
+model, or admin environment credentials. It runs with the Local user's normal
+permissions and the configured cwd; it is not a sandbox. The executable is
+explicit, not a shell command, and no package is downloaded automatically.
+Noisy stderr is discarded, each inbound frame is bounded to 2 MiB, and the
+operation has a 30-second deadline.
+
+That environment is exactly what the child gets, which is worth checking
+against what your server expects:
+
+- **`HOME` is absent** unless you configure it. A server that resolves a
+  cache, a config file or a credential helper through `$HOME` (`npm`, `pip`,
+  `git`, many SDKs) will not find one, and may fail or silently use a
+  different location. Configure `HOME` explicitly if the server needs it.
+- **A configured `PATH` or `LANG` replaces the fixed default** rather than
+  adding to it: duplicate names resolve to the configured value. Name the
+  full search path you want, and keep in mind that the default is only
+  `/usr/local/bin:/usr/bin:/bin`, so an interpreter installed under a version
+  manager in your home directory is not on it. Prefer an absolute `command`.
+- Nothing else is inherited: not `USER`, `SHELL`, `TMPDIR`, `TERM`, proxy
+  variables, or your terminal's exported values.
+
+This is the intended minimal environment, not a sandbox boundary — it keeps
+host credentials out of a granted server, and it means the server's own
+requirements must be stated in the configuration.
+
+Both discovery and calls return bounded durable results, and a bound is
+always visible in the result rather than silently applied. `mcp.list_tools`
+returns whole tool definitions only — a schema is never shortened, because a
+shortened schema invites a guessed call. If the granted server offers more
+tools than one result can hold, the result carries a `next_cursor` to pass
+back as `cursor`, `next_names` listing what is still waiting, and
+`remaining_on_page`; passing `names` instead fetches exactly the definitions
+you already know the names of. A single tool whose own definition is larger
+than a page is named in `tools_omitted` with its size and the reason, and
+paging continues past it. `page_changed` says the server's list changed under
+a cursor and discovery restarted at page zero, so tools may be re-shown.
+This includes an unseen tool moving backward into an already consumed page.
+A by-name request scans the same bounded 32 pages a call does: `scan_truncated`
+says the scan stopped at that bound, so `names_not_found` means "not in what
+was scanned", not "not offered by this server".
+Progress notifications are expendable: at most 16 are kept, each message is
+bounded, and `notifications_dropped` counts the rest; if they would displace
+the primary result they are dropped wholesale with `notifications_omitted`.
+A genuinely oversized primary result is replaced by `result_omitted` — never
+by a partial schema — and the facts needed to continue (what was dispatched,
+its outcome, the cursor and the omissions) are carried through with it. For a
+discovery page that last resort withdraws the cursor and says `repeat_request`
+instead: a continuation past schemas that were never delivered would skip them
+silently.
+
+A cursor is Sumi's own — a page number, an offset, a digest of that page's
+names, and a chained digest of every earlier page's names. A server's own
+cursor passed in its place is refused. Sumi re-walks at most 32 upstream pages
+within the operation deadline, comparing the observed names and boundaries.
+Detected changes restart at page zero with `page_changed: true`. This is not
+an atomic snapshot: changes during a single walk or schema-only changes with
+unchanged names are not detected, and a continually changing server may require
+fresh discovery. No reversible upstream cursor or server content is embedded
+in a Sumi cursor. Cursors from older implementations are refused; start again
+without a cursor.
+
+Every stored result has NULs replaced and literal occurrences of bearer tokens
+and explicitly selected private values removed, including in keys, errors and
+progress notifications. Values are scrubbed before shortening displayed names
+and progress text. Sumi's own result field names and minted cursor are left
+alone. If any part of a tool definition contains a protected value, that tool
+is omitted from `tools` and listed in `tools_omitted` with an unavailable reason
+and a scrubbed display name. That name is not a callable alias. Calls to such
+tools are refused before dispatch; fix the server definition or the private
+marking before using them. Protection can deliberately make a definition
+unavailable even when the collision is only in its description. Secret values
+transformed or encoded by the server are not automatically recognized.
+
+Local stdio uses a host-specific job kind; the Cloud MCP runner does not
+claim it, and generic job submission cannot supply executable configuration.
+Cancellation, normal host SIGTERM/INT, initialization failure, and completion
+close pipes and kill the owned process group before reaping its leader. This
+retains the group's identity during cleanup rather than signaling a reused
+PID. Descendants that deliberately leave that process group remain outside
+this lifecycle boundary. SIGKILL/power loss cannot run that cleanup; Linux
+parent-death signaling stops the direct child but is not proof that all
+children stopped. No physical-quiescence claim is made.
+
+An already started server can have initialization side effects even when no
+tool call was dispatched; the result distinguishes `server_started` from
+`dispatched`. A tool mutation whose response is lost is indeterminate and is
+never automatically sent again. Interrupted claimed jobs expire to lost;
+inspect the affected external state before deliberately issuing a new call.
+Revocation prevents queued work and future dispatch using the prior grant;
+an operation already admitted is bounded and finishes before revocation
+returns. An MCP error does not end the secretary's Local terminal or delete
+its workspace files. HTTPS retains the main API's public-destination checks,
+credential handling and protocol semantics; stdio does not enable private
+HTTP destinations. OAuth, MCP Apps, macOS support and a new onboarding UI
+are not part of this interface.
+
+The Local backend also implements the return flow's narrow tombstone-release
+contract. A caller that has re-authorized launch may remove a durable
+never-launched cancellation fence for the exact persona and operation. The
+journal removal is directory-fsynced under the same mutex before the backend
+forgets the record. A later cancellation can create a fresh fence. A running,
+completed, cancelled-after-launch or host-death-indeterminate operation is
+never releasable; this cannot resurrect an old shell or certify surviving
+processes stopped. The caller remains responsible for checking current persona
+and session/claim authority before release and launch.

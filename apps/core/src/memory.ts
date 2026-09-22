@@ -129,6 +129,13 @@ export type InputProvenance = {
   placeName: unknown;
   placeKind: unknown;
   messageId: unknown;
+  workspaceId?: unknown;
+  messageRevision?: unknown;
+  sessionId?: unknown;
+  status?: unknown;
+  endReason?: unknown;
+  exitCode?: unknown;
+  exitSignal?: unknown;
   attention: string;
   /** "edited"/"deleted" when the input reports a change to an
    * already-delivered message rather than a new message. */
@@ -141,10 +148,10 @@ const str = (v: unknown): string => (typeof v === "string" ? v : "");
  * Render the "[who in where]" marker prefixing an input's text in model
  * context and in the current input. Provenance stays inside one bracket pair
  * (names are stripped of brackets) so directive-style content still parses
- * first. A Messaging input names the place_id and message_id the secretary
- * needs to answer there through messaging.send — without them a real model
- * could see who spoke but not address a reply. The attention hint is part of
- * the marker — it informs, never mandates.
+ * first. References identify the delivered workspace/message revision or
+ * terminal session and its reported outcome. Names alone cannot distinguish
+ * same-named places or terminals. The attention hint is part of the marker
+ * — it informs, never mandates.
  */
 export function inputMarker(p: InputProvenance): string {
   const clean = (s: string) => s.replace(/[[\]]/g, "");
@@ -155,10 +162,22 @@ export function inputMarker(p: InputProvenance): string {
   const refs =
     p.surface === "messaging"
       ? [
-          str(p.placeId) && ` place_id=${str(p.placeId)}`,
-          str(p.messageId) && ` message_id=${str(p.messageId)}`,
+          str(p.workspaceId) && ` workspace_id=${clean(str(p.workspaceId))}`,
+          str(p.placeId) && ` place_id=${clean(str(p.placeId))}`,
+          str(p.messageId) && ` message_id=${clean(str(p.messageId))}`,
+          Number.isSafeInteger(p.messageRevision)
+            ? ` message_revision=${p.messageRevision}`
+            : "",
         ].join("")
-      : "";
+      : p.surface === "core_terminal_sessions"
+        ? [
+            str(p.sessionId) && ` session_id=${clean(str(p.sessionId))}`,
+            str(p.status) && ` status=${clean(str(p.status))}`,
+            str(p.endReason) && ` end_reason=${clean(str(p.endReason))}`,
+            Number.isSafeInteger(p.exitCode) ? ` exit_code=${p.exitCode}` : "",
+            str(p.exitSignal) && ` exit_signal=${clean(str(p.exitSignal))}`,
+          ].join("")
+        : "";
   const change =
     p.change === "edited"
       ? " — edited"
@@ -239,6 +258,13 @@ export function eventMessage(ev: Event): ChatMessage | null {
               placeName: p.place_name,
               placeKind: p.place_kind,
               messageId: p.message_id,
+              workspaceId: p.workspace_id,
+              messageRevision: p.message_revision,
+              sessionId: p.session_id,
+              status: p.status,
+              endReason: p.end_reason,
+              exitCode: p.exit_code,
+              exitSignal: p.exit_signal,
               attention: str(p.attention),
               change: str(p.message_change),
             });

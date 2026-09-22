@@ -57,7 +57,7 @@ jobs:
       - name: Install locked dependencies
         run: |
           corepack enable
-          corepack pnpm install --frozen-lockfile --filter @sumi/agent-core...
+          corepack pnpm install --frozen-lockfile --filter @sumi/agent-core... --filter @sumi/web...
 
       - name: Check agent core types
         run: corepack pnpm --filter @sumi/agent-core check-types

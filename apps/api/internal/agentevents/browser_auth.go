@@ -89,6 +89,22 @@ type DirectChatAuthorizer interface {
 	) error
 }
 
+// TerminalAuthorizer commits the same composite authority snapshot as the
+// direct-chat boundary — Current Employer plus the exact enabled
+// participant-owned AppInstallation — but bound to the 'terminal' app id.
+// The shared terminal is its own application: a direct-chat installation
+// can never substitute for it, and vice versa. The installation identity
+// and epoch are transport control metadata, never operation data.
+type TerminalAuthorizer interface {
+	AuthorizeTerminal(
+		ctx context.Context,
+		humanID,
+		personalityAgentID,
+		installationID string,
+		authorityEpoch int64,
+	) error
+}
+
 // DirectChatSpawner lazily starts an agent runtime on 呼びかけ (ADR 0010). The
 // EnsureRunning context bounds provisioning only; successful runtime lifetime
 // belongs to the provisioner. Calls for one agent must be idempotent. A nil

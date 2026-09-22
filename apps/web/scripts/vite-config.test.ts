@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createDevServerConfig,
   parseDevAllowedHosts,
+  parseDevFsAllow,
   SUMI_COMPOSE_API_ORIGIN,
   SUMI_DEV_API_ORIGIN,
   SUMI_DEV_HOST,
@@ -94,6 +95,38 @@ test("Feedback API requests are proxied while its Inbox remains a page", () => {
   });
 });
 
+test("terminal API and WS paths proxy while the bare page stays the SPA", () => {
+  const server = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
+  const entries = Object.entries(server.proxy ?? {}).filter(([key]) =>
+    key.includes("terminal"),
+  );
+  assert.equal(entries.length, 1);
+  const [pattern, proxy] = entries[0];
+  const matches = new RegExp(pattern);
+  for (const path of [
+    "/terminal/list",
+    "/terminal/open",
+    "/terminal/session?session_id=s",
+    "/terminal/read?session_id=s&cursor=512",
+    "/terminal/input",
+    "/terminal/control",
+    "/terminal/close",
+    "/terminal/ws",
+    "/terminal/",
+  ]) {
+    assert.equal(matches.test(path), true, path);
+  }
+  // The SPA owns the bare route: it must not be swallowed by the proxy.
+  for (const path of ["/terminal", "/terminal?session=s"]) {
+    assert.equal(matches.test(path), false, path);
+  }
+  assert.deepEqual(proxy, {
+    target: SUMI_DEV_API_ORIGIN,
+    changeOrigin: false,
+    ws: true,
+  });
+});
+
 test("the proxy target accepts only literal IPv4 or the exact Compose service", () => {
   const compose = createDevServerConfig(SUMI_COMPOSE_API_ORIGIN);
   const composeAuth = compose.proxy?.["/auth"];
@@ -160,6 +193,27 @@ test("extra allowed hosts front the dev server without loosening the host check 
       ]),
     /plain hostname/,
   );
+});
+
+test("extra fs.allow dirs extend serving only when explicitly listed", () => {
+  assert.deepEqual(parseDevFsAllow(undefined), []);
+  assert.deepEqual(parseDevFsAllow(" /abs/store , /abs/other "), [
+    "/abs/store",
+    "/abs/other",
+  ]);
+  assert.throws(() => parseDevFsAllow("relative/dir"), /not absolute/);
+  const bare = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
+  assert.equal(bare.fs, undefined);
+  const extended = createDevServerConfig(
+    SUMI_DEV_API_ORIGIN,
+    SUMI_DEV_HOST,
+    [],
+    5173,
+    ["/abs/store"],
+  );
+  // The workspace root stays allowed alongside the explicit extra dir.
+  assert.equal(extended.fs?.allow?.length, 2);
+  assert.equal(extended.fs?.allow?.at(-1), "/abs/store");
 });
 
 test("model connection login stays same-origin without proxying unrelated api routes", () => {

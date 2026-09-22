@@ -208,6 +208,16 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/status", s.reportCallSessionStatus)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/calls/sessions/{session}/utterances", s.pendingCallUtterances)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/calls/sessions/{session}/utterances/{utterance}/disposition", s.reportCallUtterance)
+	// Terminal sessions: persona-token scoped like jobs — the termexec
+	// driver's claim is its own authority, epoch-fenced, never gated on
+	// the writer lease.
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/claim", s.claimTerminalSessions)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/sweep-expired", s.sweepTerminalSessions)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/{session}/heartbeat", s.heartbeatTerminalSession)
+	mux.HandleFunc("GET /internal/core/personas/{persona}/terminals/{session}/inputs", s.pendingTerminalInputs)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/{session}/inputs/{input}/disposition", s.reportTerminalInputDisposition)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/{session}/output", s.appendTerminalOutput)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/terminals/{session}/status", s.reportTerminalStatus)
 }
 
 func (s *Server) scope(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -267,12 +277,16 @@ func storeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
 		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound),
-		errors.Is(err, ErrChunkNotFound), errors.Is(err, ErrFundingNotFound):
+		errors.Is(err, ErrChunkNotFound), errors.Is(err, ErrFundingNotFound),
+		errors.Is(err, ErrTerminalNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
 		errors.Is(err, ErrApprovalConflict), errors.Is(err, ErrPersonaInactive),
 		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
-		errors.Is(err, ErrMemoryConflict), errors.Is(err, ErrUsageFactConflict):
+		errors.Is(err, ErrMemoryConflict), errors.Is(err, ErrUsageFactConflict),
+		errors.Is(err, ErrTerminalNotClaimed), errors.Is(err, ErrTerminalNotLive),
+		errors.Is(err, ErrTerminalControl), errors.Is(err, ErrTerminalCapacity),
+		errors.Is(err, ErrTerminalEnded):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, ErrBadRequest), errors.Is(err, ErrUnknownTool), errors.Is(err, ErrApprovalDecidedBy):
 		writeError(w, http.StatusBadRequest, err.Error())

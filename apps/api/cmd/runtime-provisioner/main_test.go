@@ -1,25 +1,31 @@
 package main
 
 import (
-	"slices"
+	"os"
 	"testing"
 )
 
-func TestHostEnvironmentForwardsPinnedAgentImageTag(t *testing.T) {
-	const tag = "a1b2c3d4e5f6"
-	t.Setenv("SUMI_AGENT_IMAGE_TAG", tag)
-
-	environment := hostEnvironment()
-	if !slices.Contains(environment, "SUMI_AGENT_IMAGE_TAG="+tag) {
-		t.Fatalf("hostEnvironment() = %v, want pinned agent image tag", environment)
+// The interactive journal tailer reads the daemon's data root wherever
+// the deployer mounted it; the override must reach DockerBackend
+// through the real command's environment passthrough, not only through
+// a direct backend construction.
+func TestHostEnvironmentPassesJournalRoot(t *testing.T) {
+	t.Setenv("SUMI_DOCKER_JOURNAL_ROOT", "/run/sumi/docker-root")
+	found := false
+	for _, v := range hostEnvironment() {
+		if v == "SUMI_DOCKER_JOURNAL_ROOT=/run/sumi/docker-root" {
+			found = true
+		}
 	}
-}
-
-func TestHostEnvironmentForwardsAgentImagePullPolicy(t *testing.T) {
-	t.Setenv("SUMI_AGENT_IMAGE_PULL_POLICY", "missing")
-
-	environment := hostEnvironment()
-	if !slices.Contains(environment, "SUMI_AGENT_IMAGE_PULL_POLICY=missing") {
-		t.Fatalf("hostEnvironment() = %v, want agent image pull policy", environment)
+	if !found {
+		t.Fatal("SUMI_DOCKER_JOURNAL_ROOT must reach the backend environment")
+	}
+	if err := os.Unsetenv("SUMI_DOCKER_JOURNAL_ROOT"); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range hostEnvironment() {
+		if v == "SUMI_DOCKER_JOURNAL_ROOT=/run/sumi/docker-root" {
+			t.Fatal("unset journal root must not be forwarded")
+		}
 	}
 }

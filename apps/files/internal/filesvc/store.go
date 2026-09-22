@@ -3,12 +3,14 @@ package filesvc
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,10 +62,13 @@ import (
 // mutations fail fast and the process re-acquires or exits rather than
 // risk an unsynchronized second writer.
 type Store struct {
-	pool      *pgxpool.Pool
-	dsn       string
-	opTimeout time.Duration // bounds the fs-mutation phase
-	dbTimeout time.Duration // bounds every DB call (f51: wedged PG must not hang handlers)
+	pool          *pgxpool.Pool
+	dsn           string
+	opTimeout     time.Duration // bounds the fs-mutation phase
+	dbTimeout     time.Duration // bounds every DB call (f51: wedged PG must not hang handlers)
+	drainTimeout  time.Duration // bounds the freeze's wait for admitted intents to settle
+	cutHorizon    time.Duration // minimum writer tenure before a cut may seal (bounds predecessor fs effects)
+	cutObserveGap time.Duration // gap between the seal's two manifest walks — the stability window sampled
 
 	owner     string      // this instance's identity; intents declare it
 	rootID    string      // canonical root this DB is bound to
@@ -193,14 +198,17 @@ func NewStore(ctx context.Context, dsn, rootID string) (*Store, error) {
 	var b [8]byte
 	rand.Read(b[:])
 	s := &Store{
-		pool:      pool,
-		dsn:       dsn,
-		opTimeout: 30 * time.Second,
-		dbTimeout: 15 * time.Second,
-		owner:     "inst-" + hex.EncodeToString(b[:]),
-		rootID:    rootID,
-		done:      make(chan struct{}),
-		reconcile: make(chan struct{}, 1),
+		pool:          pool,
+		dsn:           dsn,
+		opTimeout:     30 * time.Second,
+		dbTimeout:     15 * time.Second,
+		drainTimeout:  20 * time.Second,
+		cutHorizon:    deadGrace,
+		cutObserveGap: 50 * time.Millisecond,
+		owner:         "inst-" + hex.EncodeToString(b[:]),
+		rootID:        rootID,
+		done:          make(chan struct{}),
+		reconcile:     make(chan struct{}, 1),
 	}
 	// Single-writer enforcement comes first: migrate and meta binding run
 	// under the lock so concurrent startups serialize instead of racing
@@ -229,6 +237,23 @@ func (s *Store) SetOpTimeout(d time.Duration) { s.opTimeout = d }
 // SetDBTimeout bounds every DB statement/tx. A blackholed PG fails the
 // request at the deadline instead of parking the handler (f51).
 func (s *Store) SetDBTimeout(d time.Duration) { s.dbTimeout = d }
+
+// SetDrainTimeout bounds how long a freeze waits for intents admitted
+// before the barrier to settle (tests use short values).
+func (s *Store) SetDrainTimeout(d time.Duration) { s.drainTimeout = d }
+
+// SetCutHorizon sets how long this store must have owned the writer lock
+// before a freeze may seal the cut. It bounds the window in which a
+// predecessor's already-issued filesystem effects can still land
+// (watchWriter notice latency plus FUSE-accepted residual). Production
+// uses deadGrace; tests shrink it.
+func (s *Store) SetCutHorizon(d time.Duration) { s.cutHorizon = d }
+
+// SetCutObserveGap sets the interval between the cut's two manifest
+// walks. The gap is NOT a quiescence margin: the proof is that the two
+// observations are equal — the gap only widens the window in which a
+// landing mutation is detected. Zero makes the observations adjacent.
+func (s *Store) SetCutObserveGap(d time.Duration) { s.cutObserveGap = d }
 
 // SetReconcile wires the filesystem probes the reconciler uses: stat for
 // the disk verdict, hash for expected-content verification, and check —
@@ -538,7 +563,54 @@ func (s *Store) migrate(ctx context.Context) error {
 		-- path, or landing was never proven. A diverged receipt answers a
 		-- replay with a deterministic conflict, never a silent success.
 		ALTER TABLE file_receipt ADD COLUMN IF NOT EXISTS verdict text NOT NULL DEFAULT 'applied';
+		-- file_freeze is the persisted per-scope mutation barrier: a
+		-- committed row refuses new mutation admissions for the scope
+		-- (reads unaffected). Used while a scope's working copy is being
+		-- carried elsewhere, and kept afterwards for a retained
+		-- read-only Cloud copy.
+		CREATE TABLE IF NOT EXISTS file_freeze (
+			scope    text PRIMARY KEY,
+			owner    text NOT NULL DEFAULT '',
+			reason   text NOT NULL DEFAULT '',
+			set_at   timestamptz NOT NULL DEFAULT now()
+		);
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS owner text NOT NULL DEFAULT '';
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT '';
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS set_at timestamptz NOT NULL DEFAULT now();
+		-- owner_epoch is the asserting lineage's order key (the return
+		-- session's created_at ms). Every freeze/unfreeze assertion is
+		-- accepted only when its (epoch, owner) is at least the recorded
+		-- one — a stale lineage loses AT the mutation boundary inside
+		-- this transaction, not at a caller-side owner check it could
+		-- race. released_* records who released the barrier and at what
+		-- epoch: a released row is kept as a tombstone so an older
+		-- lineage can never re-assert authority it already lost.
+		-- sealed_at marks the cut: while the barrier stands sealed, the
+		-- reconciler has no authority over the scope — tombstone
+		-- re-judgment, orphan re-attachment and name settling all skip
+		-- it, so no filesvc path can still change the public tree.
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS owner_epoch bigint NOT NULL DEFAULT 0;
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS sealed_at timestamptz;
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS released_at timestamptz;
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS released_epoch bigint NOT NULL DEFAULT 0;
+		ALTER TABLE file_freeze ADD COLUMN IF NOT EXISTS released_by text NOT NULL DEFAULT '';
 		ALTER TABLE file_version ADD COLUMN IF NOT EXISTS oid text NOT NULL DEFAULT '';
+		-- file_cut records the manifest the seal verified: the public
+		-- tree's full inventory (path, kind, fingerprint, durable
+		-- identity, link target) observed identical across the seal's
+		-- two consecutive walks. It is evidence, not a pin — a late
+		-- predecessor effect landing after seal changes the source, and
+		-- the mover's own verify against a fresh manifest is what
+		-- proves the copied bytes are a consistent snapshot.
+		CREATE TABLE IF NOT EXISTS file_cut (
+			scope        text NOT NULL,
+			epoch        bigint NOT NULL DEFAULT 0,
+			manifest     jsonb NOT NULL DEFAULT '[]'::jsonb,
+			manifest_sha text NOT NULL DEFAULT '',
+			created_at   timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (scope, epoch)
+		);
+	`+captureDDL+`
 		CREATE INDEX IF NOT EXISTS file_op_scope ON file_op(scope, path);
 		-- At most one PENDING intent per (scope, op_key): a second declare
 		-- under the same key while the first is still in flight fails
@@ -578,6 +650,16 @@ var (
 	// in-flight operation settles and is then answered by the receipt
 	// check or declares a fresh attempt.
 	ErrIdemInFlight = errors.New("an operation with this idempotency key is still in flight")
+	// ErrFrozen: a committed file_freeze row refuses new mutation
+	// admissions for the scope. Reads are unaffected. The freeze is the
+	// persisted write barrier used while a scope's contents are being
+	// moved elsewhere or kept as a retained read-only copy.
+	ErrFrozen = errors.New("scope mutations are frozen")
+	// ErrStaleBarrier: the caller's lineage epoch is older than the
+	// authority already recorded on this scope's barrier — the request
+	// came from a superseded session and must not move the barrier in
+	// either direction.
+	ErrStaleBarrier = errors.New("scope barrier is held by a newer lineage")
 )
 
 // OpIdentity is the caller's stable operation identity. When Key is set the
@@ -1160,6 +1242,27 @@ func (s *Store) declare(ctx context.Context, scope, op, path, toPath string, iv 
 		if !errors.Is(rerr, pgx.ErrNoRows) {
 			return intent{}, rerr
 		}
+	}
+
+	// Persisted mutation barrier: a committed file_freeze row refuses new
+	// admissions for the scope. The shared advisory lock orders this
+	// transaction against SetScopeFrozen's exclusive lock — an intent
+	// that committed before the freeze commits is already durable (its
+	// effect settles normally and stays observable through stat
+	// fingerprints and the changes feed); one admitted afterwards sees
+	// the row and refuses. Committed receipts above still answer replays
+	// on a frozen scope: a replay mutates nothing new.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))`, scope); err != nil {
+		return intent{}, err
+	}
+	var frozen bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM file_freeze WHERE scope=$1 AND released_at IS NULL)`, scope).Scan(&frozen); err != nil {
+		return intent{}, err
+	}
+	if frozen {
+		return intent{}, ErrFrozen
 	}
 
 	casPath := path
@@ -3162,9 +3265,25 @@ func (s *Store) knownScopes(ctx context.Context) []string {
 }
 
 // sweepScopeNames walks one scope's directories for orphan private
-// names. Depth-bounded and dedup'd by object identity so a cyclic
-// structure cannot spin the walk.
+// names, under the scope's mutation mutex — non-blocking: a scope busy
+// with an in-flight mutation is swept on a later pass, never waited
+// on. A sealed scope is skipped: its residue stays parked until the
+// barrier is released.
 func (s *Store) sweepScopeNames(ctx context.Context, scope string, view ReconView) []int64 {
+	mu := s.lockScope(scope)
+	if !mu.TryLock() {
+		return nil
+	}
+	defer mu.Unlock()
+	if s.scopeSealed(ctx, scope) {
+		return nil
+	}
+	return s.sweepScopeNamesLocked(ctx, scope, view)
+}
+
+// sweepScopeNamesLocked is the sweep body for callers already holding
+// the scope mutex (the seal's forced settle).
+func (s *Store) sweepScopeNamesLocked(ctx context.Context, scope string, view ReconView) []int64 {
 	seen := map[string]struct{}{}
 	present := map[string]struct{}{}
 	var reattach []int64
@@ -3469,18 +3588,575 @@ func (s *Store) RemoveKeyed(ctx context.Context, scope, path string, iv IfVersio
 
 // ObservedVersion returns the service-minted version and recorded fingerprint
 // for a path (0,"" if never written through the service).
-func (s *Store) ObservedVersion(ctx context.Context, scope, path string) (int64, string, error) {
+func (s *Store) ObservedVersion(ctx context.Context, scope, path string) (int64, string, string, error) {
 	ctx, cancel := s.dbCtx(ctx)
 	defer cancel()
 	var v int64
-	var fp string
+	var fp, sha string
 	err := s.pool.QueryRow(ctx,
-		`SELECT version, fp FROM file_version WHERE scope=$1 AND path=$2`,
-		scope, path).Scan(&v, &fp)
+		`SELECT version, fp, content_sha FROM file_version WHERE scope=$1 AND path=$2`,
+		scope, path).Scan(&v, &fp, &sha)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, "", nil
+		return 0, "", "", nil
 	}
-	return v, fp, err
+	return v, fp, sha, err
+}
+
+// ErrDrainPending: the freeze barrier committed but intents admitted
+// before it have not finished settling — the source is not yet a stable
+// snapshot. Callers treat this as "not yet", never as failure: the
+// barrier is up (no new admissions), the stranded intents are named,
+// and a retry drains once their effects land or reconcile.
+var ErrDrainPending = errors.New("file effects still settling")
+
+// SetScopeFrozen persists, seals, or releases the scope's mutation
+// barrier. The exclusive advisory lock orders this transaction against
+// every mutation admission's shared lock: when the freeze row commits,
+// no intent that began earlier is still open, and every later admission
+// sees the row and refuses with ErrFrozen.
+//
+// The barrier row is an authority record, not a flag: every assertion
+// carries the caller's lineage epoch (the return session's created_at
+// in ms) and may only advance the recorded (epoch, owner). A stale
+// session's freeze is refused inside this transaction — ErrStaleBarrier
+// — and a stale session's unfreeze is a no-op, so an old callback can
+// never replace or clear a newer lineage's barrier. A newer lineage's
+// unfreeze DOES release an older session's retained barrier: that is
+// the legitimate Local→Cloud hand-off (the completed local return's
+// fence ends when a newer bound return takes the store back to Cloud).
+// A released row is kept as a tombstone recording the releasing
+// authority, so a superseded lineage can never re-assert afterwards.
+//
+// A committed intent is only half the story: its filesystem effect
+// settles afterwards (runFs/applyUntilSettled, or the reconciler for a
+// lost outcome), and the reconciler deliberately re-judges retained
+// tombstones because a late effect can land after resolution. The cut
+// therefore has a third phase beyond barrier+drain: SEAL. While the
+// barrier stands sealed, the reconciler has no authority over the scope
+// — tombstone re-judgment, name settling and the orphan sweep all skip
+// it — so no filesvc path can still change the public tree. What the
+// seal cannot reach stays honest residue: an effect that had not landed
+// anywhere by seal commit remains parked under its private .filesv-op-*
+// name (invisible in list, journaled as evidence) and surfaces only if
+// the scope is ever unsealed.
+func (s *Store) SetScopeFrozen(ctx context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error {
+	dctx, cancel := s.dbCtx(ctx)
+	tx, err := s.pool.BeginTx(dctx, pgx.TxOptions{})
+	cancel()
+	if err != nil {
+		return err
+	}
+	// A rollback after Commit is a no-op; the deferred call covers every
+	// early return.
+	defer func() {
+		dctx, cancel := s.dbCtx(context.Background())
+		defer cancel()
+		_ = tx.Rollback(dctx)
+	}()
+	{
+		dctx, cancel := s.dbCtx(ctx)
+		_, err := tx.Exec(dctx,
+			`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, scope)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	if frozen {
+		// Lineage guard: the assertion must not regress recorded
+		// authority, whether the current row is an active barrier or a
+		// released tombstone. A refused update returns no row.
+		var one int
+		dctx, cancel := s.dbCtx(ctx)
+		err := tx.QueryRow(dctx,
+			`INSERT INTO file_freeze (scope, owner, owner_epoch, reason)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (scope) DO UPDATE
+			   SET owner=EXCLUDED.owner, owner_epoch=EXCLUDED.owner_epoch,
+			       reason=EXCLUDED.reason, set_at=now(),
+			       sealed_at=NULL, released_at=NULL,
+			       released_epoch=0, released_by=''
+			   WHERE (CASE WHEN file_freeze.released_at IS NULL
+			               THEN file_freeze.owner_epoch
+			               ELSE file_freeze.released_epoch END) < $3
+			      OR ((CASE WHEN file_freeze.released_at IS NULL
+			               THEN file_freeze.owner_epoch
+			               ELSE file_freeze.released_epoch END) = $3
+			          AND (CASE WHEN file_freeze.released_at IS NULL
+			                    THEN file_freeze.owner
+			                    ELSE file_freeze.released_by END) <= $2)
+			 RETURNING 1`, scope, owner, ownerEpoch, reason).Scan(&one)
+		cancel()
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleBarrier
+		}
+		if err != nil {
+			return err
+		}
+	} else {
+		// Release: the barrier's own lineage or a NEWER one clears it —
+		// atomically dropping the seal as well. An older lineage's
+		// release is a no-op: it cannot reach a barrier a newer session
+		// set, and the tombstone records the release as latest
+		// authority so that stale lineage cannot re-assert either.
+		dctx, cancel := s.dbCtx(ctx)
+		_, err := tx.Exec(dctx,
+			`UPDATE file_freeze
+			    SET released_at=now(), released_epoch=$3, released_by=$2,
+			        sealed_at=NULL
+			  WHERE scope=$1 AND released_at IS NULL
+			    AND (owner_epoch < $3 OR (owner_epoch = $3 AND owner <= $2))`,
+			scope, owner, ownerEpoch)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	{
+		dctx, cancel := s.dbCtx(ctx)
+		err := tx.Commit(dctx)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	if !frozen {
+		return nil
+	}
+	return s.cutScope(ctx, scope)
+}
+
+// errCutNotReady marks a not-yet-stable cut evaluation: the loop retries
+// it until the drain deadline, where it becomes ErrDrainPending.
+var errCutNotReady = errors.New("scope cut not yet stable")
+
+// cutScope waits until the scope's public tree is provably stable and
+// then seals the barrier. "Stable" requires all of:
+//
+//   - no unresolved file_op for the scope (every admitted intent settled);
+//   - writer tenure >= cutHorizon — this store has owned the root long
+//     enough that a predecessor's already-issued effects (watchWriter
+//     notice latency plus FUSE-accepted residual) can no longer land;
+//   - one forced settle under the scope mutex: every retained tombstone
+//     is re-judged and the orphan-name sweep runs for the scope, so
+//     parked bodies surface into the public tree BEFORE the cut rather
+//     than after it;
+//   - sealed_at committed under the same mutex — after which no filesvc
+//     path (declare, reconcile pass, orphan sweep) can mutate the tree.
+//
+// Bounded by s.drainTimeout; an unmet condition surfaces as
+// ErrDrainPending with the blocking detail so the caller can retry —
+// never a silently racy success.
+func (s *Store) cutScope(ctx context.Context, scope string) error {
+	deadline := time.Now().Add(s.drainTimeout)
+	var detail string
+	for {
+		done, d, err := s.cutScopeOnce(ctx, scope)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		detail = d
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: %s — the barrier is up and no new writes can land; "+
+				"retry once the writers settle or reconcile", ErrDrainPending, detail)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+// cutScopeOnce evaluates the cut conditions once. The settle+seal runs
+// under the scope's mutation mutex so no same-process reconcile pass can
+// interleave a public move between the last verification and the seal
+// commit; every other producer is already excluded (declare refuses on a
+// frozen scope; a deposed predecessor is fenced at the fs landing and
+// bounded by the tenure check).
+func (s *Store) cutScopeOnce(ctx context.Context, scope string) (bool, string, error) {
+	dctx, cancel := s.dbCtx(ctx)
+	var since time.Time
+	err := s.pool.QueryRow(dctx,
+		`SELECT owner_since FROM store_meta WHERE id`).Scan(&since)
+	cancel()
+	if err != nil {
+		return false, "", err
+	}
+	if elapsed := time.Since(since); elapsed < s.cutHorizon {
+		return false, fmt.Sprintf("writer tenure %s < %s: a predecessor's in-flight "+
+			"effects may still land", elapsed.Round(100*time.Millisecond), s.cutHorizon), nil
+	}
+	// The forced settle needs a filesystem view. A store with no
+	// reconcile probes cannot settle residue anyway — its reconciler is
+	// inert — so sealing on drain alone is still honest quiescence (no
+	// filesystem exists to land an unobserved effect on).
+	view, verr := s.acquireReconView(ctx)
+	if verr == nil {
+		defer view.Close()
+	}
+	// The settle runs WITHOUT the scope mutex held across the drain:
+	// WithWrite/Rename/Remove hold it for their whole fs+apply span, so
+	// locking here would deadlock against the very in-flight mutations
+	// the drain waits on. Per-intent locking (reconcileOne's granularity)
+	// is enough — the barrier already refuses new admissions, and any
+	// in-flight landing inside the manifest window is caught by pair
+	// inequality, not prevented by the lock.
+	cutSettle := func(it intent, tombstoned bool) bool {
+		mu := s.lockScope(it.scope)
+		mu.Lock()
+		defer mu.Unlock()
+		if s.scopeSealed(ctx, it.scope) {
+			return false
+		}
+		return s.settleIntent(ctx, it, view, tombstoned)
+	}
+	for round := 0; round < 4 && view != nil; round++ {
+		progress := false
+		// Stray pending intents (e.g. a just-reattached recover intent)
+		// get the same judgment rules as the pass: own+inflight and
+		// young-foreign intents are not yet decidable.
+		for _, it := range s.loadIntents(ctx, `resolved_at IS NULL AND scope=$2`, scope) {
+			if view == nil {
+				break // no fs to judge against — nothing here can settle
+			}
+			if it.owner == s.owner {
+				if _, ok := s.inflight.Load(it.id); ok {
+					continue
+				}
+			} else if time.Since(it.at) < s.cutHorizon {
+				continue
+			}
+			if cutSettle(it, false) {
+				progress = true
+			}
+		}
+		// Retained tombstones: re-judge every resolved intent once more
+		// so a late effect that already landed is surfaced before the
+		// cut, not sealed into residue.
+		for _, it := range s.loadIntents(ctx, `resolved_at IS NOT NULL AND scope=$2`, scope) {
+			if cutSettle(it, true) {
+				progress = true
+			}
+		}
+		// Orphan sweep for this scope only: names parked under dead
+		// namespaces re-attach (to an intent's journal) or mint recover
+		// intents, which the next loop iteration settles.
+		for _, id := range s.sweepScopeNames(ctx, scope, view) {
+			for _, it := range s.loadIntents(ctx, `id=$2`, id) {
+				if cutSettle(it, true) {
+					progress = true
+				}
+			}
+		}
+		dctx, cancel = s.dbCtx(ctx)
+		n := 0
+		err = s.pool.QueryRow(dctx,
+			`SELECT count(*) FROM file_op WHERE scope=$1 AND root=$2 AND resolved_at IS NULL`,
+			scope, s.rootID).Scan(&n)
+		cancel()
+		if err != nil {
+			return false, "", err
+		}
+		if n == 0 && !progress {
+			break
+		}
+		if !progress && n > 0 {
+			return false, fmt.Sprintf("%d file effect(s) unverifiable this pass", n), nil
+		}
+		if round == 3 {
+			return false, "settlement still discovering work at the round cap", nil
+		}
+	}
+	// Final unresolved gate: whatever could not settle this round — an
+	// own intent still inflight, a young foreign one, an unverifiable
+	// verdict, or (view==nil) a store with no fs to judge on — keeps
+	// the cut pending. Never seal over an unresolved intent.
+	{
+		dctx, cancel = s.dbCtx(ctx)
+		var n int
+		err = s.pool.QueryRow(dctx,
+			`SELECT count(*) FROM file_op WHERE scope=$1 AND root=$2 AND resolved_at IS NULL`,
+			scope, s.rootID).Scan(&n)
+		cancel()
+		if err != nil {
+			return false, "", err
+		}
+		if n > 0 {
+			return false, fmt.Sprintf("%d admitted file effect(s) still settling", n), nil
+		}
+	}
+	// The physical proof: two consecutive full-tree manifests must be
+	// IDENTICAL across the observation gap. This — not elapsed time,
+	// not a process flag — is what establishes the cut's bound: any
+	// mutation that lands inside the window changes the manifest and
+	// the cut stays pending. A mutation still in flight but unlanded
+	// (a predecessor goroutine parked between its last check and its
+	// syscall, a request blocked inside a filesystem daemon) cannot be
+	// detected until it lands; when it does, the next observation pair
+	// disagrees. What this proves is bounded and exact: at seal-commit
+	// the tree equaled the recorded manifest twice over a real
+	// interval, and every still-unlanded effect is journaled — the
+	// mover's own copy+verify pass (the same equality, end to end)
+	// decides whether the copied bytes are a consistent snapshot.
+	var m2 CutManifest
+	if view == nil {
+		// No filesystem is wired to this store at all — there is no
+		// tree to observe and nothing can land on one. Intent drain is
+		// the whole proof; the cut record carries an empty manifest so
+		// the weaker proof is visible in the audit row.
+		m2 = CutManifest{Scope: scope}
+	} else {
+		m1, merr := s.buildManifest(view, scope)
+		if merr != nil {
+			if errors.Is(merr, ErrUnavailable) {
+				return false, "filesystem unobservable — cannot prove stability", nil
+			}
+			return false, "", merr
+		}
+		select {
+		case <-ctx.Done():
+			return false, "", ctx.Err()
+		case <-time.After(s.cutObserveGap):
+		}
+		m2, merr = s.buildManifest(view, scope)
+		if merr != nil {
+			if errors.Is(merr, ErrUnavailable) {
+				return false, "filesystem unobservable — cannot prove stability", nil
+			}
+			return false, "", merr
+		}
+		if !equalManifest(m1, m2) {
+			return false, "public tree changed during observation — an effect landed inside the window", nil
+		}
+	}
+	// Commit the seal under the scope mutex: the last unresolved check,
+	// the manifest pair and this write are one critical section for
+	// in-process producers, so no reconcile pass can interleave a public
+	// mutation between them.
+	dctx, cancel = s.dbCtx(ctx)
+	var cutEpoch int64
+	err = s.pool.QueryRow(dctx,
+		`UPDATE file_freeze SET sealed_at=now()
+		  WHERE scope=$1 AND released_at IS NULL AND sealed_at IS NULL
+		 RETURNING owner_epoch`, scope).Scan(&cutEpoch)
+	cancel()
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Already sealed (a retried cut converges) or released by a
+			// newer authority mid-drain — distinguish them.
+			if s.scopeSealed(ctx, scope) {
+				return true, "", nil
+			}
+			return false, "", ErrStaleBarrier
+		}
+		return false, "", err
+	}
+	// Record the verified manifest as the cut's evidence. A conflict
+	// means this epoch already sealed once — the earlier record stands.
+	dctx, cancel = s.dbCtx(ctx)
+	_, err = s.pool.Exec(dctx,
+		`INSERT INTO file_cut (scope, epoch, manifest, manifest_sha)
+		 VALUES ($1, $2, $3::jsonb, $4)
+		 ON CONFLICT (scope, epoch) DO NOTHING`,
+		scope, cutEpoch, mustJSON(m2.Entries), m2.SHA)
+	cancel()
+	if err != nil {
+		return false, "", err
+	}
+	return true, "", nil
+}
+
+// CutEntry is one object in the cut manifest — the full identity a
+// mover needs to copy it and to prove afterwards that what it copied
+// is exactly what was observed.
+type CutEntry struct {
+	Path   string `json:"path"`
+	Kind   string `json:"kind"`
+	Size   int64  `json:"size"`
+	Mtime  int64  `json:"mtime_ns"`
+	FP     string `json:"fp"`
+	Oid    string `json:"oid,omitempty"`
+	Nlink  uint64 `json:"nlink,omitempty"`
+	Target string `json:"target,omitempty"` // symlink target, kind=symlink only
+}
+
+// CutManifest is the scope's observed public-tree inventory at one
+// verified-stable instant. SHA is the canonical digest of Entries —
+// equality of manifests is equality of their ordered entries.
+type CutManifest struct {
+	Scope   string     `json:"scope"`
+	Entries []CutEntry `json:"entries"`
+	SHA     string     `json:"sha"`
+}
+
+// cutLstatView is the optional stronger view a pinned root offers: the
+// manifest prefers lstat so a symlink records itself (with its target)
+// rather than the object it resolves to.
+type cutLstatView interface {
+	Lstat(scope, path string) (FileInfo, error)
+	Readlink(scope, path string) (string, error)
+}
+
+// buildManifest walks the scope's public tree beneath the pinned view
+// and returns its complete inventory — every name, its kind, size,
+// fingerprint, durable object identity when the filesystem proves one,
+// and link target. Private service names (.filesv-*) are residue, not
+// public inventory, and are excluded uniformly — they are journaled
+// separately and never part of a copy.
+func (s *Store) buildManifest(view ReconView, scope string) (CutManifest, error) {
+	lv, _ := view.(cutLstatView)
+	entries := []CutEntry{}
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		names, err := view.ListDir(scope, dir)
+		if err != nil {
+			if dir == "" && errors.Is(err, ErrNotFound) {
+				// The scope dir does not exist — a valid empty tree.
+				return nil
+			}
+			return err
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if strings.HasPrefix(name, stagingPrefix) || strings.HasPrefix(name, opStagePrefix) {
+				continue
+			}
+			rel := name
+			if dir != "" {
+				rel = dir + "/" + name
+			}
+			var info FileInfo
+			if lv != nil {
+				info, err = lv.Lstat(scope, rel)
+			} else {
+				info, err = view.Stat(scope, rel)
+			}
+			if err != nil {
+				// A name that vanished mid-walk is movement — report it
+				// as an observation failure, not a completed manifest.
+				return err
+			}
+			e := CutEntry{Path: rel, Kind: info.Kind, Size: info.Size,
+				Mtime: info.MtimeNS, FP: info.Fingerprint, Oid: info.Oid,
+				Nlink: info.Nlink}
+			if info.Kind == "symlink" && lv != nil {
+				if tgt, rerr := lv.Readlink(scope, rel); rerr == nil {
+					e.Target = tgt
+				}
+			}
+			entries = append(entries, e)
+			if info.Kind == "dir" && strings.Count(rel, "/") < 256 {
+				if err := walk(rel); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(""); err != nil {
+		return CutManifest{}, err
+	}
+	// Entries arrive in depth-first order, not global order — sort so
+	// two walks over an unchanged tree serialize identically.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	sum := sha256.Sum256(mustJSON(entries))
+	return CutManifest{Scope: scope, Entries: entries,
+		SHA: hex.EncodeToString(sum[:])}, nil
+}
+
+// equalManifest reports whether two observations describe the identical
+// tree — same names, kinds, fingerprints, identities and link targets.
+func equalManifest(a, b CutManifest) bool {
+	return a.SHA == b.SHA
+}
+
+// CutManifest observes the scope's public tree twice across the
+// observation gap and returns the manifest only when both walks agree —
+// the same physical proof the seal uses, exposed so the mover can verify
+// its copy end to end: copy the tree, then compare this manifest against
+// what it recorded; equality means the copied bytes are a consistent
+// snapshot of a tree that did not change while being read. Inequality
+// surfaces ErrDrainPending — retry; the tree is still moving.
+func (s *Store) CutManifest(ctx context.Context, scope string) (CutManifest, error) {
+	view, err := s.acquireReconView(ctx)
+	if err != nil {
+		return CutManifest{}, err
+	}
+	defer view.Close()
+	m1, err := s.buildManifest(view, scope)
+	if err != nil {
+		return CutManifest{}, err
+	}
+	select {
+	case <-ctx.Done():
+		return CutManifest{}, ctx.Err()
+	case <-time.After(s.cutObserveGap):
+	}
+	m2, err := s.buildManifest(view, scope)
+	if err != nil {
+		return CutManifest{}, err
+	}
+	if !equalManifest(m1, m2) {
+		return CutManifest{}, fmt.Errorf("%w: %s tree changed during observation — retry",
+			ErrDrainPending, scope)
+	}
+	return m2, nil
+}
+
+// SealedCutManifest returns the manifest recorded when the scope's
+// barrier sealed — the audit record of what the cut verified. The bool
+// reports whether a sealed cut exists for the scope.
+func (s *Store) SealedCutManifest(ctx context.Context, scope string) (CutManifest, bool, error) {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var raw []byte
+	var epoch int64
+	var sha string
+	err := s.pool.QueryRow(dctx,
+		`SELECT c.epoch, c.manifest, c.manifest_sha
+		   FROM file_cut c JOIN file_freeze f ON f.scope=c.scope AND f.owner_epoch=c.epoch
+		  WHERE c.scope=$1 AND f.sealed_at IS NOT NULL AND f.released_at IS NULL
+		  ORDER BY c.created_at DESC LIMIT 1`, scope).Scan(&epoch, &raw, &sha)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CutManifest{}, false, nil
+	}
+	if err != nil {
+		return CutManifest{}, false, err
+	}
+	m := CutManifest{Scope: scope, SHA: sha}
+	_ = json.Unmarshal(raw, &m.Entries)
+	return m, true, nil
+}
+
+// scopeSealed reports whether the scope's barrier stands sealed — the
+// reconciler has no authority over it. An unverifiable answer is treated
+// as sealed: a pass must not mutate a scope whose state it cannot read.
+func (s *Store) scopeSealed(ctx context.Context, scope string) bool {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var sealed bool
+	if err := s.pool.QueryRow(dctx,
+		`SELECT EXISTS(SELECT 1 FROM file_freeze
+			WHERE scope=$1 AND sealed_at IS NOT NULL AND released_at IS NULL)`,
+		scope).Scan(&sealed); err != nil {
+		return true
+	}
+	return sealed
+}
+
+// ScopeFrozen reports whether the scope currently has a committed
+// mutation barrier.
+func (s *Store) ScopeFrozen(ctx context.Context, scope string) (bool, error) {
+	ctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	var frozen bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM file_freeze WHERE scope=$1 AND released_at IS NULL)`, scope).Scan(&frozen)
+	return frozen, err
 }
 
 type Event struct {
@@ -3580,60 +4256,72 @@ func (v funcView) Close() error                  { return nil }
 // "unreachable" on the dead mount instead of "absent" on the bare
 // directory it leaves behind (f102/F-RA-1). Intents that cannot be
 // judged stay pending (or tombstoned) with their evidence intact.
+// acquireReconView is the pass's filesystem view acquisition: the pinned
+// descriptor view when wired (production), else the injected probes. The
+// seal's forced settle uses the same acquisition.
+func (s *Store) acquireReconView(ctx context.Context) (ReconView, error) {
+	if s.viewFn != nil {
+		return s.viewFn(ctx)
+	}
+	if s.statFn == nil {
+		return nil, ErrUnavailable
+	}
+	if s.fsCheck != nil {
+		if err := s.fsCheck(); err != nil {
+			return nil, err
+		}
+	}
+	return funcView{s.statFn, s.hashFn}, nil
+}
+
+const intentCols = `id, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, names, at, op_key, req_hash`
+
+// loadIntents reads file_op rows for this root matching the where clause
+// (which starts at $2). Every intent gets its name journal so settle
+// callers can patch records.
+func (s *Store) loadIntents(ctx context.Context, where string, args ...any) []intent {
+	dctx, cancel := s.dbCtx(ctx)
+	defer cancel()
+	rows, err := s.pool.Query(dctx,
+		`SELECT `+intentCols+` FROM file_op WHERE root=$1 AND `+where+` ORDER BY id`,
+		append([]any{s.rootID}, args...)...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []intent
+	for rows.Next() {
+		var it intent
+		var names []byte
+		if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
+			&it.version, &it.preFP, &it.dstFP, &it.expectSHA, &it.srcKind,
+			&it.preOid, &it.dstOid, &it.dstSHA, &names, &it.at, &it.opKey, &it.reqHash); err != nil {
+			return out
+		}
+		if len(names) > 0 {
+			json.Unmarshal(names, &it.names)
+		}
+		it.journal = &nameJournal{s: s, id: it.id}
+		out = append(out, it)
+	}
+	return out
+}
+
 func (s *Store) Reconcile(ctx context.Context) int {
 	if s.deposed.Load() {
 		return 0
 	}
-	var view ReconView
-	if s.viewFn != nil {
-		v, err := s.viewFn(ctx)
-		if err != nil {
-			log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", err)
-			return 0
-		}
-		view = v
-	} else {
-		if s.statFn == nil {
-			return 0
-		}
-		if s.fsCheck != nil {
-			if err := s.fsCheck(); err != nil {
-				log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", err)
-				return 0
-			}
-		}
-		view = funcView{s.statFn, s.hashFn}
+	view, verr := s.acquireReconView(ctx)
+	if verr != nil {
+		log.Printf("reconcile: filesystem root not verifiable (%v) — intents stay pending", verr)
+		return 0
 	}
 	defer view.Close()
 
-	dctx, cancel := s.dbCtx(ctx)
-	defer cancel()
-	const cols = `id, owner, scope, op, path, to_path, version, pre_fp, dst_fp, expect_sha, src_kind, pre_oid, dst_oid, dst_sha, names, at, op_key, req_hash`
 	load := func(where string, args ...any) []intent {
-		rows, err := s.pool.Query(dctx,
-			`SELECT `+cols+` FROM file_op WHERE root=$1 AND `+where+` ORDER BY id`, args...)
-		if err != nil {
-			return nil
-		}
-		defer rows.Close()
-		var out []intent
-		for rows.Next() {
-			var it intent
-			var names []byte
-			if err := rows.Scan(&it.id, &it.owner, &it.scope, &it.op, &it.path, &it.toPath,
-				&it.version, &it.preFP, &it.dstFP, &it.expectSHA, &it.srcKind,
-				&it.preOid, &it.dstOid, &it.dstSHA, &names, &it.at, &it.opKey, &it.reqHash); err != nil {
-				return out
-			}
-			if len(names) > 0 {
-				json.Unmarshal(names, &it.names)
-			}
-			it.journal = &nameJournal{s: s, id: it.id}
-			out = append(out, it)
-		}
-		return out
+		return s.loadIntents(ctx, where, args...)
 	}
-	pending := load(`resolved_at IS NULL`, s.rootID)
+	pending := load(`resolved_at IS NULL`)
 	// Tombstone re-judgment is rate-limited in two tiers: scanning every
 	// resolved intent every pass would pin the root descriptor (and the
 	// mount) nearly 100% of the time. Hot tombstones (younger than
@@ -3647,11 +4335,11 @@ func (s *Store) Reconcile(ctx context.Context) int {
 	var tombs []intent
 	if scanHot {
 		tombs = load(`resolved_at IS NOT NULL AND resolved_at > now() - $2::interval`,
-			s.rootID, tombstoneColdAge.String())
+			tombstoneColdAge.String())
 	}
 	if scanCold {
 		tombs = append(tombs, load(`resolved_at IS NOT NULL AND resolved_at <= now() - $2::interval`,
-			s.rootID, tombstoneColdAge.String())...)
+			tombstoneColdAge.String())...)
 	}
 	scanTombs := len(tombs) > 0
 
@@ -3696,7 +4384,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 		// Recover intents the sweep just created are owned by us and not
 		// inflight — settle them in this pass rather than leaving orphan
 		// content parked until the next sweep cadence.
-		for _, it := range load(`resolved_at IS NULL`, s.rootID) {
+		for _, it := range load(`resolved_at IS NULL`) {
 			if s.deposed.Load() {
 				break
 			}
@@ -3712,7 +4400,7 @@ func (s *Store) Reconcile(ctx context.Context) int {
 			if s.deposed.Load() {
 				break
 			}
-			for _, it := range load(`id=$2`, s.rootID, id) {
+			for _, it := range load(`id=$2`, id) {
 				if s.reconcileOne(ctx, it, view, true) {
 					settled++
 				}
@@ -3776,7 +4464,21 @@ func (s *Store) reconcileOne(ctx context.Context, it intent, view ReconView, tom
 	mu := s.lockScope(it.scope)
 	mu.Lock()
 	defer mu.Unlock()
+	// A sealed scope is outside the reconciler's authority: every
+	// retained record stays exactly as the cut left it until the
+	// barrier is released — a late effect lands as parked residue, not
+	// a public mutation.
+	if s.scopeSealed(ctx, it.scope) {
+		return false
+	}
+	return s.settleIntent(ctx, it, view, tombstoned)
+}
 
+// settleIntent judges one intent beneath the pass view. The caller holds
+// the scope's mutation mutex and has verified the scope is not sealed —
+// reconcileOne from the periodic pass, or cutScopeOnce inside the seal's
+// critical section.
+func (s *Store) settleIntent(ctx context.Context, it intent, view ReconView, tombstoned bool) bool {
 	// Settle the intent's journaled private names before judging the
 	// public paths — a process that died mid-effect can leave displaced
 	// or staged content parked under owned names, and the judgment must

@@ -295,3 +295,213 @@ func TestProcessStartCancelledDuringJournalWait(t *testing.T) {
 		t.Fatalf("expired waiter must leave no record: %v", err)
 	}
 }
+
+// The recoverable half of the cancel fence: a caller that has
+// re-authorized the launch (the termexec driver inside the persona
+// launch fence, after a cancelled return) releases the tombstone and
+// the same deterministic operation id launches normally. Only a
+// never-launched tombstone is releasable — live ops, finished ops and
+// ops that attempted a launch keep their history.
+func TestReleaseProcessTombstoneRestoresLaunch(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	directory := t.TempDir() + "/state"
+	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:released")
+
+	// Absent: nothing to release.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); !errors.Is(err, ErrProcessNotFound) {
+		t.Fatalf("release of absent op = %v, want not-found", err)
+	}
+
+	// Plant the fence exactly as the return gate does.
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:released", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatalf("plant tombstone: %v", err)
+	}
+	if _, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:released",
+		Executable: "/bin/sh",
+	}); err != nil {
+		t.Fatalf("fenced replay: %v", err)
+	}
+
+	// Release under re-authorization: the fence is gone, a real start
+	// journals and launches.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); err != nil {
+		t.Fatalf("release tombstone: %v", err)
+	}
+	op, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:released",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.Tombstone || op.State != ProcessAccepted {
+		t.Fatalf("start after release: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 1 {
+		t.Fatalf("released operation must launch: %d", b.launches)
+	}
+
+	// A live record is never releasable.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release of live op = %v, want conflict", err)
+	}
+
+	// The release is durable: a restarted service has no record and a
+	// replayed start would journal fresh — but the live op already
+	// exists, so the restart sees the real record instead.
+	s2, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := s2.ProcessStatus(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	})
+	if err != nil || after.Tombstone {
+		t.Fatalf("restarted service lost the launched op: %+v %v", after, err)
+	}
+}
+
+// A failed journal removal must not strand the fence: the durable
+// tombstone file is deleted before the in-memory record is unlinked, so
+// a filesystem error leaves the release retriable and the delayed-start
+// fence still enforced — never a record-less tombstone the next
+// StartProcess could silently overwrite into a launch.
+func TestReleaseProcessTombstoneRetainsFenceOnRemoveFailure(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	directory := t.TempDir() + "/state"
+	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:stuck-fence")
+	look := ProcessLookupRequest{PersonalityAgentID: paid, OperationID: opID}
+
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:stuck-fence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatalf("plant tombstone: %v", err)
+	}
+
+	// Force os.Remove to fail: replace the journal file with a non-empty
+	// directory of the same name (ENOTEMPTY — works under any uid).
+	journal := filepath.Join(directory, "processes", opID+".json")
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(journal, "occupant"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err == nil {
+		t.Fatal("release must fail while the journal file cannot be removed")
+	}
+	// The fence is retained in memory: the op is still reported as a
+	// tombstone, a retried release reaches the same failure (not
+	// not-found), and a delayed start still replays 'cancelled'.
+	op, err := s.ProcessStatus(ctx, look)
+	if err != nil || !op.Tombstone || op.State != ProcessCancelled {
+		t.Fatalf("tombstone record lost on failed release: %+v %v", op, err)
+	}
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err == nil || errors.Is(err, ErrProcessNotFound) {
+		t.Fatalf("retried release must stay retriable, got %v", err)
+	}
+	replayed, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:stuck-fence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || !replayed.Tombstone || replayed.State != ProcessCancelled {
+		t.Fatalf("delayed start must still replay the fence: %+v %v", replayed, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 0 {
+		t.Fatalf("no launch may follow a failed release: %d", b.launches)
+	}
+
+	// Clear the obstacle: the retried release now removes the journal
+	// (os.Remove empties the directory tree only for files — remove the
+	// occupant first, then the directory, then let the release run).
+	if err := os.RemoveAll(journal); err != nil {
+		t.Fatal(err)
+	}
+	released, err := s.ReleaseProcessTombstone(ctx, look)
+	if err != nil {
+		t.Fatalf("release must succeed once the journal removes: %v", err)
+	}
+	if !released.Tombstone || released.State != ProcessCancelled {
+		t.Fatalf("release returns the tombstone it retired: %+v", released)
+	}
+	op, err = s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:stuck-fence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.Tombstone || op.State != ProcessAccepted {
+		t.Fatalf("start after a healed release must journal fresh: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 1 {
+		t.Fatalf("the re-authorized launch must run exactly once: %d", b.launches)
+	}
+}
+
+// A tombstone planted and then released must fence again if a new cut
+// arrives: release is not one-shot unlock, the next TombstoneIfAbsent
+// cancel re-establishes it.
+func TestReleaseProcessTombstoneRefences(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	s, err := NewService(b, ServiceConfig{StateDirectory: t.TempDir() + "/state"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:refence")
+	look := ProcessLookupRequest{PersonalityAgentID: paid, OperationID: opID}
+
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:refence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err != nil {
+		t.Fatal(err)
+	}
+	// Re-fence (a second seal): late starts replay cancelled again.
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:refence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:refence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.State != ProcessCancelled || !op.Tombstone {
+		t.Fatalf("re-fenced start: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 0 {
+		t.Fatalf("re-fenced op launched: %d", b.launches)
+	}
+}
