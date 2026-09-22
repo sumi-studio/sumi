@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	firebase.google.com/go/v4 v4.19.0
 	github.com/SherClockHolmes/webpush-go v1.4.0
+	github.com/creack/pty v1.1.24
 	github.com/google/jsonschema-go v0.4.2
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3

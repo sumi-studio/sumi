@@ -1256,9 +1256,10 @@ $(log_excerpt "$fsvc_log" "$fsvc_off")"
     # over the local derivation; otherwise a running local filesvc is it.
     case $files_env_want in
       cloud:*)
-        senv+=("SUMI_FILESVC_URL=$SUMI_FILESVC_URL" "SUMI_FILESVC_TOKEN=$SUMI_FILESVC_TOKEN");;
+        senv+=("SUMI_LOCAL_WORKING_STORE=cloud" "SUMI_FILESVC_URL=$SUMI_FILESVC_URL" "SUMI_FILESVC_TOKEN=$SUMI_FILESVC_TOKEN");;
       local:*)
-        senv+=("SUMI_FILESVC_URL=http://$SUMI_FILES_LISTEN" "SUMI_FILESVC_TOKEN=$SUMI_FILES_TOKEN");;
+        senv+=("SUMI_LOCAL_WORKING_STORE=local" "SUMI_FILESVC_URL=http://$SUMI_FILES_LISTEN" "SUMI_FILESVC_TOKEN=$SUMI_FILES_TOKEN"
+          "SUMI_WORKSPACE_ROOT=$HOME_DIR/workspace" "SUMI_LOCAL_TERMINAL_ROOT=$HOME_DIR/terminals");;
     esac
     (
       exec 9>&-  # daemons must not inherit the operation lock
@@ -1629,6 +1630,12 @@ cmd_doctor() {
     || bad "config.env mode $(stat -c %a "$CONFIG") (want 0600)"
   [[ -x $(SERVICE_BIN) ]] && ok "service binary" || bad "missing $(SERVICE_BIN)"
   [[ -f $(CORE_ENTRY) ]] && ok "core payload" || bad "missing $(CORE_ENTRY)"
+  if [[ -n ${SUMI_FILESVC_URL:-} && -n ${SUMI_FILESVC_TOKEN:-} ]]; then
+    printf '  info  Local terminal unavailable: Cloud working storage is not mounted locally\n'
+  else
+    [[ -x /bin/bash && -c /dev/ptmx ]] && ok "Local shared terminal (Linux PTY, persistent Local workspace)" \
+      || bad "Local terminal requires /bin/bash and /dev/ptmx"
+  fi
   check_listen && ok "listen $SUMI_LOCAL_LISTEN" || bad "listen address"
   ((CONFIG_PREFIX_MISMATCH)) \
     && bad "SUMI_LOCAL_PREFIX=$PREFIX ≠ recorded prefix $SUMI_LOCAL_INSTALLED_PREFIX"

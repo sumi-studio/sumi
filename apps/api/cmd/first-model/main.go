@@ -28,6 +28,9 @@
 //	SUMI_FM_PERSONA_ID     reuse this persona (uuidv7) across restarts;
 //	                       unset → a fresh persona is created each boot
 //	SUMI_FM_PERSONA_NAME   display name when creating (default "first model")
+//	SUMI_WORKSPACE_ROOT   Local filesvc workspace root (with persona subdirectory)
+//	SUMI_LOCAL_TERMINAL_ROOT durable Local PTY identity/output journal directory
+//	SUMI_LOCAL_WORKING_STORE cloud disables Local PTYs even if roots are present
 package main
 
 import (
@@ -356,6 +359,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	core.RegisterRoutes(mux)
+	stopTerminal, err := wireLocalTerminal(core, fm, mux, personaID, "http://"+listen)
+	if err != nil {
+		log.Fatalf("Local terminal: %v", err)
+	}
+	defer stopTerminal()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	})

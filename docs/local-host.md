@@ -288,3 +288,58 @@ scheduled wake → restart persistence → SIGKILL mid-turn recovery →
 OpenAI-stub provider → uninstall/reinstall identity → pack-install →
 purge. `deploy/local-host/test/stub-model.mjs` is the OpenAI-compatible
 stub it uses.
+
+## Shared Local terminal
+
+On Linux/WSL, the state service runs genuine PTY shells in
+`<home>/workspace/<persona-id>`, the same Local working files served by
+filesvc. Human terminal input and the secretary's `terminal.*` tools use
+one session, one input ledger, and one output stream. A failing command
+leaves the interactive shell and previous files available. Opening another
+session uses the same directory; closing a session does not delete files.
+These are ordinary processes with the Local user's permissions, not a
+sandbox. The initial cwd is confined to the persona workspace; shell commands
+retain the user's normal filesystem/network access. Service secrets are not
+inherited into the shell environment.
+
+The existing terminal attachment protocol is mounted at `/terminal/*`.
+To attach from the existing terminal client, first POST
+`/fm/<persona-id>/terminal-session` with the install's `fm_` bearer capability
+(the same scope as its local chat surface). The result supplies
+`installation_id`, `authority_epoch`, and `terminal_base`; pass the first two
+as query parameters to the existing terminal routes. The response sets a
+random 256-bit `sumi_session` cookie, scoped to `/terminal`, HttpOnly,
+SameSite=Strict, expiring in one hour. Only its SHA-256 hash is stored in
+memory. The configured loopback HTTP origin is the only permitted browser
+origin; a Core persona bearer cannot mint this browser cookie. Expiry is
+checked for requests and while attached, and host restart invalidates cookies.
+The HTTP loopback host does not set Secure. No additional terminal screen
+or per-command approval step is introduced.
+
+Disconnecting the browser or restarting only the terminal driver leaves the
+PTY running. A driver reclaim changes its claim epoch and reattaches to that
+same shell. An input whose delivery response was lost is recorded as unknown
+and is not sent again automatically. Resize changes the actual PTY dimensions;
+INT, QUIT and TSTP target its current foreground process group through the
+kernel terminal ioctl. Other allowed signals target the owned shell leader.
+Explicit close and the eight-hour session lifetime stop the owned shell leader
+and close its PTY; arbitrary detached descendants may survive.
+
+A full state-service process restart cannot recover a PTY descriptor. The
+journal in `<home>/terminals` preserves the accepted operation identity before
+launch, so recovery reports the old session as lost/indeterminate instead of
+launching a replacement. It never looks up or signals a PID read from disk.
+A shell that ignores hangup and detaches its stdio can physically survive:
+**lost does not mean stopped**. Opening a new terminal is an explicit new
+session and retains the same workspace files. Already collected Core
+scrollback remains; output not collected before the host died may be lost.
+Backend scrollback retains a bounded 256 KiB tail with explicit skipped-output
+boundaries. Journals remain until the install data is purged.
+
+The Local launcher provides `SUMI_WORKSPACE_ROOT` and
+`SUMI_LOCAL_TERMINAL_ROOT` to the state service when Local filesvc is the
+working store. For a Cloud-to-Local return that deliberately keeps Cloud
+working storage, the Local PTY is unavailable: the Cloud filesystem is not
+mounted as a Local directory. `doctor` states this, and terminal-session
+bootstrap returns HTTP 503 with `local_terminal_unavailable` and
+`working_store: cloud`. It does not silently create another workspace.
