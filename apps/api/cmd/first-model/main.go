@@ -385,6 +385,7 @@ func main() {
 		mux.HandleFunc("POST /fm/{persona}/files/{op}", fm.serveFiles)
 		mux.HandleFunc("DELETE /fm/{persona}/files/{op}", fm.serveFiles)
 	}
+	registerLocalTerminalUI(mux, os.Getenv("SUMI_LOCAL_TERMINAL_ASSETS"))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(uiHTML))
@@ -438,6 +439,7 @@ const uiHTML = `<!doctype html>
 </head>
 <body>
 <h1>Sumi — first model <span class="act">(engineering surface, not product UX)</span></h1>
+<p><a href="/local-terminal/" rel="noreferrer">ターミナルを開く</a></p>
 <div id="log"></div>
 <form id="f"><input id="t" type="text" autocomplete="off" placeholder="Say something to your secretary…"><button>Send</button></form>
 <div id="status"></div>
@@ -459,7 +461,10 @@ const uiHTML = `<!doctype html>
 const q = new URLSearchParams(location.search);
 const persona = q.get("persona") || localStorage.fmPersona;
 const fm = q.get("fm") || localStorage.fmToken;
-if (persona && fm) { localStorage.fmPersona = persona; localStorage.fmToken = fm; }
+if (persona && fm) {
+  localStorage.fmPersona = persona; localStorage.fmToken = fm;
+  if (q.has("fm")) { q.delete("fm"); q.delete("persona"); history.replaceState(null, "", location.pathname + (q.size ? "?" + q : "") + location.hash); }
+}
 const log = document.getElementById("log"), status = document.getElementById("status");
 function line(cls, text) {
   const d = document.createElement("div");

@@ -752,6 +752,8 @@ cmd_install() {
   if [[ -n $PACK_ROOT ]]; then
     [[ -x $PACK_ROOT/bin/sumi-local-move && -x $PACK_ROOT/libexec/sumi-local-move-bin ]] \
       || die "pack is missing the move/return command — use a complete current Local pack"
+    [[ -f $PACK_ROOT/terminal/index.html ]] || die "pack is missing the shared terminal screen — use a complete current Local pack"
+    rm -rf "$prefix/terminal"; cp -r "$PACK_ROOT/terminal" "$prefix/terminal"
     cp "$PACK_ROOT/libexec/sumi-local-service" "$prefix/bin/sumi-local-service"
     cp "$PACK_ROOT/libexec/sumi-local-move-bin" "$prefix/bin/sumi-local-move-bin"
     cp "$PACK_ROOT/bin/sumi-local-move" "$prefix/bin/sumi-local-move"
@@ -768,6 +770,8 @@ cmd_install() {
     info "installed payloads from pack at $PACK_ROOT"
   elif [[ -n $REPO_ROOT ]]; then
     command -v go >/dev/null || die "go toolchain required to build from a source checkout (or install from a pack)"
+    info "building the shared Local terminal screen…"
+    "$SCRIPT_DIR/build-terminal" "$prefix/terminal"
     info "building sumi-local-service…"
     (cd "$REPO_ROOT/apps/api" && go build -buildvcs=false -o "$prefix/bin/sumi-local-service" ./cmd/first-model)
     info "building sumi-local-move…"
@@ -1260,6 +1264,7 @@ $(log_excerpt "$fsvc_log" "$fsvc_off")"
     # actually provisioned filesvc — an unset pair leaves file routes
     # unmounted rather than pointing at nothing.
     local -a senv=(
+      "SUMI_LOCAL_TERMINAL_ASSETS=$PREFIX/terminal"
       "SUMI_LOCAL_ID=$SUMI_LOCAL_ID"
       "SUMI_DB_URL=$SUMI_DB_URL"
       "SUMI_CORE_STATE_TOKEN=$SUMI_CORE_STATE_TOKEN"
@@ -1728,6 +1733,8 @@ cmd_pack() {
   chmod +x "$stage/sumi-local/bin/sumi-local"
   if [[ -n $REPO_ROOT ]]; then
     command -v go >/dev/null || die "pack from a source checkout needs the go toolchain"
+    info "building the shared Local terminal screen…"
+    "$SCRIPT_DIR/build-terminal" "$stage/sumi-local/terminal"
     info "building linux/amd64 binary…"
     (cd "$REPO_ROOT/apps/api" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
       -o "$stage/sumi-local/libexec/sumi-local-service" ./cmd/first-model)
@@ -1748,6 +1755,8 @@ cmd_pack() {
   else
     local from="${PACK_ROOT:-$PREFIX_DIR}"
     [[ -n $from ]] || die "pack needs a source checkout, a pack, or an install"
+    [[ -f $from/terminal/index.html ]] || die "source pack/install is missing terminal assets"
+    cp -r "$from/terminal" "$stage/sumi-local/terminal"
     cp "$from/libexec/sumi-local-service" "$stage/sumi-local/libexec/" 2>/dev/null \
       || cp "$from/bin/sumi-local-service" "$stage/sumi-local/libexec/"
     # The file service payload is optional in older packs — carry it when
@@ -1983,7 +1992,7 @@ cmd_uninstall() {
     # remove only our payload entries, then rmdir — foreign files a user
     # dropped into the prefix are never ours to delete
     local e leftover
-    for e in bin core docs compose.pg.yaml config.example.env VERSION \
+    for e in bin core terminal docs compose.pg.yaml config.example.env VERSION \
              .sumi-local-prefix; do
       rm -rf "$PREFIX/$e"
     done

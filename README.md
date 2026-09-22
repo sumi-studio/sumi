@@ -49,7 +49,7 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 
 `deploy/local-host/sumi-local` installs and runs the new secretary core on one machine. It runs two processes: a Go state service backed by PostgreSQL, and the secretary. With no model configured, the secretary uses a `mock` model that echoes your message, so you can try restarts and recovery before connecting a real model.
 
-Requirements: Linux (use WSL on Windows), bash 5 or newer, Node.js 22.18 or newer (or 23.6 or newer), `curl`, `openssl`, `flock` and `tar`, and either Docker or a PostgreSQL database you provide. Go is needed only to install from a source checkout or to build a bundle — installing a `sumi-local pack` bundle needs no Go and no repository.
+Requirements: Linux (use WSL on Windows), bash 5 or newer, Node.js 22.18 or newer (or 23.6 or newer), `curl`, `openssl`, `flock` and `tar`, and either Docker or a PostgreSQL database you provide. Source installs and bundle builds need Go and the installed workspace frontend dependencies (`pnpm install --frozen-lockfile`). A `sumi-local pack` bundle includes the shared terminal assets and needs no Go, pnpm, or repository to install.
 
 ```sh
 deploy/local-host/sumi-local install --managed-pg   # or: --db-url postgres://…

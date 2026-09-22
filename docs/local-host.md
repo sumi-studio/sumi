@@ -32,8 +32,10 @@ crashes, and reinstalls.
     `deploy/local-host/compose.pg.yaml`, scoped per install (see below).
     Not a shared system service — `restart: "no"`, started/stopped by
     `sumi-local`.
-- Go toolchain only when installing from a source checkout. Packs carry a
-  prebuilt binary; installing a pack does not need Go.
+- Source installs and source pack builds need Go plus the workspace frontend
+  dependencies (`pnpm install --frozen-lockfile` at the repository root). Packs
+  carry prebuilt binaries and shared terminal assets; installing a pack needs
+  neither Go, pnpm, nor a frontend build.
 
 ## Quick start
 
@@ -259,7 +261,7 @@ from the environment without editing `config.env` — see
 ## Distribution
 
 ```sh
-sumi-local pack out.tar.gz   # from a source checkout (needs Go once)
+sumi-local pack out.tar.gz   # source build: Go + installed frontend dependencies
 tar -xzf out.tar.gz && cd sumi-local && bin/sumi-local install
 ```
 
@@ -372,6 +374,34 @@ working storage, the Local PTY is unavailable: the Cloud filesystem is not
 mounted as a Local directory. `doctor` states this, and terminal-session
 bootstrap returns HTTP 503 with `local_terminal_unavailable` and
 `working_store: cloud`. It does not silently create another workspace.
+
+## Open the shared Local terminal
+
+Open the current `sumi-local url` in a browser on the Linux/WSL Local host,
+then choose **ターミナルを開く**. The same-origin `/local-terminal/` page renders
+the existing shared terminal application: create or select a session, type
+commands, and see the same PTY output that the secretary reads and writes.
+Closing the page detaches the viewer; it does not close the session. Use the
+screen's explicit close operation to end a session.
+
+The entry uses the Local capability already held by that origin's chat/files
+page to obtain the existing one-hour HttpOnly terminal cookie and persona
+binding. No Cloud account or fabricated participant installation is needed.
+It renews the binding before expiry, after definite HTTP authentication refusal,
+and after an authorization-related WebSocket close. Ambiguous input outcomes
+are not automatically replayed. A restarted host can be reattached through the
+same entry; an abruptly lost PTY remains lost rather than being relaunched.
+A missing/changed Local capability requires opening the current `sumi-local url`
+again. The page displays backend unavailability, including Cloud working storage
+and invalid terminal journals, with a retry action.
+
+The CLI installs prebuilt assets into `<prefix>/terminal` and sets
+`SUMI_LOCAL_TERMINAL_ASSETS` when starting the service. Source maintainers can
+build them separately with `deploy/local-host/build-terminal /absolute/output`
+and set that environment variable for a directly launched first-model process.
+Archive recipients need no frontend toolchain. This is the Linux Local entry;
+it retains the loopback and same-origin transport rules and does not establish
+remote Mac access or a native Mac package.
 
 ## Configure Local MCP servers
 

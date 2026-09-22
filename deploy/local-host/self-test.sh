@@ -255,6 +255,7 @@ step "pack → install from archive → same identity"
 mkdir -p "$T_WORK/packroot"
 tar -xzf "$T_WORK/sumi-local-pack.tar.gz" -C "$T_WORK/packroot"
 PKBIN="$T_WORK/packroot/sumi-local/bin/sumi-local"
+[[ -f $T_WORK/packroot/sumi-local/terminal/index.html ]] || fail "archive terminal assets missing"
 [[ -x $T_WORK/packroot/sumi-local/libexec/sumi-local-move-bin ]] || fail "archive move/return binary missing"
 "$T_WORK/packroot/sumi-local/bin/sumi-local-move" help >/dev/null || fail "archive move/return command cannot run"
 "$PKBIN" install --home "$T_HOME" --prefix "$T_PREFIX" \
@@ -266,7 +267,8 @@ PKBIN="$T_WORK/packroot/sumi-local/bin/sumi-local"
 REPLY="$("$BIN" say --wait 30 still me after pack 2>&1)" || fail "say exited nonzero"
 [[ $REPLY == *"echo: still me after pack"* ]] || fail "reply: $REPLY"
 [[ $(outbox_count_for fixture-kill) == 1 ]] || fail "history lost across pack reinstall"
-ok "pack-installed build continues the same secretary"
+curl -fsS "http://127.0.0.1:$T_PORT/local-terminal/" | grep -q 'id="root"' || fail "pack-installed terminal entry unavailable"
+ok "pack-installed build continues the same secretary and serves the shared terminal"
 
 # --- 8. purge -----------------------------------------------------------------------
 step "uninstall --purge removes state"

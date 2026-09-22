@@ -64,13 +64,17 @@ export function TerminalScreen({
   authorityEpoch,
   sessionId,
   onSelectSession,
+  apiClient,
+  onAuthorizationExpired,
 }: TerminalScope & {
   sessionId?: string;
   onSelectSession?: (sessionId: string | null) => void;
+  apiClient?: TerminalApiClient;
+  onAuthorizationExpired?: () => Promise<void>;
 }) {
   const client = useMemo(
-    () => new TerminalApiClient({ installationId, authorityEpoch }),
-    [installationId, authorityEpoch],
+    () => apiClient ?? new TerminalApiClient({ installationId, authorityEpoch }),
+    [installationId, authorityEpoch, apiClient],
   );
   const [sessions, setSessions] = useState<TerminalSession[] | null>(null);
   const [listError, setListError] = useState<string | null>(null);
@@ -260,6 +264,7 @@ export function TerminalScreen({
           session={selectedSession}
           onSession={patchSession}
           onDeselect={() => select(null)}
+          onAuthorizationExpired={onAuthorizationExpired}
         />
       ) : (
         <div className="grid flex-1 place-items-center px-6">
@@ -320,6 +325,7 @@ export function TerminalSessionView({
   session,
   onSession,
   onDeselect,
+  onAuthorizationExpired,
 }: {
   client: TerminalApiClient;
   scope: TerminalScope;
@@ -327,6 +333,7 @@ export function TerminalSessionView({
   session: TerminalSession | undefined;
   onSession: (session: TerminalSession) => void;
   onDeselect: () => void;
+  onAuthorizationExpired?: () => Promise<void>;
 }) {
   const refreshParticipantApps = useParticipantApps((state) => state.refresh);
 
@@ -472,7 +479,7 @@ export function TerminalSessionView({
             setWillRetry(info?.willRetry ?? false);
             if (info?.reason === "authorization") {
               // The install epoch may have rotated; re-read the binding.
-              void refreshParticipantApps().catch(() => undefined);
+              void (onAuthorizationExpired ?? refreshParticipantApps)().catch(() => undefined);
             }
           }
         },

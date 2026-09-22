@@ -1,0 +1,8 @@
+@import "@sumi/ui/globals.css";
+@source "../src/terminal";
+@source "./";
+html, body, #root { height: 100%; margin: 0; }
+#root { display: flex; flex-direction: column; }
+.local-navigation { padding: 8px 12px; border-bottom: 1px solid var(--border); font: 14px system-ui; }
+.local-content { flex: 1; min-height: 0; }
+.local-status { padding: 24px; font: 15px/1.6 system-ui; }
