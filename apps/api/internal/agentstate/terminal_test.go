@@ -554,3 +554,67 @@ func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
 		t.Fatalf("post-abort fence ran=%v err=%v", ran, err)
 	}
 }
+
+// Placement lifetime (see the package note at the top of terminal.go):
+// a forward seal ends admission but does not kill a session that
+// already exists — the person's shell is a resource of this install,
+// and the forward move carries no files a live writer could corrupt.
+// Under a sealed persona, creating and claiming are refused while the
+// existing human-driven claim still renews and still accepts human
+// input; the session and its ledgers stay readable as local history.
+func TestTerminalSessionSurvivesPersonaSeal(t *testing.T) {
+	s, pool := newStore(t)
+	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	sess := mustTerminalSession(t, s, pa, "kept")
+	claimed := mustClaimTerminal(t, s, pa, "keep-runner", time.Minute)
+
+	if _, err := s.SubmitTerminalInput(ctx, pa, sess.SessionID, "human", "stdin",
+		map[string]any{"data": "echo hi\n"}); err != nil {
+		t.Fatalf("pre-seal input: %v", err)
+	}
+
+	// Stand in for the committed forward seal.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+
+	// Admission is fenced: no new session, no new claim.
+	if _, err := s.CreateTerminalSession(ctx, pa, "new", "human", "test"); err == nil {
+		t.Fatal("create on a sealed persona must be refused")
+	}
+	got, _, err := s.ClaimTerminalSessions(ctx, pa, "other-runner", "cloud", time.Minute, 1)
+	if err != nil {
+		t.Fatalf("claim on sealed persona: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("sealed persona claimed %d sessions, want 0", len(got))
+	}
+
+	// The existing claim still renews — heartbeat checks claim
+	// identity, not authority.
+	renewed, err := s.HeartbeatTerminalSession(ctx, pa, sess.SessionID,
+		claimed.ClaimedBy, claimed.Epoch, time.Minute)
+	if err != nil || renewed.Status != "claimed" {
+		t.Fatalf("heartbeat on a sealed persona's session: %+v %v", renewed, err)
+	}
+
+	// The person's own input is still accepted and durable; the
+	// session stays 'claimed', not ended by the seal.
+	if _, err := s.SubmitTerminalInput(ctx, pa, sess.SessionID, "human", "stdin",
+		map[string]any{"data": "echo still-here\n"}); err != nil {
+		t.Fatalf("post-seal human input: %v", err)
+	}
+	kept, err := s.GetTerminalSession(ctx, pa, sess.SessionID)
+	if err != nil || kept.Status != "claimed" {
+		t.Fatalf("sealed persona's session: %+v %v", kept, err)
+	}
+	inputs, err := s.ListTerminalInputs(ctx, pa, sess.SessionID, 0, terminalInputListMax)
+	if err != nil || len(inputs) != 2 {
+		t.Fatalf("input ledger after seal: %d rows %v", len(inputs), err)
+	}
+}

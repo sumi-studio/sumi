@@ -375,6 +375,94 @@ func TestReleaseProcessTombstoneRestoresLaunch(t *testing.T) {
 	}
 }
 
+// A failed journal removal must not strand the fence: the durable
+// tombstone file is deleted before the in-memory record is unlinked, so
+// a filesystem error leaves the release retriable and the delayed-start
+// fence still enforced — never a record-less tombstone the next
+// StartProcess could silently overwrite into a launch.
+func TestReleaseProcessTombstoneRetainsFenceOnRemoveFailure(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	directory := t.TempDir() + "/state"
+	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:stuck-fence")
+	look := ProcessLookupRequest{PersonalityAgentID: paid, OperationID: opID}
+
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:stuck-fence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatalf("plant tombstone: %v", err)
+	}
+
+	// Force os.Remove to fail: replace the journal file with a non-empty
+	// directory of the same name (ENOTEMPTY — works under any uid).
+	journal := filepath.Join(directory, "processes", opID+".json")
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(journal, "occupant"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err == nil {
+		t.Fatal("release must fail while the journal file cannot be removed")
+	}
+	// The fence is retained in memory: the op is still reported as a
+	// tombstone, a retried release reaches the same failure (not
+	// not-found), and a delayed start still replays 'cancelled'.
+	op, err := s.ProcessStatus(ctx, look)
+	if err != nil || !op.Tombstone || op.State != ProcessCancelled {
+		t.Fatalf("tombstone record lost on failed release: %+v %v", op, err)
+	}
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err == nil || errors.Is(err, ErrProcessNotFound) {
+		t.Fatalf("retried release must stay retriable, got %v", err)
+	}
+	replayed, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:stuck-fence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || !replayed.Tombstone || replayed.State != ProcessCancelled {
+		t.Fatalf("delayed start must still replay the fence: %+v %v", replayed, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 0 {
+		t.Fatalf("no launch may follow a failed release: %d", b.launches)
+	}
+
+	// Clear the obstacle: the retried release now removes the journal
+	// (os.Remove empties the directory tree only for files — remove the
+	// occupant first, then the directory, then let the release run).
+	if err := os.RemoveAll(journal); err != nil {
+		t.Fatal(err)
+	}
+	released, err := s.ReleaseProcessTombstone(ctx, look)
+	if err != nil {
+		t.Fatalf("release must succeed once the journal removes: %v", err)
+	}
+	if !released.Tombstone || released.State != ProcessCancelled {
+		t.Fatalf("release returns the tombstone it retired: %+v", released)
+	}
+	op, err = s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:stuck-fence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.Tombstone || op.State != ProcessAccepted {
+		t.Fatalf("start after a healed release must journal fresh: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 1 {
+		t.Fatalf("the re-authorized launch must run exactly once: %d", b.launches)
+	}
+}
+
 // A tombstone planted and then released must fence again if a new cut
 // arrives: release is not one-shot unlock, the next TombstoneIfAbsent
 // cancel re-establishes it.

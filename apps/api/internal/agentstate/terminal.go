@@ -27,6 +27,24 @@ package agentstate
 //     instead of resurrecting a session the user already closed.
 //   - A held human control lease refuses agent-originated input at
 //     admission ('control_held') rather than silently dropping it.
+//
+// Placement lifetime: persona authority gates admission, never
+// existing sessions. Creating a session (createTerminalSessionTx),
+// claiming one (ClaimTerminalSessions) and launching its process
+// (WithTerminalLaunchFence) all check the persona is 'active' — a
+// sealed or moved secretary admits nothing new. A seal deliberately
+// does not kill a session that already exists: the forward move
+// carries no files, so the terminal's workspace writes corrupt no
+// copy, and the person's shell is a resource of this install, not of
+// the persona's placement authority. Heartbeat and input verify claim
+// identity, not authority, so a human-driven session keeps running
+// after a forward seal until it is closed or the service stops; the
+// moved secretary itself cannot act on it — terminal.* tool calls
+// ride turns that need the writer lease, which the seal fences. The
+// session/input/output rows stay on this placement as history. The
+// return direction is stricter by necessity — its file freeze and
+// capture must observe no writers, so the return seal quiesces
+// terminal ops before committing (returnsession.quiesceTerminalWriters).
 
 import (
 	"context"
@@ -978,7 +996,11 @@ func (s *Store) SweepExpiredTerminalClaims(ctx context.Context, personaID string
 
 // HeartbeatTerminalSession renews a live claim and returns the
 // session so the runner observes 'ending' / a control hold. A lost
-// claim is ErrTerminalNotClaimed.
+// claim is ErrTerminalNotClaimed. It deliberately does not re-check
+// persona authority: the claim fence is runner ownership, not
+// admission — a sealed persona admits no new session or claim, while
+// an existing human-driven session outlives the seal as a resource of
+// this install (see the placement-lifetime note at the top).
 func (s *Store) HeartbeatTerminalSession(ctx context.Context, personaID, sessionID, runnerID string, epoch int64, lease time.Duration) (TerminalSession, error) {
 	var out TerminalSession
 	err := s.terminalClaimTx(ctx, personaID, sessionID, runnerID, epoch, func(ctx context.Context, tx pgx.Tx, t *TerminalSession) error {

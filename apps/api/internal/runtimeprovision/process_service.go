@@ -549,21 +549,26 @@ func (service *Service) ReleaseProcessTombstone(ctx context.Context, r ProcessLo
 		s.mu.Unlock()
 		return ProcessOperation{}, fmt.Errorf("%w: operation %s is not a never-launched tombstone", ErrConflict, r.OperationID)
 	}
-	delete(s.records, r.OperationID)
-	record.mu.Unlock()
-	// Remove the journal file while the store mutex is still held so a
-	// racing StartProcess for the same id cannot interleave a fresh
-	// journal between the map delete and the file delete.
+	// Remove the journal file first, while the store mutex and the record
+	// lock are both held: a racing StartProcess for the same id cannot
+	// interleave a fresh journal between the file delete and the map
+	// delete. On failure the in-memory fence is retained — the release
+	// stays retriable and a delayed start still replays the tombstone
+	// rather than launching on a fence that outlived its record.
 	err := s.removeLocked(record)
-	s.mu.Unlock()
 	if err != nil {
+		record.mu.Unlock()
+		s.mu.Unlock()
 		return ProcessOperation{}, err
 	}
+	delete(s.records, r.OperationID)
+	record.mu.Unlock()
+	s.mu.Unlock()
 	return op, nil
 }
 
 // removeLocked deletes a record's journal file and fsyncs the directory.
-// The caller holds s.mu; the record is already unlinked from s.records.
+// The caller holds s.mu and the record's mutex.
 func (s *processStore) removeLocked(r *processRecord) error {
 	name := filepath.Join(s.directory, r.Operation.OperationID+".json")
 	if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {

@@ -50,7 +50,7 @@ var (
 const answerTimeout = 2 * time.Minute
 
 const (
-	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried."
+	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried. Open terminal sessions keep running on this install and their history stays here."
 	msgAborted     = "The move was cancelled. The secretary is active on Local again."
 )
 
