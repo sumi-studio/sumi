@@ -411,13 +411,13 @@ func (d *Driver) operationRequest(t agentstate.TerminalSession) runtimeprovision
 //
 // Tombstone leg: the seal's quiescence gate plants a durable cancel
 // fence for session ops that never journaled. If this start replays
-// that tombstone while the fence holds authority='active', the move was
-// cancelled and the fence is stale — release it and start for real,
+// that tombstone while the persona is active and this exact session claim
+// still admits launch, release the stale fence and start for real,
 // inside the same lock window, so a re-seal can never slip between the
 // authority check and the launch.
-func (d *Driver) startFenced(ctx context.Context, session agentstate.TerminalSession) (runtimeprovision.ProcessOperation, error) {
+func (d *Driver) startFenced(ctx context.Context, session agentstate.TerminalSession, claimID string) (runtimeprovision.ProcessOperation, error) {
 	var op runtimeprovision.ProcessOperation
-	err := d.store.WithTerminalLaunchFence(ctx, session.PersonaID, func(c context.Context) error {
+	err := d.store.WithTerminalLaunchFence(ctx, session.PersonaID, session.SessionID, claimID, session.Epoch, func(c context.Context) error {
 		var serr error
 		op, serr = d.proc.StartProcess(c, d.operationRequest(session))
 		if serr != nil {
@@ -502,7 +502,7 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 	} else {
 		c, cancel := call()
 		var err error
-		op, err = d.startFenced(c, session)
+		op, err = d.startFenced(c, session, claimID)
 		cancel()
 		if err != nil {
 			// Busy is a definite capacity answer; everything else is

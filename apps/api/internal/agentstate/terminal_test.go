@@ -432,10 +432,12 @@ func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
+	mustTerminalSession(t, s, pa, "fenced")
+	claimed := mustClaimTerminal(t, s, pa, "fence-runner", time.Minute)
 
 	// Active persona: the fence runs the launch body.
 	ran := false
-	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+	if err := s.WithTerminalLaunchFence(ctx, pa, claimed.SessionID, claimed.ClaimedBy, claimed.Epoch, func(context.Context) error {
 		ran = true
 		return nil
 	}); err != nil || !ran {
@@ -443,7 +445,7 @@ func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
 	}
 	// fn errors propagate and the lock releases.
 	want := errors.New("boom")
-	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error { return want }); !errors.Is(err, want) {
+	if err := s.WithTerminalLaunchFence(ctx, pa, claimed.SessionID, claimed.ClaimedBy, claimed.Epoch, func(context.Context) error { return want }); !errors.Is(err, want) {
 		t.Fatalf("fn error = %v", err)
 	}
 
@@ -465,7 +467,7 @@ func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
 	done := make(chan result, 1)
 	go func() {
 		ran := false
-		err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+		err := s.WithTerminalLaunchFence(ctx, pa, claimed.SessionID, claimed.ClaimedBy, claimed.Epoch, func(context.Context) error {
 			ran = true
 			return nil
 		})
@@ -506,7 +508,7 @@ func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
 		t.Fatal(err)
 	}
 	ran = false
-	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+	if err := s.WithTerminalLaunchFence(ctx, pa, claimed.SessionID, claimed.ClaimedBy, claimed.Epoch, func(context.Context) error {
 		ran = true
 		return nil
 	}); err != nil || !ran {

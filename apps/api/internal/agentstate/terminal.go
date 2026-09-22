@@ -225,7 +225,7 @@ func (s *Store) CreateTerminalSession(ctx context.Context, personaID, name, requ
 // is cutting this secretary off Cloud. The session row is untouched:
 // its claim simply lapses and stays reclaimable, so a cancelled move
 // leaves the queued session launchable again.
-var ErrTerminalLaunchFenced = errors.New("persona authority does not admit terminal launches")
+var ErrTerminalLaunchFenced = errors.New("persona or terminal session does not admit this launch")
 
 // WithTerminalLaunchFence runs fn — the provisioner StartProcess call —
 // while holding FOR SHARE on the persona row. That is the ordering the
@@ -235,8 +235,9 @@ var ErrTerminalLaunchFenced = errors.New("persona authority does not admit termi
 // gate's scan sees and quiesces it) or observes the committed non-active
 // authority and is refused before the launch ever reaches the runtime.
 // A bare authority read without the lock would race the seal commit;
-// this does not.
-func (s *Store) WithTerminalLaunchFence(ctx context.Context, personaID string, fn func(ctx context.Context) error) error {
+// this does not. The live session claim is also locked and rechecked, so
+// a committed close or successor claim cannot be undone by tombstone retry.
+func (s *Store) WithTerminalLaunchFence(ctx context.Context, personaID, sessionID, runnerID string, epoch int64, fn func(ctx context.Context) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -253,6 +254,18 @@ func (s *Store) WithTerminalLaunchFence(ctx context.Context, personaID string, f
 		return dataErr(err)
 	}
 	if authority != "active" {
+		return ErrTerminalLaunchFenced
+	}
+	// Keep the current claim locked through the entire launch/retry window.
+	// A persona can remain active after its terminal was closed or another
+	// runner took over; the old captured session is not launch authority.
+	// The persona -> session order matches claiming and return sealing.
+	t, err := lockTerminalSessionTx(ctx, tx, personaID, sessionID)
+	if err != nil {
+		return err
+	}
+	if (t.Status != "claimed" && t.Status != "active") || t.ClaimedBy != runnerID || t.Epoch != epoch ||
+		t.ClaimExpiresAt == nil || !t.ClaimExpiresAt.After(time.Now()) {
 		return ErrTerminalLaunchFenced
 	}
 	if err := fn(ctx); err != nil {
