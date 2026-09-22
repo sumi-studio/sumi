@@ -173,3 +173,26 @@ child-frame interaction, full accessibility tree or browser product chrome was
 added. See the [runtime limits](../apps/desktop/README.md) for the DOM operation
 scope. The API/host bridge is implemented; external hosted-network deployment
 has not been exercised in this acceptance.
+
+### Cancel a browser job
+
+Use the existing `job.cancel({job_id})` tool. Cancellation records what can still
+be stopped; it never undoes a website operation.
+
+| Point reached | Recorded result | Meaning |
+| --- | --- | --- |
+| Cancel wins before host dequeue | `cancelled`, `claimed_by:null`, `started_at:null`, `result:null` | No host received this command. It cannot subsequently be dequeued. |
+| Host already consumed the command | `cancel_requested`; result may still be null | Dispatch was admitted. The short browser operation may already be running or may still run; no hard abort is promised. |
+| Host reports completion after cancellation | Actual `done`/`failed`, with `cancel_requested_at` retained | Inspect `result.dispatched`, `result.outcome` and the returned value/code. Successful completion is not rewritten as if cancellation undid it. |
+| Claimed command loses its result and expires | `lost`, preserving cancellation timestamp and claim identity | Its effect is indeterminate. A missing `dispatched` field is **not** `false`; never blindly repeat it. |
+
+A cancelled queued command does not block later work on the tab. An admitted
+cancel-requested command retains the tab's execution slot until its receipt or
+30-second claim expiry, so cancellation does not allow another operation to race
+an in-flight click. Expiry never requeues that click. If its late receipt then
+conflicts with the terminal record (HTTP409), the host discards that receipt and
+continues polling for distinct later commands. HTTP403 still stops polling
+because the attachment is no longer authorized. A lost response to an already
+committed completion only causes replay of the identical receipt, with one
+terminal notification. Late conflicting evidence is currently not attached to
+the `lost` record through this browser endpoint; its conservative verdict remains.

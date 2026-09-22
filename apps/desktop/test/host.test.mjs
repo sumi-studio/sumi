@@ -139,3 +139,49 @@ test("revoked host stops polling and insecure remote endpoints are rejected", as
     /HTTPS/,
   );
 });
+
+test("a cancelled job's expired-claim conflict does not revoke the tab or block later jobs", async (t) => {
+  let polls = 0;
+  let completions = 0;
+  let actions = 0;
+  const receipts = [];
+  const bridge = await fixture(
+    t,
+    async (req, res) => {
+      if (req.url.endsWith("/poll")) {
+        const command = job();
+        command.job_id =
+          ++polls === 1 ? "cancelled-after-dispatch" : "later-unrelated-job";
+        res.end(JSON.stringify({ job: command }));
+      } else {
+        receipts.push(await body(req));
+        completions++;
+        if (completions === 1) {
+          // The command was cancelled after dispatch; completion transmission
+          // failed, and the claim expired to lost before the retry arrived.
+          req.socket.destroy();
+        } else if (completions === 2) {
+          res.writeHead(409);
+          res.end('{"error":"result_conflict"}');
+        } else res.end("{}");
+      }
+    },
+    {
+      act: async () => {
+        actions++;
+        return { status: "dispatched" };
+      },
+    },
+  );
+  await assert.rejects(() => bridge.tick());
+  await assert.rejects(() => bridge.tick());
+  assert.deepEqual(
+    receipts[0],
+    receipts[1],
+    "retry only the old result, not its action",
+  );
+  await bridge.tick();
+  assert.equal(polls, 2, "a command conflict is not attachment revocation");
+  assert.equal(actions, 2, "one old action and one distinct later action");
+  assert.equal(receipts[2].job_id, "later-unrelated-job");
+});

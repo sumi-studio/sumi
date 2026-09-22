@@ -140,7 +140,10 @@ export class BrowserHostAgent {
     } catch (error) {
       if (error instanceof HostHTTPError && [403, 409].includes(error.status)) {
         this.pending = undefined;
-        this.stopped = true;
+        // A terminal/expired job's receipt can conflict without revoking this
+        // tab's grant. Drop only that receipt; never retry its browser action.
+        // Authentication failure, unlike a per-job conflict, stops the host.
+        if (error.status === 403) this.stopped = true;
       }
       throw error;
     }
