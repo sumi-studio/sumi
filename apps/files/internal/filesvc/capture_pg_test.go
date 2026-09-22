@@ -40,8 +40,8 @@ type capFixture struct {
 	objroot string
 	metaDSN string
 	scope   string
-	owner   string // return lineage owner asserted on every capture op
-	epoch   int64  // return lineage epoch
+	owner   string            // return lineage owner asserted on every capture op
+	epoch   int64             // return lineage epoch
 	oracle  map[string][]byte // rel path -> expected bytes at capture time
 	links   map[string]string // rel path -> symlink target
 	dirs    map[string]bool
@@ -60,8 +60,8 @@ func capEnv(t *testing.T) *capFixture {
 	}
 	return &capFixture{
 		t: t, mount: mount, objroot: obj, metaDSN: meta,
-		scope:  "caps" + randHex(4),
-		owner:  "sessA", epoch: 7,
+		scope: "caps" + randHex(4),
+		owner: "sessA", epoch: 7,
 		oracle: map[string][]byte{}, links: map[string]string{}, dirs: map[string]bool{},
 	}
 }

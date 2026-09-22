@@ -57,8 +57,8 @@ func minioEnv(t *testing.T) *minioFixture {
 	return &minioFixture{
 		capFixture: &capFixture{
 			t: t, mount: mount, metaDSN: meta,
-			scope:  "caps" + randHex(4),
-			owner:  "sessA", epoch: 7,
+			scope: "caps" + randHex(4),
+			owner: "sessA", epoch: 7,
 			oracle: map[string][]byte{}, links: map[string]string{}, dirs: map[string]bool{},
 		},
 		s3: cfg,

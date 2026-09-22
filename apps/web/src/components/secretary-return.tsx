@@ -309,7 +309,7 @@ export function SecretaryReturn({
                         件引き継がれます。新しいローカルではあなたへの結び付きがないため、ここで決めるまでローカル側は起動できません（移行を進めるか、決めてからやり直してください）。
                       </li>
                     ) : null}
-                    {session.preflight.pending_file_effects > 0 ? (
+                    {(session.preflight.pending_file_effects ?? 0) > 0 ? (
                       <li>
                         処理中のファイル操作が{session.preflight.pending_file_effects}
                         件あります。完了が確認できるまで移行は封印されません。
