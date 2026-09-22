@@ -346,12 +346,46 @@ func scrub(v any, secrets []string) any {
 	switch x := v.(type) {
 	case string:
 		x = strings.ReplaceAll(x, "\x00", "�")
+		// Match the original string, including overlapping occurrences. Replacing
+		// one value first can destroy another match and expose its remaining bytes.
+		var ends []int
 		for _, secret := range secrets {
-			if secret != "" {
-				x = strings.ReplaceAll(x, secret, "[redacted]")
+			if secret == "" {
+				continue
+			}
+			for offset := 0; offset < len(x); {
+				i := strings.Index(x[offset:], secret)
+				if i < 0 {
+					break
+				}
+				start := offset + i
+				if ends == nil {
+					ends = make([]int, len(x))
+				}
+				ends[start] = max(ends[start], start+len(secret))
+				offset = start + 1
 			}
 		}
-		return x
+		if ends == nil {
+			return x
+		}
+		var out strings.Builder
+		for i := 0; i < len(x); {
+			end := ends[i]
+			if end == 0 {
+				out.WriteByte(x[i])
+				i++
+				continue
+			}
+			// Extend through every match that overlaps this span. Never inspect
+			// replacement text, even when a private value is part of the marker.
+			for j := i + 1; j < end; j++ {
+				end = max(end, ends[j])
+			}
+			out.WriteString("[redacted]")
+			i = end
+		}
+		return out.String()
 	case map[string]any:
 		o := map[string]any{}
 		for k, v := range x {
