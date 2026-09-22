@@ -212,13 +212,17 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 	// in-place truncation (logrotate copytruncate, filesystems without
 	// stable inode semantics) can shrink the file AND regrow it past
 	// the committed offset before the next poll, so size < pos.Off is
-	// not guaranteed observable. Keep a window of raw journal bytes —
-	// the first bytes of this stream era and the bytes immediately
-	// preceding pos.Off — and re-verify the tail window before every
-	// resume. Bytes below pos.Off are already delivered; only the
-	// resume boundary has to be proven unchanged.
+	// not guaranteed observable — and an equal-size rewrite never moves
+	// avail at all. The witness therefore tracks three things: the
+	// first bytes of this stream era (head), the raw journal bytes
+	// immediately preceding pos.Off (tail), and the file's ModTime —
+	// any content write bumps it, so a modification with no growth is
+	// itself evidence of a rewrite. These witnesses bound what a poll
+	// can establish: they prove the observed windows unchanged, not
+	// every byte. A rewrite that preserves the witnessed windows within
+	// one mtime tick is outside what offset polling can certify.
 	cont := journalContinuity{}
-	cont.seed(f, pos.Off)
+	cont.seed(f, st, pos.Off)
 	io_.attached.Store(true)
 	stable := 0
 	for {
@@ -227,22 +231,29 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 			return false
 		}
 		avail := st.Size() - pos.Off
-		if st.Size() < pos.Off || (avail > 0 && !cont.verify(f, pos.Off)) {
-			// The file shrank below the committed offset, or the bytes
-			// at the resume boundary changed — this inode no longer
-			// continues the committed stream. Mark the loss, then pick
-			// the honest resume point: if the journal's head is intact
-			// the prefix is genuine but the divergence point is
-			// unknowable, so resume at end-of-file (the gap covers the
-			// uncertain window; nothing is duplicated or invented). If
-			// the head changed the file is a new era — replay it whole.
+		// Adopt the observed ModTime before judging: a detected
+		// discontinuity re-arms against the file's current state, so
+		// the same rewrite cannot re-trigger the marker every poll.
+		modified := !st.ModTime().Equal(cont.stamp)
+		cont.stamp = st.ModTime()
+		if st.Size() < pos.Off ||
+			(modified && pos.Off > 0 && (avail <= 0 || !cont.verify(f, pos.Off))) {
+			// The file shrank below the committed offset, the bytes at
+			// the resume boundary changed, or it was rewritten without
+			// growth — this inode no longer continues the committed
+			// stream. Mark the loss, then pick the honest resume point:
+			// if the journal's head is intact the prefix is genuine but
+			// the divergence point is unknowable, so resume at
+			// end-of-file (the gap covers the uncertain window; nothing
+			// is duplicated or invented). If the head changed the file
+			// is a new era — replay it whole.
 			_ = io_.tty.recordGap("container output journal truncated or rewritten in place; bytes in the window are lost")
 			if cont.headIntact(f, st.Size()) {
 				pos.Off = st.Size()
 				cont.seedTail(f, pos.Off)
 			} else {
 				pos.Off = 0
-				cont = journalContinuity{}
+				cont.head, cont.tail = nil, nil
 			}
 			continue
 		}
@@ -309,15 +320,17 @@ const journalContinuityBytes = 64
 // reproduces the window byte-for-byte is undetectable by any
 // offset-based scheme.
 type journalContinuity struct {
-	head []byte
-	tail []byte
+	head  []byte
+	tail  []byte
+	stamp time.Time // last observed ModTime — any content write moves it
 }
 
 // seed captures the witnesses for a certified resume offset (open or
 // post-recovery). At off == 0 nothing has been consumed — the windows
 // populate on first reads.
-func (c *journalContinuity) seed(f *os.File, off int64) {
+func (c *journalContinuity) seed(f *os.File, st os.FileInfo, off int64) {
 	c.head, c.tail = nil, nil
+	c.stamp = st.ModTime()
 	if off <= 0 {
 		return
 	}

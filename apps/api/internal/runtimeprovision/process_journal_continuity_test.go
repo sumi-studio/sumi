@@ -109,8 +109,8 @@ func TestJournalInPlaceTruncateRegrowMarksGap(t *testing.T) {
 	if !drained {
 		t.Fatal("terminal drain returned false after in-place truncation")
 	}
-	if ttyGaps(t, io_) == 0 {
-		t.Fatalf("in-place truncate+regrow produced no gap marker; tty=%q", readAllTTY(t, io_.tty))
+	if n := ttyGaps(t, io_); n != 1 {
+		t.Fatalf("in-place truncate+regrow produced %d gap markers (want exactly 1); tty=%q", n, readAllTTY(t, io_.tty))
 	}
 	if got := readAllTTY(t, io_.tty); got != honest {
 		t.Fatalf("tty = %q, want %q — silent loss or duplicate replay", got, honest)
@@ -135,8 +135,8 @@ func TestJournalInPlaceTruncateSingleAppend(t *testing.T) {
 	want := "old\r\n" + "only-record-after-truncate\r\n"
 	waitTTYExact(t, io_, want)
 	endPump(t, rec, done)
-	if ttyGaps(t, io_) == 0 {
-		t.Fatalf("single-append truncation produced no gap marker; tty=%q", readAllTTY(t, io_.tty))
+	if n := ttyGaps(t, io_); n != 1 {
+		t.Fatalf("single-append truncation produced %d gap markers (want exactly 1); tty=%q", n, readAllTTY(t, io_.tty))
 	}
 	if got := readAllTTY(t, io_.tty); got != want {
 		t.Fatalf("tty = %q, want %q", got, want)
@@ -162,8 +162,8 @@ func TestJournalInPlaceShrinkTerminalDrainHonest(t *testing.T) {
 	if !drained {
 		t.Fatal("terminal drain returned false on empty post-truncate journal")
 	}
-	if ttyGaps(t, io_) == 0 {
-		t.Fatal("terminal drain certified a truncated journal with no gap marker")
+	if n := ttyGaps(t, io_); n != 1 {
+		t.Fatalf("terminal drain on truncated journal produced %d gap markers (want exactly 1)", n)
 	}
 	if got := readAllTTY(t, io_.tty); got != "old\r\n" {
 		t.Fatalf("tty = %q, want %q", got, "old\r\n")
@@ -214,8 +214,8 @@ func TestJournalInPlaceTruncatePreservedHeadNoDuplicate(t *testing.T) {
 	for time.Now().Before(deadline) && ttyGaps(t, io_) == 0 {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if ttyGaps(t, io_) == 0 {
-		t.Fatal("preserved-head truncation produced no gap marker")
+	if ttyGaps(t, io_) != 1 {
+		t.Fatalf("preserved-head truncation produced %d gap markers, want 1", ttyGaps(t, io_))
 	}
 	endPump(t, rec, done)
 	got := readAllTTY(t, io_.tty)
@@ -269,4 +269,37 @@ func waitForSrcOff(t *testing.T, io_ *interactiveIO, want int64) {
 func journalRecord(t *testing.T, s string) string {
 	t.Helper()
 	return `{"log":` + mustJSON(t, s) + `,"stream":"stdout","time":"2026-09-19T00:00:00Z"}` + "\n"
+}
+
+// Equal-size rewrite while the op is alive, then an ordinary later
+// append: the rewrite is detected (mtime moved, no growth), the new
+// era is replayed whole, and the later append lands after it — one
+// marker, no duplicates, no silent loss.
+func TestJournalEqualSizeRewriteThenAppend(t *testing.T) {
+	dir := t.TempDir()
+	journal := journalFile(t, dir, "old\r\n")
+	_, io_, rec, done := startJournalPump(t, journal, true)
+	waitTTYExact(t, io_, "old\r\n")
+	waitForSrcOff(t, io_, int64(len(journalRecord(t, "old\r\n"))))
+
+	// Same inode, same length, changed content — avail never moves.
+	newRecord := journalRecord(t, "new\r\n")
+	if len(newRecord) != len(journalRecord(t, "old\r\n")) {
+		t.Fatal("fixture sizes differ")
+	}
+	if err := os.WriteFile(journal, []byte(newRecord), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The rewrite alone must already surface the marker and the new
+	// record — before any later append.
+	waitTTYExact(t, io_, "old\r\nnew\r\n")
+
+	appendJournal(t, journal, "after-rewrite\r\n")
+	waitTTYExact(t, io_, "old\r\nnew\r\nafter-rewrite\r\n")
+	if !endPump(t, rec, done) {
+		t.Fatal("drain returned false")
+	}
+	if n := ttyGaps(t, io_); n != 1 {
+		t.Fatalf("equal-size rewrite produced %d gap markers, want exactly 1", n)
+	}
 }
