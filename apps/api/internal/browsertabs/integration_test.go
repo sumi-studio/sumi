@@ -3,6 +3,8 @@ package browsertabs
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -220,6 +224,158 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 	jobs, _, e := f.core.Store().ClaimJobs(ctx, persona, "unrelated-runner", []string{"browser"}, time.Minute, 1, "*")
 	if e != nil || len(jobs) != 0 {
 		t.Fatal(jobs, e)
+	}
+}
+
+// A claimed job swept to lost before its host receipt arrives still records
+// the authenticated host's observation under the standing lost verdict. The
+// receipt is idempotent on replay, refuses a divergent outcome, produces no
+// new notification and no re-dispatch — and the attachment's poll/claim loop
+// survives untouched, including after grant revocation.
+func TestLateLostCompletionAttachesObservedOutcome(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	a, token := f.attach(true)
+	// The host heartbeat must be fresh for a dispatch to be enqueued.
+	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+		t.Fatal(e)
+	}
+	job := f.enqueue(a, "observe")
+	claimed, e := f.store.Claim(ctx, a.ID, token)
+	if e != nil || claimed == nil || claimed.JobID != job {
+		t.Fatal("claim", claimed, e)
+	}
+	// The lease expires and the sweeper records the lost verdict; the host
+	// only learns about it when its late receipt lands. Revoking the grant
+	// in between must not erase the already-admitted host's right to
+	// report the effect it ran.
+	if _, e := f.store.Pool.Exec(ctx, `UPDATE core_jobs SET claim_expires_at=now()-interval '1 second' WHERE job_id=$1`, job); e != nil {
+		t.Fatal(e)
+	}
+	if e := f.store.Sweep(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if e := f.store.Revoke(ctx, owner, a.ID); e != nil {
+		t.Fatal(e)
+	}
+	result := map[string]any{"dispatched": true, "outcome": "returned", "value": map[string]any{"title": "Page", "url": "https://example.test"}}
+	status, body := f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": result, "error": ""})
+	if status != 200 {
+		t.Fatal("late complete", status, string(body))
+	}
+	// The response reports the standing verdict, not a re-execution.
+	if !bytes.Contains(body, []byte(`"status":"lost"`)) {
+		t.Fatalf("complete body = %s, want standing lost verdict", body)
+	}
+	j, e := f.core.Store().GetJob(ctx, persona, job)
+	if e != nil || j.Status != "lost" || j.ClaimedBy == nil || *j.ClaimedBy != "browser:"+a.ID {
+		t.Fatalf("verdict changed: %s %v", j.Status, j.ClaimedBy)
+	}
+	obs, _ := j.Result["observed_outcome"].(map[string]any)
+	if obs["status"] != "done" || !reflect.DeepEqual(obs["result"], result) {
+		t.Fatalf("observed outcome = %v", obs)
+	}
+	// Identical replay is a no-op; a divergent outcome conflicts.
+	status, _ = f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": result, "error": ""})
+	if status != 200 {
+		t.Fatal("identical replay", status)
+	}
+	status, _ = f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": map[string]any{"dispatched": false}, "error": ""})
+	if status != 409 {
+		t.Fatal("divergent replay", status)
+	}
+	// Exactly one terminal notification: the sweep's, not a second one for
+	// the attached observation.
+	var notes int
+	f.store.Pool.QueryRow(ctx, `SELECT count(*) FROM core_inputs WHERE persona_id=$1 AND input_id=$2`, persona, "job:"+job).Scan(&notes)
+	if notes != 1 {
+		t.Fatal("notification count", notes)
+	}
+	// The lost job is never re-dispatched. The attachment is revoked, so a
+	// fresh attachment on the same persona keeps working normally.
+	if replay, e := f.store.Claim(ctx, a.ID, token); e == nil {
+		t.Fatal("revoked host polled", replay)
+	}
+	c, ct := f.attach(true)
+	f.store.Claim(ctx, c.ID, ct)
+	next := f.enqueue(c, "observe")
+	claimed2, e := f.store.Claim(ctx, c.ID, ct)
+	if e != nil || claimed2 == nil || claimed2.JobID != next {
+		t.Fatal("host stopped claiming after lost completion", claimed2, e)
+	}
+}
+
+// A late receipt whose observed result exceeds AttachLostOutcome's durable
+// bound is still recorded — status plus deterministic size and digest — so
+// identical retries replay and divergent evidence still conflicts, instead
+// of the host retrying an unstoreable receipt forever.
+func TestLateLostCompletionOversizedOutcome(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	a, token := f.attach(true)
+	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+		t.Fatal(e)
+	}
+	job := f.enqueue(a, "observe")
+	claimed, e := f.store.Claim(ctx, a.ID, token)
+	if e != nil || claimed == nil || claimed.JobID != job {
+		t.Fatal("claim", claimed, e)
+	}
+	if _, e := f.store.Pool.Exec(ctx, `UPDATE core_jobs SET claim_expires_at=now()-interval '1 second' WHERE job_id=$1`, job); e != nil {
+		t.Fatal(e)
+	}
+	if e := f.store.Sweep(ctx); e != nil {
+		t.Fatal(e)
+	}
+	// ~80 KiB of observed value: over the 64 KiB outcome bound, well inside
+	// the 300 KiB HTTP body limit and the normal 256 KiB receipt bound.
+	result := map[string]any{"dispatched": true, "outcome": "returned", "value": strings.Repeat("x", 80<<10)}
+	status, body := f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": result, "error": ""})
+	if status != 200 || !bytes.Contains(body, []byte(`"status":"lost"`)) {
+		t.Fatal("oversized late complete", status, len(body))
+	}
+	j, e := f.core.Store().GetJob(ctx, persona, job)
+	if e != nil || j.Status != "lost" {
+		t.Fatal("verdict", j.Status, e)
+	}
+	obs, _ := j.Result["observed_outcome"].(map[string]any)
+	if obs["status"] != "done" || obs["result"] != nil {
+		t.Fatalf("oversized result must not be stored verbatim: %v", obs)
+	}
+	// The recorded size and digest are deterministic for this receipt.
+	wantRaw, _ := json.Marshal(map[string]any{"status": "done", "result": result})
+	sum := sha256.Sum256(wantRaw)
+	if obs["result_bytes"] != float64(len(wantRaw)) || obs["result_sha256"] != hex.EncodeToString(sum[:]) || obs["result_unavailable"] == nil {
+		t.Fatalf("digest identity = %v, want bytes=%d sha=%x", obs, len(wantRaw), sum)
+	}
+	// Identical retry replays the stored row; a changed receipt conflicts.
+	status, _ = f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": result, "error": ""})
+	if status != 200 {
+		t.Fatal("identical oversized replay", status)
+	}
+	divergent := map[string]any{"dispatched": true, "outcome": "returned", "value": strings.Repeat("y", 80<<10)}
+	status, _ = f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "done", "result": divergent, "error": ""})
+	if status != 409 {
+		t.Fatal("divergent oversized replay", status)
+	}
+	status, _ = f.api("POST", "/api/browser-host/tabs/"+a.ID+"/complete", token,
+		map[string]any{"job_id": job, "status": "failed", "result": result, "error": "boom"})
+	if status != 409 {
+		t.Fatal("status-divergent oversized replay", status)
+	}
+	var notes int
+	f.store.Pool.QueryRow(ctx, `SELECT count(*) FROM core_inputs WHERE persona_id=$1 AND input_id=$2`, persona, "job:"+job).Scan(&notes)
+	if notes != 1 {
+		t.Fatal("notification count", notes)
+	}
+	if replay, e := f.store.Claim(ctx, a.ID, token); e != nil || replay != nil {
+		t.Fatal("lost job re-dispatched")
 	}
 }
 

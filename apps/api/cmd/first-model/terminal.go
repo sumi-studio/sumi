@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -91,17 +92,30 @@ func (a *localTerminalAuthority) AuthorizeTerminal(ctx context.Context, human, p
 	return nil
 }
 
+// terminalUnavailable answers the human session-mint route when the Local
+// terminal is off for this run — Cloud working store or an untrusted
+// journal — with the specific bounded reason. No cookie is minted, no
+// terminal route is mounted, and no backend is advertised, so neither a
+// person nor the secretary can start a shell this run.
+func terminalUnavailable(fm *fmServer, detail map[string]any) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := fm.scope(w, r); !ok {
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		out := map[string]any{"code": "local_terminal_unavailable", "working_store": os.Getenv("SUMI_LOCAL_WORKING_STORE")}
+		for k, v := range detail {
+			out[k] = v
+		}
+		writeJSON(w, http.StatusServiceUnavailable, out)
+	}
+}
+
 func wireLocalTerminal(core *agentstate.Server, fm *fmServer, mux *http.ServeMux, persona, origin string) (func(), error) {
 	journal := strings.TrimSpace(os.Getenv("SUMI_LOCAL_TERMINAL_ROOT"))
 	workspace := strings.TrimSpace(os.Getenv("SUMI_WORKSPACE_ROOT"))
 	if os.Getenv("SUMI_LOCAL_WORKING_STORE") == "cloud" || (journal == "" && workspace == "") {
-		mux.HandleFunc("POST /fm/{persona}/terminal-session", func(w http.ResponseWriter, r *http.Request) {
-			if _, ok := fm.scope(w, r); !ok {
-				return
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"code": "local_terminal_unavailable", "working_store": os.Getenv("SUMI_LOCAL_WORKING_STORE"), "message": "Local terminal requires this install’s Local workspace; Cloud working storage is not mounted as a Local terminal workspace"})
-		})
+		mux.HandleFunc("POST /fm/{persona}/terminal-session", terminalUnavailable(fm, map[string]any{"message": "Local terminal requires this install’s Local workspace; Cloud working storage is not mounted as a Local terminal workspace"}))
 		return func() {}, nil
 	}
 	if journal == "" || workspace == "" {
@@ -112,7 +126,21 @@ func wireLocalTerminal(core *agentstate.Server, fm *fmServer, mux *http.ServeMux
 	}
 	backend, e := localterminal.New(localterminal.Config{PersonaID: persona, WorkspaceRoot: workspace, JournalRoot: journal})
 	if e != nil {
-		return nil, e
+		if !errors.Is(e, localterminal.ErrJournal) {
+			// Configuration and ownership problems are not a journal
+			// failure — they still refuse the whole service start.
+			return nil, e
+		}
+		// A record that cannot be validated may hide a live shell, so the
+		// terminal stays disabled — but the journal bytes are preserved and
+		// only this capability is offline: state, the Core, saved MCP
+		// connections and file access all still start. Recovery keeps the
+		// operation's identity and uncertain-execution history: restore a
+		// valid record for it, then restart. Nothing may be deleted or
+		// reset into permission to launch a possibly-live shell.
+		log.Printf("Local terminal unavailable this run: %v (journal preserved under %s; restore a valid record retaining each operation's identity and uncertain-execution history, then restart — the terminal stays unavailable until every record validates)", e, journal)
+		mux.HandleFunc("POST /fm/{persona}/terminal-session", terminalUnavailable(fm, map[string]any{"reason": "journal_invalid", "message": "Local terminal journal could not be validated (" + e.Error() + "); its records are preserved. Restore a valid record retaining each operation's identity and uncertain-execution history, then restart to re-enable the terminal."}))
+		return func() {}, nil
 	}
 	driver := termexec.New(core.Store(), backend, nil, termexec.Config{RunnerID: "local-terminal-" + persona, Backend: "local", Shell: "/bin/bash", ShellArgs: []string{"--noprofile", "--norc", "-i"}, Interval: 100 * time.Millisecond, PollInterval: 100 * time.Millisecond, HeartbeatEvery: 20})
 	core.Store().SetDefaultTerminalBackend("local")

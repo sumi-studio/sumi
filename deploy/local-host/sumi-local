@@ -1664,6 +1664,28 @@ cmd_doctor() {
   else
     [[ -x /bin/bash && -c /dev/ptmx ]] && ok "Local shared terminal (Linux PTY, persistent Local workspace)" \
       || bad "Local terminal requires /bin/bash and /dev/ptmx"
+    # A journal record the service cannot validate disables only the
+    # terminal — the rest of the service still starts. Surface that state
+    # here so a refused terminal is diagnosable without reading service logs.
+    local troot="$HOME_DIR/terminals"
+    if [[ -d $troot ]] && compgen -G "$troot/*.json" >/dev/null && command -v node >/dev/null; then
+      node - "$troot" "$SUMI_PERSONA_ID" >/dev/null 2>&1 <<'NODE' \
+        && ok "Local terminal journal validates" \
+        || bad "Local terminal journal invalid — the terminal stays disabled (service still starts, records preserved under $troot); restore a valid record retaining each operation's identity and uncertain-execution history, then restart"
+const fs = require("fs"), path = require("path");
+const [root, persona] = process.argv.slice(2);
+for (const name of fs.readdirSync(root)) {
+  if (!name.endsWith(".json")) continue;
+  const rec = JSON.parse(fs.readFileSync(path.join(root, name), "utf8"));
+  const op = (rec && rec.operation) || {};
+  if (op.personality_agent_id !== persona) throw name + " persona";
+  if (name !== op.operation_id + ".json") throw name + " id";
+  const tail = Buffer.from(rec.tail || "", "base64").length;
+  if (!(op.stdout_base >= 0) || !(op.stdout_bytes >= op.stdout_base) || op.stdout_bytes - op.stdout_base !== tail)
+    throw name + " tail";
+}
+NODE
+    fi
   fi
   check_listen && ok "listen $SUMI_LOCAL_LISTEN" || bad "listen address"
   ((CONFIG_PREFIX_MISMATCH)) \

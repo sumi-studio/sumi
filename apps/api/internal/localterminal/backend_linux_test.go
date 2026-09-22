@@ -3,6 +3,7 @@
 package localterminal
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -166,6 +167,8 @@ func TestJournalOwnerAndCwdRefusal(t *testing.T) {
 	b, cfg := newTestBackend(t, 0)
 	if _, e := New(cfg); e == nil {
 		t.Fatal("second backend acquired journal")
+	} else if errors.Is(e, ErrJournal) {
+		t.Fatal("a live owner is an ownership conflict, not a journal problem")
 	}
 	os.MkdirAll(filepath.Join(cfg.WorkspaceRoot, testPersona), 0700)
 	os.Symlink(t.TempDir(), filepath.Join(cfg.WorkspaceRoot, testPersona, "escape"))
@@ -275,8 +278,72 @@ func TestCorruptRetainedOutputJournalRefusesRecovery(t *testing.T) {
 	if e = os.WriteFile(filepath.Join(cfg.JournalRoot, id+".json"), raw, 0600); e != nil {
 		t.Fatal(e)
 	}
-	if recovered, e := New(cfg); e == nil {
+	recovered, e := New(cfg)
+	if e == nil {
 		recovered.Close()
 		t.Fatal("corrupt tail would produce invalid slices")
 	}
+	// The typed journal verdict lets the wiring degrade only the terminal
+	// capability while preserving every record byte for repair.
+	if !errors.Is(e, ErrJournal) {
+		t.Fatalf("corrupt journal err = %v, want ErrJournal", e)
+	}
+	if raw, e := os.ReadFile(filepath.Join(cfg.JournalRoot, id+".json")); e != nil || string(raw) != string(mustJSON(t, rec)) {
+		t.Fatal("journal record was modified", e)
+	}
+}
+
+// A corrupt record sorts last here on purpose: the loader must validate every
+// record before rewriting any, so the earlier valid nonterminal marker keeps
+// its original bytes when the later record disables the capability.
+func TestCorruptJournalLeavesEarlierRecordsUntouched(t *testing.T) {
+	b, cfg := newTestBackend(t, 0)
+	b.Close()
+	valid := record{Operation: runtimeprovision.ProcessOperation{OperationID: "00-early", PersonalityAgentID: testPersona, State: runtimeprovision.ProcessRunning}}
+	validRaw := mustJSON(t, valid)
+	if e := os.WriteFile(filepath.Join(cfg.JournalRoot, "00-early.json"), validRaw, 0600); e != nil {
+		t.Fatal(e)
+	}
+	corrupt := []byte("{ not a journal record")
+	if e := os.WriteFile(filepath.Join(cfg.JournalRoot, "zz-corrupt.json"), corrupt, 0600); e != nil {
+		t.Fatal(e)
+	}
+	recovered, e := New(cfg)
+	if e == nil {
+		recovered.Close()
+		t.Fatal("corrupt journal admitted")
+	}
+	if !errors.Is(e, ErrJournal) {
+		t.Fatalf("corrupt journal err = %v, want ErrJournal", e)
+	}
+	if raw, e := os.ReadFile(filepath.Join(cfg.JournalRoot, "00-early.json")); e != nil || string(raw) != string(validRaw) {
+		t.Fatal("earlier valid record rewritten before the failure", e)
+	}
+	if raw, e := os.ReadFile(filepath.Join(cfg.JournalRoot, "zz-corrupt.json")); e != nil || !bytes.Equal(raw, corrupt) {
+		t.Fatal("corrupt record modified", e)
+	}
+	// Once the record is repaired in place — operation identity retained,
+	// never deleted — the normal restart still conservatively marks the
+	// unrecoverable PTY indeterminate instead of launching a replacement.
+	repaired := record{Operation: runtimeprovision.ProcessOperation{OperationID: "zz-corrupt", PersonalityAgentID: testPersona, State: runtimeprovision.ProcessSucceeded}}
+	if e := os.WriteFile(filepath.Join(cfg.JournalRoot, "zz-corrupt.json"), mustJSON(t, repaired), 0600); e != nil {
+		t.Fatal(e)
+	}
+	nb, e := New(cfg)
+	if e != nil {
+		t.Fatalf("repaired journal refused: %v", e)
+	}
+	defer nb.Close()
+	raw, e := os.ReadFile(filepath.Join(cfg.JournalRoot, "00-early.json"))
+	if e != nil || !strings.Contains(string(raw), string(runtimeprovision.ProcessIndeterminate)) {
+		t.Fatal("nonterminal record not marked indeterminate on clean restart")
+	}
+}
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, e := json.Marshal(v)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return raw
 }

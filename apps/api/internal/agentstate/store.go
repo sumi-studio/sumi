@@ -434,6 +434,15 @@ func (s *Store) SetTerminalBackendAvailable(backend string) {
 	s.terminalBackendAvailable[backend] = true
 }
 
+// terminalBackendDefault is the backend stamped onto new terminal sessions
+// — the same fallback createTerminalSessionTx uses for admission.
+func (s *Store) terminalBackendDefault() string {
+	if s.defaultTerminalBackend != "" {
+		return s.defaultTerminalBackend
+	}
+	return "local"
+}
+
 // TerminalFailure carries the resolved input/turn identity and the recorded
 // reason to a registered terminal-failure notice hook.
 type TerminalFailure struct {
@@ -513,14 +522,21 @@ func (s *Store) claimableTool(tool string) bool {
 // built-in internal tools plus each registered delegated effect. The core
 // advertises exactly this set to the model: a tool absent here (e.g.
 // messaging.send on a store with no Messaging integration wired) must not
-// be offered, since its claim could only fail as unknown.
+// be offered, since its claim could only fail as unknown. The terminal
+// tools are likewise withheld while no runner claims the default backend —
+// terminal.open could only fail as ErrTerminalBackend.
 func (s *Store) ClaimableTools() []string {
 	// effects is fixed at wiring time (RegisterEffect is pre-serve only).
 	tools := make([]string, 0, len(toolAuthority)+len(s.effects))
+	terminalServed := s.terminalBackendAvailable[s.terminalBackendDefault()]
 	for name, info := range toolAuthority {
-		if info.internal {
-			tools = append(tools, name)
+		if !info.internal {
+			continue
 		}
+		if strings.HasPrefix(name, "terminal.") && !terminalServed {
+			continue
+		}
+		tools = append(tools, name)
 	}
 	for name := range s.effects {
 		tools = append(tools, name)

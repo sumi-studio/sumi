@@ -3,6 +3,7 @@ package agentstate
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +62,44 @@ func TestTerminalCreateRequiresLiveBackend(t *testing.T) {
 	mustPersona(t, s, other)
 	if _, err := s.GetTerminalSession(ctx, other, "01900000-0000-7000-8000-000000000000"); !errors.Is(err, ErrTerminalNotFound) {
 		t.Fatalf("foreign get err = %v, want ErrTerminalNotFound", err)
+	}
+}
+
+// The advertised tool set follows the backend-availability gate: while no
+// runner claims the default backend every terminal.* call could only fail
+// as ErrTerminalBackend, so the tools are not offered at all.
+func TestTerminalToolsNeedBackend(t *testing.T) {
+	s, _ := newStore(t)
+	terminalTools := func() []string {
+		out := []string{}
+		for _, tool := range s.ClaimableTools() {
+			if strings.HasPrefix(tool, "terminal.") {
+				out = append(out, tool)
+			}
+		}
+		return out
+	}
+	if got := terminalTools(); len(got) != 0 {
+		t.Fatalf("terminal tools advertised with no backend: %v", got)
+	}
+	// A declared default is a name, not availability.
+	s.SetDefaultTerminalBackend("local")
+	if got := terminalTools(); len(got) != 0 {
+		t.Fatalf("terminal tools advertised on unserved default: %v", got)
+	}
+	s.SetTerminalBackendAvailable("local")
+	if got := terminalTools(); len(got) == 0 {
+		t.Fatal("terminal tools withheld on a served backend")
+	}
+	// Other internal tools are unaffected by the terminal gate.
+	seen := map[string]bool{}
+	for _, tool := range s.ClaimableTools() {
+		seen[tool] = true
+	}
+	for _, want := range []string{"schedule.set", "job.start", "terminal.open", "terminal.write"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %v", want, seen)
+		}
 	}
 }
 

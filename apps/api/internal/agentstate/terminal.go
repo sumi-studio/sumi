@@ -158,10 +158,7 @@ func (s *Store) createTerminalSessionTx(ctx context.Context, tx pgx.Tx, personaI
 	if len(name) > terminalMaxName {
 		return TerminalSession{}, fmt.Errorf("%w: terminal name too long", ErrBadRequest)
 	}
-	backend := s.defaultTerminalBackend
-	if backend == "" {
-		backend = "local"
-	}
+	backend := s.terminalBackendDefault()
 	// A session on a backend with no verified runner would queue
 	// forever — refuse honestly at admission, the same gate jobs use.
 	if !s.terminalBackendAvailable[backend] {

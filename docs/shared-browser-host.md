@@ -189,13 +189,15 @@ be stopped; it never undoes a website operation.
 A cancelled queued command does not block later work on the tab. An admitted
 cancel-requested command retains the tab's execution slot until its receipt or
 30-second claim expiry, so cancellation does not allow another operation to race
-an in-flight click. Expiry never requeues that click. If its late receipt then
-conflicts with the terminal record (HTTP409), the host discards that receipt and
-continues polling for distinct later commands. HTTP403 still stops polling
-because the attachment is no longer authorized. A lost response to an already
-committed completion only causes replay of the identical receipt, with one
-terminal notification. Late conflicting evidence is currently not attached to
-the `lost` record through this browser endpoint; its conservative verdict remains.
+an in-flight click. Expiry never requeues that click. When the authenticated host's
+late receipt arrives after the job was already swept `lost`, the API attaches
+what the host actually observed under `result.observed_outcome` — the `lost`
+verdict and its single terminal notification stand, the record is enriched, never
+rewritten. An identical receipt replays the stored row; a divergent one still
+conflicts (HTTP409), and the host discards that receipt and continues polling for
+distinct later commands. HTTP403 still stops polling because the attachment is
+no longer authorized. A lost response to an already committed completion only
+causes replay of the identical receipt, with one terminal notification.
 
 ### Host network authority
 

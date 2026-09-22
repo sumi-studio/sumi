@@ -163,8 +163,8 @@ export function inputMarker(p: InputProvenance): string {
     p.surface === "messaging"
       ? [
           str(p.workspaceId) && ` workspace_id=${clean(str(p.workspaceId))}`,
-          str(p.placeId) && ` place_id=${str(p.placeId)}`,
-          str(p.messageId) && ` message_id=${str(p.messageId)}`,
+          str(p.placeId) && ` place_id=${clean(str(p.placeId))}`,
+          str(p.messageId) && ` message_id=${clean(str(p.messageId))}`,
           Number.isSafeInteger(p.messageRevision)
             ? ` message_revision=${p.messageRevision}`
             : "",

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -350,6 +351,96 @@ func TestLocalTerminalCookieExpiry(t *testing.T) {
 	restarted := &localTerminalAuthority{persona: localPersona, sessions: map[string]terminalSession{}}
 	if _, e = restarted.VerifySession(context.Background(), cookie); e == nil {
 		t.Fatal("cookie survived host restart")
+	}
+}
+
+// A journal record the backend cannot validate disables only the terminal:
+// the wiring still succeeds, the session-mint route refuses with the bounded
+// reason, terminal tools are not advertised, session admission refuses at
+// the store, and every journal byte is preserved for manual repair.
+func TestLocalTerminalJournalFailureDegrades(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx := context.Background()
+	if e := db.Migrate(ctx, pool); e != nil {
+		t.Fatal(e)
+	}
+	core := agentstate.NewServer(pool, "local-terminal-test-admin-secret-32-bytes")
+	if _, _, e := core.Store().EnsurePersona(ctx, localPersona, nil, "Local"); e != nil {
+		t.Fatal(e)
+	}
+	fm := &fmServer{store: core.Store(), secret: []byte("local-terminal-test-admin-secret-32-bytes")}
+	mux := http.NewServeMux()
+	core.RegisterRoutes(mux)
+	mux.HandleFunc("POST /fm/{persona}/inputs", fm.submitMessage)
+	server := httptest.NewUnstartedServer(mux)
+	root := t.TempDir()
+	journal := filepath.Join(root, "terminals")
+	if e := os.MkdirAll(journal, 0700); e != nil {
+		t.Fatal(e)
+	}
+	corrupt := []byte("{ not a journal record")
+	if e := os.WriteFile(filepath.Join(journal, "orphan.json"), corrupt, 0600); e != nil {
+		t.Fatal(e)
+	}
+	t.Setenv("SUMI_WORKSPACE_ROOT", filepath.Join(root, "workspace"))
+	t.Setenv("SUMI_LOCAL_TERMINAL_ROOT", journal)
+	t.Setenv("SUMI_LOCAL_WORKING_STORE", "local")
+	stop, e := wireLocalTerminal(core, fm, mux, localPersona, "http://localhost")
+	if e != nil {
+		t.Fatalf("journal failure must not stop wiring: %v", e)
+	}
+	t.Cleanup(stop)
+	server.Start()
+	t.Cleanup(server.Close)
+	f := &terminalFixture{t: t, server: server, core: core, fm: fm, workspace: filepath.Join(root, "workspace")}
+	resp := f.request("POST", "/fm/"+localPersona+"/terminal-session", nil, fm.fmToken(localPersona))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 503 || !strings.Contains(string(body), "local_terminal_unavailable") || !strings.Contains(string(body), "journal_invalid") {
+		t.Fatalf("terminal-session mint: %d %s", resp.StatusCode, body)
+	}
+	// No terminal cookie was minted.
+	for _, c := range resp.Cookies() {
+		if c.Name == agentevents.BrowserSessionCookie {
+			t.Fatal("degraded terminal minted a session cookie")
+		}
+	}
+	// Ordinary work is unaffected: a human message still lands.
+	resp = f.request("POST", "/fm/"+localPersona+"/inputs", map[string]any{"text": "hello"}, fm.fmToken(localPersona))
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		t.Fatal("input", resp.StatusCode)
+	}
+	// The secretary is not offered tools that could only fail.
+	req, e := http.NewRequest("GET", server.URL+"/internal/core/personas/"+localPersona+"/tools", nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	req.Header.Set("Authorization", "Bearer "+core.PersonaToken(localPersona))
+	toolsResp, e := http.DefaultClient.Do(req)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var toolsBody struct {
+		Tools []string `json:"tools"`
+	}
+	if e := json.NewDecoder(toolsResp.Body).Decode(&toolsBody); e != nil {
+		t.Fatal(e)
+	}
+	toolsResp.Body.Close()
+	for _, tool := range toolsBody.Tools {
+		if strings.HasPrefix(tool, "terminal.") {
+			t.Fatalf("terminal tool %s advertised on a failed backend", tool)
+		}
+	}
+	// Session admission refuses honestly at the store boundary too.
+	if _, e := core.Store().CreateTerminalSession(ctx, localPersona, "sh", "human", "test"); !errors.Is(e, agentstate.ErrTerminalBackend) {
+		t.Fatalf("session admission: %v", e)
+	}
+	// The malformed record is preserved byte-for-byte — nothing quarantined,
+	// deleted, or rewritten, and no replacement shell was launched.
+	if got, e := os.ReadFile(filepath.Join(journal, "orphan.json")); e != nil || !bytes.Equal(got, corrupt) {
+		t.Fatal("journal record modified", e)
 	}
 }
 

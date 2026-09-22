@@ -338,6 +338,26 @@ scrollback remains; output not collected before the host died may be lost.
 Backend scrollback retains a bounded 256 KiB tail with explicit skipped-output
 boundaries. Journals remain until the install data is purged.
 
+If any record in the journal cannot be validated at startup — malformed JSON,
+a record written for a different persona, a filename that does not match its
+recorded operation, or an inconsistent retained-output bound — the record may
+hide a live shell, so the whole Local terminal capability stays disabled for
+that run rather than risk a duplicate. The refusal is terminal-only: the
+state service, Core, saved MCP connections, and file access all start
+normally, and the secretary is not offered `terminal.*` tools. Validation of
+every record completes before any retained marker is rewritten, so all
+journal bytes — including the rejected record — are preserved untouched;
+nothing is deleted, quarantined, or reset, and no uncertain operation gains
+permission to relaunch. `terminal-session` bootstrap returns HTTP 503 with
+`local_terminal_unavailable` and `reason: journal_invalid`. `doctor` reports
+the invalid journal the same way: terminal disabled, service still starts,
+records preserved. Recovery is a repair that retains history: restore a
+valid record for the same operation identity under `<home>/terminals` — for
+example from a backup of the install state home — keeping its
+uncertain-execution record, then restart; the restored operation is reported
+indeterminate, never relaunched. If a record's history cannot be
+re-established, the terminal stays unavailable.
+
 The Local launcher provides `SUMI_WORKSPACE_ROOT` and
 `SUMI_LOCAL_TERMINAL_ROOT` to the state service when Local filesvc is the
 working store. For a Cloud-to-Local return that deliberately keeps Cloud

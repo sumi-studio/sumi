@@ -137,9 +137,20 @@ func TestBrowserCancellationBeforeAndAfterDispatch(t *testing.T) {
 			t.Fatal("unknown execution was falsely reported never dispatched")
 		}
 		f.assertOneNotification(id)
-		if s := f.hostCompletion(a.ID, token, id, map[string]any{"dispatched": true, "outcome": "returned"}); s != 409 {
-			t.Fatalf("late result must preserve lost verdict: %d", s)
+		// The late receipt attaches its observed outcome under the standing
+		// lost verdict: the verdict and its single notification stand, the
+		// report is durable evidence, and the command never requeues.
+		if s := f.hostCompletion(a.ID, token, id, map[string]any{"dispatched": true, "outcome": "returned"}); s != 200 {
+			t.Fatalf("late result must attach under lost verdict: %d", s)
 		}
+		j, e = f.core.Store().GetJob(ctx, persona, id)
+		if e != nil || j.Status != "lost" {
+			t.Fatal("verdict moved", j.Status, e)
+		}
+		if obs, _ := j.Result["observed_outcome"].(map[string]any); obs["status"] != "done" {
+			t.Fatal("observed outcome missing", j.Result)
+		}
+		f.assertOneNotification(id)
 		later := f.enqueue(a, "observe")
 		f.claimExpected(a, token, later)
 		f.hostCompletion(a.ID, token, later, map[string]any{"dispatched": true, "outcome": "returned"})

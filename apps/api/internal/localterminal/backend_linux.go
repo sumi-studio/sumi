@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,8 +83,13 @@ func New(cfg Config) (ProcessBackend, error) {
 	entries, e := os.ReadDir(cfg.JournalRoot)
 	if e != nil {
 		b.Close()
-		return nil, e
+		return nil, fmt.Errorf("%w: %v", ErrJournal, e)
 	}
+	// Validate every record before rewriting any: when a later record is
+	// untrusted, startup must leave ALL bytes unchanged — an earlier
+	// valid nonterminal marker rewritten to indeterminate before the failure
+	// would lose the very history the degraded run exists to preserve.
+	loaded := make([]*running, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -91,14 +97,16 @@ func New(cfg Config) (ProcessBackend, error) {
 		raw, e := os.ReadFile(filepath.Join(cfg.JournalRoot, entry.Name()))
 		if e != nil {
 			b.Close()
-			return nil, e
+			return nil, fmt.Errorf("%w: %v", ErrJournal, e)
 		}
 		var rec record
 		if e = json.Unmarshal(raw, &rec); e != nil || rec.Operation.PersonalityAgentID != cfg.PersonaID || entry.Name() != rec.Operation.OperationID+".json" || rec.Operation.StdoutBase < 0 || rec.Operation.StdoutBytes < rec.Operation.StdoutBase || rec.Operation.StdoutBytes-rec.Operation.StdoutBase != int64(len(rec.Tail)) {
 			b.Close()
-			return nil, errors.New("invalid Local terminal journal; refusing to relaunch")
+			return nil, fmt.Errorf("%w: invalid record %s; refusing to relaunch", ErrJournal, entry.Name())
 		}
-		r := &running{record: rec}
+		loaded = append(loaded, &running{record: rec})
+	}
+	for _, r := range loaded {
 		if !r.Operation.State.Terminal() {
 			r.Operation.State = runtimeprovision.ProcessIndeterminate
 			r.Operation.Error = "Local host restarted; PTY cannot be reattached; uncollected output may be lost and surviving descendants are not proven stopped"
@@ -107,7 +115,7 @@ func New(cfg Config) (ProcessBackend, error) {
 			r.Gap = true
 			if e = b.save(r); e != nil {
 				b.Close()
-				return nil, e
+				return nil, fmt.Errorf("%w: %v", ErrJournal, e)
 			}
 		}
 		b.operations[r.Operation.OperationID] = r

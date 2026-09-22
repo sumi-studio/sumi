@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -274,10 +275,54 @@ func (s *Store) Complete(ctx context.Context, id, token, jobID, status string, r
 		return agentstate.Job{}, ErrInvalid
 	}
 	raw, e := json.Marshal(result)
-	if e != nil || len(raw) > 256<<10 {
+	if e != nil {
 		return agentstate.Job{}, ErrInvalid
 	}
-	return s.Core.CompleteJob(ctx, a.PersonaID, jobID, "browser:"+id, status, result, problem)
+	if j.Status == "lost" {
+		return s.attachLostOutcome(ctx, a.PersonaID, jobID, "browser:"+id, status, result, problem)
+	}
+	if len(raw) > 256<<10 {
+		return agentstate.Job{}, ErrInvalid
+	}
+	j, e = s.Core.CompleteJob(ctx, a.PersonaID, jobID, "browser:"+id, status, result, problem)
+	if errors.Is(e, agentstate.ErrJobConflict) {
+		// The claim expired to 'lost' between the read and the completion
+		// transaction. The swept verdict still stands, but the host's
+		// actually-observed outcome is durable evidence under it.
+		if fresh, ferr := s.Core.GetJob(ctx, a.PersonaID, jobID); ferr == nil && fresh.Status == "lost" {
+			return s.attachLostOutcome(ctx, a.PersonaID, jobID, "browser:"+id, status, result, problem)
+		}
+	}
+	return j, e
+}
+
+// attachLostOutcome preserves the host's observed outcome on a job the
+// claim-expiry sweep already marked lost: the 'lost' verdict and its
+// already-sent notification stand, the report lands under
+// result.observed_outcome, an identical receipt replays the stored row and
+// a divergent one conflicts. Nothing re-executes and nothing notifies again.
+func (s *Store) attachLostOutcome(ctx context.Context, personaID, jobID, runner, status string, result map[string]any, problem string) (agentstate.Job, error) {
+	switch status {
+	case "done", "failed", "cancelled":
+	default:
+		return agentstate.Job{}, fmt.Errorf("%w: complete status must be done, failed, or cancelled", agentstate.ErrBadRequest)
+	}
+	outcome := map[string]any{"status": status, "result": result}
+	if problem != "" {
+		outcome["error"] = problem
+	}
+	if raw, e := json.Marshal(outcome); e != nil || len(raw) > 64<<10 {
+		// The report exceeds AttachLostOutcome's durable bound. Record that
+		// it arrived — status, size and content digest — so an identical
+		// receipt still replays and a divergent one still conflicts, rather
+		// than leaving the host retrying an unstoreable receipt forever.
+		sum := sha256.Sum256(raw)
+		outcome = map[string]any{"status": status, "result_unavailable": "observed result exceeds the durable bound; size and digest identify the host's report", "result_bytes": len(raw), "result_sha256": hex.EncodeToString(sum[:])}
+		if problem != "" {
+			outcome["error"] = problem
+		}
+	}
+	return s.Core.AttachLostOutcome(ctx, personaID, jobID, runner, outcome)
 }
 
 // Sweep makes vanished hosts and expired claims visible even without new user
