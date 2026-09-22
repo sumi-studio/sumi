@@ -34,6 +34,12 @@ func (h *Handler) serveProcess(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		result, err = h.service.CancelProcess(r.Context(), input)
+	case "/v1/process/release-tombstone":
+		var input ProcessLookupRequest
+		if !decodeRequest(w, r, &input) {
+			return true
+		}
+		result, err = h.service.ReleaseProcessTombstone(r.Context(), input)
 	case "/v1/process/input":
 		var input ProcessInputRequest
 		if !decodeRequest(w, r, &input) {
@@ -118,6 +124,13 @@ func (c *Client) CancelProcess(ctx context.Context, r ProcessLookupRequest) (o P
 		return
 	}
 	e = c.call(ctx, "/v1/process/cancel", r, &o)
+	return
+}
+func (c *Client) ReleaseProcessTombstone(ctx context.Context, r ProcessLookupRequest) (o ProcessOperation, e error) {
+	if e = r.Validate(); e != nil {
+		return
+	}
+	e = c.call(ctx, "/v1/process/release-tombstone", r, &o)
 	return
 }
 func (c *Client) WriteProcessInput(ctx context.Context, r ProcessInputRequest) (o ProcessInputReceipt, e error) {

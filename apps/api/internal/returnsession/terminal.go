@@ -30,16 +30,23 @@ import (
 // journal + daemon work — so waiting on quiescence inside the
 // transaction cannot deadlock the writers it is waiting on.
 //
-// Semantics per session:
-//   - op absent or already Quiesced          → no writer; safe.
+// Semantics per session — the ROW is classified before any runtime
+// call, because an admitted runSession can be anywhere between its
+// committed claim and its StartProcess RPC (scope ensure, scheduling,
+// a runner restart): 'operation absent' is never evidence that a
+// delayed start cannot arrive.
 //   - claimed/active under a live claim      → deliberate interactive
-//     work: the bind is refused and the sessions are named. The person
-//     closes them (or cancels the return); nothing is killed to make
-//     the cut pass.
-//   - anything else with an unquiesced op    → an abandoned or
-//     already-closing writer: CancelProcess{TombstoneIfAbsent} asks the
-//     runtime to stop+remove+fence it, then the gate polls until
-//     Quiesced or the deadline — never a certified live writer.
+//     work: the bind is refused and the sessions are named, before any
+//     provisioner call is made. The person closes them (or cancels the
+//     return); nothing is killed to make the cut pass.
+//   - anything else                          → CancelProcess with
+//     TombstoneIfAbsent: a live op is stopped+removed; an absent op is
+//     durably fenced so a delayed start replays the cancellation and
+//     never registers. Then the gate polls until Quiesced or the
+//     deadline — never a certified live writer. Never-launched
+//     tombstones stay recoverable: after a cancelled move the driver's
+//     launch fence releases them (see termexec startFenced), so a
+//     reclaim starts the session normally.
 
 // TerminalProcesses is the narrow provisioner surface the gate needs.
 // *runtimeprovision.Client satisfies it; tests substitute a fake.
@@ -112,25 +119,12 @@ func (s *Service) quiesceTerminalWriters(ctx context.Context, tx pgx.Tx, persona
 			ErrTerminalQuiescePending, len(sessions))
 	}
 
-	// First pass is read-only: classify every session by the op's
-	// physical evidence. A refusal must leave nothing cancelled — the
+	// First pass is read-only AND runtime-free: a live claim is
+	// deliberate work whether or not its operation has reached the
+	// provisioner yet. A refusal must leave nothing cancelled — the
 	// person may still choose to abort the move instead.
 	var blockers, pending []terminalSessionRow
 	for _, t := range sessions {
-		opID := terminalOpID(personaID, t.id)
-		op, perr := s.termProcs.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
-			PersonalityAgentID: personaID, OperationID: opID})
-		switch {
-		case errors.Is(perr, runtimeprovision.ErrProcessNotFound):
-			// Never launched — no writer. A queued/interrupted session
-			// stays un-launched through the seal because the claim
-			// fence re-checks authority under this persona lock.
-			continue
-		case perr != nil:
-			return fmt.Errorf("%w: terminal op status unreachable: %v", ErrTerminalQuiescePending, perr)
-		case op.Quiesced:
-			continue
-		}
 		if (t.status == "claimed" || t.status == "active") && t.liveClaim {
 			blockers = append(blockers, t)
 			continue

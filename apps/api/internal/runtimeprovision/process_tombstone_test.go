@@ -295,3 +295,125 @@ func TestProcessStartCancelledDuringJournalWait(t *testing.T) {
 		t.Fatalf("expired waiter must leave no record: %v", err)
 	}
 }
+
+// The recoverable half of the cancel fence: a caller that has
+// re-authorized the launch (the termexec driver inside the persona
+// launch fence, after a cancelled return) releases the tombstone and
+// the same deterministic operation id launches normally. Only a
+// never-launched tombstone is releasable — live ops, finished ops and
+// ops that attempted a launch keep their history.
+func TestReleaseProcessTombstoneRestoresLaunch(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	directory := t.TempDir() + "/state"
+	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:released")
+
+	// Absent: nothing to release.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); !errors.Is(err, ErrProcessNotFound) {
+		t.Fatalf("release of absent op = %v, want not-found", err)
+	}
+
+	// Plant the fence exactly as the return gate does.
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:released", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatalf("plant tombstone: %v", err)
+	}
+	if _, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:released",
+		Executable: "/bin/sh",
+	}); err != nil {
+		t.Fatalf("fenced replay: %v", err)
+	}
+
+	// Release under re-authorization: the fence is gone, a real start
+	// journals and launches.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); err != nil {
+		t.Fatalf("release tombstone: %v", err)
+	}
+	op, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:released",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.Tombstone || op.State != ProcessAccepted {
+		t.Fatalf("start after release: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 1 {
+		t.Fatalf("released operation must launch: %d", b.launches)
+	}
+
+	// A live record is never releasable.
+	if _, err := s.ReleaseProcessTombstone(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("release of live op = %v, want conflict", err)
+	}
+
+	// The release is durable: a restarted service has no record and a
+	// replayed start would journal fresh — but the live op already
+	// exists, so the restart sees the real record instead.
+	s2, err := NewService(b, ServiceConfig{StateDirectory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := s2.ProcessStatus(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+	})
+	if err != nil || after.Tombstone {
+		t.Fatalf("restarted service lost the launched op: %+v %v", after, err)
+	}
+}
+
+// A tombstone planted and then released must fence again if a new cut
+// arrives: release is not one-shot unlock, the next TombstoneIfAbsent
+// cancel re-establishes it.
+func TestReleaseProcessTombstoneRefences(t *testing.T) {
+	ctx := context.Background()
+	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	s, err := NewService(b, ServiceConfig{StateDirectory: t.TempDir() + "/state"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid := uuid.NewString()
+	opID := ProcessOperationID(paid, "term:refence")
+	look := ProcessLookupRequest{PersonalityAgentID: paid, OperationID: opID}
+
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:refence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReleaseProcessTombstone(ctx, look); err != nil {
+		t.Fatal(err)
+	}
+	// Re-fence (a second seal): late starts replay cancelled again.
+	if _, err := s.CancelProcess(ctx, ProcessLookupRequest{
+		PersonalityAgentID: paid, OperationID: opID,
+		OriginatingToolCallID: "term:refence", TombstoneIfAbsent: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	op, err := s.StartProcess(ctx, ProcessStartRequest{
+		PersonalityAgentID: paid, OriginatingToolCallID: "term:refence",
+		Executable: "/bin/sh",
+	})
+	if err != nil || op.State != ProcessCancelled || !op.Tombstone {
+		t.Fatalf("re-fenced start: %+v %v", op, err)
+	}
+	s.observeProcesses(ctx)
+	if b.launches != 0 {
+		t.Fatalf("re-fenced op launched: %d", b.launches)
+	}
+}

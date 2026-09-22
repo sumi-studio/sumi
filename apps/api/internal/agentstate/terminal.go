@@ -220,6 +220,47 @@ func (s *Store) CreateTerminalSession(ctx context.Context, personaID, name, requ
 	return t, nil
 }
 
+// ErrTerminalLaunchFenced refuses a terminal process launch while the
+// persona does not hold 'active' authority — the return seal has cut or
+// is cutting this secretary off Cloud. The session row is untouched:
+// its claim simply lapses and stays reclaimable, so a cancelled move
+// leaves the queued session launchable again.
+var ErrTerminalLaunchFenced = errors.New("persona authority does not admit terminal launches")
+
+// WithTerminalLaunchFence runs fn — the provisioner StartProcess call —
+// while holding FOR SHARE on the persona row. That is the ordering the
+// return cut requires: the seal takes the same row FOR NO KEY UPDATE for
+// its whole quiescence gate, so an admitted-but-delayed start either
+// journals its operation before the seal acquires the lock (and the
+// gate's scan sees and quiesces it) or observes the committed non-active
+// authority and is refused before the launch ever reaches the runtime.
+// A bare authority read without the lock would race the seal commit;
+// this does not.
+func (s *Store) WithTerminalLaunchFence(ctx context.Context, personaID string, fn func(ctx context.Context) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var authority string
+	err = tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1::uuidv7 FOR SHARE`,
+		personaID).Scan(&authority)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrPersonaNotFound
+	}
+	if err != nil {
+		return dataErr(err)
+	}
+	if authority != "active" {
+		return ErrTerminalLaunchFenced
+	}
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) GetTerminalSession(ctx context.Context, personaID, sessionID string) (TerminalSession, error) {
 	t, err := scanTerminalSession(s.pool.QueryRow(ctx,
 		`SELECT `+terminalSessionCols+` FROM core_terminal_sessions

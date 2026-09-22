@@ -511,6 +511,72 @@ func (service *Service) CancelProcess(ctx context.Context, r ProcessLookupReques
 	*record = next
 	return record.status(), nil
 }
+
+// ReleaseProcessTombstone lifts a cancel fence that was planted before
+// the operation ever journaled a launch. The tombstone exists to make a
+// delayed StartProcess replay 'cancelled'; it is released only by a
+// caller that has independently re-authorized the launch (the termexec
+// driver does so inside the persona's launch fence, where the persona
+// authority is proven 'active' under the row lock — i.e. the move that
+// planted the fence was cancelled). A record that is absent, was never
+// fenced, or actually attempted a launch is never deleted: releasing
+// anything else would rewrite real operation history.
+func (service *Service) ReleaseProcessTombstone(ctx context.Context, r ProcessLookupRequest) (ProcessOperation, error) {
+	if err := r.Validate(); err != nil {
+		return ProcessOperation{}, err
+	}
+	s := service.processes
+	if s == nil {
+		return ProcessOperation{}, ErrProcessNotFound
+	}
+	s.mu.Lock()
+	record := s.records[r.OperationID]
+	if record != nil {
+		record.mu.Lock()
+	}
+	if record == nil {
+		s.mu.Unlock()
+		return ProcessOperation{}, ErrProcessNotFound
+	}
+	op := record.status()
+	if op.PersonalityAgentID != r.PersonalityAgentID {
+		record.mu.Unlock()
+		s.mu.Unlock()
+		return ProcessOperation{}, ErrProcessNotFound
+	}
+	if !op.Tombstone || !op.State.terminal() || record.LaunchAttempted {
+		record.mu.Unlock()
+		s.mu.Unlock()
+		return ProcessOperation{}, fmt.Errorf("%w: operation %s is not a never-launched tombstone", ErrConflict, r.OperationID)
+	}
+	delete(s.records, r.OperationID)
+	record.mu.Unlock()
+	// Remove the journal file while the store mutex is still held so a
+	// racing StartProcess for the same id cannot interleave a fresh
+	// journal between the map delete and the file delete.
+	err := s.removeLocked(record)
+	s.mu.Unlock()
+	if err != nil {
+		return ProcessOperation{}, err
+	}
+	return op, nil
+}
+
+// removeLocked deletes a record's journal file and fsyncs the directory.
+// The caller holds s.mu; the record is already unlinked from s.records.
+func (s *processStore) removeLocked(r *processRecord) error {
+	name := filepath.Join(s.directory, r.Operation.OperationID+".json")
+	if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	d, err := os.Open(s.directory)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (service *Service) PendingProcessCompletions(ctx context.Context) ([]ProcessOperation, error) {
 	result := []ProcessOperation{}
 	s := service.processes

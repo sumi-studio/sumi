@@ -28,6 +28,7 @@ type fakeProcs struct {
 	mu           sync.Mutex
 	ops          map[string]*runtimeprovision.ProcessOperation
 	cancels      []string
+	cancelReqs   []runtimeprovision.ProcessLookupRequest
 	neverQuiesce bool
 	statusErr    error
 }
@@ -66,6 +67,7 @@ func (f *fakeProcs) CancelProcess(_ context.Context, req runtimeprovision.Proces
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancels = append(f.cancels, req.OperationID)
+	f.cancelReqs = append(f.cancelReqs, req)
 	op, ok := f.ops[req.OperationID]
 	if !ok {
 		if !req.TombstoneIfAbsent {
@@ -73,6 +75,7 @@ func (f *fakeProcs) CancelProcess(_ context.Context, req runtimeprovision.Proces
 		}
 		op = &runtimeprovision.ProcessOperation{OperationID: req.OperationID, PersonalityAgentID: req.PersonalityAgentID}
 		f.ops[req.OperationID] = op
+		op.Tombstone = true
 	}
 	op.State = "cancelled"
 	if !f.neverQuiesce {
@@ -154,6 +157,107 @@ func TestReturnSealRefusesLiveTerminalSession(t *testing.T) {
 	}
 	if v := asView(t, raw); v.Status != returnsession.StatusSealed {
 		t.Fatalf("status = %s", v.Status)
+	}
+}
+
+// RWC-01: a session CLAIMED before the seal whose admitted runSession
+// has not yet reached the provisioner (no operation journaled — scope
+// ensure, scheduling, restart delay) must still refuse the cut. 'Absent'
+// is not evidence the admitted start cannot arrive; the live claim is
+// classified before any runtime call, so the refusal makes zero
+// provisioner calls in both file modes.
+func TestReturnSealFencesClaimedSessionBeforeProcessJournals(t *testing.T) {
+	for _, mode := range []string{"local", "cloud"} {
+		t.Run(mode, func(t *testing.T) {
+			h := setup(t, returnsession.Config{})
+			h.sessions.SetFileStore(&fakeFiles{})
+			procs := newFakeProcs()
+			h.sessions.SetTerminalProcesses(procs)
+
+			term := newID(t)
+			termRow(t, h, term, "claimed") // live claim, no op record
+
+			sid, _, grant := h.createMode(mode)
+			code, raw := h.grantReq(http.MethodPost,
+				fmt.Sprintf("/api/secretary-return/sessions/%s/destination", sid),
+				grant, jsonBody(destMode(t, h.local, h.persona, "absent", mode)))
+			if code != http.StatusConflict {
+				t.Fatalf("seal accepted an admitted-but-unlaunched terminal: %d %s", code, raw)
+			}
+			var body struct {
+				Code string `json:"code"`
+			}
+			unmarshal(t, raw, &body)
+			if body.Code != "terminal_sessions_open" {
+				t.Fatalf("code = %q: %s", body.Code, raw)
+			}
+			if procs.cancelCount() != 0 {
+				t.Fatalf("a refused seal must not cancel anything: %v", procs.cancels)
+			}
+			if a := authority(t, h.cloud, h.persona); a != "active" {
+				t.Fatalf("authority after refused seal = %s", a)
+			}
+		})
+	}
+}
+
+// The complementary leg: a NON-live row (interrupted/lost/expired claim)
+// whose operation never journaled is not deliberate work — the seal
+// proceeds, but plants a durable cancel tombstone so an admitted start
+// still in flight replays 'cancelled' instead of registering late.
+func TestReturnSealTombstonesUnlaunchedLimboOperation(t *testing.T) {
+	h := setup(t, returnsession.Config{})
+	h.sessions.SetFileStore(&fakeFiles{})
+	procs := newFakeProcs()
+	h.sessions.SetTerminalProcesses(procs)
+
+	term := newID(t)
+	termRow(t, h, term, "interrupted") // no live claim, no op record
+
+	sid, _, grant := h.createMode("local")
+	code, raw := bindDest(t, h, sid, grant)
+	if code != http.StatusOK {
+		t.Fatalf("seal with unlaunched limbo session: %d %s", code, raw)
+	}
+	if a := authority(t, h.cloud, h.persona); a != "sealed" {
+		t.Fatalf("authority = %s", a)
+	}
+	procs.mu.Lock()
+	defer procs.mu.Unlock()
+	if len(procs.cancelReqs) != 1 || !procs.cancelReqs[0].TombstoneIfAbsent {
+		t.Fatalf("absent op was not fenced: %+v", procs.cancelReqs)
+	}
+	op := procs.ops[termOp(h.persona, term)]
+	if op == nil || !op.Tombstone || !op.Quiesced {
+		t.Fatalf("no tombstone fence planted: %+v", op)
+	}
+}
+
+// An expired claim is not deliberate work either: the admitted runner
+// may still be mid-start, so the row is quiesced (tombstone fence), not
+// treated as a blocker that could stall the move forever.
+func TestReturnSealQuiescesExpiredClaim(t *testing.T) {
+	h := setup(t, returnsession.Config{})
+	h.sessions.SetFileStore(&fakeFiles{})
+	procs := newFakeProcs()
+	h.sessions.SetTerminalProcesses(procs)
+
+	term := newID(t)
+	runner := "runner#gone"
+	mustExec(t, h.cloud.pool, `INSERT INTO core_terminal_sessions
+		(session_id, persona_id, mode, backend, status, requested_by, created_by, claimed_by, claim_expires_at)
+		VALUES ($1,$2,'pty','cloud','claimed','human','test',$3, now() - interval '1 second')`,
+		term, h.persona, runner)
+
+	sid, _, grant := h.createMode("local")
+	code, raw := bindDest(t, h, sid, grant)
+	if code != http.StatusOK {
+		t.Fatalf("seal with expired-claim session: %d %s", code, raw)
+	}
+	procs.mu.Lock()
+	defer procs.mu.Unlock()
+	if len(procs.cancelReqs) != 1 || !procs.cancelReqs[0].TombstoneIfAbsent {
+		t.Fatalf("expired-claim absent op not fenced: %+v", procs.cancelReqs)
 	}
 }
 

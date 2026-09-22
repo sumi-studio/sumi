@@ -33,6 +33,7 @@ type ProcessAPI interface {
 	ProcessStatus(context.Context, runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error)
 	ReadProcessOutput(context.Context, runtimeprovision.ProcessOutputRequest) (runtimeprovision.ProcessOutput, error)
 	CancelProcess(context.Context, runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error)
+	ReleaseProcessTombstone(context.Context, runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error)
 	WriteProcessInput(context.Context, runtimeprovision.ProcessInputRequest) (runtimeprovision.ProcessInputReceipt, error)
 	ResizeProcess(context.Context, runtimeprovision.ProcessResizeRequest) (runtimeprovision.ProcessOperation, error)
 	SignalProcess(context.Context, runtimeprovision.ProcessSignalRequest) (runtimeprovision.ProcessInputReceipt, error)
@@ -400,6 +401,42 @@ func (d *Driver) operationRequest(t agentstate.TerminalSession) runtimeprovision
 	}
 }
 
+// startFenced launches the session's operation under the persona launch
+// fence: the store holds FOR SHARE on core_personas for the whole
+// provisioner call, serializing the start against a return seal's
+// FOR NO KEY UPDATE. A start admitted before the seal but delayed past
+// it (scope ensure, scheduling, restart) observes the committed
+// non-active authority and never reaches the provisioner — an absent
+// operation at seal time is then a durable fact, not a race.
+//
+// Tombstone leg: the seal's quiescence gate plants a durable cancel
+// fence for session ops that never journaled. If this start replays
+// that tombstone while the fence holds authority='active', the move was
+// cancelled and the fence is stale — release it and start for real,
+// inside the same lock window, so a re-seal can never slip between the
+// authority check and the launch.
+func (d *Driver) startFenced(ctx context.Context, session agentstate.TerminalSession) (runtimeprovision.ProcessOperation, error) {
+	var op runtimeprovision.ProcessOperation
+	err := d.store.WithTerminalLaunchFence(ctx, session.PersonaID, func(c context.Context) error {
+		var serr error
+		op, serr = d.proc.StartProcess(c, d.operationRequest(session))
+		if serr != nil {
+			return serr
+		}
+		if !op.Tombstone {
+			return nil
+		}
+		if _, rerr := d.proc.ReleaseProcessTombstone(c, runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: session.PersonaID, OperationID: op.OperationID,
+		}); rerr != nil {
+			return rerr
+		}
+		op, serr = d.proc.StartProcess(c, d.operationRequest(session))
+		return serr
+	})
+	return op, err
+}
+
 // runSession drives one claimed session: launch/attach the provisioner
 // op, then pump inputs → container and output → scrollback until the
 // session ends, the claim is lost, or the driver is told to stop.
@@ -465,12 +502,16 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 	} else {
 		c, cancel := call()
 		var err error
-		op, err = d.proc.StartProcess(c, d.operationRequest(session))
+		op, err = d.startFenced(c, session)
 		cancel()
 		if err != nil {
 			// Busy is a definite capacity answer; everything else is
 			// indeterminate — either way the claim lapses and the
 			// session becomes reclaimable rather than failed-by-us.
+			// ErrTerminalLaunchFenced is also a lapse, not a verdict:
+			// the persona was sealed/cut before this start could
+			// journal, and a cancelled move must find the session
+			// claimable again.
 			d.cfg.Logf("termexec: session %s launch: %v", sessionID, err)
 			return
 		}

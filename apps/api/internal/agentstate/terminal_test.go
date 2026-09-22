@@ -420,3 +420,96 @@ func TestTerminalOutputAppendDedupAndGap(t *testing.T) {
 		t.Fatalf("lost report = %+v err=%v", lost, err)
 	}
 }
+
+// The launch fence serializes a delayed terminal StartProcess against
+// the return seal's persona lock: an admitted start that arrives while
+// the seal holds FOR NO KEY UPDATE waits, then observes the committed
+// non-active authority and is fenced — it never reaches the runtime.
+func TestTerminalLaunchFenceBlocksBehindSeal(t *testing.T) {
+	s, pool := newStore(t)
+	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+
+	// Active persona: the fence runs the launch body.
+	ran := false
+	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+		ran = true
+		return nil
+	}); err != nil || !ran {
+		t.Fatalf("active fence ran=%v err=%v", ran, err)
+	}
+	// fn errors propagate and the lock releases.
+	want := errors.New("boom")
+	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("fn error = %v", err)
+	}
+
+	// Stand in for the seal transaction: persona row FOR NO KEY UPDATE.
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockTx.Rollback(ctx)
+	if _, err := lockTx.Exec(ctx,
+		`SELECT 1 FROM core_personas WHERE persona_id = $1 FOR NO KEY UPDATE`, pa); err != nil {
+		t.Fatalf("persona lock: %v", err)
+	}
+
+	type result struct {
+		ran bool
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ran := false
+		err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+			ran = true
+			return nil
+		})
+		done <- result{ran, err}
+	}()
+
+	// The fence must wait on the lock, not read past it.
+	select {
+	case r := <-done:
+		t.Fatalf("launch fence completed while the seal lock was held: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if _, err := lockTx.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("seal update: %v", err)
+	}
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("seal commit: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, ErrTerminalLaunchFenced) {
+			t.Fatalf("fence behind committed seal = %v, want ErrTerminalLaunchFenced", r.err)
+		}
+		if r.ran {
+			t.Fatal("launch body ran on a sealed persona")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("launch fence never unblocked after the seal committed")
+	}
+
+	// A cancelled move restores 'active' and the fence passes again —
+	// queued sessions stay launchable.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	ran = false
+	if err := s.WithTerminalLaunchFence(ctx, pa, func(context.Context) error {
+		ran = true
+		return nil
+	}); err != nil || !ran {
+		t.Fatalf("post-abort fence ran=%v err=%v", ran, err)
+	}
+}

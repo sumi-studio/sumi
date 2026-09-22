@@ -19,14 +19,19 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -129,6 +134,21 @@ func (f *fakeProc) CancelProcess(_ context.Context, r runtimeprovision.ProcessLo
 	}
 	f.ops[r.OperationID] = tomb
 	return *tomb, nil
+}
+
+func (f *fakeProc) ReleaseProcessTombstone(_ context.Context, r runtimeprovision.ProcessLookupRequest) (runtimeprovision.ProcessOperation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o, ok := f.op(r)
+	if !ok {
+		return runtimeprovision.ProcessOperation{}, runtimeprovision.ErrProcessNotFound
+	}
+	if !o.Tombstone {
+		return runtimeprovision.ProcessOperation{}, runtimeprovision.ErrConflict
+	}
+	op := *o
+	delete(f.ops, r.OperationID)
+	return op, nil
 }
 
 func (f *fakeProc) WriteProcessInput(_ context.Context, r runtimeprovision.ProcessInputRequest) (runtimeprovision.ProcessInputReceipt, error) {
@@ -1106,4 +1126,272 @@ func TestDriverLossMarkerEmitsOnceNotEveryTick(t *testing.T) {
 	if emitted < 2 {
 		t.Fatalf("emittedGaps = %d, want the new boundary recorded", emitted)
 	}
+}
+
+// ------------------------------------------------------------------
+// Joined delayed-start fence: real agentstate store + real
+// runtimeprovision service + real unix transport. This is the exact
+// RWC-01 schedule root reproduced with a fake proc API — here the
+// provisioner is real, so "nothing journaled" is physical evidence.
+
+// fenceBackend is a real ProcessBackend that counts launches without
+// Docker: the provisioner journal is the boundary this repair fences.
+type fenceBackend struct {
+	mu       sync.Mutex
+	launches int
+	obs      runtimeprovision.ProcessObservation
+}
+
+func (b *fenceBackend) Prepare(_ context.Context, r runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error) {
+	return runtimeprovision.PreparedEpoch{PersonalityAgentID: r.PersonalityAgentID, Generation: 1, RPCBootNonce: "t", OpaquePreparedHandle: "h"}, nil
+}
+func (b *fenceBackend) Activate(context.Context, runtimeprovision.ActivateRequest) error { return nil }
+func (b *fenceBackend) Abort(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
+	return runtimeprovision.Inspection{}, nil
+}
+func (b *fenceBackend) Inspect(context.Context, string) (runtimeprovision.Inspection, error) {
+	return runtimeprovision.Inspection{}, nil
+}
+func (b *fenceBackend) Stop(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
+	return runtimeprovision.Inspection{}, nil
+}
+func (b *fenceBackend) Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
+	return runtimeprovision.Inspection{}, nil
+}
+func (b *fenceBackend) LaunchProcess(context.Context, runtimeprovision.ProcessOperation) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.launches++
+	b.obs = runtimeprovision.ProcessObservation{Exists: true, Running: true, StartedAt: time.Now().UTC()}
+	return nil
+}
+func (b *fenceBackend) InspectProcess(context.Context, runtimeprovision.ProcessOperation) (runtimeprovision.ProcessObservation, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.obs, nil
+}
+func (b *fenceBackend) StopProcess(context.Context, runtimeprovision.ProcessOperation) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.obs.Running = false
+	b.obs.ExitCode = 137
+	return nil
+}
+func (b *fenceBackend) launchCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.launches
+}
+
+// gateScope parks runSession inside EnsureScope: the terminal row is
+// 'claimed' but StartProcess has not reached the provisioner — exactly
+// the admitted-but-delayed start the seal must fence.
+type gateScope struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gateScope) EnsureScope(context.Context, string) error {
+	select {
+	case g.entered <- struct{}{}:
+	default:
+	}
+	<-g.release
+	return nil
+}
+
+// newJoinedTerminalStack wires the real store, a real
+// runtimeprovision.Service over a real unix socket, and a counting
+// ProcessBackend. The files-scope check binary is a stub that echoes
+// the canonical scope path — workspace resolution is not the boundary
+// under test (the journey proves the real FUSE mount separately); the
+// journal/fence ordering is.
+func newJoinedTerminalStack(t *testing.T, personaID string) (*agentstate.Store, *pgxpool.Pool, *fenceBackend, *runtimeprovision.Client, context.CancelFunc) {
+	t.Helper()
+	pool := testdb.Create(t)
+	if err := db.Migrate(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	s := agentstate.NewStore(pool)
+	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
+
+	scopeName, err := fileaccess.ScopeForPersona(personaID)
+	if err != nil {
+		t.Fatalf("scope name: %v", err)
+	}
+	mnt := t.TempDir() + "/mnt"
+	scopeDir := filepath.Join(mnt, scopeName)
+	if err := os.MkdirAll(scopeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	checkBin := t.TempDir() + "/sumi-files-check"
+	if err := os.WriteFile(checkBin, []byte(
+		"#!/bin/sh\nfor last; do :; done\necho \""+mnt+"/$last\"\n",
+	), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &fenceBackend{}
+	svc, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{
+		StateDirectory: t.TempDir() + "/prov",
+		Files: runtimeprovision.FilesEnvironment{
+			Mountpoint: mnt, VolumeUUID: "vol-test", CheckPath: checkBin,
+		},
+	})
+	if err != nil {
+		t.Fatalf("provisioner service: %v", err)
+	}
+	sock := t.TempDir() + "/prov.sock"
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	handler, err := runtimeprovision.NewHandler(svc)
+	if err != nil {
+		t.Fatalf("provisioner handler: %v", err)
+	}
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close(); ln.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go svc.RunProcessObserver(ctx)
+	client, err := runtimeprovision.NewUnixClient(sock)
+	if err != nil {
+		cancel()
+		t.Fatalf("provisioner client: %v", err)
+	}
+	return s, pool, backend, client, cancel
+}
+
+// RWC-01 schedule, joined: claim commits, runSession is parked before
+// StartProcess, the return seals, then the delayed start fires. The
+// launch fence must block the provisioner call entirely — nothing may
+// be journaled for the sealed persona. When the move is cancelled
+// (authority back to 'active'), the still-claimed session must start
+// normally on the next reclaim.
+func TestDriverDelayedStartFencedBySealAndRecovers(t *testing.T) {
+	ctx := context.Background()
+	pa := pid(t)
+	s, pool, backend, client, stopObs := newJoinedTerminalStack(t, pa)
+	defer stopObs()
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "late", "human", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	opID := runtimeprovision.ProcessOperationID(pa, "term:"+sess.SessionID)
+
+	var logs sync.Map
+	scope := &gateScope{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	d := New(s, client, scope, testConfig(&logs, "d:"))
+	dctx, dcancel := context.WithCancel(context.Background())
+	ddone := make(chan struct{})
+	go func() { d.Run(dctx); close(ddone) }()
+	defer func() { dcancel(); <-ddone }()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		t.Logf("final session status: %s", sessionStatus(t, s, pa, sess.SessionID))
+		var lines []string
+		logs.Range(func(_, v any) bool { lines = append(lines, v.(string)); return true })
+		sort.Strings(lines)
+		for _, l := range lines {
+			t.Log(l)
+		}
+	})
+
+	waitFor(t, 15*time.Second, "session claimed", func() bool {
+		return sessionStatus(t, s, pa, sess.SessionID) == "claimed"
+	})
+	<-scope.entered // runSession is between claim-commit and StartProcess
+
+	// The return seal commits while the admitted start is parked.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	close(scope.release)
+
+	// The fenced start must never journal on the provisioner: the op
+	// stays absent (not even a tombstone — the fence refused before the
+	// runtime boundary) and no launch is attempted.
+	waitFor(t, 10*time.Second, "op absent on provisioner", func() bool {
+		_, err := client.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: pa, OperationID: opID,
+		})
+		return errors.Is(err, runtimeprovision.ErrProcessNotFound)
+	})
+	// Settle past an observer tick to be sure no launch hides behind timing.
+	time.Sleep(1500 * time.Millisecond)
+	if n := backend.launchCount(); n != 0 {
+		t.Fatalf("fenced persona launched a process: %d", n)
+	}
+
+	// Cancelled move: authority back to 'active'. The claimed row
+	// lapses, the driver reclaims it, the launch fence passes, and the
+	// operation journals + launches normally.
+	if _, err := pool.Exec(ctx,
+		`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 20*time.Second, "op journaled non-tombstone", func() bool {
+		op, err := client.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: pa, OperationID: opID,
+		})
+		return err == nil && !op.Tombstone
+	})
+	waitFor(t, 10*time.Second, "one launch", func() bool { return backend.launchCount() == 1 })
+}
+
+// Recoverability of the gate's tombstone: a return plants
+// TombstoneIfAbsent for a limbo session, then the move is cancelled
+// before commit — the next launch under active authority must release
+// the never-launched tombstone and start, not be fenced forever.
+func TestDriverStartReleasesTombstoneOnActivePersona(t *testing.T) {
+	ctx := context.Background()
+	pa := pid(t)
+	s, _, backend, client, stopObs := newJoinedTerminalStack(t, pa)
+	defer stopObs()
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "fenced", "human", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	opID := runtimeprovision.ProcessOperationID(pa, "term:"+sess.SessionID)
+
+	// Simulate the gate's fence from an aborted return: a durable
+	// never-launched tombstone under the session's deterministic id.
+	if _, err := client.CancelProcess(ctx, runtimeprovision.ProcessLookupRequest{
+		PersonalityAgentID:    pa,
+		OperationID:           opID,
+		OriginatingToolCallID: "term:" + sess.SessionID,
+		TombstoneIfAbsent:     true,
+	}); err != nil {
+		t.Fatalf("plant tombstone: %v", err)
+	}
+
+	var logs sync.Map
+	d := New(s, client, nil, testConfig(&logs, "d:"))
+	dctx, dcancel := context.WithCancel(context.Background())
+	ddone := make(chan struct{})
+	go func() { d.Run(dctx); close(ddone) }()
+	defer func() { dcancel(); <-ddone }()
+
+	waitFor(t, 20*time.Second, "op journaled non-tombstone", func() bool {
+		op, err := client.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: pa, OperationID: opID,
+		})
+		return err == nil && !op.Tombstone
+	})
+	waitFor(t, 10*time.Second, "one launch", func() bool { return backend.launchCount() == 1 })
+	waitFor(t, 10*time.Second, "session active", func() bool {
+		return sessionStatus(t, s, pa, sess.SessionID) == "active"
+	})
 }
