@@ -167,6 +167,11 @@ type Config struct {
 	// outside the list is refused at create. Undecided policy refuses
 	// every new move regardless of the list.
 	FileModes []string
+	// TerminalQuiesceTimeout bounds how long the seal waits for stopped
+	// terminal writers to prove Quiesced; TerminalQuiescePoll is the
+	// re-check cadence. Zero uses the defaults — tests shrink both.
+	TerminalQuiesceTimeout time.Duration
+	TerminalQuiescePoll    time.Duration
 }
 
 // FileStore is the file service's administrative surface the return
@@ -192,6 +197,9 @@ type Service struct {
 	fileModes  []string
 	files      FileStore
 	capture    CaptureStore
+	termProcs  TerminalProcesses
+	termWait   time.Duration
+	termPoll   time.Duration
 	logf       func(string, ...any)
 }
 
@@ -202,8 +210,16 @@ func New(pool *pgxpool.Pool, cfg Config) *Service {
 	if len(cfg.FileModes) == 0 && cfg.FilePolicy != FilePolicyUndecided {
 		cfg.FileModes = []string{string(FileModeLocal), string(FileModeCloud)}
 	}
-	return &Service{pool: pool, portable: portable.NewService(pool), admitTTL: cfg.AdmitTTL,
-		filePolicy: cfg.FilePolicy, fileModes: cfg.FileModes}
+	s := &Service{pool: pool, portable: portable.NewService(pool), admitTTL: cfg.AdmitTTL,
+		filePolicy: cfg.FilePolicy, fileModes: cfg.FileModes,
+		termWait: cfg.TerminalQuiesceTimeout, termPoll: cfg.TerminalQuiescePoll}
+	if s.termWait <= 0 {
+		s.termWait = terminalQuiesceDeadline
+	}
+	if s.termPoll <= 0 {
+		s.termPoll = terminalQuiescePoll
+	}
+	return s
 }
 
 // SetFileStore wires the file service's administrative surface. Without
@@ -334,6 +350,12 @@ type Preflight struct {
 	// workspace under a write still landing. Surfaced here so the person
 	// sees why a seal is waiting rather than guessing.
 	PendingFileEffects int `json:"pending_file_effects"`
+	// PendingTerminalSessions names the persona's terminal sessions that
+	// are not proven closed — a live PTY writes the workspace outside
+	// every declared-effect ledger, so the seal quiesces physical writers
+	// before the cut. Listed so the person can close them (or cancel the
+	// return) instead of the move silently hanging or killing the shell.
+	PendingTerminalSessions []string `json:"pending_terminal_sessions,omitempty"`
 	// Files states the session's file handling plainly, in the selected
 	// mode's own terms. It is descriptive — the mode itself is enforced
 	// by the seal, the copy and the storage credential, not by this text.
@@ -682,6 +704,19 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 		return fmt.Errorf("%w: the session is cancelling", ErrConflict)
 	default:
 		return fmt.Errorf("%w: the session is %s", ErrClosed, status)
+	}
+	// The persona row lock serializes the terminal gate with terminal
+	// admission: session creation takes FOR SHARE on this row and the
+	// claim path re-checks authority under it, so the writer set the
+	// scan below sees is closed — nothing can be created or launched
+	// between this point and the seal's commit.
+	var personaAuthority string
+	if err := tx.QueryRow(ctx, `SELECT authority FROM core_personas
+		WHERE persona_id = $1 FOR NO KEY UPDATE`, personaID).Scan(&personaAuthority); err != nil {
+		return err
+	}
+	if err := s.quiesceTerminalWriters(ctx, tx, personaID); err != nil {
+		return err
 	}
 	// The seal joins this transaction (SealTx): the session row lock is
 	// held on this connection, so the seal must run here too — acquiring
@@ -1567,6 +1602,9 @@ func (s *Service) view(ctx context.Context, sessionID string, grantView bool) (V
 	v.Preflight = &Preflight{ActiveJobs: int(activeJobs), ModelIntentKind: intentKind,
 		PendingApprovals: int(pendingApprovals), PendingFileEffects: int(pendingFileEffects),
 		Files: filesModeText(r.fileModeStr())}
+	if terms, terr := s.openTerminalSessions(ctx, r.personaID); terr == nil && len(terms) > 0 {
+		v.Preflight.PendingTerminalSessions = terms
+	}
 	if s.files != nil && r.fileModeStr() != "" {
 		// Best-effort live size of the source workspace for the chooser:
 		// bounded enumeration, never a gate. An unreachable store leaves

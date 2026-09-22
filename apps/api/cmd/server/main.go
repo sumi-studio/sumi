@@ -879,6 +879,12 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		if termExec != nil {
 			log.Printf("termexec: Cloud interactive terminal sessions run through the runtime provisioner (runner %s, canonical files scope)", termExec.Runner())
+			if secretaryReturn != nil {
+				// The return seal's writer-cut gate consumes the same
+				// provisioner ops the driver claims: a session is only
+				// proven stopped when its op reports Quiesced.
+				secretaryReturn.service.SetTerminalProcesses(termExec.Processes())
+			}
 		}
 	}
 	// Person-facing terminal routes share the core state store — the

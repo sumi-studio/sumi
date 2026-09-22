@@ -370,6 +370,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 		code = http.StatusGone
 	case errors.Is(err, ErrConflict), errors.Is(err, ErrOpenSession),
 		errors.Is(err, ErrDestBound), errors.Is(err, ErrFilePolicyUndecided),
+		errors.Is(err, ErrTerminalSessionsOpen), errors.Is(err, ErrTerminalQuiescePending),
 		errors.Is(err, ErrScopeChanged), errors.Is(err, ErrCaptureReplaced),
 		errors.Is(err, portable.ErrTransferConflict),
 		errors.Is(err, portable.ErrPersonaExists), errors.Is(err, portable.ErrUnresolvedOperations):
@@ -401,6 +402,12 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 	body := map[string]any{"error": msg}
 	if errors.Is(err, ErrCaptureReplaced) {
 		body["code"] = "capture_replaced"
+	}
+	if errors.Is(err, ErrTerminalSessionsOpen) {
+		body["code"] = "terminal_sessions_open"
+	}
+	if errors.Is(err, ErrTerminalQuiescePending) {
+		body["code"] = "terminal_quiesce_pending"
 	}
 	if errors.Is(err, ErrFilePolicyUndecided) {
 		// A machine-readable marker: the web client renders the undecided

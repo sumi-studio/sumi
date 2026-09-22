@@ -19,10 +19,18 @@
 //	JOURNEY_SEED         "humanID:personaID:name" — create human+persona
 //	JOURNEY_MODES        "local,cloud" (default both) — explicit enable
 //	JOURNEY_FAULT        optional fault endpoint enable ("1")
+//	JOURNEY_PROVISIONER_SOCKET  real runtime-provisioner unix socket —
+//	    wires its ProcessAPI into the return seal's writer-quiescence gate
+//	JOURNEY_TERMEXEC     "1" runs the real in-process termexec driver
+//	    (claims + launches sessions through the provisioner)
+//	JOURNEY_TERMINALS    "1" exposes /_journey/terminals* fixture routes
+//	    driving the REAL agentstate admission/input/output store calls
 package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -39,6 +47,8 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession/returnsessiontest"
+	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
+	"github.com/sumi-studio/sumi/apps/api/internal/termexec"
 )
 
 func main() {
@@ -109,6 +119,37 @@ func main() {
 	}
 	svc.SetFileStore(files)
 	svc.SetCaptureStore(files)
+	// Terminal writer-cut wiring: the return seal's quiescence gate
+	// consumes the same provisioner ProcessAPI surface the real terminal
+	// driver claims on — identical to cmd/server's composition. With
+	// JOURNEY_TERMEXEC the driver itself also runs here so sessions are
+	// genuinely claimed, launched and pumped, not simulated.
+	state := agentstate.NewStore(pool)
+	if psock := os.Getenv("JOURNEY_PROVISIONER_SOCKET"); psock != "" {
+		procs, err := runtimeprovision.NewUnixClient(psock)
+		if err != nil {
+			log.Fatalf("cloudjourney: provisioner client: %v", err)
+		}
+		svc.SetTerminalProcesses(procs)
+		log.Printf("cloudjourney: return seal gates on provisioner process quiescence (%s)", psock)
+		if os.Getenv("JOURNEY_TERMEXEC") == "1" {
+			state.SetTerminalBackendAvailable("cloud")
+			state.SetDefaultTerminalBackend("cloud")
+			drv := termexec.New(state, procs, &termexec.FileScopeEnsurer{Client: files}, termexec.Config{
+				RunnerID: "termexec-journey", Backend: "cloud",
+				Lease:              20 * time.Second,
+				Interval:           400 * time.Millisecond,
+				PollInterval:       150 * time.Millisecond,
+				ClaimLimit:         4,
+				MaxLifetimeSeconds: 1800,
+				UnknownWait:        30 * time.Second,
+				CallTimeout:        15 * time.Second,
+				Logf:               log.Printf,
+			})
+			go drv.Run(ctx)
+			log.Printf("cloudjourney: termexec driver running (runner %s)", drv.Runner())
+		}
+	}
 	srv, err := returnsession.NewServer(svc, proof, "http://"+listen)
 	if err != nil {
 		log.Fatalf("cloudjourney: server: %v", err)
@@ -151,6 +192,80 @@ func main() {
 		mux.HandleFunc("POST /_journey/arm-drop-capture", func(w http.ResponseWriter, r *http.Request) {
 			dropCapture.Store(true)
 			w.WriteHeader(http.StatusNoContent)
+		})
+	}
+	if os.Getenv("JOURNEY_TERMINALS") == "1" {
+		// Terminal fixture routes — every call is the REAL agentstate
+		// store path (admission fences, input queueing, output reads);
+		// only the transport is fixture-simple.
+		writeJSON := func(w http.ResponseWriter, code int, v any) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			enc, _ := json.Marshal(v)
+			_, _ = w.Write(enc)
+		}
+		termErr := func(w http.ResponseWriter, err error) {
+			switch {
+			case errors.Is(err, agentstate.ErrPersonaInactive):
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "persona_inactive"})
+			case errors.Is(err, agentstate.ErrTerminalBackend):
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "terminal_backend"})
+			case errors.Is(err, agentstate.ErrTerminalNotFound):
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error(), "code": "not_found"})
+			default:
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			}
+		}
+		mux.HandleFunc("POST /_journey/terminals", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				PersonaID string `json:"persona_id"`
+				Name      string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			t, err := state.CreateTerminalSession(r.Context(), body.PersonaID, body.Name, "human", "journey")
+			if err != nil {
+				termErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, t)
+		})
+		mux.HandleFunc("POST /_journey/terminals/{session}/input", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				PersonaID string `json:"persona_id"`
+				Data      string `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			in, err := state.SubmitTerminalInput(r.Context(), body.PersonaID, r.PathValue("session"), "human", "stdin",
+				map[string]any{"data": body.Data})
+			if err != nil {
+				termErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, in)
+		})
+		mux.HandleFunc("GET /_journey/terminals/{session}", func(w http.ResponseWriter, r *http.Request) {
+			personaID := r.URL.Query().Get("persona_id")
+			out, err := state.ReadTerminalOutput(r.Context(), personaID, r.PathValue("session"), 0, 0, 4096)
+			if err != nil {
+				termErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+		})
+		mux.HandleFunc("POST /_journey/terminals/{session}/close", func(w http.ResponseWriter, r *http.Request) {
+			personaID := r.URL.Query().Get("persona_id")
+			t, err := state.CloseTerminalSession(r.Context(), personaID, r.PathValue("session"), "journey-close")
+			if err != nil {
+				termErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, t)
 		})
 	}
 	logReq := os.Getenv("JOURNEY_LOGREQ") == "1"

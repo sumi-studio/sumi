@@ -148,6 +148,13 @@ func New(store *agentstate.Store, proc ProcessAPI, scope ScopeEnsurer, cfg Confi
 // sessions — stable across restarts so owned sessions are recovered.
 func (d *Driver) Runner() string { return d.cfg.RunnerID }
 
+// Processes exposes the provisioner process surface the driver claims
+// through. The return seal's writer-quiescence gate consumes the same
+// ops — ProcessStatus for Quiesced evidence, CancelProcess for the
+// stop+fence request — under its own pacing, so it shares this client
+// rather than opening a second provisioner connection.
+func (d *Driver) Processes() ProcessAPI { return d.proc }
+
 // OutputAttached reports the runtime's own read-time output health
 // for a session's live op: the journal pump is attached and appending
 // records. attached=false on a live op means emitted bytes are not

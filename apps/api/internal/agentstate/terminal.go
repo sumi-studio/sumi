@@ -655,17 +655,22 @@ func (s *Store) RunnableTerminalPersonas(ctx context.Context, runnerID, backend 
 	// session to make the persona visible. Live foreign leases are
 	// never surfaced: expiry, not ownership, is the reclaim signal.
 	// The backend predicate keeps cross-backend ownership intact.
+	// Sealed/staged/transferred personas are excluded — a return seal
+	// quiesces physical writers and this filter keeps a queued or
+	// interrupted session from being claimed and launched after the
+	// cut (the claim itself re-checks authority under the persona lock).
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT persona_id FROM core_terminal_sessions
-		WHERE backend = $2
-		  AND (status IN ('requested', 'interrupted')
-		       OR (status = 'ending' AND claimed_by IS NULL)
-		       OR ((claimed_by = $1 OR starts_with(claimed_by, $1 || '#'))
-		           AND status IN ('claimed', 'active', 'ending'))
-		       OR (status IN ('claimed', 'active', 'ending')
-		           AND claim_expires_at IS NOT NULL
-		           AND claim_expires_at <= now()))
-		ORDER BY persona_id LIMIT $3`,
+		SELECT DISTINCT s.persona_id FROM core_terminal_sessions s
+		JOIN core_personas p ON p.persona_id = s.persona_id AND p.authority = 'active'
+		WHERE s.backend = $2
+		  AND (s.status IN ('requested', 'interrupted')
+		       OR (s.status = 'ending' AND s.claimed_by IS NULL)
+		       OR ((s.claimed_by = $1 OR starts_with(s.claimed_by, $1 || '#'))
+		           AND s.status IN ('claimed', 'active', 'ending'))
+		       OR (s.status IN ('claimed', 'active', 'ending')
+		           AND s.claim_expires_at IS NOT NULL
+		           AND s.claim_expires_at <= now()))
+		ORDER BY s.persona_id LIMIT $3`,
 		runnerID, backend, limit)
 	if err != nil {
 		return nil, dataErr(err)
@@ -742,6 +747,22 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 		return nil, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Persona authority is the cut fence: a sealed/staged/transferred
+	// persona launches nothing here. FOR SHARE serializes the check
+	// against the return seal's FOR NO KEY UPDATE — a claim that wins
+	// the lock before the seal commits is seen by the quiescence scan;
+	// a claim that waits sees the sealed authority and claims nothing.
+	// On a cancelled return the authority is 'active' again and the
+	// queued/interrupted sessions become claimable as before.
+	var authority string
+	if err := tx.QueryRow(ctx,
+		`SELECT authority FROM core_personas WHERE persona_id = $1::uuidv7 FOR SHARE`,
+		personaID).Scan(&authority); err != nil {
+		return nil, nil, dataErr(err)
+	}
+	if authority != "active" {
+		return nil, nil, nil
+	}
 	interrupted, err = s.sweepTerminalExpiredTx(ctx, tx, personaID, backend)
 	if err != nil {
 		return nil, nil, err
