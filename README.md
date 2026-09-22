@@ -41,7 +41,8 @@ The new core is what the Local host runs and what Sumi Cloud is moving to. Its s
 - **Verified end-to-end use of the Local→Cloud move.** The product surface exists — the sign-in screen carries a secretary-move panel — and the state transfer itself has been exercised once against the live Cloud alpha: the same secretary activated on Cloud with its pending input carried over, the Local install then answered `secretary_moved`, and a staged cancellation restored the Local secretary. That run covered state only — files do not move. Its invitation was seeded through a guarded CLI and the external sign-in proof was substituted for the test, while the transfer, confirmation and post-move requests themselves ran against the real public endpoints. The UI flow has not been exercised end to end.
 - **The rest of the apps in the Description.** Messaging is currently the only Workspace app. Tasks, calendars, notes, email, browsing, meetings and studying are not yet apps that people and secretaries share.
 - **Secretaries speaking in calls.** Call support in the source is opt-in and uses LiveKit. A secretary's call participation does not yet have a real speech-recognition engine.
-- **Desktop and native mobile apps.** `apps/web` is designed to be the single renderer for the Web app, a mobile WebApp and a future Electron desktop app ([ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md)). No desktop or native mobile app exists yet.
+- **Shared browser and desktop apps.** `apps/desktop` contains an engineering Electron browser runtime. With an existing Sumi session configured, a person can grant their secretary access to the same visible tab through the Core's browser tools; see [configured browser host](docs/shared-browser-host.md). The connected path has been exercised with real Electron, API and PostgreSQL on Linux/WSL, using fixture login proof and a deterministic model. Desktop sign-in, product browser chrome, Mac/Windows packaging and native mobile apps remain unfinished. `apps/web` remains the intended shared product renderer ([ADR 0014](docs/adr/0014-webapp-and-electron-runtime.md)).
+- **External MCP tools.** The main API can store a person's granted remote HTTPS MCP connections and execute their tools through durable Core jobs; see [MCP configuration and limits](docs/agent/external-mcp.md). This source implementation is under integration review and is not yet enabled in the hosted alpha. Local configuration, stdio, OAuth and MCP Apps rendering remain open.
 - **Signing in with a ChatGPT/Codex subscription in the new core.** Use an API-key connection instead.
 
 ## Try the Local host
@@ -89,6 +90,7 @@ apps/
   api/                Go API: sign-in sessions, identity, Workspaces, Messaging, approvals,
                       model connections, usage, and the state service the secretary core uses
   core/               TypeScript secretary core: Node.js hosts and the Cloudflare Durable Object host
+  desktop/            Engineering Electron shared browser runtime and authenticated Core host connection
   agent/              Rust agent runtime and isolated tool executor used by `make dev-rust`
 packages/
   ui/                 @sumi/ui component catalog (based on shadcn/ui)
