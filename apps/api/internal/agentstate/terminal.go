@@ -647,14 +647,24 @@ func (s *Store) RunnableTerminalPersonas(ctx context.Context, runnerID, backend 
 	// The runner identity is a logical name; each lock acquisition
 	// claims under a distinct incarnation ("runner#inc"). Discovery
 	// matches the logical runner so sessions owned by any incarnation
-	// — current or stale — keep this persona runnable.
+	// — current or stale — keep this persona runnable. It also
+	// surfaces *expired* claims regardless of who held them: the
+	// sweep inside ClaimTerminalSessions converts lapsed foreign
+	// leases to reclaimable states, so a renamed or dead runner can
+	// never strand a session — recovery must not wait for a new
+	// session to make the persona visible. Live foreign leases are
+	// never surfaced: expiry, not ownership, is the reclaim signal.
+	// The backend predicate keeps cross-backend ownership intact.
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT persona_id FROM core_terminal_sessions
 		WHERE backend = $2
 		  AND (status IN ('requested', 'interrupted')
 		       OR (status = 'ending' AND claimed_by IS NULL)
-		       OR ((claimed_by = $1 OR claimed_by LIKE $1 || '#%')
-		           AND status IN ('claimed', 'active', 'ending')))
+		       OR ((claimed_by = $1 OR starts_with(claimed_by, $1 || '#'))
+		           AND status IN ('claimed', 'active', 'ending'))
+		       OR (status IN ('claimed', 'active', 'ending')
+		           AND claim_expires_at IS NOT NULL
+		           AND claim_expires_at <= now()))
 		ORDER BY persona_id LIMIT $3`,
 		runnerID, backend, limit)
 	if err != nil {
@@ -732,7 +742,7 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 		return nil, nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	interrupted, err = s.sweepTerminalExpiredTx(ctx, tx, personaID)
+	interrupted, err = s.sweepTerminalExpiredTx(ctx, tx, personaID, backend)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -746,7 +756,7 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 		       OR (status = 'ending' AND claimed_by IS NULL)
 		       OR (claimed_by <> $4
 		           AND status IN ('claimed', 'active', 'ending')
-		           AND (claimed_by = $5 OR claimed_by LIKE $5 || '#%')))
+		           AND (claimed_by = $5 OR starts_with(claimed_by, $5 || '#'))))
 		ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT $3`,
 		personaID, backend, limit, runnerID, logical)
 	if err != nil {
@@ -780,7 +790,7 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 			       OR (status = 'ending' AND claimed_by IS NULL)
 			       OR (claimed_by <> $4
 			           AND status IN ('claimed', 'active', 'ending')
-			           AND (claimed_by = $6 OR claimed_by LIKE $6 || '#%')))`,
+			           AND (claimed_by = $6 OR starts_with(claimed_by, $6 || '#'))))`,
 			personaID, t.SessionID, epoch, runnerID,
 			fmt.Sprintf("%d milliseconds", lease.Milliseconds()), logical)
 		if err != nil {
@@ -823,15 +833,16 @@ func (s *Store) ClaimTerminalSessions(ctx context.Context, personaID, runnerID, 
 // keeps its status and only loses the claim: the close intent is
 // durable, and the next claim's runner finishes the physical stop
 // instead of resurrecting a session the user already closed.
-func (s *Store) sweepTerminalExpiredTx(ctx context.Context, tx pgx.Tx, personaID string) ([]TerminalSession, error) {
+func (s *Store) sweepTerminalExpiredTx(ctx context.Context, tx pgx.Tx, personaID, backend string) ([]TerminalSession, error) {
 	rows, err := tx.Query(ctx, `
 		UPDATE core_terminal_sessions
 		SET status = 'interrupted', claimed_by = NULL, claim_expires_at = NULL,
 			updated_at = now()
 		WHERE persona_id = $1
 		  AND status IN ('claimed', 'active')
+		  AND ($2 = '' OR backend = $2)
 		  AND claim_expires_at IS NOT NULL AND claim_expires_at <= now()
-		RETURNING `+terminalSessionCols, personaID)
+		RETURNING `+terminalSessionCols, personaID, backend)
 	if err != nil {
 		return nil, dataErr(err)
 	}
@@ -853,8 +864,9 @@ func (s *Store) sweepTerminalExpiredTx(ctx context.Context, tx pgx.Tx, personaID
 		SET claimed_by = NULL, claim_expires_at = NULL, updated_at = now()
 		WHERE persona_id = $1
 		  AND status = 'ending'
+		  AND ($2 = '' OR backend = $2)
 		  AND claim_expires_at IS NOT NULL AND claim_expires_at <= now()
-		RETURNING `+terminalSessionCols, personaID)
+		RETURNING `+terminalSessionCols, personaID, backend)
 	if err != nil {
 		return nil, dataErr(err)
 	}
@@ -878,7 +890,11 @@ func (s *Store) SweepExpiredTerminalClaims(ctx context.Context, personaID string
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	out, err := s.sweepTerminalExpiredTx(ctx, tx, personaID)
+	// The standalone route sweeps every backend: it is the persona's
+	// administrative recovery path, not a runner's claim — a dead
+	// local runner's sessions are as reclaimable as a dead cloud
+	// one's.
+	out, err := s.sweepTerminalExpiredTx(ctx, tx, personaID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -983,9 +999,11 @@ func (s *Store) ListTerminalInputs(ctx context.Context, personaID, sessionID str
 }
 
 // PendingTerminalInputs lists this epoch's deliverable inputs in seq
-// order under the live claim. 'dequeued' rows re-appear here until
-// dispositioned — dequeue is reported separately so a crash between
-// fetch and disposition is an honest 'unknown', not a silent loss.
+// order under the live claim. Only 'intended' rows are served:
+// 'dequeued' means a fetch is in flight (it never re-appears here —
+// a crash before disposition is resolved to 'unknown' by the next
+// claim's epoch bump or adoption sweep, not silently resent), and
+// 'unknown' is a terminal disposition.
 func (s *Store) PendingTerminalInputs(ctx context.Context, personaID, sessionID, runnerID string, epoch int64) ([]TerminalInput, error) {
 	var out []TerminalInput
 	err := s.terminalClaimTx(ctx, personaID, sessionID, runnerID, epoch, func(ctx context.Context, tx pgx.Tx, t *TerminalSession) error {

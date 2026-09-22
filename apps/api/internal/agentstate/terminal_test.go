@@ -16,6 +16,7 @@ func newTerminalStore(t *testing.T) *Store {
 	t.Helper()
 	s, _ := newStore(t)
 	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
 	return s
 }
 
@@ -163,6 +164,7 @@ func TestTerminalInputLedgerEpochFencing(t *testing.T) {
 func TestTerminalInputOutcomeLedgerReads(t *testing.T) {
 	s, pool := newStore(t)
 	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)

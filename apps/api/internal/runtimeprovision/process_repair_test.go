@@ -474,3 +474,62 @@ func TestRecoverSourceTornTail(t *testing.T) {
 	}
 	_ = resumed
 }
+
+// TREV2-04: a transient `docker info` failure must not disable journal
+// resolution for the provisioner's lifetime — failures retry on a
+// bounded backoff, successes cache permanently. The fake docker CLI
+// below fails its first invocation then answers — resolution recovers
+// without a restart, and the backoff keeps a dead daemon from facing
+// a `docker info` per tailer poll.
+func TestDockerJournalRootRetriesTransientFailure(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "calls")
+	stub := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+n=0
+[ -f "$COUNT_FILE" ] && n=$(cat "$COUNT_FILE")
+n=$((n+1))
+echo "$n" > "$COUNT_FILE"
+if [ "$n" -lt 2 ]; then
+  echo "daemon unreachable" >&2
+  exit 1
+fi
+echo "/var/lib/docker"
+`
+	if err := os.WriteFile(stub, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// exec.CommandContext resolves "docker" on the ambient PATH, not
+	// cmd.Env — point it at the stub.
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	b := &DockerBackend{
+		baseEnvironment: []string{"COUNT_FILE=" + counter},
+		runner:          execCommandRunner{},
+	}
+	ctx := context.Background()
+
+	if _, err := b.dockerJournalRoot(ctx); err == nil {
+		t.Fatal("first resolution should fail (daemon down)")
+	}
+	// Backoff: a poll during the window must NOT hit docker again.
+	if _, err := b.dockerJournalRoot(ctx); err == nil {
+		t.Fatal("resolution during backoff should still fail")
+	}
+	raw, _ := os.ReadFile(counter)
+	if string(raw) != "1\n" {
+		t.Fatalf("docker invocations during backoff = %s, want 1", raw)
+	}
+	// After the backoff window the retry recovers — and caches.
+	b.journalRootRetryAt = time.Now().Add(-time.Second)
+	root, err := b.dockerJournalRoot(ctx)
+	if err != nil || root != "/var/lib/docker" {
+		t.Fatalf("retry resolution = %q, %v", root, err)
+	}
+	if _, err := b.dockerJournalRoot(ctx); err != nil {
+		t.Fatalf("cached resolution failed: %v", err)
+	}
+	raw, _ = os.ReadFile(counter)
+	if string(raw) != "2\n" {
+		t.Fatalf("docker invocations after success = %s, want 2 (cached)", raw)
+	}
+}

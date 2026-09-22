@@ -50,9 +50,12 @@ type DockerBackend struct {
 	// output pump can resume the container's own json-file journal at
 	// a persisted byte offset — the only output source that survives
 	// a provisioner restart without duplicate or silent-loss replay.
-	journalRootOnce sync.Once
-	journalRoot     string
-	journalRootErr  error
+	// Only a successful resolution is cached: a transient `docker
+	// info` failure retries on a bounded backoff instead of
+	// disabling journal attach for the provisioner's lifetime.
+	journalRootMu      sync.Mutex
+	journalRoot        string
+	journalRootRetryAt time.Time
 }
 
 type commandRunner interface {
