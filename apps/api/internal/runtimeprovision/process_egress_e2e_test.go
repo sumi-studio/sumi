@@ -39,6 +39,11 @@ func egressE2EBackend(t *testing.T, egressDir string) (*DockerBackend, string) {
 // so DNS and public dials resolve exactly as they do in production.
 func startEgressProxy(t *testing.T, dir string) (socketPath string) {
 	t.Helper()
+	return startEgressProxyLabelled(t, dir, egressFixtureLabel)
+}
+
+func startEgressProxyLabelled(t *testing.T, dir, label string) (socketPath string) {
+	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -49,10 +54,10 @@ func startEgressProxy(t *testing.T, dir string) (socketPath string) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build egress proxy: %v\n%s", err, out)
 	}
-	name := egressFixtureLabel + "-proxy-" + uuid.NewString()[:8]
+	name := label + "-proxy-" + uuid.NewString()[:8]
 	cmd := exec.Command("docker", "run", "-d",
 		"--name", name,
-		"--label", "sumi.fixture="+egressFixtureLabel,
+		"--label", "sumi.fixture="+label,
 		"--label", "sumi.fixture.role=egress-proxy",
 		"--mount", "type=bind,src="+binary+",dst=/usr/local/bin/sumi-egress-proxy,ro",
 		"--mount", "type=bind,src="+dir+",dst=/sock",
@@ -141,6 +146,11 @@ func egressOutput(t *testing.T, s *Service, op ProcessOperation, stream string) 
 
 func seedEgressWorkspace(t *testing.T, persona, tag string) string {
 	t.Helper()
+	return seedEgressWorkspaceLabelled(t, persona, tag, egressFixtureLabel)
+}
+
+func seedEgressWorkspaceLabelled(t *testing.T, persona, tag, label string) string {
+	t.Helper()
 	agent32 := strings.ReplaceAll(persona, "-", "")
 	volume := "sumi-" + agent32 + "_workspace"
 	project := "sumi-" + agent32
@@ -155,7 +165,7 @@ func seedEgressWorkspace(t *testing.T, persona, tag string) string {
 	docker("volume", "create",
 		"--label", "com.docker.compose.project="+project,
 		"--label", "com.docker.compose.volume=workspace",
-		"--label", "sumi.fixture="+egressFixtureLabel,
+		"--label", "sumi.fixture="+label,
 		volume)
 	t.Cleanup(func() {
 		c := exec.Command("docker", "volume", "rm", "-f", volume)
