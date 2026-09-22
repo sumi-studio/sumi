@@ -1608,6 +1608,14 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       event_id: typeof p.event_id === "string" ? p.event_id : null,
       message_id: typeof p.message_id === "string" ? p.message_id : null,
       message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
+      workspace_id: typeof p.workspace_id === "string" ? p.workspace_id : null,
+      message_revision:
+        Number.isSafeInteger(p.message_revision) ? p.message_revision : null,
+      session_id: typeof p.session_id === "string" ? p.session_id : null,
+      status: typeof p.status === "string" ? p.status : null,
+      end_reason: typeof p.end_reason === "string" ? p.end_reason : null,
+      exit_code: Number.isSafeInteger(p.exit_code) ? p.exit_code : null,
+      exit_signal: typeof p.exit_signal === "string" ? p.exit_signal : null,
       reason: typeof p.reason === "string" ? p.reason : null,
       message_change:
         typeof p.message_change === "string" ? p.message_change : null,
@@ -1648,6 +1656,13 @@ export function assemble(
           placeName: (p.place as Record<string, unknown> | undefined)?.name,
           placeKind: (p.place as Record<string, unknown> | undefined)?.kind,
           messageId: p.message_id,
+          workspaceId: p.workspace_id,
+          messageRevision: p.message_revision,
+          sessionId: p.session_id,
+          status: p.status,
+          endReason: p.end_reason,
+          exitCode: p.exit_code,
+          exitSignal: p.exit_signal,
           attention: input.attention,
           change: typeof p.message_change === "string" ? p.message_change : "",
         });
