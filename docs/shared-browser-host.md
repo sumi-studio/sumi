@@ -196,3 +196,14 @@ because the attachment is no longer authorized. A lost response to an already
 committed completion only causes replay of the identical receipt, with one
 terminal notification. Late conflicting evidence is currently not attached to
 the `lost` record through this browser endpoint; its conservative verdict remains.
+
+### Host network authority
+
+A granted shared tab uses the browser host's ordinary HTTP(S) network reachability,
+including local and private sites the host can reach. This is intentional for the
+application people and their secretary share. The standing tab grant permits
+observing those pages and, when actions are enabled, navigating to them; it does
+not add a separate approval for each private destination. This is distinct from
+the API's server-side public-web/MCP proxy, which restricts private-network egress.
+Chromium origin and session isolation still apply. Non-web privileged protocols
+remain blocked, and malformed request URLs are cancelled with a completed callback.

@@ -113,7 +113,7 @@ func (f *fixture) enqueue(a Attachment, method string) string {
 		req["binding"] = map[string]any{"revision": float64(1), "observationId": uuid.NewString(), "url": "https://example.com/"}
 		req["action"] = map[string]any{"kind": "click", "target": "t0"}
 	}
-	out, e := f.store.Effects()["browser."+method].Apply(context.Background(), tx, persona, id, req)
+	out, e := f.store.Effects()["browser."+method].Apply(context.Background(), tx, persona, id+":tool:0", req)
 	if e != nil {
 		f.t.Fatal(e)
 	}
@@ -273,7 +273,9 @@ func TestSecretaryRealBrowser(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	_, _, e = f.core.Store().SubmitInput(ctx, &agentstate.Input{PersonaID: persona, InputID: uuid.NewString(), Kind: "message", Payload: map[string]any{"text": "Find my shared Acceptance tab, read what I typed, fill the form and save it once, then read its visible result."}, ActorKind: "human", ActorID: owner, SourceSurface: "browser-acceptance", Attention: "reply"})
+	originID := "acceptance:tool:human:" + uuid.NewString()
+	originText := "Find my shared Acceptance tab, read what I typed, fill the form and save it once, then read its visible result."
+	_, _, e = f.core.Store().SubmitInput(ctx, &agentstate.Input{PersonaID: persona, InputID: originID, Kind: "message", Payload: map[string]any{"text": originText}, ActorKind: "human", ActorID: owner, SourceSurface: "browser-acceptance", Attention: "reply"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -298,10 +300,34 @@ func TestSecretaryRealBrowser(t *testing.T) {
 	if e != nil || len(jobs) != 5 {
 		t.Fatal("jobs", len(jobs), e)
 	}
+	sawHumanOrigin := false
 	for _, j := range jobs {
 		if j.Status != "done" {
 			t.Fatal(j)
 		}
+		var notification map[string]any
+		if e := f.store.Pool.QueryRow(ctx, `SELECT payload FROM core_inputs WHERE persona_id=$1 AND input_id=$2`, persona, "job:"+j.JobID).Scan(&notification); e != nil {
+			t.Fatal(e)
+		}
+		// Later operations can start while handling a prior job notification.
+		// Resolve the actual originating turn, not an assumed transitive root.
+		var startedFrom, expectedText string
+		if e := f.store.Pool.QueryRow(ctx, `SELECT i.input_id, CASE WHEN length(i.payload->>'text') > 200 THEN left(i.payload->>'text',200)||'…' ELSE i.payload->>'text' END
+          FROM core_operations o JOIN core_turns t USING(persona_id,turn_id)
+          JOIN core_inputs i ON i.persona_id=t.persona_id AND i.input_id=t.input_id
+          WHERE o.persona_id=$1 AND o.response->'job'->>'job_id'=$2`, persona, j.JobID).Scan(&startedFrom, &expectedText); e != nil {
+			t.Fatal(e)
+		}
+		_, hasProgress := notification["origin_in_progress"].(bool)
+		if notification["origin_input_id"] != startedFrom || notification["origin_request"] != expectedText || !hasProgress {
+			t.Fatalf("real browser notification: %+v", notification)
+		}
+		if startedFrom == originID {
+			sawHumanOrigin = true
+		}
+	}
+	if !sawHumanOrigin {
+		t.Fatal("human request lost its initiating browser job")
 	}
 	t.Log("PASS actual Secretary → API/DB durable jobs → authenticated host → same visible Electron tab; discovery, human input, fill/click and result observation")
 }

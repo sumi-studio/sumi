@@ -137,3 +137,14 @@ Relevant primary references:
 [Session](https://www.electronjs.org/docs/latest/api/session),
 [Electron security](https://www.electronjs.org/docs/latest/tutorial/security),
 [ES modules](https://www.electronjs.org/docs/latest/tutorial/esm).
+
+### Host network authority
+
+A granted shared tab uses the browser host's ordinary HTTP(S) network reachability,
+including local and private sites the host can reach. This is intentional for the
+application people and their secretary share. The standing tab grant permits
+observing those pages and, when actions are enabled, navigating to them; it does
+not add a separate approval for each private destination. This is distinct from
+the API's server-side public-web/MCP proxy, which restricts private-network egress.
+Chromium origin and session isolation still apply. Non-web privileged protocols
+remain blocked, and malformed request URLs are cancelled with a completed callback.

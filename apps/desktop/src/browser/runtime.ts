@@ -17,6 +17,7 @@ import {
   validateAction,
 } from "./contract.js";
 import { pageOperation } from "./page.js";
+import { filterBrowserRequest } from "./request-policy.js";
 
 const activeProfiles = new Set<string>();
 const WORLD = 1001;
@@ -70,20 +71,7 @@ export class SharedBrowserRuntime implements BrowserTabPort {
     this.profile.on("will-download", this.denyDownload);
     // Chromium still enforces normal origin/CORS/session boundaries. These
     // checks additionally keep local files/custom host protocols out of pages.
-    this.profile.webRequest.onBeforeRequest((details, callback) => {
-      const protocol = new URL(details.url).protocol;
-      callback({
-        cancel: ![
-          "http:",
-          "https:",
-          "ws:",
-          "wss:",
-          "data:",
-          "blob:",
-          "about:",
-        ].includes(protocol),
-      });
-    });
+    this.profile.webRequest.onBeforeRequest(filterBrowserRequest);
   }
 
   private readonly denyDownload = (event: Electron.Event) =>

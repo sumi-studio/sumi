@@ -153,7 +153,10 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 				request["binding"] = req["binding"]
 				request["action"] = req["action"]
 			}
-			jobID := "browser:" + idem
+			jobID, e := agentstate.EffectJobID(idem)
+			if e != nil {
+				return nil, e
+			}
 			_, e = tx.Exec(ctx, `INSERT INTO core_jobs(persona_id,job_id,kind,request,status,created_by)VALUES($1,$2,'browser',$3,'queued',$4)`, persona, jobID, request, "tool:"+idem)
 			return map[string]any{"job": map[string]any{"job_id": jobID, "kind": "browser", "status": "queued"}}, e
 		}}
