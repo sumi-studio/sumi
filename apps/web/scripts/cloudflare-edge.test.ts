@@ -692,6 +692,7 @@ test("every production API registration has an explicit edge disposition", async
       path === "/ready" ||
       path === "/internal" ||
       path.startsWith("/internal/") ||
+      path.startsWith("/fm/") ||
       path.startsWith("/local-control/v1/")
         ? "deny"
         : "origin";
@@ -1257,5 +1258,303 @@ test("PWA manifest and icons are static assets, never SPA documents", () => {
     "/icons/apple-touch-icon.png",
   ]) {
     assert.equal(classifyPath(path), "static-asset");
+  }
+});
+
+test("shared tool grants reach the authenticated API with browser credentials intact", async () => {
+  for (const [method, path] of [
+    ["GET", "/api/mcp-connections"],
+    ["POST", "/api/mcp-connections"],
+    ["PUT", "/api/mcp-connections/connection-1"],
+    ["DELETE", "/api/mcp-connections/connection-1"],
+    ["GET", "/api/browser-tabs"],
+    ["POST", "/api/browser-tabs"],
+    ["DELETE", "/api/browser-tabs/attachment-1"],
+  ]) {
+    const body = ["POST", "PUT"].includes(method)
+      ? '{"name":"fixture"}'
+      : undefined;
+    const incoming = new Request(`https://sumi.example${path}?fixture=opaque`, {
+      method,
+      headers: {
+        Cookie: "sumi_session=fixture",
+        Origin: "https://sumi.example",
+        "X-CSRF-Token": "bound",
+        "Content-Type": "application/json",
+        "X-Forwarded-Host": "attacker.example",
+      },
+      ...(body === undefined ? {} : { body }),
+    });
+    const expected = Response.json(
+      { ok: true },
+      {
+        headers: {
+          "Cache-Control": "no-store",
+          "Set-Cookie": "sumi_session=renewed; Secure; HttpOnly",
+        },
+      },
+    );
+    let forwarded: Request | undefined;
+    const actual = await handleRequest(
+      incoming,
+      {
+        ASSETS: { fetch: () => assert.fail(`${method} ${path} reached SPA`) },
+        SUMI_ORIGIN: {
+          async fetch(request, init) {
+            forwarded = request;
+            assert.equal(init?.redirect, "manual");
+            assert.equal(init?.signal, incoming.signal);
+            return expected;
+          },
+        },
+      },
+      () => assert.fail("shared tool grant bypassed the bound origin"),
+    );
+    assert(forwarded, `${method} ${path} was not forwarded`);
+    assert.equal(forwarded.url, `http://sumi.example${path}?fixture=opaque`);
+    assert.equal(forwarded.method, method);
+    assert.equal(forwarded.headers.get("Cookie"), "sumi_session=fixture");
+    assert.equal(forwarded.headers.get("Origin"), "https://sumi.example");
+    assert.equal(forwarded.headers.get("X-CSRF-Token"), "bound");
+    assert.equal(forwarded.headers.get("Host"), "sumi.example");
+    assert.equal(forwarded.headers.get("X-Forwarded-Host"), "sumi.example");
+    assert.equal(forwarded.headers.get("X-Forwarded-Proto"), "https");
+    assert.equal(await forwarded.text(), body ?? "");
+    assert.equal(actual, expected);
+    assert.deepEqual(actual.headers.getSetCookie(), [
+      "sumi_session=renewed; Secure; HttpOnly",
+    ]);
+  }
+});
+
+test("configured browser host poll and completion retain their bearer and absent Origin", async () => {
+  for (const operation of ["poll", "complete"]) {
+    const path = `/api/browser-host/tabs/attachment-1/${operation}`;
+    const body =
+      operation === "complete"
+        ? '{"job_id":"job-1","status":"done","result":{"title":"fixture"},"error":""}'
+        : undefined;
+    const incoming = new Request(`https://sumi.example${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer host-fixture",
+        "Content-Type": "application/json",
+      },
+      ...(body === undefined ? {} : { body }),
+    });
+    const expected = Response.json(
+      { job: null },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+    let forwarded: Request | undefined;
+    const actual = await handleRequest(
+      incoming,
+      {
+        ASSETS: { fetch: () => assert.fail(`host ${operation} reached SPA`) },
+        SUMI_ORIGIN: {
+          async fetch(request) {
+            forwarded = request;
+            return expected;
+          },
+        },
+      },
+      () => assert.fail("browser host bypassed the bound origin"),
+    );
+    assert(forwarded);
+    assert.equal(forwarded.url, `http://sumi.example${path}`);
+    assert.equal(forwarded.method, "POST");
+    assert.equal(forwarded.headers.get("Authorization"), "Bearer host-fixture");
+    assert.equal(forwarded.headers.get("Origin"), null);
+    assert.equal(forwarded.headers.get("Cookie"), null);
+    assert.equal(await forwarded.text(), body ?? "");
+    assert.equal(actual, expected);
+  }
+});
+
+test("shared tool authentication and method refusals remain the API's response", async () => {
+  for (const [path, method, headers, status] of [
+    ["/api/mcp-connections", "GET", {}, 401],
+    ["/api/browser-tabs", "POST", {}, 403],
+    ["/api/browser-host/tabs/attachment-1/poll", "POST", {}, 403],
+    [
+      "/api/browser-host/tabs/attachment-1/poll",
+      "POST",
+      { Authorization: "Bearer fixture", Origin: "https://attacker.example" },
+      403,
+    ],
+    [
+      "/api/browser-host/tabs/attachment-1/poll",
+      "GET",
+      { Authorization: "Bearer fixture" },
+      405,
+    ],
+    ["/api/mcp-connections", "PATCH", {}, 405],
+    [
+      "/api/browser-host/tabs/attachment-1/unknown",
+      "POST",
+      { Authorization: "Bearer fixture" },
+      404,
+    ],
+  ] as const) {
+    const incoming = new Request(`https://sumi.example${path}`, {
+      method,
+      headers,
+    });
+    const expected = Response.json(
+      { error: "origin-refusal" },
+      { status, headers: { "Cache-Control": "no-store" } },
+    );
+    let forwarded = false;
+    const actual = await handleRequest(
+      incoming,
+      {
+        ASSETS: { fetch: () => assert.fail("API refusal replaced by SPA") },
+        SUMI_ORIGIN: {
+          async fetch(request) {
+            forwarded = true;
+            assert.equal(request.method, method);
+            assert.equal(
+              request.headers.get("Authorization"),
+              incoming.headers.get("Authorization"),
+            );
+            assert.equal(
+              request.headers.get("Origin"),
+              incoming.headers.get("Origin"),
+            );
+            return expected;
+          },
+        },
+      },
+      () => assert.fail("refusal bypassed the bound origin"),
+    );
+    assert(forwarded);
+    assert.equal(actual, expected);
+  }
+});
+
+test("shared tool routing excludes lookalikes and keeps private paths denied", async () => {
+  for (const path of [
+    "/api/mcp-connections-unrelated",
+    "/api/mcp-connections2/id",
+    "/api/mcp-connection",
+    "/api/browser-tabs-unrelated",
+    "/api/browser-tabs2/id",
+    "/api/browser-tab",
+    "/api/browser-hostile/tabs/id/poll",
+    "/api/browser-host/poll",
+    "/api/browser-host/tabs2/id/poll",
+    "/api/unrelated",
+    "/api/browser-host",
+    "/api/browser-host/tabs",
+    "/api/browser-host/tabs/id/../../../../internal/core/personas",
+    "/api/mcp-connections/../../internal/core/personas",
+    "/api/browser-tabs/../../internal/core/personas",
+    "/api/browser-host/tabs/id/source.ts",
+    "/api/mcp-connections/source.ts",
+    "/fm",
+    "/fm/persona-1/mcp-connections",
+    "/fm%252Fpersona-1%252Fmcp-connections",
+  ]) {
+    assert.notEqual(classifyPath(path), "origin", path);
+    let originCalls = 0;
+    const origin = async () => {
+      originCalls += 1;
+      return new Response("unexpected origin");
+    };
+    await handleRequest(
+      new Request(`https://sumi.example${path}`),
+      {
+        ASSETS: {
+          fetch: async () =>
+            new Response("SPA", { headers: { "Content-Type": "text/html" } }),
+        },
+        SUMI_ORIGIN: { fetch: origin },
+      },
+      origin,
+    );
+    assert.equal(originCalls, 0, `${path} reached the API`);
+  }
+  assert.equal(classifyPath("/api/browser-host"), "deny");
+  assert.equal(classifyPath("/api/browser-host/tabs"), "deny");
+  assert.equal(
+    classifyPath(
+      "/api/browser-host/tabs/id/../../../../internal/core/personas",
+    ),
+    "deny",
+  );
+  assert.equal(classifyPath("/api/mcp-connections%2Fconnection-1"), "origin");
+  assert.equal(classifyPath("/api/browser-tabs%252Fattachment-1"), "origin");
+  assert.equal(
+    classifyPath("/api/browser-host%2Ftabs%2Fattachment-1%2Fpoll"),
+    "origin",
+  );
+});
+
+test("route discovery expands literal string ranges without accepting dynamic or mutated bindings", async () => {
+  const temporary = await mkdtemp(resolve(tmpdir(), "sumi-edge-range-"));
+  const source = resolve(temporary, "cmd/server/main.go");
+  try {
+    await mkdir(dirname(source), { recursive: true });
+    await mkdir(resolve(temporary, "internal"));
+    const register = async (body: string) =>
+      writeFile(
+        source,
+        `package main
+import "net/http"
+const prefix = "/api/"
+const route = "GET /shadowed-package-constant"
+func dynamic() string { return "GET /runtime" }
+func alter(value *string) { *value = dynamic() }
+func register(mux *http.ServeMux) {
+${body}
+}
+`,
+      );
+    await register(`
+for _, route := range []string{"GET " + prefix + "mcp-connections", "POST /api/browser-tabs"} {
+  mux.HandleFunc(route, nil)
+}
+for _, route := range []string{"POST /api/browser-host/tabs/{id}/poll"} {
+  mux.HandleFunc(route, nil)
+}
+{
+  const prefix = "/local-shadow/"
+  for _, route := range []string{"GET " + prefix + "actual"} { mux.HandleFunc(route, nil) }
+}`);
+    const found = await discoverApiRoutes(temporary);
+    assert.deepEqual(
+      found.routes.map((entry) => entry.pattern),
+      [
+        "GET /api/mcp-connections",
+        "POST /api/browser-tabs",
+        "POST /api/browser-host/tabs/{id}/poll",
+        "GET /local-shadow/actual",
+      ],
+    );
+    for (const body of [
+      `routes := []string{"GET /known"}; for _, route := range routes { mux.HandleFunc(route, nil) }`,
+      `for _, route := range []string{dynamic()} { mux.HandleFunc(route, nil) }`,
+      `for _, route := range []string{"GET /known"} { route = dynamic(); mux.HandleFunc(route, nil) }`,
+      `for _, route := range []string{"GET /known"} { alter(&route); mux.HandleFunc(route, nil) }`,
+      `for _, route := range []string{"GET /known"} { for _, route = range []string{"GET /changed"} {}; mux.HandleFunc(route, nil) }`,
+      `for _, route := range []string{"GET /known"} { { route := dynamic(); mux.HandleFunc(route, nil) }; mux.HandleFunc(route, nil) }`,
+      `route := dynamic(); for _, entry := range []string{route} { mux.HandleFunc(entry, nil) }`,
+    ]) {
+      await register(body);
+      await assert.rejects(
+        discoverApiRoutes(temporary),
+        /route parity cannot skip dynamic registrations/,
+        body,
+      );
+    }
+    await register(
+      `for _, route := range []string{"not-a-route"} { mux.HandleFunc(route, nil) }`,
+    );
+    await assert.rejects(
+      discoverApiRoutes(temporary),
+      /invalid HTTP route pattern/,
+    );
+  } finally {
+    await rm(temporary, { force: true, recursive: true });
   }
 });
