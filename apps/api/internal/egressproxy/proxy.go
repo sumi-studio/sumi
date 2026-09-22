@@ -322,14 +322,26 @@ func (p *Proxy) tunnel(client, upstream net.Conn) {
 		// origin can flush its final bytes and the conn+slot are reclaimed
 		// without waiting out the idle reaper. Bytes the origin still
 		// sends afterwards flow back through the surviving direction.
-		if tcp, ok := dst.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
-		}
+		closeWrite(dst)
 	}
 	wg.Add(2)
 	go splice(upstream, client)
 	go splice(client, upstream)
 	wg.Wait()
+}
+
+// closeWrite propagates a half-close on the conn types this proxy
+// actually splices: the upstream is a dialed *net.TCPConn and the
+// client side is the hijacked *net.UnixConn from the socket listener —
+// both support CloseWrite; anything else falls back to the deferred
+// full close when the tunnel ends.
+func closeWrite(c net.Conn) {
+	switch v := c.(type) {
+	case *net.TCPConn:
+		_ = v.CloseWrite()
+	case *net.UnixConn:
+		_ = v.CloseWrite()
+	}
 }
 
 // handleForward proxies a plain-HTTP request: the request line must carry

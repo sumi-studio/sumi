@@ -106,14 +106,42 @@ func terminalSession(t *testing.T, s *Service, persona, sessionID string) (Proce
 // bridgeProbe emits a tagged liveness check against the in-container
 // bridge listener — it reports the bridge's own liveness, not the
 // proxy's (a down proxy is honest degradation, not bridge death). The
-// echoed input line contains the tag text too, so probeUp matches the
-// output line specifically: `^tag$` for up, `tag-DOWN` for down.
+// echoed input line contains the tag text too, so callers must match
+// the output line specifically: `^tag$` for up, `tag-DOWN` for down —
+// via waitTTYLine, which fails on timeout.
 func bridgeProbe(tag string) string {
 	return `if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then echo ` + tag + `; exec 3>&- 3<&-; else echo ` + tag + `-DOWN; fi`
 }
 
-func probeUp(out, tag string) bool {
-	return regexp.MustCompile(`(?m)^` + tag + `\r?$`).MatchString(out)
+// waitTTYRe waits for transcript content matching want and fails the
+// test on timeout. The plain waitTTY helpers return partial output
+// silently on deadline — fine for diagnostics, but a gate that must
+// prove a command RAN needs a hard wait.
+func waitTTYRe(t *testing.T, tty *ttyLog, want *regexp.Regexp, d time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		data, _, _, _, err := tty.read(0, 1<<20)
+		if err == nil && want.Match(data) {
+			return string(data)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	data, _, _, _, _ := tty.read(0, 1<<20)
+	t.Fatalf("tty never matched %s; transcript:\n%s", want, data)
+	return ""
+}
+
+// waitTTYLine waits for an output line that is exactly `line`. PTY echo
+// puts the marker text inside the echoed input line too — only a line
+// whose content starts with the marker proves real command output. The
+// tty stream separates output lines with bare \r as well as \r\n, and
+// readline emits bracketed-paste escapes (\x1b[?2004l) glued to the
+// front of the first output line — so anchor on ^ or \r and allow
+// leading CSI sequences.
+func waitTTYLine(t *testing.T, tty *ttyLog, line string, d time.Duration) string {
+	t.Helper()
+	return waitTTYRe(t, tty, regexp.MustCompile(`(?m)(?:^|\r)(?:\x1b\[[0-9;?]*[a-zA-Z])*`+regexp.QuoteMeta(line)+`\r?$`), d)
 }
 
 // The packet's terminal acceptance plus the review's recovery findings:
@@ -144,7 +172,7 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	// no real NIC. The PTY starts at 80 columns — widen it and keep
 	// markers short so line-discipline wraps cannot split a match.
 	write("stty cols 200; echo PROXY=$HTTPS_PROXY NO=$NO_PROXY; test -S /run/sumi/egress/proxy.sock && echo SOCK-OK; awk 'NR>2{print $1}' /proc/net/dev\n")
-	out := waitTTY(t, io_.tty, "SOCK-OK", 30*time.Second)
+	out := waitTTYLine(t, io_.tty, "SOCK-OK", 30*time.Second)
 	if !strings.Contains(out, "PROXY=http://127.0.0.1:3128") {
 		t.Fatalf("proxy env absent in terminal session:\n%s", out)
 	}
@@ -159,7 +187,7 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	// unreachable by foreground-group signals. Prove the process state
 	// first (comm is truncated to 15 chars), then the actual signals.
 	write("b=; for p in /proc/[0-9]*/comm; do read c < $p; case $c in sumi-egress-bri*) b=${p#/proc/}; b=${b%/comm};; esac; done; awk '{print \"BRIDGE-PGRP-\"$5\"-SID-\"$6}' /proc/$b/stat\n")
-	out = waitTTY(t, io_.tty, "BRIDGE-PGRP-", 30*time.Second)
+	out = waitTTYRe(t, io_.tty, regexp.MustCompile(`BRIDGE-PGRP-(\d+)-SID-(\d+)`), 30*time.Second)
 	m := regexp.MustCompile(`BRIDGE-PGRP-(\d+)-SID-(\d+)`).FindStringSubmatch(out)
 	if m == nil || m[1] != m[2] {
 		t.Fatalf("bridge is not a detached session leader:\n%s", out)
@@ -170,7 +198,8 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	write("\x03")
 	time.Sleep(500 * time.Millisecond)
 	write("echo IDLE-INT-$?; " + bridgeProbe("BR1") + "\n")
-	if out := waitTTYCount(t, io_.tty, "BR1", 2, 30*time.Second); !strings.Contains(out, "IDLE-INT-130") || !probeUp(out, "BR1") {
+	out = waitTTYLine(t, io_.tty, "IDLE-INT-130", 30*time.Second)
+	if out := waitTTYLine(t, io_.tty, "BR1", 30*time.Second); !strings.Contains(out, "IDLE-INT-130") {
 		t.Fatalf("idle Ctrl-C killed the bridge or the shell:\n%s", out)
 	}
 	// Foreground command interruption: ^C must still kill the running
@@ -181,7 +210,8 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	write("\x03")
 	time.Sleep(500 * time.Millisecond)
 	write("echo FG-$?; " + bridgeProbe("BR2") + "\n")
-	if out := waitTTYCount(t, io_.tty, "BR2", 2, 30*time.Second); !strings.Contains(out, "FG-130") || !probeUp(out, "BR2") {
+	out = waitTTYLine(t, io_.tty, "FG-130", 30*time.Second)
+	if out := waitTTYLine(t, io_.tty, "BR2", 30*time.Second); !strings.Contains(out, "FG-130") {
 		t.Fatalf("foreground Ctrl-C did not interrupt sleep or killed bridge:\n%s", out)
 	}
 	// The SignalProcess group path — same delivery the session driver
@@ -191,7 +221,8 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 	write("echo SIG-OK; " + bridgeProbe("BR3") + "\n")
-	if out := waitTTYCount(t, io_.tty, "BR3", 2, 30*time.Second); !strings.Contains(out, "SIG-OK") || !probeUp(out, "BR3") {
+	out = waitTTYLine(t, io_.tty, "SIG-OK", 30*time.Second)
+	if out := waitTTYLine(t, io_.tty, "BR3", 30*time.Second); !strings.Contains(out, "SIG-OK") {
 		t.Fatalf("SignalProcess killed the bridge or the shell:\n%s", out)
 	}
 
@@ -199,7 +230,8 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	// flags — the NO_PROXY bypass — while public egress stays proxied.
 	write("echo keep > /workspace/term-marker\n")
 	write("(python3 -m http.server 8901 --bind 127.0.0.1 >/dev/null 2>&1 &) ; sleep 0.5; curl -s --max-time 5 http://127.0.0.1:8901/term-marker; echo LOOP-$?\n")
-	if out := waitTTY(t, io_.tty, "LOOP-0", 30*time.Second); !strings.Contains(out, "keep") {
+	out = waitTTYLine(t, io_.tty, "LOOP-0", 30*time.Second)
+	if !strings.Contains(out, "keep") {
 		t.Fatalf("job-local loopback server unreachable through normal tools:\n%s", out)
 	}
 
@@ -207,33 +239,37 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	// public packages into the canonical workspace (HOME=/workspace) —
 	// one library and one console script.
 	write("pip install --user six==1.16.0 chardet==5.2.0 && echo PIP-DONE-$?\n")
-	if out := waitTTY(t, io_.tty, "PIP-DONE-0", 120*time.Second); !strings.Contains(out, "PIP-DONE-0") {
+	if out := waitTTYLine(t, io_.tty, "PIP-DONE-0", 120*time.Second); !strings.Contains(out, "PIP-DONE-0") {
 		t.Fatalf("pip install did not succeed in the terminal:\n%s", out)
 	}
 	write("python3 -c 'import six; print(\"SIX-\"+six.__version__)'; chardetect --version && echo CLI-OK\n")
-	if out := waitTTY(t, io_.tty, "SIX-1.16.0", 30*time.Second); !strings.Contains(out, "SIX-1.16.0") {
+	if out := waitTTYLine(t, io_.tty, "SIX-1.16.0", 30*time.Second); !strings.Contains(out, "SIX-1.16.0") {
 		t.Fatalf("installed package not importable in the installing session:\n%s", out)
 	}
-	// f419: the console script is runnable BY NAME — /workspace/.local/bin
-	// is on PATH even in this login shell (the echoed input contributes
-	// one CLI-OK, the output the second).
-	if out := waitTTYCount(t, io_.tty, "CLI-OK", 2, 30*time.Second); !strings.Contains(out, "chardetect") {
+	// f419: the console script is runnable BY NAME in this installing
+	// login shell — on a fresh workspace .local/bin did not exist at
+	// login, so this is the exact gap review A reproduced. CLI-OK must be
+	// a real output line (waitTTYLine), and the version line is checked
+	// as output too — echoed input contains neither `chardetect 5.2.0`.
+	if out := waitTTYLine(t, io_.tty, "CLI-OK", 30*time.Second); !strings.Contains(out, "chardetect 5.2.0") {
 		t.Fatalf("installed console script not on PATH:\n%s", out)
 	}
 
 	// A private destination is denied through the same session.
 	write("curl -sS --max-time 10 http://169.254.169.254/latest/meta-data; echo DENY-RC=$?\n")
-	if out := waitTTY(t, io_.tty, "DENY-RC=", 30*time.Second); !strings.Contains(out, "sumi-egress") {
+	// The denial body text is output-only — an echoed input line cannot
+	// contain it — so it is a strict gate on the refusal arriving.
+	if out := waitTTYRe(t, io_.tty, regexp.MustCompile(`sumi-egress: destination`), 30*time.Second); !strings.Contains(out, "DENY-RC=0") {
 		t.Fatalf("private destination not denied in the terminal:\n%s", out)
 	}
 
 	// A failed install must leave this shell and the workspace usable.
 	write("pip install --user definitely-not-a-real-package-sumiterm==9.9.9\n")
-	if out := waitTTY(t, io_.tty, "No matching distribution", 120*time.Second); !strings.Contains(out, "No matching distribution") {
+	if out := waitTTYRe(t, io_.tty, regexp.MustCompile(`No matching distribution`), 120*time.Second); !strings.Contains(out, "No matching distribution") {
 		t.Fatalf("bogus install did not report its failure:\n%s", out)
 	}
-	write("echo SHELL-ALIVE-$?; cat /workspace/term-marker\n")
-	if out := waitTTY(t, io_.tty, "SHELL-ALIVE-0", 15*time.Second); !strings.Contains(out, "keep") {
+	write("echo SHELL-ALIVE; cat /workspace/term-marker\n")
+	if out := waitTTYLine(t, io_.tty, "SHELL-ALIVE", 15*time.Second); !strings.Contains(out, "keep") {
 		t.Fatalf("shell unusable or workspace damaged after failed install:\n%s", out)
 	}
 
@@ -255,8 +291,8 @@ func TestDockerJobEgressInteractiveTerminal(t *testing.T) {
 	// A subsequent real terminal session — new container on the same
 	// canonical workspace — reuses the installed dependency AND its CLI.
 	op2, io2, write2 := terminalSession(t, service, persona, "sess-"+uuid.NewString()[:8])
-	write2("python3 -c 'import six; print(\"REUSED-\"+six.__version__)'; chardetect --version && echo CLI2-OK; cat /workspace/term-marker\n")
-	if out := waitTTYCount(t, io2.tty, "CLI2-OK", 2, 30*time.Second); !strings.Contains(out, "REUSED-1.16.0") || !strings.Contains(out, "keep") {
+	write2("stty cols 200; python3 -c 'import six; print(\"REUSED-\"+six.__version__)'; chardetect --version && echo CLI2-OK; cat /workspace/term-marker\n")
+	if out := waitTTYLine(t, io2.tty, "CLI2-OK", 30*time.Second); !strings.Contains(out, "REUSED-1.16.0") || !strings.Contains(out, "chardetect 5.2.0") || !strings.Contains(out, "keep") {
 		t.Fatalf("second terminal did not reuse the workspace install:\n%s", out)
 	}
 	if _, err := service.CancelProcess(context.Background(), ProcessLookupRequest{

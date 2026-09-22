@@ -7,9 +7,12 @@
 #
 # This snippet re-adds the directory only when the egress socket mount is
 # actually present, so the explicit-egress-disabled and agent-image
-# contracts stay byte-identical, and only when the directory exists.
+# contracts stay byte-identical. It must NOT require the directory to
+# exist: on a fresh workspace pip creates $HOME/.local/bin during the
+# install — after login — and the installing session still needs the
+# console script on PATH (a nonexistent PATH entry is harmless).
 sumi_egress_home=${HOME:-/workspace}
-if [ -S /run/sumi/egress/proxy.sock ] && [ -d "$sumi_egress_home/.local/bin" ]; then
+if [ -S /run/sumi/egress/proxy.sock ]; then
     case ":$PATH:" in
         *":$sumi_egress_home/.local/bin:"*) ;;
         *) PATH="$sumi_egress_home/.local/bin:$PATH" ;;

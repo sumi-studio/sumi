@@ -533,3 +533,60 @@ func TestTunnelHalfClosePropagates(t *testing.T) {
 		t.Fatalf("final upstream bytes lost: %q err=%v", buf, err)
 	}
 }
+
+// O1 regression: in production the tunnel's client side is a
+// *net.UnixConn hijacked from the unix-socket listener, not a TCPConn.
+// When the upstream ends its write side, that half-close must reach the
+// unix client too — otherwise the peer (the in-container bridge) never
+// sees EOF and the conn+slot hang until the idle reaper.
+func TestTunnelHalfCloseReachesUnixClient(t *testing.T) {
+	p := NewProxy(Config{IdleTimeout: time.Minute, Logf: func(string, ...any) {}})
+	// Upstream: deliver bytes, then half-close its write side and hold
+	// the read side open — the client must still see EOF.
+	upstreamListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstreamListener.Close()
+	go func() {
+		conn, err := upstreamListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("upstream-done"))
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		_, _ = io.Copy(io.Discard, conn) // hold until the client goes away
+	}()
+	// Client side over a real unix socket — the production transport.
+	dir := t.TempDir()
+	ulistener, err := net.Listen("unix", dir+"/c.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ulistener.Close()
+	go func() {
+		conn, err := ulistener.Accept()
+		if err != nil {
+			return
+		}
+		upstream, err := net.Dial("tcp", upstreamListener.Addr().String())
+		if err != nil {
+			conn.Close()
+			return
+		}
+		p.tunnel(conn, upstream)
+	}()
+	user, err := net.Dial("unix", dir+"/c.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer user.Close()
+	_ = user.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf, err := io.ReadAll(user) // returns at EOF on the upstream half-close
+	if err != nil || string(buf) != "upstream-done" {
+		t.Fatalf("unix client never saw the upstream half-close: %q err=%v", buf, err)
+	}
+}
