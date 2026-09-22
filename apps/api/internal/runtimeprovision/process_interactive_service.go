@@ -207,6 +207,18 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 	if pos.Ino == 0 {
 		pos.Ino = ino
 	}
+	// Same-inode continuity witnesses. A file offset alone cannot prove
+	// the bytes at pos.Off continue the stream this pump committed: an
+	// in-place truncation (logrotate copytruncate, filesystems without
+	// stable inode semantics) can shrink the file AND regrow it past
+	// the committed offset before the next poll, so size < pos.Off is
+	// not guaranteed observable. Keep a window of raw journal bytes —
+	// the first bytes of this stream era and the bytes immediately
+	// preceding pos.Off — and re-verify the tail window before every
+	// resume. Bytes below pos.Off are already delivered; only the
+	// resume boundary has to be proven unchanged.
+	cont := journalContinuity{}
+	cont.seed(f, pos.Off)
 	io_.attached.Store(true)
 	stable := 0
 	for {
@@ -215,6 +227,25 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 			return false
 		}
 		avail := st.Size() - pos.Off
+		if st.Size() < pos.Off || (avail > 0 && !cont.verify(f, pos.Off)) {
+			// The file shrank below the committed offset, or the bytes
+			// at the resume boundary changed — this inode no longer
+			// continues the committed stream. Mark the loss, then pick
+			// the honest resume point: if the journal's head is intact
+			// the prefix is genuine but the divergence point is
+			// unknowable, so resume at end-of-file (the gap covers the
+			// uncertain window; nothing is duplicated or invented). If
+			// the head changed the file is a new era — replay it whole.
+			_ = io_.tty.recordGap("container output journal truncated or rewritten in place; bytes in the window are lost")
+			if cont.headIntact(f, st.Size()) {
+				pos.Off = st.Size()
+				cont.seedTail(f, pos.Off)
+			} else {
+				pos.Off = 0
+				cont = journalContinuity{}
+			}
+			continue
+		}
 		if avail > 0 {
 			want := avail
 			if want > journalReadChunk {
@@ -231,6 +262,7 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 			}
 			if n > 0 {
 				pos.Off += int64(n)
+				cont.advance(buf[:n])
 				if serr := io_.tty.saveSrc(pos); serr != nil {
 					return false
 				}
@@ -261,6 +293,96 @@ func (s *processStore) pumpJournal(io_ *interactiveIO, path string, alive bool) 
 		}
 		alive = !s.interactiveTerminal(io_.op.OperationID)
 	}
+}
+
+// journalContinuityBytes bounds the raw journal window kept as the
+// same-inode continuity witness.
+const journalContinuityBytes = 64
+
+// journalContinuity witnesses the byte stream around the committed
+// journal offset so the tailer can tell a genuinely continued file
+// from an in-place truncated/regrown one. head is the first bytes of
+// the current stream era; tail is the bytes immediately preceding the
+// committed offset. Both are raw journal bytes (JSON lines with
+// per-record timestamps), so an unrelated rewrite colliding with the
+// window is not a practical false-negative risk — and a rewrite that
+// reproduces the window byte-for-byte is undetectable by any
+// offset-based scheme.
+type journalContinuity struct {
+	head []byte
+	tail []byte
+}
+
+// seed captures the witnesses for a certified resume offset (open or
+// post-recovery). At off == 0 nothing has been consumed — the windows
+// populate on first reads.
+func (c *journalContinuity) seed(f *os.File, off int64) {
+	c.head, c.tail = nil, nil
+	if off <= 0 {
+		return
+	}
+	c.head = readWindow(f, 0, min(off, journalContinuityBytes))
+	c.tail = readWindow(f, max(0, off-journalContinuityBytes), off)
+}
+
+// seedTail re-arms the tail witness at a resume point chosen after a
+// detected discontinuity: the bytes now preceding pos.Off are what
+// future polls must still see unchanged.
+func (c *journalContinuity) seedTail(f *os.File, off int64) {
+	c.tail = readWindow(f, max(0, off-journalContinuityBytes), off)
+}
+
+// verify reports whether the bytes immediately preceding off still
+// equal what was committed there — i.e. the file continues the
+// witnessed stream. A nil tail (era start) always verifies.
+func (c *journalContinuity) verify(f *os.File, off int64) bool {
+	if c.tail == nil {
+		return true
+	}
+	got := readWindow(f, off-int64(len(c.tail)), off)
+	return bytes.Equal(got, c.tail)
+}
+
+// headIntact reports whether the file's head still matches the
+// witnessed stream era — distinguishing a head-preserving truncation
+// (prefix genuine, divergence point unknowable) from a restart
+// (new era, safe to replay from offset 0).
+func (c *journalContinuity) headIntact(f *os.File, size int64) bool {
+	if c.head == nil {
+		return false
+	}
+	want := int64(len(c.head))
+	if size < want {
+		return false
+	}
+	return bytes.Equal(readWindow(f, 0, want), c.head)
+}
+
+// advance folds consumed raw journal bytes into the witnesses.
+func (c *journalContinuity) advance(consumed []byte) {
+	c.tail = append(c.tail, consumed...)
+	if len(c.tail) > journalContinuityBytes {
+		c.tail = c.tail[len(c.tail)-journalContinuityBytes:]
+	}
+	if len(c.head) < journalContinuityBytes {
+		need := journalContinuityBytes - len(c.head)
+		if need > len(consumed) {
+			need = len(consumed)
+		}
+		c.head = append(c.head, consumed[:need]...)
+	}
+}
+
+func readWindow(f *os.File, from, to int64) []byte {
+	if to <= from {
+		return nil
+	}
+	buf := make([]byte, to-from)
+	n, err := f.ReadAt(buf, from)
+	if err != nil && err != io.EOF {
+		return nil
+	}
+	return buf[:n]
 }
 
 // journalDrain consumes complete journal records from buf, appending

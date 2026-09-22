@@ -14,7 +14,11 @@ package termexec
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +39,7 @@ func newStore(t *testing.T) *agentstate.Store {
 	}
 	s := agentstate.NewStore(pool)
 	s.SetDefaultTerminalBackend("cloud")
+	s.SetTerminalBackendAvailable("cloud")
 	return s
 }
 
@@ -666,4 +671,439 @@ func TestDriverShutdownReleasesLockAfterPumps(t *testing.T) {
 		t.Fatalf("post-shutdown acquire lock=%v err=%v, want held", probe, err)
 	}
 	defer probe.Release(ctx)
+}
+
+// ------------------------------------------------------------------
+// TREV2-01: transport ambiguity → 'unknown', never resent.
+//
+// wireProvisioner serves the real runtimeprovision HTTP protocol on a
+// unix socket, so these tests exercise the actual Client's transport,
+// marshalling and error decoding — not a stubbed error value. The
+// "drop" mode applies the effect server-side and then destroys the
+// connection before the response is read: the exact window where a
+// definite 'failed' would invite a duplicate resend.
+// ------------------------------------------------------------------
+
+type wireProvisioner struct {
+	sock string
+	mu   sync.Mutex
+	// modes[endpoint] ∈ "ok" | "drop" | "conflict" | "operation_failed"
+	// | "resize_unsupported" | "not_interactive" | "garbage"
+	modes   map[string]string
+	effects map[string]int
+}
+
+func startWireProvisioner(t *testing.T) *wireProvisioner {
+	t.Helper()
+	dir := t.TempDir()
+	wp := &wireProvisioner{sock: dir + "/prov.sock", modes: map[string]string{}, effects: map[string]int{}}
+	ln, err := net.Listen("unix", wp.sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	mux := http.NewServeMux()
+	reply := func(w http.ResponseWriter, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(v)
+		_, _ = w.Write(b)
+	}
+	fail := func(w http.ResponseWriter, status int, code, msg string) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		fmt.Fprintf(w, `{"code":%q,"message":%q}`, code, msg)
+	}
+	op := func(r *http.Request) runtimeprovision.ProcessOperation {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		paid, _ := req["personality_agent_id"].(string)
+		return runtimeprovision.ProcessOperation{
+			OperationID:        runtimeprovision.ProcessOperationID(paid, "term:composed-wire"),
+			PersonalityAgentID: paid,
+			Executable:         "/bin/bash",
+			State:              runtimeprovision.ProcessRunning,
+			Interactive:        true, TTY: true,
+		}
+	}
+	effect := func(endpoint string, w http.ResponseWriter) bool {
+		wp.mu.Lock()
+		defer wp.mu.Unlock()
+		switch wp.modes[endpoint] {
+		case "conflict":
+			fail(w, 409, "conflict", "operation is terminal")
+		case "operation_failed":
+			fail(w, 502, "operation_failed", "internal fault after dispatch")
+		case "resize_unsupported":
+			fail(w, 502, "resize_unsupported", "daemon cannot resize")
+		case "not_interactive":
+			fail(w, 409, "not_interactive", "operation is not interactive")
+		case "garbage":
+			w.WriteHeader(502)
+			_, _ = w.Write([]byte("<html>proxy failure</html>"))
+		case "drop":
+			// The effect is applied HERE — the same point a real
+			// provisioner completes sink.Write before forming the
+			// receipt — then the response never arrives.
+			wp.effects[endpoint]++
+			if hj, ok := w.(http.Hijacker); ok {
+				conn, _, herr := hj.Hijack()
+				if herr == nil {
+					_ = conn.Close()
+				}
+			}
+		default:
+			wp.effects[endpoint]++
+			return true
+		}
+		return false
+	}
+	mux.HandleFunc("/v1/process/start", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, op(r))
+	})
+	mux.HandleFunc("/v1/process/status", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, op(r))
+	})
+	mux.HandleFunc("/v1/process/cancel", func(w http.ResponseWriter, r *http.Request) {
+		o := op(r)
+		o.State = runtimeprovision.ProcessSucceeded
+		reply(w, o)
+	})
+	mux.HandleFunc("/v1/process/output", func(w http.ResponseWriter, r *http.Request) {
+		var req runtimeprovision.ProcessOutputRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		reply(w, runtimeprovision.ProcessOutput{
+			OperationID: req.OperationID, Stream: "stdout",
+			Offset: req.Offset, NextOffset: req.Offset, EOF: true,
+		})
+	})
+	mux.HandleFunc("/v1/process/input", func(w http.ResponseWriter, r *http.Request) {
+		var req runtimeprovision.ProcessInputRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if effect("/v1/process/input", w) {
+			reply(w, runtimeprovision.ProcessInputReceipt{Delivered: true})
+		}
+	})
+	mux.HandleFunc("/v1/process/signal", func(w http.ResponseWriter, r *http.Request) {
+		var req runtimeprovision.ProcessSignalRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if effect("/v1/process/signal", w) {
+			reply(w, runtimeprovision.ProcessInputReceipt{Delivered: true})
+		}
+	})
+	mux.HandleFunc("/v1/process/resize", func(w http.ResponseWriter, r *http.Request) {
+		if effect("/v1/process/resize", w) {
+			reply(w, op(r))
+		}
+	})
+	srv := &http.Server{Handler: mux}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close(); _ = ln.Close() })
+	return wp
+}
+
+func (wp *wireProvisioner) set(endpoint, mode string) {
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+	wp.modes[endpoint] = mode
+}
+
+func (wp *wireProvisioner) count(endpoint string) int {
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+	return wp.effects[endpoint]
+}
+
+func inputStatus(t *testing.T, s *agentstate.Store, pa, sid string, seq int64) string {
+	t.Helper()
+	rows, err := s.ListTerminalInputs(context.Background(), pa, sid, seq-1, 10)
+	if err != nil {
+		t.Fatalf("list inputs: %v", err)
+	}
+	for _, r := range rows {
+		if r.Seq == seq {
+			return r.Status
+		}
+	}
+	return ""
+}
+
+// The decisive TREV2-01 schedule: the provisioner applies the stdin
+// effect, then the response is destroyed before the client reads it.
+// The durable ledger must say 'unknown' (never auto-resent), not
+// 'failed' — the byte ran in the shell and 'failed' invites a
+// duplicate. Controls: explicit pre-effect refusals stay 'failed';
+// generic/undecodable server failures are ambiguous → 'unknown'.
+func TestDriverTransportLossRecordsUnknown(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatalf("persona: %v", err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "sh", "human", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	wp := startWireProvisioner(t)
+	client, err := runtimeprovision.NewUnixClient(wp.sock)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	var logs sync.Map
+	d := New(s, client, nil, testConfig(&logs, "d:"))
+	ctx1, cancel1 := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { d.Run(ctx1); close(done) }()
+	defer func() { cancel1(); <-done }()
+
+	waitFor(t, 10*time.Second, "session active", func() bool {
+		return sessionStatus(t, s, pa, sess.SessionID) == "active"
+	})
+
+	submit := func(kind string, payload map[string]any) int64 {
+		t.Helper()
+		in, err := s.SubmitTerminalInput(ctx, pa, sess.SessionID, "human", kind, payload)
+		if err != nil {
+			t.Fatalf("submit %s: %v", kind, err)
+		}
+		return in.Seq
+	}
+	waitStatus := func(seq int64, want string) {
+		t.Helper()
+		waitFor(t, 8*time.Second, fmt.Sprintf("input %d → %s", seq, want), func() bool {
+			return inputStatus(t, s, pa, sess.SessionID, seq) == want
+		})
+	}
+
+	// 1. Effect applied + response destroyed → 'unknown', and the
+	//    input is never re-delivered even after several pump ticks.
+	wp.set("/v1/process/input", "drop")
+	seq := submit("stdin", map[string]any{"data": "echo hi\n"})
+	waitStatus(seq, "unknown")
+	if wp.count("/v1/process/input") != 1 {
+		t.Fatalf("input effects = %d, want exactly 1 (effect applied once)", wp.count("/v1/process/input"))
+	}
+	time.Sleep(400 * time.Millisecond) // several 50ms pump ticks
+	if got := wp.count("/v1/process/input"); got != 1 {
+		t.Fatalf("input re-delivered after 'unknown': effects = %d", got)
+	}
+
+	// 2. Explicit pre-effect refusal → 'failed' (safe to resend).
+	wp.set("/v1/process/input", "conflict")
+	seq = submit("stdin", map[string]any{"data": "echo no\n"})
+	waitStatus(seq, "failed")
+
+	// 3. Generic structured server failure → ambiguous → 'unknown'.
+	wp.set("/v1/process/input", "operation_failed")
+	seq = submit("stdin", map[string]any{"data": "echo maybe\n"})
+	waitStatus(seq, "unknown")
+
+	// 4. Undecodable server reply → 'unknown'.
+	wp.set("/v1/process/input", "garbage")
+	seq = submit("stdin", map[string]any{"data": "echo html\n"})
+	waitStatus(seq, "unknown")
+
+	// 5. Same contract on the signal path: effect + lost answer.
+	wp.set("/v1/process/signal", "drop")
+	seq = submit("signal", map[string]any{"signal": "TERM"})
+	waitStatus(seq, "unknown")
+	if wp.count("/v1/process/signal") != 1 {
+		t.Fatalf("signal effects = %d, want 1", wp.count("/v1/process/signal"))
+	}
+
+	// 6. Resize definite refusal → 'failed'.
+	wp.set("/v1/process/resize", "resize_unsupported")
+	seq = submit("resize", map[string]any{"cols": 120.0, "rows": 40.0})
+	waitStatus(seq, "failed")
+
+	// 7. Delivery still lands 'written' on a clean response.
+	wp.set("/v1/process/input", "ok")
+	seq = submit("stdin", map[string]any{"data": "echo ok\n"})
+	waitStatus(seq, "written")
+}
+
+// Client-side decode of an unknown structured code must not collapse
+// into a definite sentinel: the driver treats it as ambiguous.
+func TestClientStructuredUnknownCodeStaysAmbiguous(t *testing.T) {
+	wp := startWireProvisioner(t)
+	wp.set("/v1/process/input", "operation_failed")
+	client, err := runtimeprovision.NewUnixClient(wp.sock)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	pa := pid(t)
+	opID := runtimeprovision.ProcessOperationID(pa, "call-x")
+	_, err = client.WriteProcessInput(context.Background(), runtimeprovision.ProcessInputRequest{
+		ProcessLookupRequest: runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: pa, OperationID: opID,
+		},
+		Data: []byte("x"),
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, sentinel := range []error{
+		runtimeprovision.ErrProcessNotFound, runtimeprovision.ErrProcessBusy,
+		runtimeprovision.ErrInvalidProcessRequest, runtimeprovision.ErrConflict,
+		runtimeprovision.ErrProcessWorkspace, runtimeprovision.ErrProcessNotInteractive,
+		runtimeprovision.ErrProcessResizeUnsupported,
+	} {
+		if errors.Is(err, sentinel) {
+			t.Fatalf("ambiguous server failure collapsed into %v", sentinel)
+		}
+	}
+	// A structured refusal DOES map to its sentinel — the contract
+	// nonterminal consumers already rely on.
+	wp.set("/v1/process/input", "not_interactive")
+	_, err = client.WriteProcessInput(context.Background(), runtimeprovision.ProcessInputRequest{
+		ProcessLookupRequest: runtimeprovision.ProcessLookupRequest{
+			PersonalityAgentID: pa, OperationID: opID,
+		},
+		Data: []byte("x"),
+	})
+	if !errors.Is(err, runtimeprovision.ErrProcessNotInteractive) {
+		t.Fatalf("not_interactive did not map to sentinel: %v", err)
+	}
+}
+
+// TREV2-05: a RunnerID containing '#' would blur the incarnation
+// prefix boundary — the driver refuses visibly instead of driving
+// under a corrupt identity. Literal starts_with matching makes
+// LIKE metacharacters inert, but the name rule is enforced at run.
+func TestDriverInvalidRunnerIDRefusesVisibly(t *testing.T) {
+	s := newStore(t)
+	var logs sync.Map
+	for _, bad := range []string{"a#b", "runner%all", "with space", "runner/x"} {
+		fake := &fakeProc{ops: map[string]*runtimeprovision.ProcessOperation{}}
+		cfg := testConfig(&logs, "d:")
+		cfg.RunnerID = bad
+		d := New(s, fake, nil, cfg)
+		done := make(chan struct{})
+		go func() { d.Run(context.Background()); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("RunnerID %q: Run did not refuse", bad)
+		}
+		fake.mu.Lock()
+		if fake.startCalls != 0 {
+			t.Fatalf("RunnerID %q launched ops despite refusal", bad)
+		}
+		fake.mu.Unlock()
+	}
+	var refused bool
+	logs.Range(func(_, v any) bool {
+		if strings.Contains(v.(string), "refusing to run") {
+			refused = true
+		}
+		return true
+	})
+	if !refused {
+		t.Fatal("no visible refusal logged for invalid RunnerID")
+	}
+}
+
+// TREV2-06: a zero-width loss marker sitting at the drain frontier is
+// emitted once — the pump's emittedGaps high-water stops the
+// every-tick doomed re-insert — while a genuinely new boundary still
+// reaches the scrollback.
+func TestDriverLossMarkerEmitsOnceNotEveryTick(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatalf("persona: %v", err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "sh", "human", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, _, err := s.ClaimTerminalSessions(ctx, pa, "runner-x", "cloud", time.Minute, 1); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	var mu sync.Mutex
+	secondGap := false
+	fake := &fakeProc{
+		ops: map[string]*runtimeprovision.ProcessOperation{},
+		readFunc: func(offset int64) runtimeprovision.ProcessOutput {
+			mu.Lock()
+			defer mu.Unlock()
+			gaps := []runtimeprovision.ProcessOutputGap{{At: 6, Note: "journal rotated"}}
+			if secondGap {
+				gaps = append(gaps,
+					runtimeprovision.ProcessOutputGap{At: 6, Note: "journal vanished"},
+					runtimeprovision.ProcessOutputGap{At: 9, Note: "journal rotated again"})
+			}
+			return runtimeprovision.ProcessOutput{
+				Offset: offset, NextOffset: 12, Content: "beforeafter",
+				EOF: true, Gaps: gaps,
+			}
+		},
+	}
+	var logs sync.Map
+	d := New(s, fake, nil, testConfig(&logs, "d:"))
+	ctx1, cancel1 := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { d.Run(ctx1); close(done) }()
+	defer func() { cancel1(); <-done }()
+
+	waitFor(t, 5*time.Second, "session active", func() bool {
+		return sessionStatus(t, s, pa, sess.SessionID) == "active"
+	})
+	waitFor(t, 5*time.Second, "loss marker emitted", func() bool {
+		d.mu.Lock()
+		p := d.pumps[sess.SessionID]
+		d.mu.Unlock()
+		return p != nil && p.emittedGapCount() == 1
+	})
+	// Settle several ticks: the marker must not be re-appended — the
+	// emitted-set, not another dead insert, is the frontier state.
+	time.Sleep(300 * time.Millisecond)
+	count := func() int {
+		read, err := s.ReadTerminalOutput(ctx, pa, sess.SessionID, 0, 0, 64)
+		if err != nil {
+			t.Fatalf("read output: %v", err)
+		}
+		n := 0
+		for _, c := range read.Chunks {
+			if c.Kind == "gap" && c.Base == 6 {
+				n++
+			}
+		}
+		return n
+	}
+	if got := count(); got != 1 {
+		t.Fatalf("loss markers in scrollback = %d, want exactly 1", got)
+	}
+	// A genuinely new boundary is a distinct event — it must still be
+	// emitted. The same-position repeat (different note) is attempted
+	// once and absorbed by the store's (session, base, kind) dedupe:
+	// a marker at position 6 already states the only reader-visible
+	// fact a zero-width boundary can carry, so the scrollback gains
+	// exactly one new row — at position 9.
+	mu.Lock()
+	secondGap = true
+	mu.Unlock()
+	waitFor(t, 5*time.Second, "second boundary emitted", func() bool {
+		read, err := s.ReadTerminalOutput(ctx, pa, sess.SessionID, 0, 0, 64)
+		if err != nil {
+			t.Fatalf("read output: %v", err)
+		}
+		var at9 bool
+		for _, c := range read.Chunks {
+			if c.Kind == "gap" && c.Base == 9 {
+				at9 = true
+			}
+		}
+		return at9
+	})
+	if got := count(); got != 1 {
+		t.Fatalf("same-position markers = %d, want 1 (positional dedupe)", got)
+	}
+	d.mu.Lock()
+	p := d.pumps[sess.SessionID]
+	d.mu.Unlock()
+	emitted := p.emittedGapCount()
+	if emitted < 2 {
+		t.Fatalf("emittedGaps = %d, want the new boundary recorded", emitted)
+	}
 }

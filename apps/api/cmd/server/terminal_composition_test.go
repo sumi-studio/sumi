@@ -65,6 +65,7 @@ func newComposedTerminalWorld(t *testing.T) *composedTerminalWorld {
 	appStore := applicationapps.New(pool, wsStore, fence)
 	stateStore := agentstate.NewStore(pool)
 	stateStore.SetDefaultTerminalBackend("cloud")
+	stateStore.SetTerminalBackendAvailable("cloud")
 
 	dir := t.TempDir()
 	cmdStore, err := agentevents.OpenCommandStore(dir + "/commands")

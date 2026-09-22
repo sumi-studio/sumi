@@ -350,3 +350,183 @@ func TestResidualRunnerLockPingReleaseRace(t *testing.T) {
 		}
 	}
 }
+
+// TREV2-02: expired claims held by a *different* logical runner must
+// still surface the persona for discovery — the sweep inside
+// ClaimTerminalSessions converts them so a renamed or dead runner can
+// never strand a session. Live foreign leases are never stolen, and
+// the backend boundary keeps foreign backends untouched. One persona
+// per fixture keeps ClaimTerminalSessions deterministic.
+func TestResidualForeignExpiredClaimSweptAndReclaimed(t *testing.T) {
+	s := newTerminalStore(t)
+	ctx := context.Background()
+	newPA := func() string {
+		pa := pid(t)
+		mustPersona(t, s, pa)
+		return pa
+	}
+	expire := func(sid string) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE core_terminal_sessions
+			SET claim_expires_at = now() - interval '1 second'
+			WHERE session_id = $1`, sid); err != nil {
+			t.Fatalf("expire: %v", err)
+		}
+	}
+	get := func(pa, sid string) TerminalSession {
+		t.Helper()
+		sess, err := s.GetTerminalSession(ctx, pa, sid)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		return sess
+	}
+
+	// A) claimed/active session under an EXPIRED foreign claim —
+	//    including an orphaned 'dequeued' input that must end
+	//    'unknown', never re-served.
+	paA := newPA()
+	sessA := mustTerminalSession(t, s, paA, "a")
+	claimA := mustClaimTerminal(t, s, paA, "foreign-runner#f1", time.Minute)
+	in, err := s.SubmitTerminalInput(ctx, paA, sessA.SessionID, "human", "stdin",
+		map[string]any{"data": "in flight"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if _, err := s.ReportTerminalInputDisposition(ctx, paA, sessA.SessionID, in.InputID,
+		"foreign-runner#f1", claimA.Epoch, "dequeued", nil); err != nil {
+		t.Fatalf("dequeue: %v", err)
+	}
+	expire(sessA.SessionID)
+
+	// B) 'ending' under an expired foreign claim — recovery must not
+	//    resurrect it; the new owner finishes the physical stop.
+	paB := newPA()
+	sessB := mustTerminalSession(t, s, paB, "b")
+	mustClaimTerminal(t, s, paB, "foreign-runner#f2", time.Minute)
+	if _, err := s.CloseTerminalSession(ctx, paB, sessB.SessionID, "close while foreign"); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := get(paB, sessB.SessionID); got.Status != "ending" || got.ClaimedBy == "" {
+		t.Fatalf("setup: B = %+v, want ending with foreign claim", got)
+	}
+	expire(sessB.SessionID)
+
+	// C) LIVE foreign lease — must never be surfaced or stolen.
+	paC := newPA()
+	sessC := mustTerminalSession(t, s, paC, "c")
+	live := mustClaimTerminal(t, s, paC, "foreign-runner#f3", time.Hour)
+	if live.ClaimedBy == "" {
+		t.Fatal("setup: C unclaimed")
+	}
+
+	// D) backend boundary: an expired foreign claim on another
+	//    backend is not this runner's to sweep or adopt.
+	paD := newPA()
+	sessD := mustTerminalSession(t, s, paD, "d")
+	mustClaimTerminal(t, s, paD, "foreign-runner#f4", time.Minute)
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE core_terminal_sessions SET backend = 'local' WHERE session_id = $1`,
+		sessD.SessionID); err != nil {
+		t.Fatalf("rebackend: %v", err)
+	}
+	expire(sessD.SessionID)
+
+	// Discovery surfaces A and B purely on their expired foreign
+	// claims — no new session needed. C (live lease) and D (foreign
+	// backend) stay invisible to this runner.
+	runnable, err := s.RunnableTerminalPersonas(ctx, "my-runner", "cloud", 64)
+	if err != nil {
+		t.Fatalf("runnable: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range runnable {
+		got[p] = true
+	}
+	if !got[paA] || !got[paB] {
+		t.Fatalf("expired foreign claims not runnable: %v", runnable)
+	}
+	if got[paC] {
+		t.Fatal("live foreign lease surfaced for another runner")
+	}
+	if got[paD] {
+		t.Fatal("cross-backend expired claim surfaced for cloud runner")
+	}
+
+	// The claim pass sweeps (dequeued→unknown, claims cleared) and
+	// adopts: A resumes, B keeps 'ending' for physical stop.
+	claimedA, _, err := s.ClaimTerminalSessions(ctx, paA, "my-runner#i1", "cloud", time.Minute, 4)
+	if err != nil || len(claimedA) != 1 {
+		t.Fatalf("claim A: %v %v", claimedA, err)
+	}
+	a := claimedA[0]
+	if a.SessionID != sessA.SessionID || a.ClaimedBy != "my-runner#i1" || a.Status != "claimed" {
+		t.Fatalf("A = %+v, want claimed by my-runner#i1", a)
+	}
+	claimedB, _, err := s.ClaimTerminalSessions(ctx, paB, "my-runner#i1", "cloud", time.Minute, 4)
+	if err != nil || len(claimedB) != 1 || claimedB[0].Status != "ending" {
+		t.Fatalf("B = %+v, want adopted ending for physical stop", claimedB)
+	}
+
+	// C: nothing expired — the claim pass must leave the live foreign
+	//    lease entirely alone.
+	claimedC, _, err := s.ClaimTerminalSessions(ctx, paC, "my-runner#i1", "cloud", time.Minute, 4)
+	if err != nil {
+		t.Fatalf("claim C: %v", err)
+	}
+	if len(claimedC) != 0 {
+		t.Fatalf("live foreign claim stolen: %+v", claimedC)
+	}
+	if c := get(paC, sessC.SessionID); c.ClaimedBy != "foreign-runner#f3" {
+		t.Fatalf("live foreign claim disturbed: %+v", c)
+	}
+
+	// The sweep converted the orphaned dequeue to 'unknown' —
+	// indeterminate, never 'failed', never re-served.
+	rows, err := s.ListTerminalInputs(ctx, paA, sessA.SessionID, 0, 16)
+	if err != nil || len(rows) != 1 || rows[0].Status != "unknown" {
+		t.Fatalf("ledger = %+v, want one unknown row", rows)
+	}
+	pend, err := s.PendingTerminalInputs(ctx, paA, sessA.SessionID, "my-runner#i1", a.Epoch)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	for _, p := range pend {
+		if p.InputID == in.InputID {
+			t.Fatal("unknown row re-served to the reclaiming runner")
+		}
+	}
+
+	// D): a cloud-scoped claim sweep must not touch the local-backend
+	//     session's expired foreign claim.
+	if _, _, err := s.ClaimTerminalSessions(ctx, paD, "my-runner#i1", "cloud", time.Minute, 4); err != nil {
+		t.Fatalf("claim D: %v", err)
+	}
+	if d := get(paD, sessD.SessionID); d.Status != "claimed" || d.ClaimedBy != "foreign-runner#f4" {
+		t.Fatalf("cross-backend session disturbed: %+v", d)
+	}
+	// The local backend's own runner sweeps and reclaims it.
+	claimedD, _, err := s.ClaimTerminalSessions(ctx, paD, "local-runner#l1", "local", time.Minute, 4)
+	if err != nil || len(claimedD) != 1 || claimedD[0].ClaimedBy != "local-runner#l1" {
+		t.Fatalf("local reclaim = %+v, %v", claimedD, err)
+	}
+}
+
+// TREV2-03: declaring a default backend never declares it served —
+// sessions stamped with an unserved backend refuse at admission.
+func TestResidualDefaultBackendIsNotAvailability(t *testing.T) {
+	s := newTerminalStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	s.SetDefaultTerminalBackend("local") // name only — no runner
+	if _, err := s.CreateTerminalSession(ctx, pa, "sh", "human", "test"); !errors.Is(err, ErrTerminalBackend) {
+		t.Fatalf("unserved default backend admitted a session: %v", err)
+	}
+	// Once a runner proves 'local' live, admission opens.
+	s.SetTerminalBackendAvailable("local")
+	if _, err := s.CreateTerminalSession(ctx, pa, "sh", "human", "test"); err != nil {
+		t.Fatalf("served default backend refused: %v", err)
+	}
+}

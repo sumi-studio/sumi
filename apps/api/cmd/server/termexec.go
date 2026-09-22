@@ -65,6 +65,12 @@ func termexecFromEnv(store *agentstate.Store, filesClient *fileaccess.Client) (*
 	store.SetTerminalBackendAvailable(backend)
 	if def := envOr("SUMI_TERMINALS_DEFAULT_BACKEND", "cloud"); def == "cloud" || def == "local" {
 		store.SetDefaultTerminalBackend(def)
+		if def != backend {
+			// Naming a default does not conjure a runner: sessions
+			// stamped %q are refused at admission until wiring proves
+			// a %q backend live — say so instead of queueing forever.
+			log.Printf("termexec: SUMI_TERMINALS_DEFAULT_BACKEND=%q has no proven runner (served backend is %q); new sessions will be refused at admission", def, backend)
+		}
 	}
 	return termexec.New(store, client, &termexec.FileScopeEnsurer{Client: filesClient}, termexec.Config{
 		RunnerID:           envOr("SUMI_TERMEXEC_RUNNER_ID", "termexec-docker"),

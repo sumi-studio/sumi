@@ -416,15 +416,13 @@ func (s *Store) SetJobBackendAvailable(backend string) {
 }
 
 // SetDefaultTerminalBackend configures the backend stamped onto new
-// terminal sessions. Declaring a default also declares it served —
-// wiring sets it only after the runner behind it is proven live, so a
-// 'cloud' session request on a deployment without termexec is refused
-// at admission instead of queueing forever.
+// terminal sessions. A default is a name, not a service guarantee —
+// wiring must separately call SetTerminalBackendAvailable for the
+// backend a live runner actually claims; otherwise sessions stamped
+// with the default are refused at admission (ErrTerminalBackend)
+// instead of queueing forever for a runner that does not exist.
 func (s *Store) SetDefaultTerminalBackend(backend string) {
 	s.defaultTerminalBackend = backend
-	if backend != "" {
-		s.SetTerminalBackendAvailable(backend)
-	}
 }
 
 // SetTerminalBackendAvailable declares that a live runner claims the

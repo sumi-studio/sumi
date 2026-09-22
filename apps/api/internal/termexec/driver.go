@@ -136,11 +136,12 @@ type Driver struct {
 
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
+	pumps  map[string]*sessionPump
 	wg     sync.WaitGroup
 }
 
 func New(store *agentstate.Store, proc ProcessAPI, scope ScopeEnsurer, cfg Config) *Driver {
-	return &Driver{store: store, proc: proc, scope: scope, cfg: cfg.normalize(), active: map[string]context.CancelFunc{}}
+	return &Driver{store: store, proc: proc, scope: scope, cfg: cfg.normalize(), active: map[string]context.CancelFunc{}, pumps: map[string]*sessionPump{}}
 }
 
 // Runner is the claim identity this driver writes into terminal
@@ -169,6 +170,25 @@ func (d *Driver) OutputAttached(ctx context.Context, personaID, sessionID string
 // logging once and silently leaving the deployment with no driver.
 const lockRetryInterval = 2 * time.Second
 
+// validRunnerID enforces the logical runner alphabet. Incarnations
+// are "runner#<uuid>" and store predicates match the logical name as
+// a literal prefix — '#' would blur the boundary between two
+// runners' incarnations, and whitespace/format noise would corrupt
+// every claim row. Conservative POSIX-token alphabet only.
+func validRunnerID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, r := range id {
+		if r != '-' && r != '_' && r != '.' &&
+			!(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
+			!(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
 // Run is the driver's claim loop. Exactly one live process may drive
 // a RunnerID. Two fences work together:
 //
@@ -186,6 +206,15 @@ const lockRetryInterval = 2 * time.Second
 //     'unknown' at the steal — never re-served even if the stale
 //     pump's transport write lands afterwards.
 func (d *Driver) Run(ctx context.Context) {
+	if !validRunnerID(d.cfg.RunnerID) {
+		// The claim-incarnation prefix ("runner#<uuid>") is matched
+		// literally; a '#' in the logical name would make one
+		// runner's prefix indistinguishable from another's
+		// incarnation and silently widen the steal fence. Refuse
+		// visibly instead of driving under a corrupt identity.
+		d.cfg.Logf("termexec: refusing to run: RunnerID %q must be non-empty and match [a-zA-Z0-9._-]+", d.cfg.RunnerID)
+		return
+	}
 	announced := false
 	for ctx.Err() == nil {
 		lock, err := d.store.TryAcquireTerminalRunnerLock(ctx, d.cfg.RunnerID)
@@ -446,7 +475,16 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 	pump := &sessionPump{
 		d: d, ctx: ctx, sessionID: sessionID, personaID: personaID,
 		claimID: claimID, epoch: epoch, opID: opID, ending: session.Status == "ending",
+		emittedGaps: map[string]struct{}{},
 	}
+	d.mu.Lock()
+	d.pumps[sessionID] = pump
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.pumps, sessionID)
+		d.mu.Unlock()
+	}()
 	// Same-epoch adoption (a driver restart inside a live lease) can
 	// inherit 'dequeued' rows the previous pump never dispositioned.
 	// They are indeterminate — resolve them to 'unknown' now, under
@@ -487,10 +525,29 @@ type sessionPump struct {
 	ending    bool
 	unknownAt time.Time
 	ticks     int
+	// emittedGaps dedupes journaled loss markers already appended to
+	// the scrollback. The provisioner returns every boundary at or
+	// ahead of the read offset, so a marker sitting at the drain
+	// frontier would otherwise be re-appended every tick — each a
+	// no-op deduped insert but still a claim-checked transaction.
+	// Keyed by (position, note): a genuinely new boundary — including
+	// a second loss event at the same position with different
+	// evidence — still emits. Guarded by mu (the drain goroutine is
+	// the only writer; tests observe through it).
+	mu          sync.Mutex
+	emittedGaps map[string]struct{}
 }
 
 func (p *sessionPump) call() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(p.ctx, p.d.cfg.CallTimeout)
+}
+
+// emittedGapCount reports how many distinct journaled loss markers
+// this pump has committed to the scrollback — test/ops observability.
+func (p *sessionPump) emittedGapCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.emittedGaps)
 }
 
 func (p *sessionPump) run() {
@@ -642,7 +699,7 @@ func (p *sessionPump) deliver(in agentstate.TerminalInput) (string, map[string]a
 		}
 		switch {
 		case err != nil:
-			return "failed", map[string]any{"error": err.Error()}
+			return effectErrorDisposition(err)
 		case receipt.Delivered:
 			return "written", nil
 		case receipt.Indeterminate:
@@ -660,7 +717,7 @@ func (p *sessionPump) deliver(in agentstate.TerminalInput) (string, map[string]a
 		})
 		cancel()
 		if err != nil {
-			return "failed", map[string]any{"error": err.Error()}
+			return effectErrorDisposition(err)
 		}
 		return "written", nil
 	case "signal":
@@ -672,7 +729,7 @@ func (p *sessionPump) deliver(in agentstate.TerminalInput) (string, map[string]a
 		cancel()
 		switch {
 		case err != nil:
-			return "failed", map[string]any{"error": err.Error()}
+			return effectErrorDisposition(err)
 		case receipt.Delivered:
 			return "written", nil
 		case receipt.Indeterminate:
@@ -682,6 +739,31 @@ func (p *sessionPump) deliver(in agentstate.TerminalInput) (string, map[string]a
 		}
 	}
 	return "failed", map[string]any{"error": "unknown input kind"}
+}
+
+// effectErrorDisposition classifies a backend effect's error. Only an
+// explicit pre-effect refusal — the typed sentinels the provisioner
+// answers before touching the container (or client-side validation
+// rejects before any request is sent) — is 'failed', safe to resend.
+// Transport loss, client timeouts, undecodable replies, and generic
+// server failures ('operation_failed', unrecognized codes) prove
+// nothing about whether the effect landed: 'unknown', never resent.
+func effectErrorDisposition(err error) (string, map[string]any) {
+	detail := map[string]any{"error": err.Error()}
+	for _, refusal := range [...]error{
+		runtimeprovision.ErrProcessNotFound,
+		runtimeprovision.ErrProcessBusy,
+		runtimeprovision.ErrInvalidProcessRequest,
+		runtimeprovision.ErrConflict,
+		runtimeprovision.ErrProcessWorkspace,
+		runtimeprovision.ErrProcessNotInteractive,
+		runtimeprovision.ErrProcessResizeUnsupported,
+	} {
+		if errors.Is(err, refusal) {
+			return "failed", detail
+		}
+	}
+	return "unknown", detail
 }
 
 // drainOutput pulls retained output from the provisioner into the
@@ -732,10 +814,19 @@ func (p *sessionPump) drainOutput() {
 		// drain window has reached are emitted; later events return on
 		// the next read. (session_id, base, kind) dedupe makes a
 		// re-drained marker idempotent.
+		var newGapKeys []string
 		for _, ev := range out.Gaps {
 			if ev.At > p.cursor {
 				continue
 			}
+			key := fmt.Sprintf("%d\x00%s", ev.At, ev.Note)
+			p.mu.Lock()
+			_, seen := p.emittedGaps[key]
+			p.mu.Unlock()
+			if seen {
+				continue
+			}
+			newGapKeys = append(newGapKeys, key)
 			gapTo := ev.At
 			chunks = append(chunks, agentstate.TerminalOutputChunk{
 				Kind: "gap", Base: ev.At, GapTo: &gapTo,
@@ -746,6 +837,13 @@ func (p *sessionPump) drainOutput() {
 			_, err = p.d.store.AppendTerminalOutput(c2, p.personaID, p.sessionID,
 				p.claimID, p.epoch, chunks)
 			cancel2()
+			if err == nil {
+				p.mu.Lock()
+				for _, k := range newGapKeys {
+					p.emittedGaps[k] = struct{}{}
+				}
+				p.mu.Unlock()
+			}
 			if err != nil {
 				// Roll the cursor back: uncommitted chunks re-drain
 				// next tick and dedupe if they partially landed.

@@ -78,28 +78,46 @@ func (b *DockerBackend) dockerHostSocket() (string, error) {
 // provisioner running in a container reads it wherever the deployer
 // mounted the data root — the override names that mount point rather
 // than pretending the host path is valid locally.
+// journalRootRetryBackoff bounds how often a failed `docker info`
+// resolution is retried — the journal tailer calls on every poll, so
+// an unrecovered daemon must not face an unbounded `docker info`
+// storm.
+const journalRootRetryBackoff = 5 * time.Second
+
 func (b *DockerBackend) dockerJournalRoot(ctx context.Context) (string, error) {
-	b.journalRootOnce.Do(func() {
-		for _, v := range b.baseEnvironment {
-			if strings.HasPrefix(v, "SUMI_DOCKER_JOURNAL_ROOT=") {
-				b.journalRoot = strings.TrimSpace(strings.TrimPrefix(v, "SUMI_DOCKER_JOURNAL_ROOT="))
-				return
-			}
-		}
-		raw, err := b.processDocker(ctx, "info", "--format", "{{.DockerRootDir}}")
-		if err == nil {
-			b.journalRoot = strings.TrimSpace(string(raw))
-		}
-		b.journalRootErr = err
-	})
-	if b.journalRootErr != nil {
-		return "", b.journalRootErr
+	b.journalRootMu.Lock()
+	defer b.journalRootMu.Unlock()
+	if b.journalRoot != "" {
+		return b.journalRoot, nil
 	}
+	for _, v := range b.baseEnvironment {
+		if strings.HasPrefix(v, "SUMI_DOCKER_JOURNAL_ROOT=") {
+			b.journalRoot = strings.TrimSpace(strings.TrimPrefix(v, "SUMI_DOCKER_JOURNAL_ROOT="))
+			return b.journalRoot, nil
+		}
+	}
+	// Resolution failures are not cached: a transient docker outage
+	// must recover without a provisioner restart. A short backoff
+	// keeps the tailer's retry cadence cheap.
+	if time.Now().Before(b.journalRootRetryAt) {
+		return "", errJournalRootUnresolved
+	}
+	raw, err := b.processDocker(ctx, "info", "--format", "{{.DockerRootDir}}")
+	if err != nil {
+		b.journalRootRetryAt = time.Now().Add(journalRootRetryBackoff)
+		return "", err
+	}
+	b.journalRoot = strings.TrimSpace(string(raw))
 	if b.journalRoot == "" {
-		return "", fmt.Errorf("%w: docker journal root unresolved", ErrProcessNotFound)
+		b.journalRootRetryAt = time.Now().Add(journalRootRetryBackoff)
+		return "", errJournalRootUnresolved
 	}
 	return b.journalRoot, nil
 }
+
+// errJournalRootUnresolved is not ErrProcessNotFound: an unresolved
+// journal root is a degraded-output condition, not a missing op.
+var errJournalRootUnresolved = errors.New("docker journal root unresolved")
 
 // ProcessJournalPath resolves the container's json-file journal on the
 // host filesystem. The pump reads this file rather than `docker logs
