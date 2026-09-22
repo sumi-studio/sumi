@@ -86,6 +86,10 @@ services:
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-messaging-attachments
         install -d -m 0750 -o 65532 -g 20000 /run/sumi/local-control
         install -d -m 0700 -o root -g root /run/sumi/runtime-secrets
+        # The job egress proxy owns this directory; job containers only
+        # traverse it to reach the unix socket (socket mode 0622 — connect
+        # needs write on the socket file, not the directory).
+        install -d -m 0755 -o 65532 -g 65532 /run/sumi/egress
     cap_add: [CHOWN, FOWNER]
     volumes:
       - api-command-log:/var/lib/sumi-command-log
@@ -97,6 +101,9 @@ services:
       - type: bind
         source: /run/sumi/runtime-secrets
         target: /run/sumi/runtime-secrets
+      - type: bind
+        source: /run/sumi/egress
+        target: /run/sumi/egress
     restart: "no"
 
   api:
@@ -313,6 +320,11 @@ services:
       # mounted read-only at a stable in-container point and the
       # override names it.
       SUMI_DOCKER_JOURNAL_ROOT: ${SUMI_DOCKER_JOURNAL_ROOT:-/run/sumi/docker-root}
+      # Host directory holding the job egress proxy's unix socket. The
+      # provisioner only names it to dockerd (bind source); it never opens
+      # the socket itself. Empty disables job egress entirely — job
+      # containers then launch with the byte-for-byte no-network contract.
+      SUMI_JOB_EGRESS_DIR: ${SUMI_JOB_EGRESS_DIR-/run/sumi/egress}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - type: bind
@@ -344,6 +356,39 @@ services:
       retries: 30
     restart: unless-stopped
     stop_grace_period: 2m
+
+  # The only network path granted to --network none job containers. Job
+  # traffic reaches it exclusively through the bind-mounted unix socket;
+  # it resolves destinations itself and refuses anything that is not a
+  # public TCP :443/:80 address. No Docker socket, no secrets, no inbound
+  # listener — compromise of this container yields outbound TCP only.
+  job-egress-proxy:
+    image: ghcr.io/sumi-studio/sumi-provisioner:${SUMI_PROVISIONER_IMAGE_TAG:-latest}
+    pull_policy: always
+    user: "65532:65532"
+    entrypoint: ["/usr/local/bin/sumi-egress-proxy"]
+    command:
+      - -socket
+      - /run/sumi/egress/proxy.sock
+      - -socket-mode
+      - "0622"
+    cap_drop: [ALL]
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: /run/sumi/egress
+        target: /run/sumi/egress
+    depends_on:
+      api-state-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/sumi/egress/proxy.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
 
   web:
     image: ghcr.io/sumi-studio/sumi-web:${SUMI_WEB_IMAGE_TAG:-latest}
