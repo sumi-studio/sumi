@@ -77,6 +77,8 @@ esac
 bin="${SUMI_LOCAL_MOVE_BIN:-}"
 if [[ -z $bin && -x $SCRIPT_DIR/sumi-local-move-bin ]]; then
   bin="$SCRIPT_DIR/sumi-local-move-bin"
+elif [[ -z $bin && -x $SCRIPT_DIR/../libexec/sumi-local-move-bin ]]; then
+  bin="$SCRIPT_DIR/../libexec/sumi-local-move-bin"
 elif [[ -z $bin && -f $SCRIPT_DIR/../../apps/api/cmd/local-move/main.go ]]; then
   command -v go >/dev/null || die "go is required to build sumi-local-move from a source checkout"
   mkdir -p "$home/run"

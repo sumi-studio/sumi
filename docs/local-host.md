@@ -49,7 +49,7 @@ sumi-local uninstall            # removes executables, keeps your data
 sumi-local uninstall --purge    # also deletes the state home (+ managed PG data)
 ```
 
-Installing drops a `sumi-local` shim in `~/.local/bin` once the install
+Installing drops `sumi-local` and `sumi-local-move` shims in `~/.local/bin` once the install
 completes. A failed install (for example, no database configured) leaves
 an existing shim pointing at the previous install and its half-written
 payload removable by `uninstall`.
@@ -263,9 +263,16 @@ sumi-local pack out.tar.gz   # from a source checkout (needs Go once)
 tar -xzf out.tar.gz && cd sumi-local && bin/sumi-local install
 ```
 
-A pack contains the prebuilt linux/amd64 service binary, the `core/`
-TypeScript payload, this CLI, compose file, and docs. Installing a pack
-needs no Go, no repository.
+A pack contains the prebuilt linux/amd64 state service, file service and
+move/return command, the `core/` TypeScript payload, both CLIs, compose file,
+and docs. Installing a pack needs no Go and no repository; Node and the other
+Linux requirements above still apply. `sumi-local-move` is installed alongside
+`sumi-local` and gets its own `~/.local/bin` shim. It reads the same
+`SUMI_LOCAL_HOME` and configuration, so custom installs use the same environment
+printed by the installer. `sumi-local-move return-status` checks that install;
+`return` reads a Cloud return URL from stdin. See
+[Cloud→Local return](cloud-local-return.md) for admission, file choice and recovery.
+The pack is not a macOS application and does not bundle the Electron browser host.
 
 ## Known limits / not yet
 

@@ -15,22 +15,40 @@ bundle instead of staging an upload.
 
 ## What moves
 
-Only core state moves: journal (including notes), inputs, turns, plans,
-operations, approvals, reminders, outbox and memory chunks. **Shared files
-do not move and are not deleted** — whether Cloud files come to Local is a
-product decision still open; the session view and the command both say so
-plainly (`state_only: true`, the `not_included` list, and the preflight
-`files` note). Jobs, model connections and credentials, account and
-workspace membership, and usage records do not move either. A persona that
-carried an unresolved model selection arrives with `needs_rebinding` —
-see "Model connection" below.
+The portable bundle carries core state: journal (including notes), inputs,
+turns, plans, operations, approvals, reminders, outbox and memory chunks.
+The owner also explicitly selects the working file store; nothing is preselected:
+
+- **`local`**: copy an immutable capture of the Cloud workspace into Local's
+  working directory. The Cloud copy remains read-only; this is not ongoing
+  synchronization or a backup service.
+- **`cloud`**: keep Cloud as the working store. Local receives a scoped file
+  credential, and the person and secretary use that same Cloud workspace.
+  File operations require connectivity. The Local PTY is unavailable because
+  that Cloud store is not mounted as a Local directory.
+
+Before sealing, the return waits for admitted file effects and terminal writers
+to reach the required durable cut. A pending terminal or uncertain writer is a
+reason to finish/reconcile it, never permission to copy a changing tree. For
+`local`, immutable-capture capability must be configured on filesvc; an
+unavailable capture cannot fall back to walking the live workspace.
+
+Jobs, model connections and credentials, account and workspace membership, and
+usage records do not move in the core bundle. The Cloud-file credential above
+is issued separately for that file mode. A persona with unresolved model
+selection arrives with `needs_rebinding`; see "Model connection" below.
+
+The supported packaged receiver is Linux/amd64, with Node and PostgreSQL as
+specified in [Local host](local-host.md). Current packs include the prebuilt
+`local-move` binary and install a `sumi-local-move` command beside `sumi-local`;
+no source checkout or Go compiler is needed. This is not a native Mac receiver.
 
 ## The flow
 
 1. In Cloud settings the owner chooses **秘書をローカルに戻す** (bring the
    secretary back to Local). The app asks Cloud for a session through the
    owner's live browser session — never with ids in the request body — and
-   shows the return URL:
+   records the selected file mode and shows the return URL:
    `https://<api>/api/secretary-return/sessions/<session_id>#grant=<grant>`.
    The grant is in the fragment, so it never reaches a request line or an
    access log; Cloud stores only its hash. The app keeps the URL in the
@@ -156,22 +174,30 @@ logs or Cloud rows (Cloud stores its hash).
 move). Unset means the feature does not exist: no routes, no sweep, and
 the settings surface hides it when the routes answer 404.
 
-Mounted is not admitted. Whether shared files travel with a return is
-still the user's open product decision, so `returnsession.Config` carries
-a `FilePolicy` whose zero value is **undecided** — and production wiring
-leaves it undecided. With the policy unanswered the service refuses new
-moves at the two admission points — `POST /sessions` (owner create) and
-`POST .../destination` (the seal) — with 409 `file_policy_undecided`.
-Status, cancel, download and proof reports are never gated: a session
-that already moved authority resolves honestly whatever the policy knob
-says. The base URL is reachability, not a policy answer; no environment
-variable stands in for the user's decision. Author fixtures exercise the
-common protocol under the explicit test-only `FilePolicyFixture`.
+Mounted is not admitted. `SUMI_RETURN_FILE_MODES` selects which implemented
+file modes new sessions may choose: `local,cloud`, or either mode alone. Unset
+keeps `FilePolicyUndecided`: owner create and destination binding refuse new
+moves with `409 file_policy_undecided`. Invalid nonempty values fail server
+startup. The public base URL alone never admits a move.
+
+Enable only the modes whose API/provisioner/filesvc/Local receiver have passed
+integrated acceptance. For `local`, filesvc additionally requires the
+`FILESV_CAPTURE_META_URL` and matching object backend configuration described in
+`apps/files/cmd/filesvc/main.go`; incomplete configuration fails startup and
+absent configuration leaves capture unavailable. The mode gate does not create
+that capability. The user's file choice remains per session.
+
+Status, cancellation, download and proof reports remain available when new-move
+admission is disabled. Keep `SUMI_TRANSFER_PUBLIC_BASE_URL` configured during
+recovery; unsetting it removes those routes too.
 
 ## Migration
 
 `0060_return_sessions` adds the `return_sessions` table — bookkeeping
 around the portable ledger (`core_transfers`), not a second copy of it.
+`0063_return_file_modes` adds the selected file mode and storage-epoch binding.
+Terminal coordination also requires `0062_terminal_sessions`. filesvc maintains
+its capture/barrier tables in its own database at startup.
 Receipts, proofs and persona authority stay in the portable contract;
 `transfer_id = session_id::text`. The down migration drops the table;
 running it while a session is open abandons that session's bookkeeping
@@ -189,8 +215,7 @@ its proofs).
 - **Mount** — `returnsession.NewServer(svc, proof, publicBaseURL)`;
   mount only with a real adapter and run the sweep. The grant is not the
   core state administrator token and must never be accepted as one.
-- **Files policy** — unresolved. The session and the UI state the
-  boundary (`files` preflight note); nothing here moves, deletes or
-  promises a file snapshot. Integrating the decision is separate work:
-  whichever policy is chosen, the preflight wording and the client copy
-  change, the session contract does not.
+- **Files policy** — the owner chooses `local` or `cloud` from the modes the
+  deployment enables. Session binding, preflight and client copy retain that
+  choice. The portable state contract still carries core state; capture/import
+  and the Cloud-file credential are the file-mode-specific paths.

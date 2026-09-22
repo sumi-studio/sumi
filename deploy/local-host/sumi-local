@@ -706,9 +706,12 @@ cmd_install() {
     || die "this install has processes still running anchored on ${oldpref:-$prefix} (pids: $live) — stop it first: $PROG stop"
   # A regular file at the shim path is authored content — never overwrite
   # it. A symlink elsewhere is repointed with a note (reversible).
-  local shim_dst="$HOME/.local/bin/sumi-local"
-  [[ ! -e $shim_dst || -L $shim_dst ]] \
-    || die "$shim_dst exists and is not a symlink — refusing to overwrite it; move it aside and re-run install"
+  local shim_dst shim_name
+  for shim_name in sumi-local sumi-local-move; do
+    shim_dst="$HOME/.local/bin/$shim_name"
+    [[ ! -e $shim_dst || -L $shim_dst ]] \
+      || die "$shim_dst exists and is not a symlink — refusing to overwrite it; move it aside and re-run install"
+  done
   mkdir -p "$prefix/bin" "$prefix/docs" "$home/run" "$home/log" "$home/workspace"
   chmod 700 "$home"
   # Serialize the claim/payload/config writes with start/stop/uninstall of
@@ -747,7 +750,11 @@ cmd_install() {
 
   # --- payloads -------------------------------------------------------------
   if [[ -n $PACK_ROOT ]]; then
+    [[ -x $PACK_ROOT/bin/sumi-local-move && -x $PACK_ROOT/libexec/sumi-local-move-bin ]] \
+      || die "pack is missing the move/return command — use a complete current Local pack"
     cp "$PACK_ROOT/libexec/sumi-local-service" "$prefix/bin/sumi-local-service"
+    cp "$PACK_ROOT/libexec/sumi-local-move-bin" "$prefix/bin/sumi-local-move-bin"
+    cp "$PACK_ROOT/bin/sumi-local-move" "$prefix/bin/sumi-local-move"
     # A pack built before the file service existed simply lacks the
     # payload — the install then runs without file routes.
     [[ -f $PACK_ROOT/libexec/sumi-local-filesvc ]] \
@@ -755,20 +762,25 @@ cmd_install() {
     rm -rf "$prefix/core"; cp -r "$PACK_ROOT/core" "$prefix/core"
     cp "$PACK_ROOT/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$PACK_ROOT/config.example.env" "$prefix/config.example.env"
-    cp "$PACK_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
+    cp "$PACK_ROOT/docs/local-host.md" "$PACK_ROOT/docs/local-cloud-move.md" \
+      "$PACK_ROOT/docs/cloud-local-return.md" "$prefix/docs/"
     [[ -f $PACK_ROOT/VERSION ]] && cp "$PACK_ROOT/VERSION" "$prefix/VERSION"
     info "installed payloads from pack at $PACK_ROOT"
   elif [[ -n $REPO_ROOT ]]; then
     command -v go >/dev/null || die "go toolchain required to build from a source checkout (or install from a pack)"
     info "building sumi-local-service…"
     (cd "$REPO_ROOT/apps/api" && go build -buildvcs=false -o "$prefix/bin/sumi-local-service" ./cmd/first-model)
+    info "building sumi-local-move…"
+    (cd "$REPO_ROOT/apps/api" && go build -buildvcs=false -o "$prefix/bin/sumi-local-move-bin" ./cmd/local-move)
+    cp "$SCRIPT_DIR/sumi-local-move" "$prefix/bin/sumi-local-move"
     info "building sumi-local-filesvc…"
     (cd "$REPO_ROOT/apps/files" && go build -buildvcs=false -o "$prefix/bin/sumi-local-filesvc" ./cmd/filesvc)
     rm -rf "$prefix/core"; mkdir -p "$prefix/core"
     cp -r "$REPO_ROOT/apps/core/src/." "$prefix/core/"
     cp "$SCRIPT_DIR/compose.pg.yaml" "$prefix/compose.pg.yaml"
     cp "$SCRIPT_DIR/config.example.env" "$prefix/config.example.env"
-    cp "$REPO_ROOT/docs/local-host.md" "$prefix/docs/local-host.md" 2>/dev/null || true
+    cp "$REPO_ROOT/docs/local-host.md" "$REPO_ROOT/docs/local-cloud-move.md" \
+      "$REPO_ROOT/docs/cloud-local-return.md" "$prefix/docs/"
     (cd "$REPO_ROOT" && { git rev-parse HEAD 2>/dev/null || echo source; } | sed 's/^/source /' >"$prefix/VERSION")
     info "built payloads from $REPO_ROOT"
   elif [[ -n $PREFIX_DIR && $(canon "$PREFIX_DIR") == "$prefix" ]]; then
@@ -776,7 +788,7 @@ cmd_install() {
   else
     die "cannot locate payloads — run from a source checkout or an extracted pack"
   fi
-  chmod +x "$prefix/bin/sumi-local-service"
+  chmod +x "$prefix/bin/sumi-local-service" "$prefix/bin/sumi-local-move" "$prefix/bin/sumi-local-move-bin"
   [[ -f $prefix/bin/sumi-local-filesvc ]] && chmod +x "$prefix/bin/sumi-local-filesvc"
 
   # this script itself is the CLI payload (skip when we already are it)
@@ -902,18 +914,20 @@ cmd_install() {
   # repoint earlier would hand the user's command entry to an install
   # that never completed — possibly over a still-working one.
   mkdir -p "$HOME/.local/bin"
-  local shim_dst="$HOME/.local/bin/sumi-local"
-  if [[ -e $shim_dst || -L $shim_dst ]] \
-     && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/sumi-local" ]]; then
-    info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
-  fi
-  ln -sf "$prefix/bin/sumi-local" "$shim_dst"
+  for shim_name in sumi-local sumi-local-move; do
+    shim_dst="$HOME/.local/bin/$shim_name"
+    if [[ -e $shim_dst || -L $shim_dst ]] \
+       && [[ $(readlink "$shim_dst" 2>/dev/null) != "$prefix/bin/$shim_name" ]]; then
+      info "note: $shim_dst pointed elsewhere ($(readlink "$shim_dst" 2>/dev/null || echo 'not a symlink')) — now points at this install"
+    fi
+    ln -sf "$prefix/bin/$shim_name" "$shim_dst"
+  done
 
   cat <<EOF
 [$PROG] installed.
   executables : $prefix
   state home  : $home  (identity, secrets, logs — survives uninstall)
-  CLI         : $HOME/.local/bin/sumi-local -> $prefix/bin/sumi-local
+  CLI         : $HOME/.local/bin/{sumi-local,sumi-local-move} -> $prefix/bin/
 Next: edit $cfg for your model connection, then: $PROG start
 EOF
   # Non-default paths are not discoverable by later invocations — print the
@@ -1717,13 +1731,18 @@ cmd_pack() {
     info "building linux/amd64 binary…"
     (cd "$REPO_ROOT/apps/api" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
       -o "$stage/sumi-local/libexec/sumi-local-service" ./cmd/first-model)
+    info "building linux/amd64 move/return command…"
+    (cd "$REPO_ROOT/apps/api" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+      -o "$stage/sumi-local/libexec/sumi-local-move-bin" ./cmd/local-move)
+    cp "$SCRIPT_DIR/sumi-local-move" "$stage/sumi-local/bin/sumi-local-move"
     info "building linux/amd64 file service…"
     (cd "$REPO_ROOT/apps/files" && GOOS=linux GOARCH=amd64 go build -buildvcs=false \
       -o "$stage/sumi-local/libexec/sumi-local-filesvc" ./cmd/filesvc)
     cp -r "$REPO_ROOT/apps/core/src/." "$stage/sumi-local/core/"
     cp "$SCRIPT_DIR/compose.pg.yaml" "$stage/sumi-local/"
     cp "$SCRIPT_DIR/config.example.env" "$stage/sumi-local/"
-    cp "$REPO_ROOT/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null || true
+    cp "$REPO_ROOT/docs/local-host.md" "$REPO_ROOT/docs/local-cloud-move.md" \
+      "$REPO_ROOT/docs/cloud-local-return.md" "$stage/sumi-local/docs/"
     (cd "$REPO_ROOT" && { git rev-parse HEAD 2>/dev/null || echo source; }) \
       | sed 's/^/source /' >"$stage/sumi-local/VERSION"
   else
@@ -1736,11 +1755,14 @@ cmd_pack() {
     cp "$from/libexec/sumi-local-filesvc" "$stage/sumi-local/libexec/" 2>/dev/null \
       || cp "$from/bin/sumi-local-filesvc" "$stage/sumi-local/libexec/" 2>/dev/null \
       || true
+    cp "$from/bin/sumi-local-move" "$stage/sumi-local/bin/"
+    cp "$from/libexec/sumi-local-move-bin" "$stage/sumi-local/libexec/" 2>/dev/null \
+      || cp "$from/bin/sumi-local-move-bin" "$stage/sumi-local/libexec/"
     cp -r "$from/core/." "$stage/sumi-local/core/"
     cp "$from/compose.pg.yaml" "$stage/sumi-local/" 2>/dev/null || true
     cp "$from/config.example.env" "$stage/sumi-local/" 2>/dev/null || true
-    cp "$from/docs/local-host.md" "$stage/sumi-local/docs/" 2>/dev/null \
-      || cp "$from/local-host.md" "$stage/sumi-local/docs/local-host.md" 2>/dev/null || true
+    cp "$from/docs/local-host.md" "$from/docs/local-cloud-move.md" \
+      "$from/docs/cloud-local-return.md" "$stage/sumi-local/docs/"
     [[ -f $from/VERSION ]] && cp "$from/VERSION" "$stage/sumi-local/VERSION"
   fi
   tar -czf "$out" -C "$stage" sumi-local
@@ -1975,8 +1997,11 @@ cmd_uninstall() {
         || info "removed $PROG payloads under $PREFIX"
     fi
   fi
-  local shim="$HOME/.local/bin/sumi-local"
-  [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/sumi-local" ]] && rm -f "$shim"
+  local shim shim_name
+  for shim_name in sumi-local sumi-local-move; do
+    shim="$HOME/.local/bin/$shim_name"
+    [[ -L $shim && $(readlink "$shim") == "$PREFIX/bin/$shim_name" ]] && rm -f "$shim"
+  done
   # truthful survivors report: processes still anchored on this prefix, or
   # a listener still holding the port, must be named rather than implied gone
   local left; left="$(proc_pids_under "$PREFIX")"
