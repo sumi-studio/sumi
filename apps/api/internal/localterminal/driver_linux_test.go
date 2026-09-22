@@ -128,3 +128,63 @@ func TestDriverRestartKeepsPTYAndDoesNotReplayUnknownWrite(t *testing.T) {
 	}
 	t.Log("actual PostgreSQL driver epoch takeover + same live PTY; lost post-write reply remains unknown and original file effect occurs once")
 }
+
+func TestDriverReleasesDurableLocalFenceAndLaunchesPTY(t *testing.T) {
+	pool := testdb.Create(t)
+	ctx := context.Background()
+	if e := db.Migrate(ctx, pool); e != nil {
+		t.Fatal(e)
+	}
+	store := agentstate.NewStore(pool)
+	store.SetDefaultTerminalBackend("local")
+	store.SetTerminalBackendAvailable("local")
+	if _, _, e := store.EnsurePersona(ctx, testPersona, nil, "Local"); e != nil {
+		t.Fatal(e)
+	}
+	session, e := store.CreateTerminalSession(ctx, testPersona, "recovered Local terminal", "human", "test")
+	if e != nil {
+		t.Fatal(e)
+	}
+	first, cfg := newTestBackend(t, 0)
+	look := runtimeprovision.ProcessLookupRequest{PersonalityAgentID: testPersona, OperationID: runtimeprovision.ProcessOperationID(testPersona, "term:"+session.SessionID), TombstoneIfAbsent: true}
+	if _, e = first.CancelProcess(ctx, look); e != nil {
+		t.Fatal(e)
+	}
+	first.Close()
+	backend, e := New(cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer backend.Close()
+	driver := termexec.New(store, backend, nil, termexec.Config{RunnerID: "local-durable-fence", Backend: "local", Shell: "/bin/bash", ShellArgs: []string{"--noprofile", "--norc", "-i"}, Interval: 20 * time.Millisecond, PollInterval: 20 * time.Millisecond})
+	run, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); driver.Run(run) }()
+	defer func() { cancel(); <-done }()
+	eventually(t, "released fence and active session", func() bool {
+		got, e := store.GetTerminalSession(ctx, testPersona, session.SessionID)
+		return e == nil && got.Status == "active"
+	})
+	op, e := backend.ProcessStatus(ctx, look)
+	if e != nil || op.Tombstone || op.StartedAt == nil || !op.OutputAttached {
+		t.Fatal("driver did not launch real PTY", op, e)
+	}
+	if _, e = store.SubmitTerminalInput(ctx, testPersona, session.SessionID, "human", "stdin", map[string]any{"data": "test -t 0 && printf recovered-once > release-driver.txt\n"}); e != nil {
+		t.Fatal(e)
+	}
+	eventually(t, "released PTY writes actual persistent workspace", func() bool {
+		b, _ := os.ReadFile(filepath.Join(cfg.WorkspaceRoot, testPersona, "release-driver.txt"))
+		return string(b) == "recovered-once"
+	})
+	if _, e = store.CloseTerminalSession(ctx, testPersona, session.SessionID, "close recovered session"); e != nil {
+		t.Fatal(e)
+	}
+	eventually(t, "recovered terminal closes normally", func() bool {
+		got, e := store.GetTerminalSession(ctx, testPersona, session.SessionID)
+		return e == nil && got.Status == "ended"
+	})
+	if _, e = backend.ReleaseProcessTombstone(ctx, look); !errors.Is(e, runtimeprovision.ErrConflict) {
+		t.Fatal("driver's real closed session became releasable", e)
+	}
+	t.Log("real PG driver releases restart-persisted never-launched Local tombstone; same session acquires actual PTY, writes workspace, and closes without erasing execution history")
+}

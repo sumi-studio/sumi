@@ -425,3 +425,13 @@ its workspace files. HTTPS retains the main API's public-destination checks,
 credential handling and protocol semantics; stdio does not enable private
 HTTP destinations. OAuth, MCP Apps, macOS support and a new onboarding UI
 are not part of this interface.
+
+The Local backend also implements the return flow's narrow tombstone-release
+contract. A caller that has re-authorized launch may remove a durable
+never-launched cancellation fence for the exact persona and operation. The
+journal removal is directory-fsynced under the same mutex before the backend
+forgets the record. A later cancellation can create a fresh fence. A running,
+completed, cancelled-after-launch or host-death-indeterminate operation is
+never releasable; this cannot resurrect an old shell or certify surviving
+processes stopped. The caller remains responsible for checking current persona
+and session/claim authority before release and launch.
