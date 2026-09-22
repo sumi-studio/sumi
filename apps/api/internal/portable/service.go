@@ -362,6 +362,23 @@ func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID
 		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
 			ErrUnresolvedOperations, strings.Join(inflight, ", "))
 	}
+	// A job file operation admitted but not yet settled is an unresolved
+	// file effect of the same kind: its upstream outcome is not known, so
+	// sealing could strand a write the destination knows nothing about —
+	// and for file-inclusive moves, could cut the workspace under a write
+	// still landing. The keyed resend reconciles it; seal only once the
+	// ledger is quiet.
+	fileOps, err := strings_(ctx, tx, `
+		SELECT op_id || ' (' || status || ')' FROM core_job_file_ops
+		WHERE persona_id = $1 AND status IN ('admitted','unknown')
+		ORDER BY op_id COLLATE "C"`, personaID)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if len(fileOps) > 0 {
+		return Receipt{}, fmt.Errorf("%w: file operations %s still unresolved; reconcile them before sealing",
+			ErrUnresolvedOperations, strings.Join(fileOps, ", "))
+	}
 	// A live call session is a runner claim of the same detachable kind as
 	// a job: its media actor keeps minting tickets and speaking on this
 	// placement while the seal claims authority ended. Call sessions are

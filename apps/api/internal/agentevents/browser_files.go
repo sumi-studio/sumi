@@ -2,6 +2,7 @@ package agentevents
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +51,13 @@ func (s *BrowserServer) RegisterFileRoutes(mux *http.ServeMux) {
 // boundary with history and the socket — and adds the lifecycle fence and
 // authority-epoch check, so a revoked installation or a stale epoch cannot
 // reach filesvc even for reads.
+//
+// Working-store semantics: when the persona's files moved to a Sumi Local
+// install (a completed local-mode return), the Cloud copy is retained —
+// reads keep working and are marked X-Sumi-Working-Store: local, while
+// mutations refuse with a clear reason. The file service's own persisted
+// barrier is the real fence (it also covers the copy window); this check
+// is the honest explanation in front of it.
 func (s *BrowserServer) serveFileOp(w http.ResponseWriter, r *http.Request, op string) {
 	w.Header().Set("Cache-Control", "no-store")
 	if s.Sessions == nil || s.Files == nil || s.Authorizer == nil || s.LifecycleFence == nil {
@@ -86,6 +94,21 @@ func (s *BrowserServer) serveFileOp(w http.ResponseWriter, r *http.Request, op s
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	workingStore := ""
+	if s.WorkingStore != nil {
+		if ws, err := s.WorkingStore(r.Context(), paid); err == nil {
+			workingStore = ws
+		}
+	}
+	if workingStore == "local" && (op == "write" || op == "mkdir" || op == "remove") {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "this workspace moved to the secretary's Sumi Local install — the Cloud copy is retained read-only, it is not a synced or managed backup",
+			"code":  "working_store_moved",
+		})
+		return
+	}
 	reachedFiles := false
 	err = s.authorizeBrowserOperation(r.Context(), claims, scope, func() error {
 		reachedFiles = true
@@ -94,6 +117,9 @@ func (s *BrowserServer) serveFileOp(w http.ResponseWriter, r *http.Request, op s
 			return uerr
 		}
 		defer resp.Body.Close()
+		if workingStore == "local" {
+			w.Header().Set("X-Sumi-Working-Store", "local")
+		}
 		copyFileResponse(w, resp)
 		return nil
 	})

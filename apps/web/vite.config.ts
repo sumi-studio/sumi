@@ -130,6 +130,7 @@ export function createDevServerConfig(
       "/api/model-connections": apiProxy(target.origin),
       "/api/secretary-transfer": apiProxy(target.origin),
       "/api/secretary-return": apiProxy(target.origin),
+      "/api/secretary-files": apiProxy(target.origin),
       "/direct-chat": apiProxy(target.origin, true),
       "/messaging": apiProxy(target.origin, true),
       // The shared terminal SPA page owns bare `/terminal`; every path

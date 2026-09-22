@@ -34,11 +34,13 @@ var (
 	errStalled       = errors.New("the connection stopped moving data")
 
 	// beforeComplete and afterComplete are failpoints around the source
-	// Complete transaction. They do nothing unless the binary is built with
-	// the movefailpoint tag (failpoint.go), which tests use to stop the real
-	// process there.
+	// Complete transaction. midPromote fires after each journaled
+	// placement in the return file promotion. They do nothing unless the
+	// binary is built with the movefailpoint tag (failpoint.go), which
+	// tests use to stop the real process there.
 	beforeComplete = func() {}
 	afterComplete  = func() {}
+	midPromote     = func() {}
 )
 
 // answerTimeout bounds the wait for a response after a request has been
@@ -136,6 +138,11 @@ type mover struct {
 	unreachable time.Duration
 	sealRetries int
 	sealDelay   time.Duration
+	// wsRoot is the install's local file store root (SUMI_WORKSPACE_ROOT):
+	// the directory whose children are persona scope directories. A
+	// local-mode return copies the Cloud workspace under it; unset is a
+	// provisioning gap reported only when a copy actually needs it.
+	wsRoot string
 	// stall bounds a silent upload: how long the connection may carry no
 	// bytes at all before this attempt is given up and retried. It is not a
 	// limit on the upload's total time — a large secretary on a slow link

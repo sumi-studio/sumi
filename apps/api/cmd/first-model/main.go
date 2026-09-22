@@ -39,8 +39,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -49,6 +51,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
+	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 )
 
 var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -56,6 +59,11 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 type fmServer struct {
 	store  *agentstate.Store
 	secret []byte
+	// files is the install's configured file service client (local
+	// filesvc, or a returned secretary's scoped Cloud storage proxy —
+	// fileaccess.FromEnv makes the distinction invisible here). nil
+	// leaves the file routes unmounted.
+	files *fileaccess.Client
 }
 
 // fmToken derives the browser-scoped capability for one persona.
@@ -196,6 +204,82 @@ func afterSeq(r *http.Request) int64 {
 	return n
 }
 
+// fmFileOps is the person-facing file surface's op set — the same
+// delegated operations every file surface uses. The scope is derived
+// from the authorized persona, never from a request parameter.
+var fmFileOps = map[string]string{
+	"list":   http.MethodGet,
+	"stat":   http.MethodGet,
+	"read":   http.MethodGet,
+	"write":  http.MethodPut,
+	"mkdir":  http.MethodPost,
+	"remove": http.MethodDelete,
+}
+
+// fmFileParams is the query vocabulary the file surface forwards — path
+// selection, paging and ranges only; nothing caller-supplied ever names
+// a scope or an upstream credential.
+var fmFileParams = map[string]bool{
+	"path": true, "limit": true, "cursor": true,
+	"offset": true, "len": true,
+}
+
+// files serves /fm/{persona}/files/{op}: the person's access to the same
+// working file set the secretary uses — the local file store, or the
+// Cloud store a cloud-mode return kept. The fm token's persona binding
+// is what scopes the operation; the upstream answer streams back with
+// its own verdicts (version, external-change) intact.
+func (s *fmServer) serveFiles(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	op := r.PathValue("op")
+	want, known := fmFileOps[op]
+	if !known || r.Method != want {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "unknown file op"})
+		return
+	}
+	scope, err := fileaccess.ScopeForPersona(personaID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	q := url.Values{}
+	for k := range fmFileParams {
+		if v := r.URL.Query().Get(k); v != "" {
+			q.Set(k, v)
+		}
+	}
+	headers := http.Header{}
+	for _, h := range []string{"If-Version", "X-Idempotency-Key", "Content-Type"} {
+		if v := r.Header.Get(h); v != "" {
+			headers.Set(h, v)
+		}
+	}
+	var body io.Reader
+	if r.Method == http.MethodPut {
+		// A person-surface write is bounded independently of the store's
+		// own ceiling — the body streams, it is never assembled here.
+		body = http.MaxBytesReader(w, r.Body, 32<<20)
+	}
+	resp, err := s.files.ProxyOp(r.Context(), scope, op, r.Method, q, headers, body)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": "file service unreachable; safe to retry",
+		})
+		return
+	}
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Content-Length", "X-File-Version", "X-External-Change"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -249,7 +333,26 @@ func main() {
 	}
 
 	core := agentstate.NewServer(pool.Pool, token)
-	fm := &fmServer{store: store, secret: []byte(token)}
+
+	// The install's file service: a local filesvc when this install owns
+	// the working store, or the scoped Cloud storage proxy a cloud-mode
+	// return configured — fileaccess.FromEnv makes the two identical
+	// here. The secretary's file.* effects and the person's /fm files
+	// surface share the one client, so both faces reach the same store.
+	filesClient, err := fileaccess.FromEnv(os.Getenv)
+	if err != nil {
+		log.Fatalf("file service config: %v", err)
+	}
+	fm := &fmServer{store: store, secret: []byte(token), files: filesClient}
+	if filesClient != nil {
+		for tool, effect := range fileaccess.FileEffects(filesClient) {
+			if err := core.RegisterToolEffect(tool, effect); err != nil {
+				log.Fatalf("register file effect %s: %v", tool, err)
+			}
+		}
+		core.SetJobFileService(fileaccess.JobFileService(filesClient))
+		log.Print("file service configured (file.* effects and /fm files surface armed)")
+	}
 
 	mux := http.NewServeMux()
 	core.RegisterRoutes(mux)
@@ -261,6 +364,12 @@ func main() {
 	mux.HandleFunc("GET /fm/{persona}/outbox", fm.outbox)
 	mux.HandleFunc("GET /fm/{persona}/events", fm.events)
 	mux.HandleFunc("GET /fm/{persona}/state", fm.state)
+	if fm.files != nil {
+		mux.HandleFunc("GET /fm/{persona}/files/{op}", fm.serveFiles)
+		mux.HandleFunc("PUT /fm/{persona}/files/{op}", fm.serveFiles)
+		mux.HandleFunc("POST /fm/{persona}/files/{op}", fm.serveFiles)
+		mux.HandleFunc("DELETE /fm/{persona}/files/{op}", fm.serveFiles)
+	}
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(uiHTML))
@@ -302,6 +411,20 @@ const uiHTML = `<!doctype html>
 <div id="log"></div>
 <form id="f"><input id="t" type="text" autocomplete="off" placeholder="Say something to your secretary…"><button>Send</button></form>
 <div id="status"></div>
+<section id="files" style="margin-top:1.5rem; display:none">
+  <h2 style="font-size:1rem">Files <span class="act">(same store the secretary uses)</span></h2>
+  <div style="display:flex;gap:.5rem;margin:.4rem 0">
+    <input id="fpath" type="text" placeholder="path (blank lists the workspace root)" style="flex:1">
+    <button id="flist" type="button">List</button>
+    <button id="fread" type="button">Read</button>
+  </div>
+  <pre id="fout" style="border:1px solid #8884;border-radius:8px;padding:.75rem;min-height:4rem;max-height:16rem;overflow:auto;white-space:pre-wrap"></pre>
+  <div style="display:flex;gap:.5rem">
+    <input id="fwpath" type="text" placeholder="path to write" style="flex:1">
+    <input id="fwtext" type="text" placeholder="text content" style="flex:2">
+    <button id="fwrite" type="button">Write</button>
+  </div>
+</section>
 <script>
 const q = new URLSearchParams(location.search);
 const persona = q.get("persona") || localStorage.fmPersona;
@@ -368,6 +491,35 @@ if (!persona || !fm) {
     });
     if (!r.ok) line("fail", "send failed: " + r.status);
     t.value = "";
+  });
+  // Files pane: the person's window on the same store the secretary's
+  // file.* tools use. Hidden unless the surface answers — an install
+  // without a configured file service shows no broken pane.
+  const fsec = document.getElementById("files"), fout = document.getElementById("fout");
+  fetch("/fm/" + persona + "/files/list?limit=1", { headers }).then(r => {
+    if (!r.ok) return;
+    fsec.style.display = "block";
+  }).catch(() => {});
+  document.getElementById("flist").addEventListener("click", async () => {
+    const p = document.getElementById("fpath").value.trim();
+    const r = await fetch("/fm/" + persona + "/files/list?path=" + encodeURIComponent(p) + "&limit=1000", { headers });
+    const j = await r.json().catch(() => null);
+    fout.textContent = r.ok
+      ? (j.entries || []).map(e => e.kind.padEnd(7) + " " + e.name).join("\n") || "(empty)"
+      : "list failed: " + (j && j.error ? j.error : r.status);
+  });
+  document.getElementById("fread").addEventListener("click", async () => {
+    const p = document.getElementById("fpath").value.trim();
+    const r = await fetch("/fm/" + persona + "/files/read?path=" + encodeURIComponent(p), { headers });
+    fout.textContent = r.ok ? await r.text() : "read failed: " + r.status;
+  });
+  document.getElementById("fwrite").addEventListener("click", async () => {
+    const p = document.getElementById("fwpath").value.trim();
+    if (!p) return;
+    const r = await fetch("/fm/" + persona + "/files/write?path=" + encodeURIComponent(p), {
+      method: "PUT", headers, body: document.getElementById("fwtext").value,
+    });
+    fout.textContent = r.ok ? "wrote " + p : "write failed: " + r.status;
   });
   poll();
 }

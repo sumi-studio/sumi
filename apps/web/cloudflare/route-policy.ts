@@ -44,6 +44,10 @@ export const originRoutes = Object.freeze({
     // and the origin itself refuses new admission. Routing is transport,
     // not the policy decision.
     "/api/secretary-return/",
+    // The scoped storage proxy for a returned secretary's Cloud working
+    // store (cloud file mode). Same posture as the return namespace:
+    // routing is transport; the origin authorizes the storage credential.
+    "/api/secretary-files/",
     // Person file workspace: the API proxies these ops to the private
     // filesvc with session-derived scope; filesvc itself is never on the
     // public edge.
@@ -115,6 +119,7 @@ export const deniedRoutes = Object.freeze({
     "/apps",
     "/api/secretary-transfer",
     "/api/secretary-return",
+    "/api/secretary-files",
     "/agent/ws",
     "/internal",
     "/local-control/v1",

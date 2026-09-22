@@ -18,6 +18,11 @@ type StatInfo struct {
 	MtimeNS        int64
 	Version        int64
 	Fingerprint    string
+	// ContentSHA is the sha256 the service recorded for the last write it
+	// admitted — the durable per-file content receipt. Empty for files
+	// that arrived outside the service (external_change says whether the
+	// record may be stale).
+	ContentSHA     string
 	ExternalChange bool
 }
 
@@ -30,6 +35,7 @@ func (c *Client) Stat(ctx context.Context, scope, path string) (StatInfo, error)
 	var st StatInfo
 	st.Kind, _ = out["kind"].(string)
 	st.Fingerprint, _ = out["fingerprint"].(string)
+	st.ContentSHA, _ = out["content_sha"].(string)
 	st.ExternalChange, _ = out["external_change"].(bool)
 	st.Size = jsonInt(out["size"])
 	st.MtimeNS = jsonInt(out["mtime_ns"])
@@ -118,6 +124,25 @@ func (c *Client) WriteKeyed(ctx context.Context, scope, path, ifVersion, opKey s
 	}
 	out, _, err := c.doJSON(ctx, scope, "write", http.MethodPut,
 		url.Values{"path": {path}}, h, bytes.NewReader(body))
+	if err != nil {
+		return 0, false, err
+	}
+	replayed, _ := out["replayed"].(bool)
+	return jsonInt(out["version"]), replayed, nil
+}
+
+// WriteKeyedBody is WriteKeyed for a streamed body: the file service
+// accepts a whole-file body up to its service ceiling, so a copier can
+// stream large files without holding them in memory. Callers that reuse
+// opKey must send identical bytes — a same-key different-content request
+// is refused as an idempotency conflict.
+func (c *Client) WriteKeyedBody(ctx context.Context, scope, path, ifVersion, opKey string, body io.Reader) (int64, bool, error) {
+	h := http.Header{"If-Version": {ifVersion}}
+	if opKey != "" {
+		h.Set("X-Idempotency-Key", opKey)
+	}
+	out, _, err := c.doJSON(ctx, scope, "write", http.MethodPut,
+		url.Values{"path": {path}}, h, body)
 	if err != nil {
 		return 0, false, err
 	}
