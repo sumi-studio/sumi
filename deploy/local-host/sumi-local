@@ -1681,7 +1681,8 @@ for (const name of fs.readdirSync(root)) {
   if (op.personality_agent_id !== persona) throw name + " persona";
   if (name !== op.operation_id + ".json") throw name + " id";
   const tail = Buffer.from(rec.tail || "", "base64").length;
-  if (!(op.stdout_base >= 0) || !(op.stdout_bytes >= op.stdout_base) || op.stdout_bytes - op.stdout_base !== tail)
+  const base = op.stdout_base ?? 0;
+  if (!(base >= 0) || !(op.stdout_bytes >= base) || op.stdout_bytes - base !== tail)
     throw name + " tail";
 }
 NODE
