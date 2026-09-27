@@ -131,11 +131,21 @@ export class OpenAIResponsesProvider implements ModelProvider {
               ...toInput(request.messages, toWire),
               ...(tools.length
                 ? {
+                    // `strict: false` is explicit: when it is omitted,
+                    // Responses normalizes each schema into strict mode
+                    // where it can, which marks every property required.
+                    // Sumi's tools use optional fields as alternatives
+                    // (conversation_history's seq/chunk_seq/from_seq, a
+                    // search-only query), so the normalized schema admits
+                    // no valid read at all. The canonical schema, as
+                    // written, is the contract on every provider;
+                    // receivers validate the call.
                     tools: tools.map((t) => ({
                       type: "function",
                       name: t.wire,
                       description: t.spec.description,
                       parameters: t.parameters,
+                      strict: false,
                     })),
                   }
                 : {}),
