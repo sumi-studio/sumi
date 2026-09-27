@@ -14,7 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
+	"unicode/utf16"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -196,6 +196,9 @@ func validateRequest(method string, req map[string]any) error {
 	return nil
 }
 
+// jsLength counts UTF-16 code units, matching the desktop host's bounds.
+func jsLength(s string) int { return len(utf16.Encode([]rune(s))) }
+
 var inputName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,39}$`)
 
 // validateGoal mirrors the host's bounds so a malformed goal fails before it
@@ -212,7 +215,7 @@ func validateGoal(req map[string]any) error {
 		return bad("NUL characters are not allowed")
 	}
 	goal, _ := req["goal"].(string)
-	if n := utf8.RuneCountInString(strings.TrimSpace(goal)); n == 0 || len(goal) > 2000 {
+	if strings.TrimSpace(goal) == "" || jsLength(goal) > 2000 {
 		return bad("goal text of at most 2000 characters is required")
 	}
 	inputs := map[string]any{}
@@ -223,7 +226,7 @@ func validateGoal(req map[string]any) error {
 	}
 	for k, v := range inputs {
 		s, ok := v.(string)
-		if !inputName.MatchString(k) || !ok || utf8.RuneCountInString(s) > 8000 {
+		if !inputName.MatchString(k) || !ok || jsLength(s) > 8000 {
 			return bad("input names are lower_snake_case and values are text of at most 8000 characters")
 		}
 	}

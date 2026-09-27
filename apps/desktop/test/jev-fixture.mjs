@@ -109,7 +109,7 @@ export async function startJevFixture({
         return reply(failure.status, failure.body ?? {}, failure.headers);
       reply(200, {
         model: "jev-fixture-double",
-        answers: policy(body, requests.length),
+        answers: await policy(body, requests.length),
         usage: { input_tokens: raw.length >> 2, output_tokens: 8 },
       });
     } catch (error) {

@@ -72,7 +72,13 @@ but never reattaches an old tab reference.
   HTTP(S) navigation. DOM click/input events are synthetic; websites requiring
   trusted input, custom editors, select menus, file upload, drag/drop or nested
   frames need a later interaction adapter. This is not a complete browser-use
-  engine. No high-level agent loop or Jev integration is included.
+  engine by itself. The optional Jev goal loop (`src/browser/goal.ts`, see
+  [delegated goals](../../docs/shared-browser-host.md#delegate-a-goal-to-jev))
+  uses exactly these operations; it adds no new page capability.
+- `act(..., { guard: true })` additionally refuses with `page_changed` when
+  native person input (key/pointer down, wheel, touch) reached the tab after
+  the observation, or an observed control's label, value, enabled/checked state
+  or visibility changed. The direct path does not set it.
 - An observation creates opaque target IDs retained only in a separate isolated
   JavaScript world. Bindings are single-use, expire after 30 seconds, and are
   replaced by the next observation. Main-frame navigation (including history
