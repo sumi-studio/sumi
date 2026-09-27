@@ -24,6 +24,7 @@ import (
 
 var ErrInvalid = errors.New("invalid browser attachment request")
 var ErrUnavailable = errors.New("browser attachment unavailable or not authorized")
+var ErrActionsNotAllowed = errors.New("the person shared this tab observe-only (allow_actions is false); browser.act and browser.goal are not allowed, use browser.observe")
 var ErrJevUnavailable = errors.New("the Jev operation layer is not configured on this tab's browser host; use browser.observe and browser.act directly")
 
 type TabRef struct {
@@ -135,6 +136,8 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			switch {
 			case !available:
 				layer = "host_offline"
+			case !write:
+				layer = "actions_not_allowed"
 			case jev:
 				layer = "available"
 			}
@@ -154,11 +157,14 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			var tab TabRef
 			var allow, jev bool
 			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions,b.jev_available FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND b.last_seen_at>now()-interval '30 seconds' FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow, &jev)
-			if errors.Is(e, pgx.ErrNoRows) || e == nil && method != "observe" && !allow {
+			if errors.Is(e, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: %w", agentstate.ErrBadRequest, ErrUnavailable)
 			}
 			if e != nil {
 				return nil, e
+			}
+			if method != "observe" && !allow {
+				return nil, fmt.Errorf("%w: %w", agentstate.ErrBadRequest, ErrActionsNotAllowed)
 			}
 			if method == "goal" && !jev {
 				// Distinct from choosing the direct path: nothing was queued and
@@ -181,8 +187,21 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			if e != nil {
 				return nil, e
 			}
-			_, e = tx.Exec(ctx, `INSERT INTO core_jobs(persona_id,job_id,kind,request,status,created_by)VALUES($1,$2,'browser',$3,'queued',$4)`, persona, jobID, request, "tool:"+idem)
-			return map[string]any{"job": map[string]any{"job_id": jobID, "kind": "browser", "status": "queued"}}, e
+			if _, e = tx.Exec(ctx, `INSERT INTO core_jobs(persona_id,job_id,kind,request,status,created_by)VALUES($1,$2,'browser',$3,'queued',$4)`, persona, jobID, request, "tool:"+idem); e != nil {
+				return nil, e
+			}
+			out := map[string]any{"job": map[string]any{"job_id": jobID, "kind": "browser", "status": "queued"}}
+			// Jobs on one tab run one at a time; a goal ahead may hold the tab
+			// for minutes. Say so instead of letting the wait look like an outage.
+			var goal, status string
+			e = tx.QueryRow(ctx, `SELECT job_id,status FROM core_jobs WHERE persona_id=$1 AND kind='browser' AND request->>'attachment_id'=$2 AND request->>'method'='goal' AND job_id<>$3 AND status IN('queued','running','cancel_requested') ORDER BY created_at LIMIT 1`, persona, id, jobID).Scan(&goal, &status)
+			if e == nil {
+				out["waiting_for"] = map[string]any{"job_id": goal, "method": "goal", "status": status}
+				out["note"] = "This tab is busy with a delegated browser goal; this job runs after it ends (it fails with code tab_busy if the tab is still held " + queueBound + " after queuing). Follow the goal with job.status and stop it with job.cancel."
+			} else if !errors.Is(e, pgx.ErrNoRows) {
+				return nil, e
+			}
+			return out, nil
 		}}
 	}
 	return effects
@@ -452,7 +471,11 @@ func (s *Store) Sweep(ctx context.Context) error {
 	if _, e := s.Core.SweepExpiredJobs(ctx, []string{"browser"}, 64); e != nil {
 		return e
 	}
-	rows, e := s.Pool.Query(ctx, `UPDATE core_jobs j SET status='running',claimed_by='browser-expiry',claim_expires_at=now()+interval '30 seconds',started_at=now() WHERE (j.persona_id,j.job_id) IN (SELECT persona_id,job_id FROM core_jobs WHERE status='queued' AND kind='browser' AND created_at<now()-interval '60 seconds' ORDER BY created_at LIMIT 64 FOR UPDATE SKIP LOCKED) RETURNING j.persona_id,j.job_id`)
+	// A queued job is dispatched once its tab is free. It fails undispatched
+	// after 60 s without a claim — counted from when its tab was last busy
+	// with a live host claim, since a delegated goal holds the tab for up to
+	// ~6.5 min — and never waits longer than queueBound in total.
+	rows, e := s.Pool.Query(ctx, `UPDATE core_jobs j SET status='running',claimed_by='browser-expiry',claim_expires_at=now()+interval '30 seconds',started_at=now() WHERE (j.persona_id,j.job_id) IN (SELECT q.persona_id,q.job_id FROM core_jobs q WHERE q.status='queued' AND q.kind='browser' AND q.created_at<now()-interval '60 seconds' AND (q.created_at<now()-$1::interval OR NOT EXISTS(SELECT 1 FROM core_jobs o WHERE `+tabBusy+` AND (o.status IN('running','cancel_requested') AND o.claim_expires_at>now() OR o.status IN('done','failed','cancelled') AND o.finished_at>now()-interval '60 seconds'))) ORDER BY q.created_at LIMIT 64 FOR UPDATE OF q SKIP LOCKED) RETURNING j.persona_id,j.job_id`, queueBound)
 	if e != nil {
 		return e
 	}
@@ -471,11 +494,55 @@ func (s *Store) Sweep(ctx context.Context) error {
 		return e
 	}
 	for _, k := range keys {
-		if _, e = s.Core.CompleteJob(ctx, k.p, k.j, "browser-expiry", "failed", map[string]any{"dispatched": false, "outcome": "not_dispatched"}, "browser host unavailable or grant revoked before dispatch"); e != nil {
+		result, problem, e := s.undispatched(ctx, k.p, k.j)
+		if e != nil {
+			return e
+		}
+		if _, e = s.Core.CompleteJob(ctx, k.p, k.j, "browser-expiry", "failed", result, problem); e != nil {
 			return e
 		}
 	}
 	return nil
+}
+
+// queueBound caps how long a browser job may wait for its tab: longer than a
+// delegated goal can hold it (5 min budget, progress refused after 6 min,
+// then a 30 s claim).
+const queueBound = "7 minutes"
+
+// tabBusy matches another job o holding (or recently holding) job q's tab
+// under an actual host claim; callers add the time condition.
+const tabBusy = `o.persona_id=q.persona_id AND o.kind='browser' AND o.request->>'attachment_id'=q.request->>'attachment_id' AND o.job_id<>q.job_id AND o.claimed_by LIKE 'browser:%'`
+
+// undispatched explains why a queued browser job was never dispatched, from
+// the tab's current state: a revoked grant, a host that stopped polling, a
+// tab still held by another job (typically a running goal), or a connected
+// host that did not claim it.
+func (s *Store) undispatched(ctx context.Context, personaID, jobID string) (map[string]any, string, error) {
+	result := map[string]any{"dispatched": false, "outcome": "not_dispatched"}
+	var granted, online bool
+	var blocker, method *string
+	e := s.Pool.QueryRow(ctx, `SELECT b.enabled AND p.authority='active',b.last_seen_at>now()-interval '30 seconds',o.job_id,o.request->>'method' FROM core_jobs q JOIN browser_tab_attachments b ON b.attachment_id::text=q.request->>'attachment_id' JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id LEFT JOIN LATERAL (SELECT o.job_id,o.request FROM core_jobs o WHERE `+tabBusy+` AND o.status IN('running','cancel_requested') AND o.claim_expires_at>now() ORDER BY o.started_at LIMIT 1) o ON true WHERE q.persona_id=$1 AND q.job_id=$2`, personaID, jobID).Scan(&granted, &online, &blocker, &method)
+	switch {
+	case errors.Is(e, pgx.ErrNoRows) || e == nil && !granted:
+		result["code"] = "grant_revoked"
+		return result, "the tab grant was revoked before dispatch; nothing was dispatched", nil
+	case e != nil:
+		return nil, "", e
+	case blocker != nil:
+		result["code"] = "tab_busy"
+		result["blocked_by"] = *blocker
+		what := "another browser job"
+		if method != nil && *method == "goal" {
+			what = "a running browser goal"
+		}
+		return result, fmt.Sprintf("the tab was still busy with %s (job %s) %s after this job was queued; nothing was dispatched. Follow a goal with job.status and stop it with job.cancel", what, *blocker, queueBound), nil
+	case !online:
+		result["code"] = "host_offline"
+		return result, "the browser host stopped polling before dispatch (closed, offline or restarting); nothing was dispatched", nil
+	}
+	result["code"] = "not_claimed"
+	return result, "the connected browser host did not claim the job within 60 s; nothing was dispatched", nil
 }
 func (s *Store) Run(ctx context.Context) {
 	t := time.NewTicker(time.Second)
