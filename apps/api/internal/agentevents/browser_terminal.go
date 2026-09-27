@@ -48,6 +48,7 @@ const (
 	terminalNameMaxRunes      = 80
 	terminalWSPollInterval    = 250 * time.Millisecond
 	terminalWSAuthInterval    = 5 * time.Second
+	terminalWSHealthRecheck   = time.Second
 	terminalWSMaxRead         = 96 * 1024
 )
 
@@ -656,6 +657,30 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 		v := attached
 		lastAttached = &v
 	}
+	lastHealthCheck := time.Now()
+	// recheckHealth pushes a session frame when output health changed;
+	// false means the socket is gone.
+	recheckHealth := func() bool {
+		lastHealthCheck = time.Now()
+		t, gerr := s.Terminals.GetTerminalSession(ctx, paid, session.SessionID)
+		if gerr != nil {
+			return true
+		}
+		wire := s.sessionWire(ctx, t)
+		cur, known := wire["output_attached"].(bool)
+		var curPtr *bool
+		if known {
+			v := cur
+			curPtr = &v
+		}
+		changed := (curPtr == nil) != (lastAttached == nil) ||
+			(curPtr != nil && lastAttached != nil && *curPtr != *lastAttached)
+		if !changed {
+			return true
+		}
+		lastAttached = curPtr
+		return send(map[string]any{"type": "session", "session": wire})
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -682,25 +707,22 @@ func (s *BrowserServer) runTerminalSocket(conn *websocket.Conn, claims UserSessi
 			// re-check it on this slow tick and push a session frame when
 			// it changes so a detached journal pump surfaces honestly
 			// instead of the client believing output still flows.
-			if t, gerr := s.Terminals.GetTerminalSession(ctx, paid, session.SessionID); gerr == nil {
-				wire := s.sessionWire(ctx, t)
-				cur, known := wire["output_attached"].(bool)
-				var curPtr *bool
-				if known {
-					v := cur
-					curPtr = &v
-				}
-				changed := (curPtr == nil) != (lastAttached == nil) ||
-					(curPtr != nil && lastAttached != nil && *curPtr != *lastAttached)
-				if changed {
-					lastAttached = curPtr
-					if !send(map[string]any{"type": "session", "session": wire}) {
-						wg.Wait()
-						return
-					}
-				}
+			if !recheckHealth() {
+				wg.Wait()
+				return
 			}
 		case <-poll.C:
+			// A just-started session reports output_attached=false until
+			// the runtime's output capture is up (well under a second).
+			// While the client holds false, re-check about once a second
+			// rather than on the slow tick, so the normal startup window
+			// is not shown as an output failure for seconds.
+			if lastAttached != nil && !*lastAttached && time.Since(lastHealthCheck) >= terminalWSHealthRecheck {
+				if !recheckHealth() {
+					wg.Wait()
+					return
+				}
+			}
 			read, err := s.Terminals.ReadTerminalOutput(ctx, paid, session.SessionID, cursor, eventCursor, terminalReadDefaultLimit)
 			if err != nil {
 				if errors.Is(err, agentstate.ErrTerminalNotFound) {

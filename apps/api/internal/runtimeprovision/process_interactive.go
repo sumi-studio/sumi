@@ -155,52 +155,63 @@ type journalEntry struct {
 
 // OpenProcessInput opens a stdin-only stream to the container through
 // the daemon API. The docker CLI's `attach` cannot detach output
-// streams on the daemon versions this provisioner supports, and a
-// stdout attachment would only duplicate bytes the journal tailer
-// already owns — so input is a raw HTTP-upgrade hijack carrying stdin
-// and nothing else. Closing the stream detaches; the container's
+// streams on the daemon versions this provisioner supports, and output
+// has its own owners (the journal tailer, and the pre-start live tail
+// in process_interactive_live.go) — so input is a raw HTTP-upgrade
+// hijack carrying stdin and nothing else. Closing the stream detaches; the container's
 // stdin stays open (created with --interactive) and a later call
 // reattaches. A non-unix DOCKER_HOST cannot be hijacked this way and
 // fails honestly.
 func (b *DockerBackend) OpenProcessInput(ctx context.Context, o ProcessOperation) (*processSink, error) {
+	conn, _, err := b.attachStream(ctx, o, "stream=1&stdin=1&stdout=0&stderr=0", "process input attach")
+	if err != nil {
+		return nil, err
+	}
+	// The hijacked connection now carries raw stdin bytes; the daemon
+	// copies them to the container's input fifo until we detach.
+	return &processSink{WriteCloser: conn}, nil
+}
+
+// attachStream performs the daemon attach HTTP-upgrade hijack for the
+// container and returns the raw connection plus the reader positioned
+// after the response headers (it may already buffer stream bytes).
+func (b *DockerBackend) attachStream(ctx context.Context, o ProcessOperation, query, what string) (net.Conn, *bufio.Reader, error) {
 	socket, err := b.dockerHostSocket()
 	if err != nil {
-		return nil, fmt.Errorf("%w: process input attach", ErrProcessInputUnsupported)
+		return nil, nil, fmt.Errorf("%w: %s", ErrProcessInputUnsupported, what)
 	}
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", socket)
 	if err != nil {
-		return nil, fmt.Errorf("attach process input: %w", err)
+		return nil, nil, fmt.Errorf("%s: %w", what, err)
 	}
-	fail := func(e error) (*processSink, error) {
+	fail := func(e error) (net.Conn, *bufio.Reader, error) {
 		_ = conn.Close()
-		return nil, e
+		return nil, nil, e
 	}
-	req := fmt.Sprintf("POST /containers/%s/attach?stream=1&stdin=1&stdout=0&stderr=0 HTTP/1.1\r\nHost: docker\r\nUser-Agent: sumi-runtime-provisioner\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n", url.PathEscape(processContainer(o)))
+	req := fmt.Sprintf("POST /containers/%s/attach?%s HTTP/1.1\r\nHost: docker\r\nUser-Agent: sumi-runtime-provisioner\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Length: 0\r\n\r\n", url.PathEscape(processContainer(o)), query)
 	if _, err = conn.Write([]byte(req)); err != nil {
-		return fail(fmt.Errorf("attach process input: %w", err))
+		return fail(fmt.Errorf("%s: %w", what, err))
 	}
 	br := bufio.NewReader(conn)
 	status, err := br.ReadString('\n')
 	if err != nil {
-		return fail(fmt.Errorf("attach process input: %w", err))
+		return fail(fmt.Errorf("%s: %w", what, err))
 	}
 	if !strings.Contains(status, "101") {
 		body, _ := io.ReadAll(io.LimitReader(br, 8192))
-		return fail(fmt.Errorf("attach process input: %s: %s", strings.TrimSpace(status), strings.TrimSpace(string(body))))
+		return fail(fmt.Errorf("%s: %s: %s", what, strings.TrimSpace(status), strings.TrimSpace(string(body))))
 	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			return fail(fmt.Errorf("attach process input: %w", err))
+			return fail(fmt.Errorf("%s: %w", what, err))
 		}
 		if line == "\r\n" || line == "\n" {
 			break
 		}
 	}
-	// The hijacked connection now carries raw stdin bytes; the daemon
-	// copies them to the container's input fifo until we detach.
-	return &processSink{WriteCloser: conn}, nil
+	return conn, br, nil
 }
 
 // SignalProcess delivers one allowlisted signal to the interactive

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path"
 	"regexp"
@@ -169,8 +170,26 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	if _, err = b.processDocker(ctx, args...); err != nil {
 		return err
 	}
-	_, err = b.processDocker(ctx, "start", processContainer(o))
-	return err
+	// A TTY session's output stream is attached before the container
+	// starts, so it carries every byte from the first one (see
+	// process_interactive_live.go). Best effort: without it the session
+	// still runs on the journal alone.
+	var live io.ReadCloser
+	if o.Interactive && o.TTY {
+		if live, err = b.openProcessOutput(ctx, o); err != nil {
+			live = nil
+		}
+	}
+	if _, err = b.processDocker(ctx, "start", processContainer(o)); err != nil {
+		if live != nil {
+			_ = live.Close()
+		}
+		return err
+	}
+	if live != nil {
+		b.liveOutputs.Store(o.OperationID, live)
+	}
+	return nil
 }
 func processMarker(o ProcessOperation) string { return "SUMI_PROCESS_START_" + o.OperationID }
 
@@ -214,12 +233,17 @@ var jobEgressEnvNames = map[string]bool{
 // argv. setsid detaches it into its own session/process group: the session
 // signal path (Ctrl-C line-discipline INT, SignalProcess foreground-group
 // delivery) must never kill it, while container teardown still reaps it
-// with the PID namespace. A missing bridge is a loud warning, not a launch
-// failure: the job still runs and its network calls fail honestly with
-// connection refused. The /dev/tcp probe confirms the listener is bound
-// before the workload starts, so a fast command cannot race the bridge;
-// the probe subshell closes its fd so nothing leaks into the exec'd argv.
-const jobEgressPrelude = `if [ -x /usr/local/bin/sumi-egress-bridge ]; then setsid /usr/local/bin/sumi-egress-bridge & sumi_egress_n=0; while [ "$sumi_egress_n" -lt 100 ]; do if (exec 3<>/dev/tcp/127.0.0.1/3128 && exec 3>&-) 2>/dev/null; then break; fi; sumi_egress_n=$((sumi_egress_n+1)); sleep 0.05; done; else echo 'sumi-egress: bridge unavailable; outbound network disabled' >&2; fi; `
+// with the PID namespace. The bridge's own diagnostics go to
+// /tmp/sumi-egress-bridge.log, not to the job's stdout/stderr: in a shared
+// terminal that stream is the person's screen (hosted acceptance showed its
+// startup line as the first thing a fresh terminal printed). Failure stays
+// loud: a missing bridge, or one whose listener never comes up, prints a
+// warning into the job's stderr — not a launch failure; the job still runs
+// and its network calls fail honestly with connection refused. The
+// /dev/tcp probe confirms the listener is bound before the workload
+// starts, so a fast command cannot race the bridge; the probe subshell
+// closes its fd so nothing leaks into the exec'd argv.
+const jobEgressPrelude = `if [ -x /usr/local/bin/sumi-egress-bridge ]; then setsid /usr/local/bin/sumi-egress-bridge </dev/null >>/tmp/sumi-egress-bridge.log 2>&1 & sumi_egress_n=0; while [ "$sumi_egress_n" -lt 100 ]; do if (exec 3<>/dev/tcp/127.0.0.1/3128 && exec 3>&-) 2>/dev/null; then break; fi; sumi_egress_n=$((sumi_egress_n+1)); sleep 0.05; done; if [ "$sumi_egress_n" -ge 100 ]; then echo 'sumi-egress: bridge did not start; outbound network disabled (details: /tmp/sumi-egress-bridge.log)' >&2; fi; else echo 'sumi-egress: bridge unavailable; outbound network disabled' >&2; fi; `
 
 type cappedProcessOutput struct {
 	bytes.Buffer

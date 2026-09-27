@@ -341,7 +341,9 @@ func (service *Service) ProcessStatus(ctx context.Context, r ProcessLookupReques
 			base, total := io_.tty.stats()
 			op.StdoutBase = base
 			op.StdoutBytes = total
-			op.OutputAttached = io_.attached.Load()
+			// The live tail counts: while it is on, readers receive the
+			// session's output even before the journal pump attaches.
+			op.OutputAttached = io_.attached.Load() || io_.live.active()
 		}
 	}
 	return op, nil
@@ -381,15 +383,44 @@ func (service *Service) ReadProcessOutput(ctx context.Context, r ProcessOutputRe
 		if err != nil {
 			return ProcessOutput{}, err
 		}
-		data, base, next, gap, err := io_.tty.read(r.Offset, r.Limit)
-		if err != nil {
-			return ProcessOutput{}, err
+		var data []byte
+		var next int64
+		var gap bool
+		base, total := io_.tty.stats()
+		// A finished session is served from the journal only: the daemon
+		// flushes the last partial line at exit and the pump drains it.
+		live := !operation.State.terminal()
+		ahead := r.Offset > total
+		if ahead {
+			// The reader is ahead of the durable end: it was served the
+			// live tail earlier. Never re-serve [total, offset) — only the
+			// live tail from its own offset, or nothing until the journal
+			// catches up with the bytes it already has.
+			next = r.Offset
+			if extra, ok := io_.live.read(r.Offset, r.Limit); ok && live {
+				data, next = extra, r.Offset+int64(len(extra))
+			}
+		} else {
+			data, base, next, gap, err = io_.tty.read(r.Offset, r.Limit)
+			if err != nil {
+				return ProcessOutput{}, err
+			}
+			// Past the durable end, add what the journal has not
+			// delivered yet (a prompt, keystroke echo, a partial line).
+			if room := r.Limit - len(data); room > 0 && !gap && live {
+				if extra, ok := io_.live.read(next, room); ok && len(extra) > 0 {
+					data = append(data, extra...)
+					next += int64(len(extra))
+				}
+			}
+			if _, t2 := io_.tty.stats(); t2 > total {
+				total = t2
+			}
 		}
-		_, total := io_.tty.stats()
 		out := ProcessOutput{
 			OperationID: r.OperationID, Stream: r.Stream, Offset: r.Offset,
 			NextOffset: next, Content: string(data),
-			EOF:        operation.State.terminal() && next >= total,
+			EOF:        operation.State.terminal() && next >= total && !ahead,
 			Truncated:  gap,
 			BaseOffset: base, Gap: gap,
 		}
@@ -818,7 +849,11 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 			// is not up yet, and stopping it only happens on a
 			// terminal state.
 			if io_, err := s.ensureInteractive(original); err == nil {
-				_ = io_
+				if lb, ok := s.backend.(liveOutputBackend); ok {
+					if rc := lb.TakeProcessLiveOutput(next.Operation.OperationID); rc != nil {
+						io_.startLive(rc)
+					}
+				}
 			}
 		}
 	}

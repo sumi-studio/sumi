@@ -49,6 +49,7 @@ import {
 const LIST_REFRESH_MS = 15_000;
 const SESSION_REFRESH_MS = 15_000;
 const NOTICE_TTL_MS = 4_000;
+const OUTPUT_DETACHED_GRACE_MS = 3_000;
 const INPUT_OBSERVE_MS = 2_500;
 const RESIZE_RETRY_MAX = 3;
 
@@ -627,6 +628,25 @@ export function TerminalSessionView({
     [],
   );
 
+  // Output health: a just-started session honestly reports "not yet
+  // attached" for a moment while the runtime brings output capture up.
+  // Only a detached state that outlasts OUTPUT_DETACHED_GRACE_MS is shown
+  // as an output failure, so ordinary startup does not flash a warning
+  // over a prompt that is already on screen.
+  const detached = current?.outputAttached === false && ended === null;
+  const [detachedLong, setDetachedLong] = useState(false);
+  useEffect(() => {
+    if (!detached) {
+      setDetachedLong(false);
+      return;
+    }
+    const timer = setTimeout(
+      () => setDetachedLong(true),
+      OUTPUT_DETACHED_GRACE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [detached]);
+
   const status = ended?.status ?? current?.status ?? "requested";
   const acceptingInput = ended === null && isTerminalAcceptingInput({ status });
   const controlHeld = current?.controlHolder === "human";
@@ -737,7 +757,7 @@ export function TerminalSessionView({
         </div>
       ) : null}
 
-      {current?.outputAttached === false && ended === null ? (
+      {detached && detachedLong ? (
         <div
           role="status"
           className="flex items-center gap-2 border-border border-b bg-muted/40 px-3 py-1.5 text-xs"
