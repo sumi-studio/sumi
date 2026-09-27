@@ -10,6 +10,8 @@ import type {
   ModelRequest,
 } from "../src/provider.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
+import { StateError } from "../src/state-client.ts";
+import type { CommitRequest } from "../src/types.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-0000000000c7";
 const DAY = 86_400_000;
@@ -222,4 +224,161 @@ test("a restarted secretary on a different model sees the same journal, with the
     b.requests[0]!.messages.at(-1)?.content,
     "[Received 2026-09-28 16:49:03 UTC; approximately 23 hours 59 minutes since the previous incoming message]\n[human] third",
   );
+});
+
+/** A store that deterministically rejects (400) every commit whose events
+ * include one of `rejectKinds` — the persistence-rejection paths that send
+ * commitTurnFinal down its scrubbed and minimal tiers. */
+class RejectingState extends FakeState {
+  readonly sent: CommitRequest[] = [];
+  readonly rejectKinds: string[];
+  healed = false;
+  rejectFirst = 0;
+  constructor(rejectKinds: string[]) {
+    super();
+    this.rejectKinds = rejectKinds;
+  }
+  override async commitTurn(
+    persona: string,
+    turnId: string,
+    generation: number,
+    req: CommitRequest,
+  ) {
+    if (this.healed) return super.commitTurn(persona, turnId, generation, req);
+    this.sent.push(structuredClone(req));
+    if (
+      this.sent.length <= this.rejectFirst ||
+      req.outcome === "complete" ||
+      req.events.some((e) => this.rejectKinds.includes(e.kind))
+    ) {
+      throw new StateError(400, "commit contains a NUL byte jsonb cannot store");
+    }
+    return super.commitTurn(persona, turnId, generation, req);
+  }
+}
+
+const markers = (req: CommitRequest) =>
+  req.events.filter((e) => e.kind === "turn_failed");
+
+/** Serve in-1 through `provider` against `state`, then let a fresh
+ * secretary serve in-2 and return what that next model was shown. */
+async function failThenContinue(
+  state: RejectingState,
+  provider: ModelProvider,
+): Promise<string[]> {
+  const t0 = Date.parse("2026-09-20T09:00:00Z");
+  state.addPersona(PERSONA);
+  arrive(state, "in-1", "book the usual table", t0);
+  const first = new Secretary(cfg(state, provider));
+  await first.start();
+  assert.equal(await first.step(), "turn");
+  // Replaying the stored tier is the identical request: no conflict, and
+  // the journal still holds exactly one marker.
+  const turn = [...state.turns.values()].find((t) => t.input_id === "in-1")!;
+  state.healed = true;
+  await state.commitTurn(PERSONA, turn.turn_id, turn.generation, state.sent.at(-1)!);
+  state.healed = false;
+  const journal = await state.events(PERSONA, 0);
+  assert.equal(journal.filter((e) => e.kind === "turn_failed").length, 1);
+  await first.stop();
+  assert.equal(state.inputs.find((i) => i.input_id === "in-1")?.status, "done");
+  assert.deepEqual(
+    state.outboxEntries.map((e) => e.kind),
+    ["turn_failed"],
+    "the requester is told the turn failed",
+  );
+  // Every tier sent at most one marker — scrubbing never adds a second.
+  for (const req of state.sent) assert.ok(markers(req).length <= 1);
+
+  // The store heals; the next message goes to a working model.
+  state.healed = true;
+  arrive(state, "in-2", "any news?", t0 + 3_600_000);
+  const next = new RecordingProvider("model-b");
+  const s = new Secretary(cfg(state, next));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  assert.equal(await s.step(), "idle", "the failed request is not served again");
+  await s.stop();
+  assert.equal(next.requests.length, 1);
+  const sent = next.requests[0]!;
+  assert.equal(
+    sent.messages.at(-1)?.content,
+    "[Received 2026-09-20 10:00:00 UTC; 1 hour since the previous incoming message]\n[human] any news?",
+  );
+  return journalView(sent).map((m) => m.content);
+}
+
+test("a reply the store rejects is downgraded to a marked failure the next model sees", async () => {
+  // Only the complete commit is rejected: the scrubbed tier stores the
+  // downgraded failure with its events and one marker.
+  const state = new RejectingState([]);
+  const view = await failThenContinue(state, new RecordingProvider("model-a"));
+  assert.deepEqual(state.sent.map((r) => [r.outcome, markers(r).length]), [
+    ["complete", 0],
+    ["fail", 1],
+  ]);
+  assert.deepEqual(view, [
+    "[Received 2026-09-20 09:00:00 UTC]\n[human] book the usual table",
+    "reply from model-a",
+    "[turn failed — this turn ended without a completed reply]",
+  ]);
+});
+
+test("a downgraded reply whose events cannot be stored at all still leaves a marker", async () => {
+  const state = new RejectingState(["assistant_message"]);
+  const view = await failThenContinue(state, new RecordingProvider("model-a"));
+  const minimal = state.sent.at(-1)!;
+  assert.equal(state.sent.length, 3);
+  assert.equal(minimal.retryable, false);
+  assert.deepEqual(minimal.events, [
+    { kind: "turn_failed", payload: { error_kind: null, record_lost: true } },
+  ]);
+  assert.deepEqual(view, [
+    "[turn failed — this turn ended without a completed reply; its record could not be stored]",
+  ]);
+});
+
+test("a terminal failure whose events cannot be stored keeps its marker and cause in the minimal tier", async () => {
+  // No model selected: the turn fails terminally before any model call,
+  // and the store refuses every commit carrying the input receipt.
+  const state = new RejectingState(["input_received"]);
+  const view = await failThenContinue(state, new NoSelectionProvider());
+  assert.deepEqual(state.sent.map((r) => [r.retryable, markers(r).length]), [
+    [false, 1],
+    [false, 1],
+    [false, 1],
+  ]);
+  assert.deepEqual(state.sent.at(-1)!.events, [
+    {
+      kind: "turn_failed",
+      payload: { error_kind: "no_model_connection", record_lost: true },
+    },
+  ]);
+  assert.deepEqual(view, [
+    "[turn failed: no model connection was selected — this turn ended without a completed reply; its record could not be stored]",
+  ]);
+});
+
+test("a retryable failure stays unmarked through the scrubbed and minimal tiers", async () => {
+  const state = new RejectingState([]);
+  state.rejectFirst = 2;
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-1", "hi");
+  const flaky: ModelProvider = {
+    name: "flaky",
+    async *stream() {
+      throw new Error("provider exploded");
+    },
+  };
+  const s = new Secretary(cfg(state, flaky));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  await s.stop();
+  assert.deepEqual(state.sent.map((r) => [r.retryable, markers(r).length]), [
+    [true, 0],
+    [true, 0],
+    [true, 0],
+  ]);
+  assert.equal(state.inputs.find((i) => i.input_id === "in-1")?.status, "queued");
+  assert.deepEqual(await state.events(PERSONA, 0), []);
 });

@@ -349,9 +349,12 @@ export function eventMessage(ev: Event): ChatMessage | null {
       // The requester was told; the secretary must be too, or an
       // unanswered input reads as a request still waiting for it.
       const why = FAILURE_REASONS[str(p.error_kind)];
+      const lost = p.record_lost === true
+        ? "; its record could not be stored"
+        : "";
       return {
         role: "user",
-        content: `[turn failed${why ? `: ${why}` : ""} — this turn ended without a completed reply]`,
+        content: `[turn failed${why ? `: ${why}` : ""} — this turn ended without a completed reply${lost}]`,
       };
     }
     case "assistant_message":

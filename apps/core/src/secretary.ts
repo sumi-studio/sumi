@@ -1409,16 +1409,13 @@ export class Secretary {
    * must never become a fabricated record.
    */
   private async commitTurnFinal(turn: Turn, req: CommitRequest): Promise<void> {
+    // Every tier that commits a terminal failure journals that the turn
+    // ended, so a later turn never reads the input as a request still
+    // waiting to be served — including a complete downgraded below and the
+    // minimal tier that stores no other event. The marker carries no
+    // provider bytes, so it can never be what makes a commit un-storable.
     if (req.outcome === "fail" && req.retryable !== true) {
-      // A terminal failure journals that the turn ended, so a later turn
-      // never reads the input as a request still waiting to be served.
-      req = {
-        ...req,
-        events: [
-          ...req.events,
-          { kind: "turn_failed", payload: { error_kind: req.error_kind ?? null } },
-        ],
-      };
+      req = { ...req, events: withFailureMarker(req.events, req.error_kind) };
     }
     const { state, personaId } = this.cfg;
     const commit = (r: CommitRequest) =>
@@ -1444,17 +1441,21 @@ export class Secretary {
       RECORDED_ERROR_BYTES,
     );
     const msg = `commit rejected deterministically (${why}): ${detail}`;
+    // A fail+retryable commit (e.g. a provider error whose message was
+    // un-storable) keeps its retryable disposition — the input still
+    // deserves the retry. Only an un-storable *complete* downgrade is
+    // terminal, since its output cannot be honestly recorded.
+    const retryable = req.outcome === "fail" && req.retryable === true;
+    const scrubbedEvents = (req.events ?? []).map((e) => ({
+      kind: e.kind,
+      payload: scrubJson(e.payload) as Record<string, unknown>,
+    }));
     const scrubbed: CommitRequest = {
       outcome: "fail",
-      // A fail+retryable commit (e.g. a provider error whose message was
-      // un-storable) keeps its retryable disposition — the input still
-      // deserves the retry. Only an un-storable *complete* downgrade is
-      // terminal, since its output cannot be honestly recorded.
-      retryable: req.outcome === "fail" && req.retryable === true,
-      events: (req.events ?? []).map((e) => ({
-        kind: e.kind,
-        payload: scrubJson(e.payload) as Record<string, unknown>,
-      })),
+      retryable,
+      events: retryable
+        ? scrubbedEvents
+        : withFailureMarker(scrubbedEvents, req.error_kind),
       error: msg,
       // A certain bounded cause survives the scrub — it carries no
       // provider bytes, so it can never be what made the commit un-storable.
@@ -1477,11 +1478,27 @@ export class Secretary {
     const why2 = truncateText(scrubJson(rejected.message) as string, 512);
     await commit({
       outcome: "fail",
-      retryable: req.outcome === "fail" && req.retryable === true,
-      events: [],
+      retryable,
+      events: retryable
+        ? []
+        : withFailureMarker([], req.error_kind, { record_lost: true }),
       error: `commit rejected deterministically (${why}; then ${why2}): ${detail}; original commit events could not be stored`,
     });
   }
+}
+
+/** Append the terminal-failure journal marker unless the events already
+ * carry one — a tier retrying an already-marked request adds no second. */
+function withFailureMarker(
+  events: EventInput[],
+  errorKind: CommitRequest["error_kind"],
+  extra: Json = {},
+): EventInput[] {
+  if (events.some((e) => e.kind === "turn_failed")) return events;
+  return [
+    ...events,
+    { kind: "turn_failed", payload: { error_kind: errorKind ?? null, ...extra } },
+  ];
 }
 
 // Recorded-error budget: a persisted failure only needs the reason, not
