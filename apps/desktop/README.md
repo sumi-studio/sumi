@@ -68,11 +68,22 @@ but never reattaches an old tab reference.
   targets. It omits password/file values, hidden/offscreen text, child-frame
   contents, shadow DOM and canvas content. It is not a full accessibility tree.
   Observations contain untrusted website content, not host instructions.
-- `act` supports DOM click, text/password input or textarea fill, scroll, and
-  HTTP(S) navigation. DOM click/input events are synthetic; websites requiring
-  trusted input, custom editors, select menus, file upload, drag/drop or nested
-  frames need a later interaction adapter. This is not a complete browser-use
-  engine. No high-level agent loop or Jev integration is included.
+- `act` supports DOM click, text/password input or textarea fill, choosing an
+  observed option of a native `<select>` (`{kind: "select", target, value}`;
+  observations list up to 50 options per select), scroll, and HTTP(S)
+  navigation. DOM click/input/change events are synthetic; websites requiring
+  trusted input, custom editors, custom (ARIA) dropdowns, file upload,
+  drag/drop or nested frames need a later interaction adapter. This is not a complete browser-use
+  engine by itself. The optional Jev goal loop (`src/browser/goal.ts`, see
+  [delegated goals](../../docs/shared-browser-host.md#delegate-a-goal-to-jev))
+  uses exactly these operations; it adds no new page capability.
+  `openTab(window, url, { top })` leaves host-owned space above the page; the
+  connected entry uses it for the goal strip (`src/browser/goal-control.ts`).
+- `act(..., { guard: true })` additionally refuses with `page_changed` when
+  native person input (key/pointer down, wheel, touch) reached the tab after
+  the observation, an observed control's label, value, enabled/checked state
+  or visibility changed, or the text of the acted-on control's enclosing
+  form/dialog/row changed. The direct path does not set it.
 - An observation creates opaque target IDs retained only in a separate isolated
   JavaScript world. Bindings are single-use, expire after 30 seconds, and are
   replaced by the next observation. Main-frame navigation (including history

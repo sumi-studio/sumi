@@ -16,6 +16,7 @@
     "check-types": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm build && node --test test/*.test.mjs",
     "test:browser": "pnpm build && electron test/acceptance.mjs",
+    "test:browser:jev": "pnpm build && electron test/jev-acceptance.mjs",
     "dev:browser": "pnpm build && electron dist/browser-dev.js",
     "dev:browser:connected": "pnpm build && electron dist/browser-connected.js"
   },

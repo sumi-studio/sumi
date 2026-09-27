@@ -54,7 +54,7 @@ func (f *fixture) assertOneNotification(id string) {
 }
 func (f *fixture) claimExpected(a Attachment, token, want string) *agentstate.Job {
 	f.t.Helper()
-	j, e := f.store.Claim(context.Background(), a.ID, token)
+	j, e := f.store.Claim(context.Background(), a.ID, token, false)
 	if e != nil || j == nil || j.JobID != want {
 		f.t.Fatalf("claim expected %s: %+v %v", want, j, e)
 	}
@@ -65,7 +65,7 @@ func TestBrowserCancellationBeforeAndAfterDispatch(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
 	a, token := f.attach(true)
-	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+	if _, e := f.store.Claim(ctx, a.ID, token, false); e != nil {
 		t.Fatal(e)
 	}
 	t.Run("queued_cancel_is_never_dispatched_and_does_not_block_next", func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestBrowserCancellationBeforeAndAfterDispatch(t *testing.T) {
 		if s := f.hostCompletion(a.ID, token, later, map[string]any{"dispatched": true, "outcome": "returned"}); s != 200 {
 			t.Fatal(s)
 		}
-		if repeat, e := f.store.Claim(ctx, a.ID, token); e != nil || repeat != nil {
+		if repeat, e := f.store.Claim(ctx, a.ID, token, false); e != nil || repeat != nil {
 			t.Fatal("cancelled command replayed", repeat, e)
 		}
 	})
@@ -154,7 +154,7 @@ func TestBrowserCancellationBeforeAndAfterDispatch(t *testing.T) {
 		later := f.enqueue(a, "observe")
 		f.claimExpected(a, token, later)
 		f.hostCompletion(a.ID, token, later, map[string]any{"dispatched": true, "outcome": "returned"})
-		if repeat, e := f.store.Claim(ctx, a.ID, token); e != nil || repeat != nil {
+		if repeat, e := f.store.Claim(ctx, a.ID, token, false); e != nil || repeat != nil {
 			t.Fatal("expired/cancelled command replayed", repeat, e)
 		}
 	})
