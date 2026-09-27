@@ -216,6 +216,8 @@ var NotIncluded = []Exclusion{
 		Reason: "human account, employer and workspace membership are resolved by the destination's authentication, never imported"},
 	{Name: "usage", Owner: "unassigned (M14)",
 		Reason: "usage, budget and billing records are not core state"},
+	{Name: "browser_profiles", Owner: "everyday-tools",
+		Reason: "Cloud browser profiles, cookies and origin storage stay with their source placement; checkpoints are encrypted with that placement's key and browser grants are not carried. Moving a secretary does not restore its Cloud browser in the destination"},
 }
 
 type colKind int
@@ -388,6 +390,12 @@ var placementLocalTables = map[string]string{
 	// for this placement's host routes. Credentials never travel — a
 	// destination must mint its own attachment for its own tabs.
 	"browser_tab_attachments": "host-scoped grant and credential for a live tab incarnation on this placement; credentials are never carried",
+	// Browser checkpoints contain cookies and origin storage sealed with
+	// this placement's key. Their profile/incarnation identifies a browser
+	// owned by this placement, not portable execution authority. Keep the
+	// checkpoint on the source; do not copy ciphertext the destination
+	// cannot decrypt or silently transfer its browser credentials.
+	"cloud_browser_profiles": "placement-owned browser incarnation and encrypted session checkpoint; retained on the source, not restored by a core transfer",
 	// Local MCP grants bind one install's host to secrets and endpoint
 	// configuration held as ciphertext; the migration that creates the
 	// table declares this material is not portable core state. A

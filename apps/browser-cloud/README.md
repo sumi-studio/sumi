@@ -91,6 +91,12 @@ A recreated browser is a new incarnation: earlier observations, tickets and
 in-flight work are refused (`stale_observation`); an action whose effect was
 uncertain when the browser was lost is reported as unknown and never replayed.
 
+These checkpoints restore browsers within the same Cloud placement. A
+secretary's Local/Cloud transfer does not carry the browser profile, cookies,
+origin storage or grants: the encrypted checkpoint remains on its source, and
+the destination does not resume that browser. The transfer contract lists
+`browser_profiles` among the excluded application state.
+
 ## Control
 
 The person's input (except bare mouse moves) takes control before it is
