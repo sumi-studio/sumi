@@ -212,7 +212,12 @@ export class ProfileBrowser {
     if (profile && this.meta && this.meta.profile !== profile) throw new Error("profile mismatch");
     // Every caller waits for the restored control, not only the first.
     if (this.meta) {
-      this.controlLoaded ??= this.restoreControl();
+      this.controlLoaded ??= this.restoreControl().catch((error) => {
+        // A failed read is not an absent takeover. Reject every waiting
+        // request and allow the next request to retry on this instance.
+        this.controlLoaded = undefined;
+        throw error;
+      });
       await this.controlLoaded;
     }
     return this.meta;
@@ -792,7 +797,7 @@ export class ProfileBrowser {
    * a fresh one alike: the takeover belongs to the profile, not to a
    * browser session. Goals the takeover stopped stay stopped. */
   private async restoreControl(): Promise<void> {
-    const saved = await this.ctx.storage.get<SavedControl>("control").catch(() => undefined);
+    const saved = await this.ctx.storage.get<SavedControl>("control");
     if (!saved) return;
     this.control = { mode: saved.mode === "human" ? "human" : "agent", epoch: Number(saved.epoch) || 0 };
     this.controlReturned = saved.returned;

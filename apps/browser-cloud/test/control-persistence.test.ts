@@ -56,10 +56,15 @@ function fakeRemote() {
 function world(meta: unknown, grace?: string) {
   const store = new Map<string, unknown>([["meta", meta]]);
   const controlWrites: Any[] = [];
-  const hooks: { failNext: number; gate?: Promise<void> } = { failNext: 0 };
+  const hooks: { failNext: number; failGet: number; gate?: Promise<void>; getGate?: Promise<void> } = { failNext: 0, failGet: 0 };
   const ctx = {
     storage: {
       async get(k: string) {
+        if (k === "control" && hooks.getGate) await hooks.getGate;
+        if (k === "control" && hooks.failGet > 0) {
+          hooks.failGet--;
+          throw new Error("storage unavailable");
+        }
         return structuredClone(store.get(k));
       },
       async put(k: string, v: unknown) {
@@ -215,6 +220,44 @@ test("N1: the takeover survives a DO restart that reattaches the same live brows
     w.controlWrites.map((c) => [c.mode, c.holdUntil === undefined ? "-" : "hold", c.returned?.reason ?? "-"]),
     [["human", "-", "-"], ["human", "hold", "-"], ["human", "-", "-"], ["agent", "-", "person_release"]],
   );
+});
+
+test("R1: a failed control read blocks all callers; the same instance retries and preserves human control", async () => {
+  const remote = fakeRemote();
+  const w = world(LIVE_META);
+  const { pb: before } = await takenOver(w, remote);
+  await before.controlWrite;
+  const saved = structuredClone(w.store.get("control"));
+  w.hooks.failGet = 1;
+  let finishRead!: () => void;
+  w.hooks.getGate = new Promise<void>((resolve) => { finishRead = resolve; });
+  const after = w.browser();
+
+  // Both entry points must await the same restoration, including its error.
+  const requests = Promise.allSettled([
+    after.fetch(new Request("https://profile.invalid/wake", { method: "POST", body: JSON.stringify({ profile: PROFILE, work: true }) })),
+    after.alarm(),
+  ]);
+  await tick();
+  finishRead();
+  for (const result of await requests) {
+    assert.equal(result.status, "rejected");
+    if (result.status === "rejected") assert.match(String(result.reason), /storage unavailable/);
+  }
+  assert.equal(after.remote, undefined, "the browser is not attached using default control");
+  assert.deepEqual(remote.navigations, []);
+  assert.deepEqual(w.store.get("control"), saved, "a failed read must not overwrite the saved takeover");
+
+  // Recovery on the same object must retry instead of caching the rejection.
+  assert.equal(await after.ensureLive(), true);
+  assert.equal(after.control.mode, "human");
+  await assert.rejects(secretaryNavigates(after), /person took control/);
+  assert.deepEqual(remote.navigations, []);
+  const viewer = await connectViewer(after, "n-read-recovered");
+  assert.equal(lastHello(viewer).control.mode, "human");
+  await say(viewer, { type: "release" });
+  assert.equal((await secretaryNavigates(after)).status, "dispatched");
+  assert.deepEqual(remote.navigations, [PAY]);
 });
 
 test("N1: restart during the hold keeps the original deadline; expiry returns control with its reason", async () => {
