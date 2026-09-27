@@ -24,7 +24,7 @@ func TestToolJobOriginNotifications(t *testing.T) {
 			ctx := context.Background()
 
 			attachment, token := f.attach(true)
-			if _, e := f.store.Claim(ctx, attachment.ID, token); e != nil {
+			if _, e := f.store.Claim(ctx, attachment.ID, token, false); e != nil {
 				t.Fatal(e)
 			}
 			pool := f.store.Pool
@@ -70,7 +70,7 @@ func TestToolJobOriginNotifications(t *testing.T) {
 			for _, id := range ids {
 				switch scenario.status {
 				case "done":
-					job, e := f.store.Claim(ctx, attachment.ID, token)
+					job, e := f.store.Claim(ctx, attachment.ID, token, false)
 					if e != nil || job == nil || job.JobID != id {
 						t.Fatalf("claim: %+v %v", job, e)
 					}
@@ -85,7 +85,7 @@ func TestToolJobOriginNotifications(t *testing.T) {
 			}
 			if scenario.status == "lost" {
 				for _, id := range ids {
-					job, e := f.store.Claim(ctx, attachment.ID, token)
+					job, e := f.store.Claim(ctx, attachment.ID, token, false)
 					if e != nil || job == nil || job.JobID != id {
 						t.Fatalf("lost claim: %+v %v", job, e)
 					}
@@ -96,7 +96,7 @@ func TestToolJobOriginNotifications(t *testing.T) {
 						t.Fatal(e)
 					}
 				}
-				again, e := f.store.Claim(ctx, attachment.ID, token)
+				again, e := f.store.Claim(ctx, attachment.ID, token, false)
 				if e != nil || again != nil {
 					t.Fatalf("uncertain job replayed %+v %v", again, e)
 				}

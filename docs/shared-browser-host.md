@@ -14,7 +14,7 @@ never receives that session or the separate host credential.
 
 ## Configured launch
 
-Run API migrations through `0065_browser_tabs`; the normal API server wires the
+Run API migrations through `0067_browser_goal`; the normal API server wires the
 browser attachment routes, tool effects and orphan-job sweeper whenever the Core
 state service is configured. No extra browser service token is needed by the API.
 
@@ -34,9 +34,16 @@ Origin. Placeholders below are not valid credentials:
   "profileId": "my-browser-profile",
   "name": "My research tab",
   "url": "https://example.com",
-  "allowActions": true
+  "allowActions": true,
+  "jev": {
+    "apiKeyFile": "/absolute/path/to/owned/typesafe-api-key",
+    "model": "jev-latest"
+  }
 }
 ```
+
+`jev` is optional; omit it for direct browser use only. See
+[Delegate a goal to Jev](#delegate-a-goal-to-jev).
 
 From the repository root:
 
@@ -120,9 +127,17 @@ its grant. No command is rebound to a different tab/profile/process.
 Revocation is serialized with dispatch admission. It prevents subsequent Core
 admission and host dequeue. **An operation already admitted for dispatch may
 still execute or finish after revocation returns.** Revocation does not retract
-a prior observation from the secretary's durable history. Queued operations that
-cannot be dispatched fail after 60 seconds with `dispatched:false`. A host that
-has not polled for 30 seconds is shown unavailable and new operations are refused.
+a prior observation from the secretary's durable history. Operations on one tab
+run one at a time. A queued operation that is not dispatched fails with
+`dispatched:false` after 60 seconds — counted from when its tab was last held
+under a live host claim, because a delegated goal may hold the tab for minutes —
+and never waits more than 7 minutes in total. Its `result.code` says why:
+`tab_busy` (still held by another job, `blocked_by` names it), `host_offline`
+(the host stopped polling), `grant_revoked`, or `not_claimed` (the connected host
+did not take it). A queued `browser.observe`/`browser.act`/`browser.goal` whose
+tab has a goal queued or running ahead of it returns `waiting_for` with that
+goal's job id. A host that has not polled for 30 seconds is shown unavailable and
+new operations are refused.
 
 The bridge never repeats a possibly dispatched action. If a poll response is
 lost after the server consumed the command, it becomes `lost` when its claim
@@ -168,11 +183,205 @@ response loss retries receipts, not clicks, and mismatched tab identities fail.
 
 No new packages are needed beyond the existing Electron/runtime dependencies.
 No live-tab restart restoration, native sign-in UI, Mac/Windows packaging or
-validation, Jev integration, arbitrary-page trusted-input compatibility,
+validation, arbitrary-page trusted-input compatibility,
 child-frame interaction, full accessibility tree or browser product chrome was
 added. See the [runtime limits](../apps/desktop/README.md) for the DOM operation
 scope. The API/host bridge is implemented; external hosted-network deployment
 has not been exercised in this acceptance.
+
+## Delegate a goal to Jev
+
+A secretary can hand a purpose, rather than each click, to the
+[TypeSafe Jev](https://docs.typesafe.ai/) operation layer on the same granted
+tab. Jev is a decision model: it returns typed choices with probabilities, not
+generated text. It does not replace the person's chosen main model or the
+secretary; the secretary decides when to delegate, supplies the values, and
+verifies the outcome.
+
+**Configure (host only).** Save the person's TypeSafe API key in its own
+owner-only file (`chmod 600`, at most 4 KiB) and reference it from the host
+configuration's `jev.apiKeyFile`. `jev.model` defaults to `jev-latest`; pin a
+versioned id such as `jev-1.13.0` to keep behavior fixed. `jev.endpoint`
+defaults to `https://api.typesafe.ai` (HTTP is accepted only on loopback, for
+owned test doubles). `jev.minConfidence` (0–1, default 0.3, untuned) stops a
+goal as `uncertain` instead of acting on a weak choice. The key is read into the
+Electron main process only. It is never put in the environment, the website,
+`apps/web`, the Sumi API/DB, logs or job results. An unreadable or malformed key
+file logs `Jev operation layer disabled: …` and the host continues with the
+direct path.
+
+**Availability.** Each host poll declares whether it can currently run Jev.
+`browser.tabs` returns `operation_layers: {direct: true, jev: "available" |
+"actions_not_allowed" | "not_configured" | "host_offline"}`: `available` only
+while the host is connected (polled within 30 s), the grant allows actions and
+the host's latest poll declared Jev; an observe-only grant is
+`actions_not_allowed` (and `browser.act`/`browser.goal` are refused with that
+reason); a host that stopped polling is `host_offline`, not a stale
+`available`. After Jev rejects
+the key (401/403) the host stops declaring Jev until it restarts, so the tab
+reports `not_configured` from its next poll (≤250 ms later; a goal admitted in
+that window fails `jev_not_configured` without touching the tab).
+`browser.goal` requires the action grant and `jev: "available"`; otherwise it
+is refused before anything is queued with "the Jev operation layer is not
+configured on this tab's browser host; use browser.observe and browser.act
+directly". No other model is substituted.
+
+**Call.**
+
+```json
+{"attachment_id": "…", "goal": "Sign up for the newsletter with my name and email, then save.",
+ "inputs": {"name": "Ada Lovelace", "email": "ada@example.test", "password": "…"},
+ "private_inputs": ["password"], "max_steps": 15}
+```
+
+The host claims the job like any browser job and loops on the same tab:
+observe → one `POST /v1/systemone` request (operation choice, click-target,
+field/input, dropdown-option and URL-input choices, and a separate "does the
+page show the goal complete?" judgment) → admission → guarded act. Operations
+are click (links, buttons, checkbox/radio), fill a text field with one of the
+`inputs`, choose an option of a native `<select>`, open an `inputs` value that
+is an http(s) URL, scroll, wait, DONE and BLOCKED. Jev never supplies text or
+URLs; dropdown options are the page's own observed options, offered by code.
+Exact comparisons (does a field already contain an input? which option is
+already selected?) are done in code. Jev receives the goal, the non-private
+input values, the page's visible text (≤6000 chars), the control table and the
+last eight steps. Answers are validated strictly: every question answered, only
+offered options, probabilities over exactly the offered options summing to 1
+with the choice at the maximum; anything else executes nothing
+(`jev_invalid_response`). Input values are stored in the durable job request
+like direct `fill` text.
+
+**Private inputs.** Values named in `private_inputs` are typed into the page
+but never sent to Jev and never stored in progress, results or errors. The
+input table shows `(private value, not shown)`. Because a site can echo what was
+typed, the observation itself is protected first — before any of it is escaped,
+shortened or formatted for Jev, progress or the result:
+
+- In page text, title, URL, control labels and option labels, the value is
+  replaced by `[private:name]` (the rest stays): as typed, with any whitespace
+  between its words (a textarea's line breaks shown as spaces), in any letter
+  case, and JSON-escaped, URL-encoded or form-encoded.
+- A control whose value contains a private value, or is the beginning of one (a
+  partly typed or page-capped value), shows only `[private:name]`.
+- Where the page observation's own bounds cut text inside a private value
+  (16 000 characters of text, 512 of a title or control value, 256 of a control
+  name, 160 of an option label), the cut beginning (3+ characters) is replaced
+  too. The goal's shorter excerpts (6000 characters of page text for Jev, 2000
+  of `final_page.text`, 160 of a step target, 120 of a shown value) are cut only
+  after replacement, so they cannot expose a beginning.
+- Every progress/result string is scrubbed again as a backstop.
+
+Not protected, so do not rely on this for secrets a site re-displays in altered
+form: values shorter than 3 characters except where a whole string equals them;
+masked (`••••1234`), reformatted (`1234 5678` for `12345678`) or HTML-escaped
+echoes; a value split across elements or separate controls; text a site derives
+from it. The durable job request still holds the value, as for direct `fill`.
+
+**The person's view and Stop.** The connected entry
+(`src/browser-connected.ts`) reserves a 36 px strip above the page
+(`src/browser/goal-control.ts`). It is a separate WebContents in its own
+in-memory session with fixed local content, no preload and no network; the
+website cannot reach or script it. While a goal runs it reads "Secretary is
+operating this tab (Jev) · step n/max · next: … · goal: …" and enables a
+**Stop** button; otherwise it shows the grant and "Secretary goal ended
+(outcome)". Stop semantics: it immediately aborts a pending Jev request, retry
+wait or loop pause; no further action is started; an action already handed to
+the page (at most one, bounded by the 5 s operation limit) completes and is
+recorded; the goal completes `cancelled` with `goal_outcome:
+"stopped_by_person"` (distinct from the secretary's `job.cancel`, which also
+sets `cancel_requested_at`). Revoking the grant or closing the window remain
+the stronger stops. Direct `browser.act` calls are single dispatches and are
+not shown in the strip.
+
+**Progress and cancellation.** Before every action and every 3 s the host posts
+`POST /api/browser-host/tabs/{id}/progress`. The API renews the 30 s claim and
+tab presence and stores `result.progress` (phase, step, actions dispatched, last
+step, next action, URL/title, Jev call count), which `job.status` shows while
+running. It answers with the job status: after `job.cancel` the goal stops
+within one heartbeat (the in-flight Jev request is aborted) or at its next
+admission and completes `cancelled`; a `cancel_requested` goal's claim is no
+longer renewed, so a host that ignored it is swept `lost`. After revocation the
+progress call is refused (403) and the goal completes `failed` /
+`grant_revoked`. Only the claiming attachment's own token can renew or complete
+a goal; another host of the same persona gets 409/403. A progress/heartbeat
+transport failure never repeats an action: a failed admission ends the goal
+(`api_unreachable`) without acting, and a missed renewal lets the claim expire.
+An action already admitted may still land; nothing is undone. Progress is
+refused after 6 minutes (the host's own budget is 5 minutes), for non-goal jobs,
+and for lost/finished jobs. While a goal runs it holds the tab: follow it with
+`job.status`; a `browser.observe` or `browser.act` queued meanwhile waits for
+the goal to end (see [Disconnects](#disconnects-navigation-revocation-and-unknown-effects)).
+
+**Person and page changes, late answers.** Each action uses the observation Jev
+decided on and the runtime guard: native person input on the tab, a changed
+observed control, or changed text in the acted-on control's form/dialog/row
+(not page-wide content) after that observation refuses the action with
+`page_changed`. A decision applied more than 8 s after its observation (slow
+Jev, retries, slow admission) is discarded unused (`discarded:late_decision`).
+The loop re-observes and asks Jev again; three consecutive refusals end the goal
+as `page_changed_repeatedly`, three late decisions as `jev_too_slow`, so the
+person or secretary can take over. Jev retries wait at most 5 s and are
+abortable; a `Retry-After` above 5 s is reported as `jev_rate_limited` instead
+of slept through. Each Jev request is also bounded by the goal's remaining
+5-minute budget.
+
+**Asynchronous effects.** After a click or select that has not yet visibly
+changed the page, the loop re-observes every 250 ms for up to 2 s before asking
+Jev again, so an effect that lands a moment later (a form saving over the
+network with no spinner) is not judged "no effect" and repeated. A slower effect
+is left to Jev's WAIT (up to three in a row, 700 ms each) and to the
+three-unchanged-actions `no_progress` stop; code does not itself refuse a second
+identical click, so a site that saves after more than ~4 s without any visible
+sign can still be clicked twice.
+
+**Result.** The receipt keeps the browser shape `{dispatched, outcome, value,
+code?}` and the late-receipt/lost semantics above. `value` has
+`operation_layer: "jev"`, `goal_outcome`, `jev_claimed_complete`, `verified:
+false`, `reason`, `actions_dispatched`, each step (operation, target name, input
+name, result such as `dispatched`, `refused:page_changed` or
+`discarded:late_decision`, confidence), `jev` (response model id, call count,
+tokens, last decision's completion judgment and top probabilities) and
+`final_page`. `jev_reported_done` requires both Jev's DONE choice and its
+separate completion judgment ≥0.7; DONE without it is `uncertain`. Neither is
+verification: `jev_claimed_complete` is Jev's claim and the secretary should
+`browser.observe` to verify. Job status is `done` for `jev_reported_done`,
+`blocked`, `uncertain`, `step_limit`, `time_limit`, `no_progress` and
+`page_changed_repeatedly` (only the first is a completion claim); `cancelled`
+for `cancelled` / `stopped_by_person`; `failed` with `code` for Jev errors
+(`jev_auth_failed` 401/403, `jev_rate_limited` 429, `jev_overloaded` 408/5xx
+incl. 529, `jev_request_rejected` 422, `jev_unreachable`,
+`jev_invalid_response`, `jev_too_slow`), `jev_not_configured`,
+`grant_revoked`, `claim_lost`, `api_unreachable` or a browser error. 408/429/5xx
+and connection failures are retried twice with backoff, like the official SDKs.
+`jev.calls` counts only calls that returned answers.
+
+**Scope.** Same DOM operations as the direct path: top-level document only;
+links, buttons, checkbox/radio, text fields and native `<select>` (first 50
+options); no frames, shadow DOM, custom (ARIA) dropdowns/comboboxes, uploads,
+drag/drop, canvas or other custom widgets. Pages with more than 100 visible
+controls are truncated. Jev-1.13 is strongest in English and is documented as
+vulnerable to adversarial page text; the page is marked untrusted in every
+question, only supplied inputs can be typed, and the step budget bounds a
+misled goal, but the standing action grant is what authorizes its clicks.
+
+**Acceptance and limits.** `pnpm --filter @sumi/desktop test` covers the
+adapter, decision space, redaction, stop/late/malformed cases and the loop
+against a contract-checking loopback Jev test double. `xvfb-run -a pnpm
+--filter @sumi/desktop test:browser:jev` runs the actual Electron journeys,
+including a native click on the strip's Stop, a site echoing a private value,
+a native select and a form-text change. `TestSecretaryJevGoalRealBrowser`
+(same env as the real-browser test above) runs Secretary → API/DB → host → the
+double → the same tab, including the person's Stop and the Jev withdrawal after
+a rejected key. `TestConnectedEntryKeepsPrivateInputsFromJev` starts the
+configured entry itself (`dist/browser-connected.js` with an owner-only config
+and key file) against the API/DB and the double, on a site that echoes
+multi-line, quoted/backslashed, long and boundary-straddling private values, and
+checks every Jev request and the goal's durable progress, result and
+notification for any form or fragment of them. Setting
+`SUMI_JEV_LIVE_KEY_FILE` (owner-only key file) runs two
+bounded goals of the Electron journey against the live TypeSafe API instead
+(sign-up with a page-text injection; select + private echo); this is separate
+from the double-based acceptance.
 
 ### Cancel a browser job
 

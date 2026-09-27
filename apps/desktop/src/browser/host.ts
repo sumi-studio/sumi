@@ -4,6 +4,13 @@ import type {
   PageBinding,
   TabRef,
 } from "./contract.js";
+import {
+  type Admission,
+  parseGoalRequest,
+  privateRedactor,
+  runGoal,
+} from "./goal.js";
+import type { JevClient } from "./jev.js";
 
 export interface BrowserAttachment {
   attachment_id: string;
@@ -12,6 +19,7 @@ export interface BrowserAttachment {
   tab: TabRef;
   allow_actions: boolean;
   available: boolean;
+  jev_available?: boolean;
 }
 export interface HostCredential {
   attachment: BrowserAttachment;
@@ -21,16 +29,27 @@ interface BrowserJob {
   job_id: string;
   claim_expires_at: string;
   request: {
-    method: "observe" | "act";
+    method: "observe" | "act" | "goal";
     attachment_id: string;
     tab: TabRef;
     binding?: PageBinding;
     action?: BrowserAction;
+    goal?: string;
+    inputs?: Record<string, string>;
+    private_inputs?: string[];
+    max_steps?: number;
   };
 }
+/** What the host window shows the person about a delegated goal. Progress is
+ * the same scrubbed record the API stores; nothing here comes from the page's
+ * scripts directly. */
+export type GoalActivity =
+  | { state: "running"; goal: string; progress?: Record<string, unknown> }
+  | { state: "ended"; goal: string; outcome: string; status: string };
+
 interface Receipt {
   job_id: string;
-  status: "done" | "failed";
+  status: "done" | "failed" | "cancelled";
   result: Record<string, unknown>;
   error: string;
 }
@@ -123,14 +142,36 @@ export class BrowserHostAgent {
       credential: HostCredential;
       browser: BrowserTabPort;
       tab: TabRef;
+      /** Optional Jev operation layer for delegated goals. Without it the
+       * direct observe/act path is unchanged and goals fail as not configured. */
+      jev?: JevClient;
+      minConfidence?: number;
+      /** Host-window display of a running goal (see GoalActivity). */
+      onGoal?: (activity: GoalActivity) => void;
     },
   ) {
     apiURL(options.apiOrigin, "/");
     if (!sameTab(options.credential.attachment.tab, options.tab))
       throw new Error("Attachment does not bind this live tab");
   }
+  private readonly shutdown = new AbortController();
+  private personStop?: AbortController;
+  /** Set after Jev rejects the configured key: polls stop declaring Jev, so
+   * browser.tabs and browser.goal stop offering it until the host restarts. */
+  private jevRejected = false;
   stop(): void {
     this.stopped = true;
+    this.shutdown.abort();
+  }
+  /** The person's Stop control. Ends the running goal before its next action;
+   * an action already handed to the page completes and is recorded. */
+  stopGoal(): boolean {
+    if (!this.personStop || this.personStop.signal.aborted) return false;
+    this.personStop.abort();
+    return true;
+  }
+  get jevAvailable(): boolean {
+    return !!this.options.jev && !this.jevRejected;
   }
   private async sendReceipt(): Promise<void> {
     if (!this.pending) return;
@@ -148,7 +189,10 @@ export class BrowserHostAgent {
       throw error;
     }
   }
-  private post<T>(operation: "poll" | "complete", body?: unknown): Promise<T> {
+  private post<T>(
+    operation: "poll" | "complete" | "progress",
+    body?: unknown,
+  ): Promise<T> {
     const c = this.options.credential;
     return request(
       this.options.apiOrigin,
@@ -168,7 +212,8 @@ export class BrowserHostAgent {
       if (this.stopped) return;
       let response: { job: BrowserJob | null };
       try {
-        response = await this.post("poll");
+        // Declares whether this host can run delegated Jev goals.
+        response = await this.post("poll", { jev: this.jevAvailable });
       } catch (error) {
         if (error instanceof HostHTTPError && error.status === 403)
           this.stopped = true;
@@ -207,8 +252,52 @@ export class BrowserHostAgent {
             job.request.binding,
             job.request.action,
           );
+        } else if (
+          job.request.method === "goal" &&
+          this.options.credential.attachment.allow_actions
+        ) {
+          const request = parseGoalRequest(job.request);
+          // runGoal reports its own dispatch state; an unexpected throw after
+          // this point may follow a landed action, so it is recorded as unknown.
+          dispatched = true;
+          const show = this.options.onGoal ?? (() => {});
+          const goal = privateRedactor(request)(request.goal);
+          this.personStop = new AbortController();
+          show({ state: "running", goal });
+          let receipt: Awaited<ReturnType<typeof runGoal>> | undefined;
+          try {
+            receipt = await runGoal({
+              browser: this.options.browser,
+              tab: this.options.tab,
+              jev: this.jevAvailable ? this.options.jev : undefined,
+              request,
+              minConfidence: this.options.minConfidence,
+              session: {
+                signal: this.shutdown.signal,
+                stop: this.personStop.signal,
+                report: (progress) => {
+                  show({ state: "running", goal, progress });
+                  return this.progress(job.job_id, progress);
+                },
+              },
+            });
+          } finally {
+            this.personStop = undefined;
+            const value = receipt?.result.value as
+              | { goal_outcome?: string }
+              | undefined;
+            show({
+              state: "ended",
+              goal,
+              outcome: value?.goal_outcome ?? "host_error",
+              status: receipt?.status ?? "failed",
+            });
+          }
+          if (receipt.result.code === "jev_auth_failed")
+            this.jevRejected = true;
+          this.pending = { job_id: job.job_id, ...receipt };
         } else throw new Error("Unsupported or unauthorized browser request");
-        this.pending = {
+        this.pending ??= {
           job_id: job.job_id,
           status: "done",
           result: { dispatched, outcome: "returned", value },
@@ -233,13 +322,29 @@ export class BrowserHostAgent {
             "Browser operation did not return successfully; inspect its recorded outcome before any new action",
         };
       }
-      // JSONB cannot store NUL, which arbitrary website text can contain.
-      this.pending = JSON.parse(JSON.stringify(this.pending), (_key, value) =>
-        typeof value === "string" ? value.replaceAll("\0", "�") : value,
-      ) as Receipt;
+      this.pending = withoutNUL(this.pending);
       await this.sendReceipt();
     } finally {
       this.busy = false;
+    }
+  }
+  /** Claim renewal + progress for a running goal; the API answers with the
+   * job's status so cancellation and revocation stop the next action. */
+  private async progress(
+    jobID: string,
+    progress: Record<string, unknown>,
+  ): Promise<Admission> {
+    try {
+      const { status } = await this.post<{ status: string }>("progress", {
+        job_id: jobID,
+        progress: withoutNUL(progress),
+      });
+      return status === "running" ? "continue" : "cancel";
+    } catch (error) {
+      if (error instanceof HostHTTPError && error.status === 403)
+        return "revoked";
+      if (error instanceof HostHTTPError && error.status === 409) return "lost";
+      throw error;
     }
   }
   async run(
@@ -256,6 +361,12 @@ export class BrowserHostAgent {
     }
     this.stop();
   }
+}
+// JSONB cannot store NUL, which arbitrary website text can contain.
+function withoutNUL<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value), (_key, v) =>
+    typeof v === "string" ? v.replaceAll("\0", "�") : v,
+  ) as T;
 }
 function sameTab(a: TabRef, b: TabRef): boolean {
   return (

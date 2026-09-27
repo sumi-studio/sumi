@@ -28,9 +28,12 @@ test("browser action inputs are bounded before dispatch", () => {
     { kind: "fill", target: "t0", text: "x".repeat(LIMITS.input + 1) },
     { kind: "scroll", x: Infinity, y: 0 },
     { kind: "click", target: "#selector" },
+    { kind: "select", target: "t0" },
+    { kind: "select", target: "t0", text: "jp" },
   ]) {
     assert.throws(() => validateAction(action), { code: "invalid_request" });
   }
   validateAction({ kind: "fill", target: "t0", text: "hello" });
   validateAction({ kind: "scroll", x: 0, y: 200 });
+  validateAction({ kind: "select", target: "t3", value: "jp" });
 });
