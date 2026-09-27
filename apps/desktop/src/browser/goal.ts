@@ -174,7 +174,7 @@ function describe(
   request: GoalRequest,
 ): string {
   const kind = t.tag === "input" ? `input(${t.type ?? "text"})` : t.tag;
-  const role = t.role ? ` role=${t.role}` : "";
+  const role = shown.role ? ` role=${shown.role}` : "";
   const selected = t.options?.findIndex((o) => o.value === t.value) ?? -1;
   const value =
     selected >= 0
@@ -304,7 +304,8 @@ export function privateRedactor(request: GoalRequest): PrivateRedactor {
     return cut || out.length > max ? trailing(out.slice(0, max)) : out;
   };
   const field = (value: string): string => {
-    const out = replace(value);
+    // page.ts caps control and option values at 512, possibly inside an echo.
+    const out = text(value, Infinity, value.length >= 512);
     if (out !== value) {
       const labels = out.match(/\[private:[a-z0-9_]+\]/g);
       return labels ? [...new Set(labels)].join(" ") : out;

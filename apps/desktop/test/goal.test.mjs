@@ -673,6 +673,64 @@ test("private values are protected before escaping, shortening and at every trun
   }
 });
 
+test("capped private echoes with a public prefix stay out of decisions and saved observations", async (t) => {
+  const token = `tok_${"Q7w8E9r0T1".repeat(60)}`;
+  const req = parseGoalRequest({
+    goal: "Check my token is saved.",
+    inputs: { token },
+    private_inputs: ["token"],
+  });
+  for (const [name, echo] of [
+    ["control value", { value: `ref ${token}`.slice(0, 512) }],
+    ["role attribute", { role: `ref ${token}`.slice(0, 100) }],
+  ]) {
+    await t.test(name, () => {
+      const page = {
+        tab,
+        binding: {
+          revision: 0,
+          observationId: "o",
+          url: "http://fixture.test/",
+        },
+        title: "Token",
+        text: "Saved",
+        truncated: false,
+        targets: [
+          {
+            id: "t0",
+            tag: "input",
+            type: "text",
+            role: "",
+            name: "Reference",
+            bounds: {},
+            ...echo,
+          },
+          { id: "t1", tag: "button", role: "", name: "Save", bounds: {} },
+          { id: "t2", tag: "button", role: "", name: "Cancel", bounds: {} },
+        ],
+      };
+      const decision = buildDecision(page, req, []);
+      const wire = JSON.stringify({
+        state: decision.state,
+        questions: decision.questions,
+      });
+      const saved = JSON.stringify(privateRedactor(req).page(page));
+      for (const output of [wire, saved]) {
+        assert.ok(
+          !output.includes(token.slice(0, 40)),
+          "no private prefix leaves the host",
+        );
+        assert.ok(output.includes("[private:token]"));
+      }
+      assert.equal(
+        req.inputs.token,
+        token,
+        "the value available for filling stays intact",
+      );
+    });
+  }
+});
+
 test("the redactor keeps short values exact-only and leaves unrelated text alone", () => {
   const scrub = privateRedactor(
     parseGoalRequest({
