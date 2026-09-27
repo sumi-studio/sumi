@@ -333,9 +333,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
-          # dockerd refuses any other mode for a source inside its data root
-          # ("invalid mount config"); left unset it applies rslave, but a
-          # rendered or hand-written config that says rprivate fails to create.
+          # dockerd requires rslave or rshared inside its data root and applies
+          # rslave when unset. Keep that choice explicit so rendered configs
+          # cannot accidentally use rprivate, which fails at container creation.
           propagation: rslave
       - type: bind
         source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}
