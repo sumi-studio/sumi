@@ -1,5 +1,6 @@
 import {
   DoorOpen,
+  Globe,
   MessageCircle,
   MessageSquarePlus,
   SquareTerminal,
@@ -45,6 +46,18 @@ export const TERMINAL_RENDERER = {
   label: "ターミナル",
   icon: SquareTerminal,
   route: "/terminal",
+} as const;
+
+/**
+ * The secretary's Cloud browser: one remote browser profile per secretary,
+ * shown to the person as the same live screen. Offered only where the API
+ * reports it configured. `/browser` is the SPA page.
+ */
+export const BROWSER_RENDERER = {
+  appId: "browser",
+  label: "秘書のブラウザ",
+  icon: Globe,
+  route: "/browser",
 } as const;
 
 export const FEEDBACK_RENDERER = {

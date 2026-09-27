@@ -54,7 +54,12 @@ interface Receipt {
   error: string;
 }
 
-function apiURL(base: string, path: string): string {
+/** A private transport to the API, such as a Workers VPC Service binding in
+ * the Cloud browser host. The binding, not the URL, decides where requests
+ * go, so its API origin may be plain HTTP. */
+export type HostTransport = (url: string, init: RequestInit) => Promise<Response>;
+
+function apiURL(base: string, path: string, privateTransport = false): string {
   const url = new URL(base);
   if (
     url.username ||
@@ -65,7 +70,8 @@ function apiURL(base: string, path: string): string {
     (url.protocol !== "https:" &&
       !(
         url.protocol === "http:" &&
-        ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname)
+        (privateTransport ||
+          ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))
       ))
   ) {
     throw new Error(
@@ -84,12 +90,15 @@ async function request<T>(
   path: string,
   headers: Record<string, string>,
   body?: unknown,
+  transport?: HostTransport,
 ): Promise<T> {
-  const response = await fetch(apiURL(base, path), {
+  const response = await (transport ?? fetch)(apiURL(base, path, !!transport), {
     method: "POST",
     headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
-    redirect: "error",
+    // Never follow redirects; a 3xx is not ok and fails like any error
+    // ("error" is unavailable in Workers, where this code also runs).
+    redirect: "manual",
     signal: AbortSignal.timeout(5000),
   });
   if (!response.ok) {
@@ -148,9 +157,11 @@ export class BrowserHostAgent {
       minConfidence?: number;
       /** Host-window display of a running goal (see GoalActivity). */
       onGoal?: (activity: GoalActivity) => void;
+      /** Private API transport (see HostTransport); global fetch otherwise. */
+      transport?: HostTransport;
     },
   ) {
-    apiURL(options.apiOrigin, "/");
+    apiURL(options.apiOrigin, "/", !!options.transport);
     if (!sameTab(options.credential.attachment.tab, options.tab))
       throw new Error("Attachment does not bind this live tab");
   }
@@ -199,6 +210,7 @@ export class BrowserHostAgent {
       `/api/browser-host/tabs/${encodeURIComponent(c.attachment.attachment_id)}/${operation}`,
       { Authorization: `Bearer ${c.host_token}` },
       body,
+      this.options.transport,
     );
   }
   async tick(): Promise<void> {

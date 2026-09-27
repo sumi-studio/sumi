@@ -31,6 +31,12 @@
           "service_id": "01a09449-94f3-7fc3-b6db-daaffb98df22"
         }
       ],
+      "services": [
+        {
+          "binding": "SUMI_BROWSER_CLOUD",
+          "service": "sumi-browser-alpha"
+        }
+      ],
       "vars": {
         "SUMI_ORIGIN_PROTOCOL": "http",
         "SUMI_FIREBASE_AUTH_DOMAIN": "sumi-studio.firebaseapp.com"

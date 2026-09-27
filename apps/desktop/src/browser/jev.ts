@@ -102,7 +102,8 @@ export class JevClient {
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(this.model))
       throw new Error("Invalid Jev model name.");
     this.endpoint = jevEndpoint(options.endpoint);
-    this.#fetch = options.fetch ?? fetch;
+    // Called unbound: Workers reject the global fetch invoked as a method.
+    this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#retries = Math.max(0, Math.min(options.maxRetries ?? 2, 4));
   }
@@ -129,7 +130,9 @@ export class JevClient {
             "Content-Type": "application/json",
           },
           body,
-          redirect: "error",
+          // Never follow redirects; a 3xx is not ok and fails like any error
+          // ("error" is unavailable in Workers, where this code also runs).
+          redirect: "manual",
           signal: signal
             ? AbortSignal.any([signal, AbortSignal.timeout(this.#timeoutMs)])
             : AbortSignal.timeout(this.#timeoutMs),

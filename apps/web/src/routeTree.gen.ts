@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as TerminalRouteImport } from './routes/terminal'
 import { Route as FeedbackRouteImport } from './routes/feedback'
 import { Route as DirectRouteImport } from './routes/direct'
+import { Route as BrowserRouteImport } from './routes/browser'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as WWorkspaceIdRouteImport } from './routes/w.$workspaceId'
 import { Route as WWorkspaceIdIndexRouteImport } from './routes/w.$workspaceId.index'
@@ -35,6 +36,11 @@ const FeedbackRoute = FeedbackRouteImport.update({
 const DirectRoute = DirectRouteImport.update({
   id: '/direct',
   path: '/direct',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BrowserRoute = BrowserRouteImport.update({
+  id: '/browser',
+  path: '/browser',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -90,6 +96,7 @@ const WWorkspaceIdMessagingCChannelIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/browser': typeof BrowserRoute
   '/direct': typeof DirectRoute
   '/feedback': typeof FeedbackRoute
   '/terminal': typeof TerminalRoute
@@ -104,6 +111,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/browser': typeof BrowserRoute
   '/direct': typeof DirectRoute
   '/feedback': typeof FeedbackRoute
   '/terminal': typeof TerminalRoute
@@ -117,6 +125,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/browser': typeof BrowserRoute
   '/direct': typeof DirectRoute
   '/feedback': typeof FeedbackRoute
   '/terminal': typeof TerminalRoute
@@ -133,6 +142,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/browser'
     | '/direct'
     | '/feedback'
     | '/terminal'
@@ -147,6 +157,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/browser'
     | '/direct'
     | '/feedback'
     | '/terminal'
@@ -159,6 +170,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/browser'
     | '/direct'
     | '/feedback'
     | '/terminal'
@@ -174,6 +186,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  BrowserRoute: typeof BrowserRoute
   DirectRoute: typeof DirectRoute
   FeedbackRoute: typeof FeedbackRoute
   TerminalRoute: typeof TerminalRoute
@@ -201,6 +214,13 @@ declare module '@tanstack/react-router' {
       path: '/direct'
       fullPath: '/direct'
       preLoaderRoute: typeof DirectRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/browser': {
+      id: '/browser'
+      path: '/browser'
+      fullPath: '/browser'
+      preLoaderRoute: typeof BrowserRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -306,6 +326,7 @@ const WWorkspaceIdRouteWithChildren = WWorkspaceIdRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  BrowserRoute: BrowserRoute,
   DirectRoute: DirectRoute,
   FeedbackRoute: FeedbackRoute,
   TerminalRoute: TerminalRoute,

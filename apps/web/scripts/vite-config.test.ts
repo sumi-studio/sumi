@@ -224,3 +224,50 @@ test("model connection login stays same-origin without proxying unrelated api ro
   });
   assert.equal(server.proxy?.["/api"], undefined);
 });
+
+test("Cloud browser person routes proxy to the API; the viewer only to a configured Worker", () => {
+  const previous = process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN;
+  try {
+    delete process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN;
+    const server = createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST);
+    const entries = Object.entries(server.proxy ?? {}).filter(([key]) =>
+      key.includes("cloud-browser"),
+    );
+    assert.equal(entries.length, 1);
+    const matches = new RegExp(entries[0][0]);
+    for (const path of [
+      "/api/cloud-browser",
+      "/api/cloud-browser/profiles",
+      "/api/cloud-browser/profiles/p/viewer-ticket",
+      "/api/cloud-browser/jev-key",
+    ]) {
+      assert.equal(matches.test(path), true, path);
+    }
+    for (const path of [
+      "/api/cloud-browser-host/profiles/p/begin",
+      "/browser",
+      "/browser-cloud/viewer",
+    ]) {
+      assert.equal(matches.test(path), false, path);
+    }
+    assert.equal(server.proxy?.["/browser-cloud/viewer"], undefined);
+
+    process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN = "http://127.0.0.1:19402";
+    const withWorker = createDevServerConfig(
+      SUMI_DEV_API_ORIGIN,
+      SUMI_DEV_HOST,
+    );
+    assert.deepEqual(withWorker.proxy?.["/browser-cloud/viewer"], {
+      target: "http://127.0.0.1:19402",
+      changeOrigin: true,
+      ws: true,
+    });
+    process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN = "http://127.0.0.1:19402/x";
+    assert.throws(() =>
+      createDevServerConfig(SUMI_DEV_API_ORIGIN, SUMI_DEV_HOST),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN;
+    else process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN = previous;
+  }
+});

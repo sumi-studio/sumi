@@ -1,0 +1,806 @@
+import { navigationURL, type TabRef } from "@sumi/desktop/browser-contract";
+import { BrowserHostAgent, type GoalActivity, type HostCredential } from "@sumi/desktop/browser-host";
+import { JevClient } from "@sumi/desktop/browser-jev";
+import { type BrowserRunBinding, localPool, MAX_KEEP_ALIVE_MS, sessionAlive } from "./browser-run.ts";
+import { takesControl, toCdp, type ViewerInput } from "./input.ts";
+import { type Frame, RemoteBrowser, type Snapshot, VIEWPORT } from "./remote-browser.ts";
+import { type HostSession, StateClient, StateError, type FetcherLike } from "./state.ts";
+import { type AgentActivity, CloudTabPort, type Control } from "./tab-port.ts";
+import { type TicketClaims, verifyTicket } from "./ticket.ts";
+
+/** Minimal structural Workers types (no workers-types dependency). */
+interface DOStorage {
+  get<T>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  setAlarm(when: number): Promise<void>;
+}
+export interface DOState {
+  storage: DOStorage;
+}
+interface ServerSocket {
+  accept(): void;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
+  addEventListener(type: "close" | "error", listener: () => void): void;
+}
+declare const WebSocketPair: { new (): { 0: ServerSocket; 1: ServerSocket } };
+
+export interface Env {
+  BROWSER?: BrowserRunBinding;
+  /** `.dev.vars` only: local stand-in pool (scripts/local-pool.mjs). */
+  LOCAL_POOL?: string;
+  SUMI_STATE_URL: string;
+  SUMI_STATE?: FetcherLike;
+  SUMI_BROWSER_CLOUD_TOKEN?: string;
+  /** How long an idle browser (no viewer, no job) stays up. Default 60 s. */
+  SUMI_BROWSER_IDLE_GRACE_MS?: string;
+  /** Browser Run keepAlive: how long the remote browser survives without
+   * this host. Default 60 s; maximum 1,200,000. */
+  SUMI_BROWSER_KEEPALIVE_MS?: string;
+  /** Test/dev only: loopback Jev fixture. Unset in product. */
+  SUMI_JEV_ENDPOINT?: string;
+  /** Test configuration only: synthetic fixture sites reached through
+   * Browser Run's outboundByHost (comma-separated host names). */
+  FIXTURE?: unknown;
+  FIXTURE_HOSTS?: string;
+}
+
+type Phase = "sleeping" | "starting" | "restoring" | "live" | "saving" | "closing" | "unavailable";
+
+interface Meta {
+  profile: string;
+  session?: string;
+  incarnation: number;
+  /** targetId -> stable tab slot id, for reconnecting after a host restart. */
+  slots: Record<string, string>;
+}
+
+interface Intent {
+  tab: string;
+  kind: string;
+  label?: string;
+  incarnation: number;
+  at: number;
+}
+
+/** What the person is told after the browser was reconnected or rebuilt. */
+interface Recovery {
+  kind: "reconnected" | "restored" | "fresh";
+  at: number;
+  checkpointAt?: string;
+  /** An action the secretary started whose result was never observed. */
+  uncertain?: { kind: string; label?: string };
+  skippedOrigins?: string[];
+}
+
+interface Viewer {
+  human: string;
+  authUntil: number;
+}
+
+interface AgentEntry {
+  agent: BrowserHostAgent;
+  credential: HostCredential;
+  ticking?: Promise<void>;
+  tickStarted: number;
+}
+
+const VIEWER_SESSION_MS = 10 * 60_000;
+const HEARTBEAT_MS = 20_000;
+const PERIODIC_CHECKPOINT_MS = 60_000;
+const LOOP_LIFETIME_MS = 14 * 60_000;
+const MAX_VIEWERS = 8;
+
+function number(value: string | undefined, fallback: number, max: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, max) : fallback;
+}
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One Durable Object per Cloud browser profile: the only owner of its
+ * remote browser. It is the desktop host's counterpart in Cloud — the same
+ * BrowserHostAgent drives the existing grant/job/progress contract — and it
+ * relays the shared screen and the person's input. */
+export class ProfileBrowser {
+  private meta?: Meta;
+  private remote?: RemoteBrowser;
+  private readonly port: CloudTabPort;
+  private readonly agents = new Map<string, AgentEntry>();
+  private jevKey?: string;
+  private jevReported = false;
+  private persona?: string;
+  private control: Control = { mode: "agent", epoch: 0 };
+  private humanAt = 0;
+  private readonly viewers = new Map<ServerSocket, Viewer>();
+  private readonly nonces = new Map<string, number>();
+  /** The person's screen operations apply in arrival order (a new tab before
+   * the address typed into it, key down before key up). */
+  private viewerOps: Promise<void> = Promise.resolve();
+  private phase: Phase = "sleeping";
+  private phaseDetail?: string;
+  private starting?: Promise<void>;
+  private loopRunning = false;
+  private startFailed = false;
+  private wantLive = false;
+  private closingIntentionally = false;
+  private lastActivity = Date.now();
+  private lastHeartbeat = 0;
+  private checkpointSeq = 0;
+  private lastCheckpoint?: Snapshot;
+  private lastCheckpointAt?: string;
+  private dirty = false;
+  private checkpointTimer?: ReturnType<typeof setTimeout>;
+  private checkpointing?: Promise<void>;
+  private goal?: GoalActivity;
+  private recovery?: Recovery;
+  private dialog?: { tab: string; dialogType: string; message: string };
+  private readonly state: StateClient;
+
+  private readonly ctx: DOState;
+  private readonly env: Env;
+
+  constructor(ctx: DOState, env: Env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.state = new StateClient(env.SUMI_STATE_URL, env.SUMI_BROWSER_CLOUD_TOKEN ?? "", env.SUMI_STATE);
+    this.port = new CloudTabPort({
+      browser: () => this.remote,
+      profileId: () => this.meta?.profile ?? "",
+      control: () => this.control,
+      humanInputAt: () => this.humanAt,
+      recordIntent: (intent) => this.recordIntent(intent),
+      activity: (event) => this.onAgentActivity(event),
+    });
+  }
+
+  private binding(): BrowserRunBinding {
+    if (this.env.LOCAL_POOL) return localPool(this.env.LOCAL_POOL);
+    if (!this.env.BROWSER) throw new Error("Browser Run binding is not configured");
+    return this.env.BROWSER;
+  }
+
+  private async loadMeta(profile?: string): Promise<Meta | undefined> {
+    this.meta ??= await this.ctx.storage.get<Meta>("meta");
+    if (!this.meta && profile) this.meta = { profile, incarnation: 0, slots: {} };
+    if (profile && this.meta && this.meta.profile !== profile) throw new Error("profile mismatch");
+    return this.meta;
+  }
+
+  private async saveMeta(): Promise<void> {
+    if (this.meta) await this.ctx.storage.put("meta", this.meta);
+  }
+
+  // ---------- requests from the Worker ----------
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/wake" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { profile?: string; work?: boolean };
+      if (!body.profile) return new Response("bad request", { status: 400 });
+      await this.loadMeta(body.profile);
+      if (body.work) this.wantLive = true;
+      if (this.live()) void this.refresh().catch(() => {});
+      await this.kick();
+      return Response.json({ accepted: true, phase: this.phase });
+    }
+    if (url.pathname === "/viewer") {
+      const claims = JSON.parse(request.headers.get("x-sumi-viewer") ?? "null") as TicketClaims | null;
+      if (!claims) return new Response("forbidden", { status: 403 });
+      return this.acceptViewer(claims);
+    }
+    return new Response("not found", { status: 404 });
+  }
+
+  async alarm(): Promise<void> {
+    if (!(await this.loadMeta())) return;
+    await this.runLoop();
+  }
+
+  private live(): boolean {
+    return !!this.remote && !this.remote.closed && this.phase === "live";
+  }
+
+  /** The loop runs inside an alarm invocation, which keeps this object
+   * active; a sleeping profile has no alarm and no loop. */
+  private async kick(): Promise<void> {
+    if (!this.loopRunning) await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  // ---------- lifecycle ----------
+
+  private setPhase(phase: Phase, detail?: string): void {
+    this.phase = phase;
+    this.phaseDetail = detail;
+    this.broadcast({ type: "status", phase, detail, checkpointAt: this.lastCheckpointAt });
+  }
+
+  private async ensureLive(): Promise<boolean> {
+    if (this.live()) return true;
+    this.starting ??= this.start().finally(() => {
+      this.starting = undefined;
+    });
+    await this.starting;
+    return this.live();
+  }
+
+  private async start(): Promise<void> {
+    const meta = await this.loadMeta();
+    if (!meta) return;
+    const binding = this.binding();
+    this.setPhase("starting");
+    const intent = await this.ctx.storage.get<Intent>("intent");
+    try {
+      if (meta.session && (await sessionAlive(binding, meta.session).catch(() => false))) {
+        try {
+          const session = await this.state.begin(meta.profile, false, meta.incarnation);
+          if (!session.enabled) return await this.retire(meta);
+          await this.connect(meta.session, meta.slots);
+          this.adopt(session, false);
+          this.recovery = { kind: "reconnected", at: Date.now(), uncertain: intent ? { kind: intent.kind, label: intent.label } : undefined };
+          if (intent) await this.ctx.storage.delete("intent");
+          this.setPhase("live");
+          this.announce();
+          return;
+        } catch (error) {
+          // A stale incarnation or broken connection: never reuse it.
+          this.remote?.close();
+          this.remote = undefined;
+          if (!(error instanceof StateError) || error.status !== 409) throw error;
+        }
+      }
+      if (meta.session) {
+        await binding.closeSession(meta.session).catch(() => {});
+        meta.session = undefined;
+      }
+      const session = await this.state.begin(meta.profile, true);
+      if (!session.enabled) return await this.retire(meta);
+      const outbound: Record<string, unknown> = {};
+      if (this.env.FIXTURE && this.env.FIXTURE_HOSTS)
+        for (const host of this.env.FIXTURE_HOSTS.split(",")) outbound[host.trim()] = this.env.FIXTURE;
+      const acquired = await binding.acquire({
+        keepAlive: number(this.env.SUMI_BROWSER_KEEPALIVE_MS, 60_000, MAX_KEEP_ALIVE_MS),
+        ...(Object.keys(outbound).length ? { outboundByHost: outbound } : {}),
+      });
+      meta.session = acquired.sessionId;
+      meta.incarnation = session.incarnation;
+      meta.slots = {};
+      await this.saveMeta();
+      await this.connect(acquired.sessionId, {});
+      this.checkpointSeq = session.snapshot_seq;
+      this.lastCheckpoint = session.snapshot ?? undefined;
+      this.lastCheckpointAt = session.snapshot_at;
+      if (session.snapshot) {
+        this.setPhase("restoring", session.snapshot_at);
+        await this.remote?.restore(session.snapshot);
+      }
+      this.recovery =
+        session.snapshot || intent || session.incarnation > 1
+          ? {
+              kind: session.snapshot ? "restored" : "fresh",
+              at: Date.now(),
+              checkpointAt: session.snapshot_at,
+              uncertain: intent ? { kind: intent.kind, label: intent.label } : undefined,
+              skippedOrigins: session.snapshot?.notSaved.skippedOrigins,
+            }
+          : undefined;
+      if (intent) await this.ctx.storage.delete("intent");
+      this.adopt(session, true);
+      this.setPhase("live");
+      this.announce();
+      this.scheduleSlotSave();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.remote?.close();
+      this.remote = undefined;
+      // Quota, concurrency and plan limits come from Browser Run; say so.
+      const limited = /limit|quota|too many|429|concurren/i.test(message);
+      this.setPhase("unavailable", limited ? "browser_limit" : "start_failed");
+      console.error("cloud browser start failed", limited ? "limit" : message.slice(0, 200));
+    }
+  }
+
+  private async connect(sessionId: string, known: Record<string, string>): Promise<void> {
+    this.closingIntentionally = false;
+    this.port.invalidate();
+    const remote = await RemoteBrowser.connect(this.binding(), sessionId, {
+      onTabs: () => {
+        this.broadcastTabs();
+        this.scheduleSlotSave();
+      },
+      onFrame: (frame) => this.sendFrame(frame),
+      onLoaded: () => {
+        this.dirty = true;
+        this.scheduleCheckpoint(3_000);
+      },
+      onNotice: (code, detail) => this.broadcast({ type: "notice", code, ...detail }),
+      onDialog: (slot, dialog) => this.onDialog(slot.id, dialog),
+      onClosed: (why) => this.onRemoteClosed(remote, why),
+    });
+    this.remote = remote;
+    await remote.init(known);
+    if (this.viewers.size) await remote.startScreencast();
+  }
+
+  /** Install the host session: persona, Jev key and one BrowserHostAgent
+   * per standing grant (each with its freshly rotated host token). */
+  private adopt(session: HostSession, fresh: boolean): void {
+    this.persona = session.persona_id;
+    if (fresh) {
+      for (const entry of this.agents.values()) entry.agent.stop();
+      this.agents.clear();
+    }
+    const keyChanged = (session.jev_key ?? undefined) !== this.jevKey;
+    this.jevKey = session.jev_key || undefined;
+    if (keyChanged) this.jevReported = false;
+    if (keyChanged)
+      for (const [id, entry] of this.agents)
+        if (!entry.ticking) {
+          entry.agent.stop();
+          this.agents.set(id, this.agent(entry.credential));
+        }
+    for (const credential of session.attachments) this.agents.set(credential.attachment.attachment_id, this.agent(credential));
+    for (const viewer of [...this.viewers.keys()])
+      if (this.persona && this.viewerPersona.get(viewer) !== this.persona) viewer.close(4403, "not_authorized");
+    this.broadcastTabs();
+  }
+
+  private agent(credential: HostCredential): AgentEntry {
+    let jev: JevClient | undefined;
+    if (this.jevKey) {
+      try {
+        jev = new JevClient({ apiKey: this.jevKey, endpoint: this.env.SUMI_JEV_ENDPOINT || undefined });
+      } catch {
+        jev = undefined;
+      }
+    }
+    const agent = new BrowserHostAgent({
+      apiOrigin: new URL(this.env.SUMI_STATE_URL).origin + "/",
+      credential,
+      browser: this.port,
+      tab: credential.attachment.tab as TabRef,
+      jev,
+      transport: this.state.hostTransport,
+      onGoal: (activity) => {
+        this.goal = activity;
+        this.broadcast({ type: "goal", activity });
+        if (activity.state === "ended") this.scheduleCheckpoint(2_000);
+      },
+    });
+    return { agent, credential, tickStarted: 0 };
+  }
+
+  private async refresh(): Promise<void> {
+    const meta = this.meta;
+    if (!meta || !this.live()) return;
+    try {
+      const session = await this.state.refresh(meta.profile, meta.incarnation, [...this.agents.keys()]);
+      if (!session.enabled) return await this.retire(meta);
+      this.adopt(session, false);
+    } catch (error) {
+      if (error instanceof StateError && error.status === 409) await this.sleepNow("stale");
+    }
+  }
+
+  /** The profile was reset or its secretary retired: close without saving. */
+  private async retire(meta: Meta): Promise<void> {
+    this.closingIntentionally = true;
+    for (const entry of this.agents.values()) entry.agent.stop();
+    this.agents.clear();
+    this.remote?.close();
+    this.remote = undefined;
+    if (meta.session) await this.binding().closeSession(meta.session).catch(() => {});
+    meta.session = undefined;
+    this.lastCheckpoint = undefined;
+    await this.saveMeta();
+    this.setPhase("sleeping", "reset");
+    for (const viewer of [...this.viewers.keys()]) viewer.close(4410, "profile_reset");
+  }
+
+  /** Save, then release the remote browser. */
+  private async sleepNow(reason: string): Promise<void> {
+    const meta = this.meta;
+    if (!meta) return;
+    if (this.live() && reason !== "stale") {
+      this.setPhase("saving");
+      await this.checkpoint("before_close").catch(() => {});
+    }
+    this.setPhase("closing");
+    this.closingIntentionally = true;
+    for (const entry of this.agents.values()) entry.agent.stop();
+    this.agents.clear();
+    this.remote?.close();
+    this.remote = undefined;
+    if (meta.session) await this.binding().closeSession(meta.session).catch(() => {});
+    const incarnation = meta.incarnation;
+    meta.session = undefined;
+    await this.saveMeta();
+    await this.state.setState(meta.profile, incarnation, "sleeping").catch(() => {});
+    this.control = { mode: "agent", epoch: this.control.epoch + 1 };
+    this.setPhase("sleeping", reason);
+  }
+
+  private onRemoteClosed(remote: RemoteBrowser, why: string): void {
+    if (remote !== this.remote || this.closingIntentionally) return;
+    this.remote = undefined;
+    this.port.invalidate();
+    // Admitted work fails as unknown through its own receipt; nothing is replayed.
+    const meta = this.meta;
+    if (meta) void this.state.setState(meta.profile, meta.incarnation, "lost").catch(() => {});
+    this.setPhase("unavailable", "browser_lost");
+    console.warn("cloud browser connection closed", why.slice(0, 80));
+  }
+
+  // ---------- main loop ----------
+
+  private async runLoop(): Promise<void> {
+    if (this.loopRunning) return;
+    this.loopRunning = true;
+    const until = Date.now() + LOOP_LIFETIME_MS;
+    const grace = number(this.env.SUMI_BROWSER_IDLE_GRACE_MS, 60_000, 30 * 60_000);
+    try {
+      while (Date.now() < until) {
+        const wanted = this.wantLive || this.viewers.size > 0;
+        if (!this.live()) {
+          if (!wanted) break;
+          this.wantLive = false;
+          if (!(await this.ensureLive())) {
+            // Unavailable: viewers see why and may press 再開; a later wake
+            // with work retries. Nothing re-arms on its own.
+            this.startFailed = true;
+            break;
+          }
+          this.startFailed = false;
+          this.lastActivity = Date.now();
+        }
+        this.wantLive = false;
+        const now = Date.now();
+        let working = false;
+        for (const [id, entry] of this.agents) {
+          if (entry.ticking) {
+            if (now - entry.tickStarted > 2_000) working = true;
+            continue;
+          }
+          entry.tickStarted = now;
+          entry.ticking = entry.agent
+            .tick()
+            .catch((error: { status?: number }) => {
+              // 403: the grant was revoked or the secretary retired.
+              if (error?.status === 403) {
+                entry.agent.stop();
+                this.agents.delete(id);
+                this.broadcastTabs();
+              }
+            })
+            .finally(() => {
+              entry.ticking = undefined;
+              // Jev refused the key (401): withdraw it for every tab until
+              // the person saves a new one.
+              if (this.jevKey && !entry.agent.jevAvailable && !this.jevReported && this.meta) {
+                this.jevReported = true;
+                void this.state.jevRejected(this.meta.profile).catch(() => {});
+              }
+            });
+        }
+        if (working) this.lastActivity = now;
+        if (now - this.lastHeartbeat > HEARTBEAT_MS) {
+          this.lastHeartbeat = now;
+          await this.remote?.heartbeat().catch(() => {});
+        }
+        if (this.dirty && this.lastCheckpointAt && now - Date.parse(this.lastCheckpointAt) > PERIODIC_CHECKPOINT_MS)
+          this.scheduleCheckpoint(0);
+        for (const [viewer, info] of this.viewers)
+          if (info.authUntil < now) viewer.close(4401, "reauth_required");
+        for (const [nonce, exp] of this.nonces) if (exp < now) this.nonces.delete(nonce);
+        if (!this.viewers.size && !working && now - this.lastActivity > grace) {
+          await this.sleepNow("idle");
+          break;
+        }
+        await sleep(400);
+      }
+    } finally {
+      this.loopRunning = false;
+    }
+    // Still in use at the end of this invocation's lifetime: continue in a
+    // new alarm (one storage write per 14 minutes of live browser).
+    if (this.live() || (this.viewers.size && !this.startFailed)) await this.ctx.storage.setAlarm(Date.now() + 1_000);
+  }
+
+  // ---------- checkpoint ----------
+
+  private scheduleCheckpoint(delay: number): void {
+    if (this.checkpointTimer) return;
+    this.checkpointTimer = setTimeout(() => {
+      this.checkpointTimer = undefined;
+      void this.checkpoint("scheduled").catch(() => {});
+    }, delay);
+  }
+
+  private async checkpoint(_reason: string): Promise<void> {
+    if (this.checkpointing) return this.checkpointing;
+    const run = async () => {
+      const meta = this.meta;
+      const remote = this.remote;
+      if (!meta || !remote || remote.closed) return;
+      const snapshot = await remote.collect(this.lastCheckpoint);
+      const size = new TextEncoder().encode(JSON.stringify(snapshot)).length;
+      if (size > 2 << 20) {
+        this.broadcast({ type: "notice", code: "checkpoint_too_large", bytes: size });
+        return;
+      }
+      try {
+        const saved = await this.state.saveSnapshot(meta.profile, meta.incarnation, this.checkpointSeq + 1, snapshot);
+        this.checkpointSeq++;
+        this.lastCheckpoint = snapshot;
+        this.lastCheckpointAt = saved.saved_at;
+        this.dirty = false;
+        this.broadcast({ type: "checkpoint", at: saved.saved_at, notSaved: snapshot.notSaved });
+      } catch (error) {
+        if (error instanceof StateError && error.status === 409) {
+          // Another incarnation owns the profile now; this browser is stale.
+          await this.sleepNow("stale");
+        }
+      }
+    };
+    this.checkpointing = run().finally(() => {
+      this.checkpointing = undefined;
+    });
+    return this.checkpointing;
+  }
+
+  private slotTimer?: ReturnType<typeof setTimeout>;
+  private scheduleSlotSave(): void {
+    if (this.slotTimer) return;
+    this.slotTimer = setTimeout(() => {
+      this.slotTimer = undefined;
+      const meta = this.meta;
+      const remote = this.remote;
+      if (!meta || !remote || remote.closed) return;
+      const slots = remote.targetsBySlot();
+      if (JSON.stringify(slots) === JSON.stringify(meta.slots)) return;
+      meta.slots = slots;
+      void this.saveMeta();
+      this.dirty = true;
+      this.scheduleCheckpoint(2_000);
+    }, 2_000);
+  }
+
+  private async recordIntent(intent: { tab: string; kind: string; label?: string } | null): Promise<void> {
+    this.lastActivity = Date.now();
+    if (!intent) {
+      await this.ctx.storage.delete("intent");
+      return;
+    }
+    await this.ctx.storage.put("intent", { ...intent, incarnation: this.meta?.incarnation ?? 0, at: Date.now() } satisfies Intent);
+  }
+
+  // ---------- control ----------
+
+  /** The person's input or Take over: control moves to the person before
+   * the input is dispatched. The running goal stops before its next action
+   * (an action already handed to the page completes and is recorded). */
+  private takeControl(reason: string): void {
+    this.humanAt = Date.now();
+    if (this.control.mode === "human") return;
+    this.control = { mode: "human", epoch: this.control.epoch + 1 };
+    let stopped = 0;
+    for (const entry of this.agents.values()) if (entry.agent.stopGoal()) stopped++;
+    this.broadcast({ type: "control", mode: "human", reason, goalStopped: stopped > 0, inFlight: this.inFlight });
+  }
+
+  private release(): void {
+    if (this.control.mode === "agent") return;
+    this.control = { mode: "agent", epoch: this.control.epoch + 1 };
+    this.broadcast({ type: "control", mode: "agent", reason: "person_release" });
+    this.dirty = true;
+    this.scheduleCheckpoint(500);
+  }
+
+  private inFlight?: { kind: string; label?: string };
+
+  private onAgentActivity(event: AgentActivity): void {
+    this.lastActivity = Date.now();
+    this.inFlight = event.phase === "start" ? { kind: event.kind, label: event.label } : undefined;
+    this.broadcast({ type: "agent", ...event });
+    if (event.phase === "end" && event.outcome === "dispatched") {
+      this.dirty = true;
+      this.scheduleCheckpoint(2_000);
+    }
+  }
+
+  private onDialog(tab: string, dialog: { type: string; message: string }): void {
+    this.dialog = { tab, dialogType: dialog.type, message: dialog.message };
+    if (!this.viewers.size) {
+      // Nobody can answer: dismiss so the page does not stay blocked.
+      void this.remote?.answerDialog(tab, false).catch(() => {});
+      this.dialog = undefined;
+      return;
+    }
+    this.broadcast({ type: "dialog", ...this.dialog });
+  }
+
+  // ---------- viewers ----------
+
+  private readonly viewerPersona = new Map<ServerSocket, string>();
+
+  private async acceptViewer(claims: TicketClaims): Promise<Response> {
+    const meta = await this.loadMeta(claims.b);
+    if (!meta || this.nonces.has(claims.n) || this.viewers.size >= MAX_VIEWERS || (this.persona && claims.p !== this.persona))
+      return new Response("forbidden", { status: 403 });
+    this.nonces.set(claims.n, claims.e);
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+    this.viewers.set(server, { human: claims.h, authUntil: Date.now() + VIEWER_SESSION_MS });
+    this.viewerPersona.set(server, claims.p);
+    server.addEventListener("message", (event) => {
+      const fail = (error: { code?: string } | undefined) => this.send(server, { type: "error", code: error?.code ?? "failed" });
+      // Control changes do not wait behind a slow navigation.
+      if (typeof event.data === "string" && event.data.length < 64 && /"type":"(?:takeover|stop-goal)"/.test(event.data)) {
+        void this.onViewerMessage(server, event.data).catch(fail);
+        return;
+      }
+      this.viewerOps = this.viewerOps.then(() => this.onViewerMessage(server, event.data).catch(fail));
+    });
+    const gone = () => {
+      if (!this.viewers.delete(server)) return;
+      this.viewerPersona.delete(server);
+      this.lastActivity = Date.now();
+      if (!this.viewers.size) {
+        void this.remote?.stopScreencast();
+        // The person left: the secretary may continue; save what they did.
+        this.release();
+      }
+    };
+    server.addEventListener("close", gone);
+    server.addEventListener("error", gone);
+    this.send(server, this.hello());
+    if (this.remote?.lastFrame) this.sendFrame(this.remote.lastFrame, server);
+    this.wantLive = true;
+    this.lastActivity = Date.now();
+    if (this.live()) await this.remote?.startScreencast().catch(() => {});
+    await this.kick();
+    return new Response(null, { status: 101, webSocket: client } as ResponseInit);
+  }
+
+  private hello(): Record<string, unknown> {
+    return {
+      type: "hello",
+      viewport: VIEWPORT,
+      phase: this.phase,
+      detail: this.phaseDetail,
+      control: { mode: this.control.mode },
+      tabs: this.remote?.tabs() ?? [],
+      shared: this.sharedTabs(),
+      goal: this.goal,
+      recovery: this.recovery,
+      checkpointAt: this.lastCheckpointAt,
+      dialog: this.dialog,
+      unsupported: ["file_upload", "file_drag_drop", "download", "clipboard_copy_out", "audio", "extensions"],
+    };
+  }
+
+  private sharedTabs(): { tab: string; allowActions: boolean }[] {
+    return [...this.agents.values()].map((entry) => ({
+      tab: (entry.credential.attachment.tab as TabRef).tabId,
+      allowActions: entry.credential.attachment.allow_actions,
+    }));
+  }
+
+  private announce(): void {
+    this.broadcast(this.hello());
+  }
+
+  private broadcastTabs(): void {
+    this.broadcast({ type: "tabs", tabs: this.remote?.tabs() ?? [], shared: this.sharedTabs() });
+  }
+
+  private send(viewer: ServerSocket, message: Record<string, unknown>): void {
+    try {
+      viewer.send(JSON.stringify(message));
+    } catch {
+      this.viewers.delete(viewer);
+    }
+  }
+
+  private broadcast(message: Record<string, unknown>): void {
+    if (!this.viewers.size) return;
+    const text = JSON.stringify(message);
+    for (const viewer of [...this.viewers.keys()]) {
+      try {
+        viewer.send(text);
+      } catch {
+        this.viewers.delete(viewer);
+      }
+    }
+  }
+
+  private sendFrame(frame: Frame, only?: ServerSocket): void {
+    const text = JSON.stringify({ type: "frame", tab: this.remote?.active, ...frame });
+    for (const viewer of only ? [only] : [...this.viewers.keys()]) {
+      try {
+        viewer.send(text);
+      } catch {
+        this.viewers.delete(viewer);
+      }
+    }
+  }
+
+  private async onViewerMessage(viewer: ServerSocket, data: unknown): Promise<void> {
+    if (typeof data !== "string" || data.length > 16_384) return;
+    const message = JSON.parse(data) as { type: string } & Record<string, unknown>;
+    const info = this.viewers.get(viewer);
+    if (!info) return;
+    this.lastActivity = Date.now();
+    switch (message.type) {
+      case "reauth": {
+        const claims = await verifyTicket(String(message.ticket), this.env.SUMI_BROWSER_CLOUD_TOKEN ?? "");
+        if (!claims || claims.b !== this.meta?.profile || claims.h !== info.human || this.nonces.has(claims.n)) {
+          viewer.close(4401, "reauth_failed");
+          return;
+        }
+        this.nonces.set(claims.n, claims.e);
+        info.authUntil = Date.now() + VIEWER_SESSION_MS;
+        return;
+      }
+      case "start":
+        this.wantLive = true;
+        await this.kick();
+        return;
+      case "takeover":
+        this.takeControl("person_takeover");
+        return;
+      case "release":
+        this.release();
+        return;
+      case "stop-goal":
+        for (const entry of this.agents.values()) entry.agent.stopGoal();
+        return;
+    }
+    if (!this.live() || !this.remote) {
+      this.send(viewer, { type: "error", code: "not_live" });
+      return;
+    }
+    const remote = this.remote;
+    switch (message.type) {
+      case "input": {
+        const input = message as unknown as ViewerInput;
+        const commands = toCdp(input);
+        if (!commands) return;
+        if (takesControl(input)) this.takeControl("person_input");
+        else if (this.control.mode !== "human") return;
+        this.dirty = true;
+        for (const command of commands) await remote.input(command.method, command.params);
+        return;
+      }
+      case "tab": {
+        this.takeControl("person_tab");
+        const op = String(message.op);
+        const id = typeof message.id === "string" ? message.id : remote.active;
+        if (op === "new") {
+          const slot = await remote.newTab(typeof message.url === "string" ? navigationURL(message.url) : undefined);
+          await remote.activate(slot.id);
+        } else if (!id) return;
+        else if (op === "activate") await remote.activate(id);
+        else if (op === "close") await remote.closeTab(id);
+        else if (op === "navigate") await remote.navigate(id, navigationURL(message.url));
+        else if (op === "back") await remote.history(id, -1);
+        else if (op === "forward") await remote.history(id, 1);
+        else if (op === "reload") await remote.reload(id);
+        this.dirty = true;
+        return;
+      }
+      case "dialog": {
+        if (!this.dialog) return;
+        const { tab } = this.dialog;
+        this.dialog = undefined;
+        this.takeControl("person_dialog");
+        await remote.answerDialog(tab, message.accept === true, typeof message.text === "string" ? message.text.slice(0, 2000) : undefined);
+        this.broadcast({ type: "dialog", closed: true });
+        return;
+      }
+    }
+  }
+}

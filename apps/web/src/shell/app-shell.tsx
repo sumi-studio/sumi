@@ -29,6 +29,7 @@ export function AppShell() {
   const personalApp =
     pathname === "/direct" ||
     pathname === "/terminal" ||
+    pathname === "/browser" ||
     pathname === "/feedback";
   const workspaceId =
     routeWorkspaceId ??
@@ -75,6 +76,8 @@ export function AppShell() {
       ? "direct-chat"
       : pathname === "/terminal"
         ? "terminal"
+        : pathname === "/browser"
+          ? "browser"
         : pathname === "/feedback"
           ? "feedback"
           : "workspace";

@@ -1,0 +1,21 @@
+{
+  "name": "@sumi/browser-cloud",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.ts",
+    "dev:worker": "wrangler dev --config wrangler.jsonc",
+    "dev:pool": "node scripts/local-pool.mjs"
+  },
+  "dependencies": {
+    "@sumi/desktop": "workspace:*"
+  },
+  "devDependencies": {
+    "@sumi/typescript-config": "workspace:*",
+    "@types/node": "^24.13.2",
+    "typescript": "~6.0.3",
+    "wrangler": "4.120.1"
+  }
+}
