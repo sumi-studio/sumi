@@ -427,11 +427,12 @@ func (service *Service) ReadProcessOutput(ctx context.Context, r ProcessOutputRe
 		// Journaled loss boundaries (rotation, vanished journal,
 		// uncertified resume) must reach readers too — otherwise a
 		// rotation under load is a silent hole in the scrollback.
-		// Return every boundary at or ahead of the requested offset;
-		// the caller emits an explicit gap marker when its cursor
-		// reaches each one. Unknown-size loss stays a boundary, never
-		// an invented byte range.
-		if events, err := io_.tty.gapsAtOrAfter(r.Offset); err == nil {
+		// A live reader may already be past a boundary when the journal
+		// records it. Include earlier markers too; termexec deduplicates
+		// them by position/note and its durable output ledger. Otherwise
+		// disagreement with already displayed live bytes would be silent.
+		// Unknown-size loss stays a boundary, never an invented byte range.
+		if events, err := io_.tty.gapsAtOrAfter(0); err == nil {
 			for _, ev := range events {
 				out.Gaps = append(out.Gaps, ProcessOutputGap{At: ev.At, Note: ev.Note})
 			}

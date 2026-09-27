@@ -133,10 +133,12 @@ HTTP_PROXY=http://127.0.0.1:3128
   `docker start` and serves the bytes the journal has not received yet
   past the durable end of the scrollback. The journal remains the only
   durable source; each committed byte is checked against the live stream,
-  and any disagreement journals a loss marker. After a provisioner
-  restart, a journal gap or rotation, or a live backlog above 4 MiB, the
-  session falls back to journal-only output: complete, but a partial line
-  appears once it ends.
+  and any disagreement journals a loss marker, including for readers
+  already ahead of that marker. After a provisioner restart, a lost live
+  connection, a journal gap or rotation, or either stream getting more
+  than 4 MiB ahead of the other, the session falls back to the durable
+  journal. A partial line then appears once it ends; any recorded loss
+  remains explicit. Ending supervision closes the live connection too.
 - `SUMI_JOB_EGRESS_DIR` is the host directory containing `proxy.sock`.
   `api-state-init` creates it owned by the proxy uid (mode 0755); the
   socket itself is mode 0622 — connect needs write on the socket file.

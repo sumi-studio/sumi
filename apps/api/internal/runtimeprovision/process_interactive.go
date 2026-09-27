@@ -185,6 +185,10 @@ func (b *DockerBackend) attachStream(ctx context.Context, o ProcessOperation, qu
 	if err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", what, err)
 	}
+	// DialContext only bounds dialing. Bound the upgrade handshake too;
+	// after handoff the stream must outlive the launch/request context.
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 	fail := func(e error) (net.Conn, *bufio.Reader, error) {
 		_ = conn.Close()
 		return nil, nil, e
@@ -210,6 +214,9 @@ func (b *DockerBackend) attachStream(ctx context.Context, o ProcessOperation, qu
 		if line == "\r\n" || line == "\n" {
 			break
 		}
+	}
+	if !stopCancel() {
+		return fail(fmt.Errorf("%s: %w", what, ctx.Err()))
 	}
 	return conn, br, nil
 }

@@ -35,7 +35,7 @@ import (
 	"unicode/utf8"
 )
 
-// liveTailMax bounds the live bytes held ahead of the journal. The
+// liveTailMax bounds either stream's bytes held ahead of the other. The
 // daemon flushes a partial line at 16 KiB, so a healthy journal is
 // never this far behind; exceeding it means the journal pump stalled.
 const liveTailMax = 4 << 20
@@ -159,6 +159,10 @@ func (l *liveTail) committed(at int64, p []byte) {
 		return
 	}
 	l.pending = l.pending[n:]
+	if len(p)-n > liveTailMax-len(l.verify) {
+		l.offLocked()
+		return
+	}
 	l.verify = append(l.verify, p[n:]...)
 	l.durable += int64(len(p))
 }
@@ -205,10 +209,16 @@ func completeRunes(p []byte) []byte {
 // gap-free prefix of that stream; whatever the journal pump committed
 // before this call becomes the first bytes to verify.
 func (io_ *interactiveIO) startLive(rc io.ReadCloser) {
+	io_.mu.Lock()
+	defer io_.mu.Unlock()
+	if io_.closed {
+		_ = rc.Close()
+		return
+	}
 	t := io_.tty
 	l := &io_.live
 	t.mu.Lock()
-	ok := t.base == 0 && !t.gapped
+	ok := t.base == 0 && !t.gapped && t.total <= liveTailMax
 	var committed []byte
 	if ok && t.total > 0 {
 		committed = make([]byte, t.total)
@@ -235,6 +245,9 @@ func (io_ *interactiveIO) startLive(rc io.ReadCloser) {
 		return
 	}
 	go func() {
+		// A disconnected attach is no longer an output source. The
+		// journal still owns recovery, including any final partial line.
+		defer l.off()
 		buf := make([]byte, 32<<10)
 		for {
 			n, err := rc.Read(buf)
@@ -242,9 +255,6 @@ func (io_ *interactiveIO) startLive(rc io.ReadCloser) {
 				l.delivered(buf[:n])
 			}
 			if err != nil {
-				// The stream ends with the container (or was closed by
-				// off). Keep serving what is held: the journal commits
-				// the rest when the daemon flushes at exit.
 				return
 			}
 		}

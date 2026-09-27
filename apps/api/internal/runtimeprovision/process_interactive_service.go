@@ -458,6 +458,7 @@ func (s *processStore) stopInteractive(io_ *interactiveIO) {
 	if !io_.closed {
 		io_.closed = true
 		close(io_.done)
+		io_.live.off()
 		if io_.sink != nil {
 			_ = io_.sink.Close()
 			io_.sink = nil
