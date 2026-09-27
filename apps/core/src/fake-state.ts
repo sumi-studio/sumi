@@ -1,5 +1,6 @@
 import { jsonEqual } from "./json.ts";
 import { FencedError, type StateClient, StateError } from "./state-client.ts";
+import { isInternalActor } from "./memory.ts";
 import type {
   Approval,
   ApprovalDecision,
@@ -599,6 +600,18 @@ export class FakeState implements StateClient {
     rec.human_id = humanId;
   }
 
+  /** Go previousReceiptCol: the receipt time of the last admitted
+   *  incoming message, read before the new one is pushed. */
+  private previousReceipt(persona: string): string | null {
+    for (let i = this.inputs.length - 1; i >= 0; i--) {
+      const x = this.inputs[i]!;
+      if (x.persona_id === persona && !isInternalActor(x.actor_kind)) {
+        return x.created_at;
+      }
+    }
+    return null;
+  }
+
   addInput(personaId: string, inputId: string, text: string, kind = "message") {
     this.inputs.push({
       persona_id: personaId,
@@ -619,6 +632,7 @@ export class FakeState implements StateClient {
       not_before: null,
       waiting_since: null,
       waited_ms: 0,
+      previous_received_at: this.previousReceipt(personaId),
     });
   }
 
@@ -3242,6 +3256,8 @@ export class FakeState implements StateClient {
           typeof input.payload.text === "string" ? input.payload.text : null,
         actor_kind: input.actor_kind,
         source_surface: input.source_surface,
+        received_at: input.created_at,
+        previous_received_at: input.previous_received_at ?? null,
         attempt: turn.attempt,
       },
       created_at: new Date().toISOString(),
@@ -3309,6 +3325,7 @@ export class FakeState implements StateClient {
           not_before: null,
           waiting_since: null,
           waited_ms: 0,
+          previous_received_at: this.previousReceipt(persona),
         });
       }
       s.status = "fired";
@@ -3494,6 +3511,7 @@ export class FakeState implements StateClient {
         not_before: null,
         waiting_since: null,
         waited_ms: 0,
+        previous_received_at: this.previousReceipt(job.persona_id),
       });
     }
     job.notified_at = new Date().toISOString();
@@ -3751,6 +3769,7 @@ export class FakeState implements StateClient {
         not_before: null,
         waiting_since: null,
         waited_ms: 0,
+        previous_received_at: this.previousReceipt(t.persona_id),
       });
     }
   }

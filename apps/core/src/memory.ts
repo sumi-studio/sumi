@@ -241,6 +241,75 @@ export function inputBodyText(p: Record<string, unknown>): string {
   return attachments !== "" ? attachments : text;
 }
 
+const GAP_UNITS: [string, number][] = [
+  ["day", 86_400_000],
+  ["hour", 3_600_000],
+  ["minute", 60_000],
+  ["second", 1000],
+];
+
+/** A clock-reading difference in at most two units, "approximately" when
+ * rounding dropped anything (docs/agent/incoming-event-time-2026-09-08.md). */
+export function formatGap(ms: number): string {
+  if (ms < 1000) return "less than a second";
+  const lead = GAP_UNITS.findIndex(([, u]) => ms >= u);
+  const step = GAP_UNITS[Math.min(lead + 1, GAP_UNITS.length - 1)]![1];
+  const rounded = Math.round(ms / step) * step;
+  // Rounding can carry into the next unit (59.6 s → 1 minute).
+  const top = GAP_UNITS.findIndex(([, u]) => rounded >= u);
+  let rest = rounded;
+  const parts: string[] = [];
+  for (const [name, u] of GAP_UNITS.slice(top, top + 2)) {
+    const n = Math.floor(rest / u);
+    rest -= n * u;
+    if (n > 0) parts.push(`${n} ${name}${n === 1 ? "" : "s"}`);
+  }
+  return `${rounded === ms ? "" : "approximately "}${parts.join(" ")}`;
+}
+
+const utcSeconds = (ms: number) =>
+  `${new Date(ms).toISOString().slice(0, 19).replace("T", " ")} UTC`;
+
+/**
+ * The receipt line that opens an incoming message: when Sumi's durable
+ * intake accepted it and the gap since the previous incoming message, both
+ * fixed at admission. "" when the receipt time is unknown. A journal
+ * record from before receipts were pinned shows its journal time, labelled
+ * as such, and no gap — the previous receipt was never recorded for it.
+ */
+export function receiptLine(
+  receivedAt: unknown,
+  previousReceivedAt: unknown,
+  recordedAt?: unknown,
+): string {
+  const at = typeof receivedAt === "string" ? Date.parse(receivedAt) : NaN;
+  if (Number.isNaN(at)) {
+    const rec = typeof recordedAt === "string" ? Date.parse(recordedAt) : NaN;
+    return Number.isNaN(rec) ? "" : `[Recorded ${utcSeconds(rec)}]`;
+  }
+  const prev =
+    typeof previousReceivedAt === "string"
+      ? Date.parse(previousReceivedAt)
+      : NaN;
+  if (Number.isNaN(prev)) return `[Received ${utcSeconds(at)}]`;
+  const gap =
+    at >= prev
+      ? `${formatGap(at - prev)} since the previous incoming message`
+      : `the receipt clock reads ${formatGap(prev - at)} earlier than for the previous incoming message`;
+  return `[Received ${utcSeconds(at)}; ${gap}]`;
+}
+
+/** Inputs Sumi raises itself — not incoming messages, so they carry no
+ * receipt line and never serve as the previous receipt (Go
+ * previousReceiptCol). */
+export const isInternalActor = (actorKind: unknown): boolean =>
+  actorKind === "schedule" || actorKind === "job" || actorKind === "terminal";
+
+const FAILURE_REASONS: Record<string, string> = {
+  no_model_connection: "no model connection was selected",
+  oversize_plan: "the reply exceeded the size that can be recorded",
+};
+
 /** Map one journal event to the model-visible message, or null for kinds
  * with no context rendering (e.g. internal bookkeeping). */
 export function eventMessage(ev: Event): ChatMessage | null {
@@ -268,7 +337,22 @@ export function eventMessage(ev: Event): ChatMessage | null {
               attention: str(p.attention),
               change: str(p.message_change),
             });
-      return { role: "user", content: `${who} ${inputBodyText(p)}` };
+      const receipt = isInternalActor(p.actor_kind)
+        ? ""
+        : receiptLine(p.received_at, p.previous_received_at, ev.created_at);
+      return {
+        role: "user",
+        content: `${receipt ? `${receipt}\n` : ""}${who} ${inputBodyText(p)}`,
+      };
+    }
+    case "turn_failed": {
+      // The requester was told; the secretary must be too, or an
+      // unanswered input reads as a request still waiting for it.
+      const why = FAILURE_REASONS[str(p.error_kind)];
+      return {
+        role: "user",
+        content: `[turn failed${why ? `: ${why}` : ""} — this turn ended without a completed reply]`,
+      };
     }
     case "assistant_message":
       return { role: "assistant", content: String(p.text ?? "") };

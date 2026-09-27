@@ -18,6 +18,11 @@ import {
 import { toolSpecs } from "../src/tools.ts";
 import type { Event } from "../src/types.ts";
 
+// Incoming messages open with a receipt line (conversation-continuity
+// tests); these assertions are about what follows it.
+const afterReceipt = (c: string | undefined) =>
+  c?.replace(/^\[(?:Received|Recorded) [^\]]*\]\n/, "");
+
 const PERSONA = "01930e00-0000-7000-8000-000000000001";
 
 /** Emits one scripted decision per round; records which rounds were consulted. */
@@ -699,13 +704,13 @@ test("assemble shows Messaging provenance a reply can be addressed to", () => {
   };
   const messages = assemble(earlier, input);
   assert.equal(
-    messages.at(-2)?.content,
+    afterReceipt(messages.at(-2)?.content),
     `[Haru (human) in general place_id=${place} message_id=m-1 — fyi, no reply needed] みんなへの周知`,
   );
   // Another secretary is named as one; brackets in names cannot close the
   // marker early, so a directive after it still parses.
   assert.equal(
-    messages.at(-1)?.content,
+    afterReceipt(messages.at(-1)?.content),
     `[Shiro bot (personality_agent) in general place_id=${place} message_id=m-2] 見てくれる？`,
   );
   // Non-Messaging inputs keep the plain actor marker without place refs.
@@ -715,7 +720,7 @@ test("assemble shows Messaging provenance a reply can be addressed to", () => {
     actor_kind: "human",
     source_surface: "test",
   });
-  assert.equal(plain.at(-1)?.content, "[human] hi");
+  assert.equal(afterReceipt(plain.at(-1)?.content), "[human] hi");
 });
 
 test("assemble and journal render message change updates, not rewrites", () => {
@@ -788,11 +793,11 @@ test("assemble and journal render message change updates, not rewrites", () => {
   };
   const messages = assemble(journaled, tombstone);
   assert.equal(
-    messages.at(-3)?.content,
+    afterReceipt(messages.at(-3)?.content),
     `[Haru (human) in general place_id=${place} message_id=m-1] 元の相談`,
   );
   assert.equal(
-    messages.at(-2)?.content,
+    afterReceipt(messages.at(-2)?.content),
     `[Haru (human) in general place_id=${place} message_id=m-1 — edited] 訂正後です`,
   );
   // A tombstone input carries no text — the marker itself reports it.

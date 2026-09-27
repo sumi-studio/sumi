@@ -1813,3 +1813,66 @@ func TestRetryAfterMsPacesRequeue(t *testing.T) {
 		t.Fatalf("an absurd Retry-After must be clamped to 2min, got %v", d)
 	}
 }
+
+// An input carries the receipt time of the incoming message admitted just
+// before it, fixed by admission order — inputs Sumi raises itself (a wake,
+// a job ending) do not move it — and
+// the journaled receipt pins both times, so a later reader (another model,
+// a restarted core) sees the same gap the first one did.
+func TestInputReceiptTiming(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	for _, id := range []string{"in-1", "in-wake", "in-job", "in-2"} {
+		if _, _, err := s.SubmitInput(ctx, &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": id}}); err != nil {
+			t.Fatalf("submit %s: %v", id, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE core_inputs SET
+			actor_kind = CASE input_id WHEN 'in-wake' THEN 'schedule' WHEN 'in-job' THEN 'job' ELSE actor_kind END,
+			created_at = CASE WHEN input_id = 'in-1' THEN now() - interval '10 days' ELSE created_at END
+		WHERE persona_id = $1`, pa); err != nil {
+		t.Fatalf("shape inputs: %v", err)
+	}
+	first, _, err := s.GetInput(ctx, pa, "in-1")
+	if err != nil || first.PreviousReceivedAt != nil {
+		t.Fatalf("first input has no previous receipt: %+v err=%v", first.PreviousReceivedAt, err)
+	}
+	second, _, err := s.GetInput(ctx, pa, "in-2")
+	if err != nil || second.PreviousReceivedAt == nil || !second.PreviousReceivedAt.Equal(first.CreatedAt) {
+		t.Fatalf("previous receipt skips internal inputs: got %v want %v err=%v",
+			second.PreviousReceivedAt, first.CreatedAt, err)
+	}
+
+	// The claim hands the core the same value, and a mid-turn receipt
+	// journals it.
+	load, err := s.LoadTurn(ctx, pa, lease.Generation, "t-1", 10)
+	if err != nil || load.Input == nil || load.Input.InputID != "in-1" || load.Input.PreviousReceivedAt != nil {
+		t.Fatalf("claim in-1: %+v err=%v", load.Input, err)
+	}
+	mustPlan(t, s, pa, "t-1", lease.Generation,
+		PlanCall{Tool: "journal.note", Route: "normal", Request: map[string]any{"text": "n"}})
+	if _, _, _, err := s.ClaimOperation(ctx, pa, "t-1", lease.Generation,
+		"op-n", "journal.note", 0, map[string]any{"text": "n"}); err != nil {
+		t.Fatalf("note claim: %v", err)
+	}
+	evs, err := s.Events(ctx, pa, 0, 10)
+	if err != nil || len(evs) != 2 || evs[0].Kind != "input_received" {
+		t.Fatalf("events: %+v err=%v", evs, err)
+	}
+	got, _ := evs[0].Payload["received_at"].(string)
+	at, perr := time.Parse(time.RFC3339Nano, got)
+	if perr != nil || !at.Equal(first.CreatedAt) {
+		t.Fatalf("received_at: %q want %v (%v)", got, first.CreatedAt, perr)
+	}
+	if prev, ok := evs[0].Payload["previous_received_at"]; !ok || prev != nil {
+		t.Fatalf("first receipt previous_received_at: %v present=%v", prev, ok)
+	}
+}

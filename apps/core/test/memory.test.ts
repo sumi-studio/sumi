@@ -151,7 +151,7 @@ test("memory: a correction during preparation survives; the replacement renders 
   await turn("m3", "CORRECTION=violet, not amber");
   const during = lastTurn().messages.map((m) => m.content);
   assert.ok(
-    during.some((c) => /^\[\w+\] COLOR=amber/.test(c)),
+    during.some((c) => /^(?:\[Received [^\]]*\]\n)?\[\w+\] COLOR=amber/.test(c)),
     "the raw original stays in context while its chunk is prepared",
   );
 
@@ -183,13 +183,13 @@ test("memory: a correction during preparation survives; the replacement renders 
       c.startsWith("[Memory fragment") &&
       c.includes("L1 chunk 1: the human said COLOR=amber"),
   );
-  const m2 = after.findIndex((c) => /^\[\w+\] second topic/.test(c));
-  const corr = after.findIndex((c) => /^\[\w+\] CORRECTION=violet/.test(c));
+  const m2 = after.findIndex((c) => /^(?:\[Received [^\]]*\]\n)?\[\w+\] second topic/.test(c));
+  const corr = after.findIndex((c) => /^(?:\[Received [^\]]*\]\n)?\[\w+\] CORRECTION=violet/.test(c));
   assert.ok(
     frag > 0 && frag < m2 && m2 < corr,
     JSON.stringify({ frag, m2, corr }),
   );
-  assert.ok(!after.some((c) => /^\[\w+\] COLOR=amber/.test(c)));
+  assert.ok(!after.some((c) => /^(?:\[Received [^\]]*\]\n)?\[\w+\] COLOR=amber/.test(c)));
 
   // Application changes the sent context only; the journal keeps the original.
   const evs = await state.events(PERSONA, 0);

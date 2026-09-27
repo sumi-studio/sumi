@@ -6,6 +6,8 @@ import {
   evictToBudget,
   inputBodyText,
   inputMarker,
+  isInternalActor,
+  receiptLine,
   renderedViewTokens,
   renderJournalContext,
   runMemoryPreparation,
@@ -1407,6 +1409,17 @@ export class Secretary {
    * must never become a fabricated record.
    */
   private async commitTurnFinal(turn: Turn, req: CommitRequest): Promise<void> {
+    if (req.outcome === "fail" && req.retryable !== true) {
+      // A terminal failure journals that the turn ended, so a later turn
+      // never reads the input as a request still waiting to be served.
+      req = {
+        ...req,
+        events: [
+          ...req.events,
+          { kind: "turn_failed", payload: { error_kind: req.error_kind ?? null } },
+        ],
+      };
+    }
     const { state, personaId } = this.cfg;
     const commit = (r: CommitRequest) =>
       state.commitTurn(personaId, turn.turn_id, turn.generation, r);
@@ -1605,6 +1618,10 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       place_kind: typeof place.kind === "string" ? place.kind : null,
       attention: input.attention,
       occurred_at: input.occurred_at,
+      // Pinned at receipt so a restart, a model change or a later
+      // compaction renders the same times the first reader saw.
+      received_at: input.created_at,
+      previous_received_at: input.previous_received_at ?? null,
       event_id: typeof p.event_id === "string" ? p.event_id : null,
       message_id: typeof p.message_id === "string" ? p.message_id : null,
       message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
@@ -1666,7 +1683,13 @@ export function assemble(
           attention: input.attention,
           change: typeof p.message_change === "string" ? p.message_change : "",
         });
-  messages.push({ role: "user", content: `${who} ${text}` });
+  const receipt = isInternalActor(input.actor_kind)
+    ? ""
+    : receiptLine(input.created_at, input.previous_received_at);
+  messages.push({
+    role: "user",
+    content: `${receipt ? `${receipt}\n` : ""}${who} ${text}`,
+  });
   return messages;
 }
 

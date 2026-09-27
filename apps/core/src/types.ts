@@ -40,6 +40,10 @@ export interface Input {
    *  the provider retry budget (a person's thinking time is not model
    *  failure). Durable; survives restarts. */
   waited_ms: number;
+  /** Receipt time (created_at) of the incoming message admitted just before
+   *  this one — null for the first; absent from a state service that
+   *  predates it. Fixed by admission order, never re-measured. */
+  previous_received_at?: string | null;
 }
 
 export interface Turn {
