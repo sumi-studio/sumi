@@ -41,3 +41,12 @@ jobs:
 
       - name: Run Web tests
         run: corepack pnpm --filter @sumi/web test
+
+      - name: Check Cloud browser types
+        run: corepack pnpm --filter @sumi/browser-cloud check-types
+
+      - name: Run Cloud browser tests with real Chrome checkpoint coverage
+        run: |
+          export CHROME="$(command -v google-chrome)"
+          test -x "$CHROME"
+          corepack pnpm --filter @sumi/browser-cloud test
