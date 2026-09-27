@@ -231,11 +231,11 @@ func (f *fakeStore) RemoveKeyed(ctx context.Context, scope, path string, iv IfVe
 	return nil
 }
 
-func (f *fakeStore) ObservedVersion(ctx context.Context, scope, path string) (int64, string, error) {
+func (f *fakeStore) ObservedVersion(ctx context.Context, scope, path string) (int64, string, string, error) {
 	if f.obsErr != nil {
-		return 0, "", f.obsErr
+		return 0, "", "", f.obsErr
 	}
-	return f.vers[scope+"/"+path], f.fps[scope+"/"+path], nil
+	return f.vers[scope+"/"+path], f.fps[scope+"/"+path], "", nil
 }
 
 func (f *fakeStore) Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error) {

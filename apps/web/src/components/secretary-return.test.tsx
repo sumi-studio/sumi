@@ -70,6 +70,16 @@ const GET_SESSION = "/api/secretary-return/session";
 const POST_SESSIONS = "/api/secretary-return/sessions";
 const CSRF = "/auth/csrf";
 
+/** Picks the explicit "carry files into Local" choice — issue/retry stay
+ * disabled until the owner makes one. */
+async function chooseLocalFiles() {
+  fireEvent.click(
+    await screen.findByRole("radio", {
+      name: /ファイルをローカルに持ってくる/,
+    }),
+  );
+}
+
 describe("SecretaryReturn", () => {
   beforeEach(() => {
     vi.stubGlobal(
@@ -111,6 +121,10 @@ describe("SecretaryReturn", () => {
     const issue = await screen.findByRole("button", {
       name: "移行URLを発行する",
     });
+    // No selection, no issue: the button stays disabled until the owner
+    // explicitly picks where the working files live.
+    expect(issue).toBeDisabled();
+    await chooseLocalFiles();
     await waitFor(() => expect(issue).toBeEnabled());
     fireEvent.click(issue);
     const refusal = await screen.findByText(
@@ -179,6 +193,10 @@ describe("SecretaryReturn", () => {
     const retry = screen.getByRole("button", {
       name: "新しい移行URLを発行する",
     });
+    // The retry path asks for the file choice again — a new session never
+    // inherits the last one's mode.
+    expect(retry).toBeDisabled();
+    await chooseLocalFiles();
     await waitFor(() => expect(retry).toBeEnabled());
     fireEvent.click(retry);
     await screen.findByText(/ローカルの受け取りを待っています/);
@@ -189,6 +207,13 @@ describe("SecretaryReturn", () => {
       expect.stringContaining(POST_SESSIONS),
       expect.objectContaining({ method: "POST" }),
     );
+    // The create body carries the owner's explicit choice.
+    const createCall = fetchMock.mock.calls.find(([u]) =>
+      String(u).includes(POST_SESSIONS),
+    );
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
+      file_mode: "local",
+    });
   });
 
   it("shows the honest refusal again when retry meets the undecided gate", async () => {
@@ -209,6 +234,7 @@ describe("SecretaryReturn", () => {
     const retry = screen.getByRole("button", {
       name: "新しい移行URLを発行する",
     });
+    await chooseLocalFiles();
     await waitFor(() => expect(retry).toBeEnabled());
     fireEvent.click(retry);
     await screen.findByText(/移行は開始されていません/);

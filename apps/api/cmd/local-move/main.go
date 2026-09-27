@@ -21,6 +21,9 @@
 //	SUMI_LOCAL_CONFIG  this install's config.env — used by `return` to
 //	                   retarget an empty slot to the secretary that came
 //	                   home, only after its activation committed
+//	SUMI_WORKSPACE_ROOT  this install's local file store root — needed
+//	                   only when a return carries the Cloud workspace
+//	                   to local file storage
 //
 // The move and return URLs carry the Cloud-issued grant in the fragment. It
 // is read from stdin (never argv), stored only in the 0600 state file, and
@@ -119,8 +122,18 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return exitError
 	}
 	defer pool.Close()
+	// A fresh install may never have run `start`, leaving its database
+	// without the schema — and an unstarted install is exactly the
+	// documented fresh target for a return. The schema is this install's
+	// own and the migration is idempotent, so apply it rather than fail
+	// the slot check on a missing relation.
+	if err := db.Migrate(ctx, pool.Pool); err != nil {
+		fmt.Fprintf(stderr, "sumi-local-move: migrate the Local database: %v\n", err)
+		return exitError
+	}
 	m := newMover(home, personaID, portable.NewService(pool.Pool), agentstate.NewStore(pool.Pool), stdout)
 	m.wait = *wait
+	m.wsRoot = getenv("SUMI_WORKSPACE_ROOT")
 	config := getenv("SUMI_LOCAL_CONFIG")
 
 	readURL := func(what string) (string, int) {

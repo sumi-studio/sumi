@@ -106,6 +106,21 @@ var toolAuthority = map[string]struct {
 	// Lightweight scripts (M10): same ordinary internal effect, a bounded
 	// JavaScript run(input, sumi) job — no human decision, same lifecycle.
 	"script.start": {internal: true},
+	// Interactive terminal sessions (everyday-tools slice): ordinary
+	// internal effects under the secretary's own authority — the same
+	// privilege as job.start's command execution inside the same
+	// hardened, persona-owned environment. Writes are durable input
+	// ledger commits, not direct process control; delivery and its
+	// evidence belong to the claiming runner.
+	"terminal.open":   {internal: true},
+	"terminal.list":   {internal: true, readOnly: true},
+	"terminal.read":   {internal: true, readOnly: true},
+	"terminal.inputs": {internal: true, readOnly: true},
+	"terminal.write":  {internal: true},
+	"terminal.resize": {internal: true},
+	"terminal.signal": {internal: true},
+	"terminal.eof":    {internal: true},
+	"terminal.close":  {internal: true},
 	// Speaking into the shared channel on the human's behalf is an
 	// outward-facing act requiring consent. Per ADR 0013 §2 the Normal
 	// route does not ask the human, so a normal call is recorded as a
@@ -181,6 +196,36 @@ func validateToolRequest(tool string, request map[string]any) error {
 		// never run, so it never parks a grant.
 		if code, _ := request["code"].(string); code == "" {
 			return fmt.Errorf("%w: script.start requires code (a JavaScript module exporting run(input, sumi))", ErrBadRequest)
+		}
+	case "terminal.open":
+		if name, _ := request["name"].(string); len(name) > 80 {
+			return fmt.Errorf("%w: terminal.open name too long", ErrBadRequest)
+		}
+	case "terminal.read", "terminal.inputs", "terminal.write", "terminal.resize", "terminal.signal", "terminal.eof", "terminal.close":
+		if sessionID, _ := request["session_id"].(string); !uuidv7Re.MatchString(sessionID) {
+			return fmt.Errorf("%w: %s requires a session_id", ErrBadRequest, tool)
+		}
+		if tool == "terminal.write" {
+			data, _ := request["data"].(string)
+			if eof, _ := request["eof"].(bool); data == "" && !eof {
+				return fmt.Errorf("%w: terminal.write requires data or eof", ErrBadRequest)
+			}
+			if len(data) > 64<<10 {
+				return fmt.Errorf("%w: terminal.write data exceeds 64 KiB", ErrBadRequest)
+			}
+		}
+		if tool == "terminal.resize" {
+			cols, cok := request["cols"].(float64)
+			rows, rok := request["rows"].(float64)
+			if !cok || !rok || cols < 2 || cols > 1000 || rows < 2 || rows > 500 {
+				return fmt.Errorf("%w: terminal.resize requires cols 2..1000 and rows 2..500", ErrBadRequest)
+			}
+		}
+		if tool == "terminal.signal" {
+			sig, _ := request["signal"].(string)
+			if !terminalSignalAllowlist[sig] {
+				return fmt.Errorf("%w: terminal.signal not permitted", ErrBadRequest)
+			}
 		}
 	case "messaging.send":
 		// The delegated Messaging effect performs the full deterministic

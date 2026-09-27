@@ -28,6 +28,7 @@ import { useWorkspaceControl } from "../workspace/store";
 import {
   DIRECT_CHAT_RENDERER,
   FEEDBACK_RENDERER,
+  TERMINAL_RENDERER,
   WORKSPACE_APP_RENDERERS,
 } from "./app-descriptors";
 
@@ -76,6 +77,10 @@ export function AppRail({
     participantInstallations,
     DIRECT_CHAT_RENDERER.appId,
   );
+  const terminalInstallation = participantInstallation(
+    participantInstallations,
+    TERMINAL_RENDERER.appId,
+  );
   const exactHumanOwner =
     authenticated &&
     user !== null &&
@@ -87,7 +92,13 @@ export function AppRail({
     (exactHumanOwner &&
       directInstallation !== "duplicate" &&
       directInstallation?.state === "enabled");
+  const terminalEnabled =
+    preissuedSessionMode ||
+    (exactHumanOwner &&
+      terminalInstallation !== "duplicate" &&
+      terminalInstallation?.state === "enabled");
   const DirectIcon = DIRECT_CHAT_RENDERER.icon;
+  const TerminalIcon = TERMINAL_RENDERER.icon;
   const feedbackEnabled = Boolean(authenticated && user);
   const FeedbackIcon = FEEDBACK_RENDERER.icon;
 
@@ -217,7 +228,8 @@ export function AppRail({
             })
           : null}
 
-        {workspaceId && (directChatEnabled || feedbackEnabled) ? (
+        {workspaceId &&
+        (directChatEnabled || terminalEnabled || feedbackEnabled) ? (
           <hr className="mx-2 my-1 border-0 border-border border-t" />
         ) : null}
 
@@ -228,6 +240,15 @@ export function AppRail({
             onClick={() => void navigate({ to: DIRECT_CHAT_RENDERER.route })}
           >
             <DirectIcon className="size-4" />
+          </RailButton>
+        ) : null}
+        {terminalEnabled ? (
+          <RailButton
+            label={TERMINAL_RENDERER.label}
+            active={activeAppId === TERMINAL_RENDERER.appId}
+            onClick={() => void navigate({ to: TERMINAL_RENDERER.route })}
+          >
+            <TerminalIcon className="size-4" />
           </RailButton>
         ) : null}
         {feedbackEnabled ? (

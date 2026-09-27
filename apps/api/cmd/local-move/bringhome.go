@@ -106,6 +106,25 @@ type returnState struct {
 	// they only shorten a clean resume.
 	Bound      bool `json:"bound,omitempty"`
 	Downloaded bool `json:"downloaded,omitempty"`
+	// FileMode is the session's selected file handling, learned from the
+	// sealed session view and never allowed to change mid-run.
+	FileMode string `json:"file_mode,omitempty"`
+	// FilesDone/CredDone mark the file phase's durable completion for
+	// local (copy verified and promoted) and cloud (storage credential
+	// minted and configured) modes.
+	FilesDone bool `json:"files_done,omitempty"`
+	CredDone  bool `json:"cred_done,omitempty"`
+	// SvcRestart records an owed service restart: the file retarget
+	// stopped the running service while the persona was still staged
+	// (a restarted core cannot take the writer lease until activation
+	// commits). The value is the marker the restarted service must
+	// record; convergeFileService clears it once the restart is proven.
+	SvcRestart string `json:"svc_restart,omitempty"`
+	// FilesCopied/FilesBytes/FilesQuarantined summarize the carried
+	// workspace for the operator and the evidence file.
+	FilesCopied      int64 `json:"files_copied,omitempty"`
+	FilesBytes       int64 `json:"files_bytes,omitempty"`
+	FilesQuarantined int64 `json:"files_quarantined,omitempty"`
 	// Outcome records the terminal step the driver reached so status after
 	// a finished run still explains what happened.
 	Outcome   string    `json:"outcome,omitempty"`
@@ -375,14 +394,14 @@ func (r *returner) step(ctx context.Context, st *returnState) (code int, again b
 			case returnsession.StatusCompleted:
 				return r.finishActive(ctx, st)
 			default:
-				return r.finishTerminal(st, v)
+				return r.finishTerminal(ctx, st, v)
 			}
 		case "retired":
 			switch v.Status {
 			case returnsession.StatusSealed, returnsession.StatusCancelling:
 				return 0, true, r.reportRetired(ctx, st, imp.RetireProof)
 			default:
-				return r.finishTerminal(st, v)
+				return r.finishTerminal(ctx, st, v)
 			}
 		}
 	}
@@ -400,6 +419,13 @@ func (r *returner) step(ctx context.Context, st *returnState) (code int, again b
 
 	case returnsession.StatusSealed:
 		if hasImp && imp.Status == "staged" {
+			// The file phase must durably complete before activation —
+			// a local-mode copy that cannot finish never produces a
+			// live-but-fileless secretary, and the seal stays
+			// cancellable while it runs.
+			if err := r.filesPhase(ctx, st, v); err != nil {
+				return 0, false, err
+			}
 			return 0, true, r.activate(ctx, st)
 		}
 		return 0, true, r.downloadAndImport(ctx, st, v)
@@ -417,7 +443,7 @@ func (r *returner) step(ctx context.Context, st *returnState) (code int, again b
 		return r.finishActive(ctx, st)
 
 	default:
-		return r.finishTerminal(st, v)
+		return r.finishTerminal(ctx, st, v)
 	}
 }
 
@@ -521,6 +547,11 @@ func (r *returner) bind(ctx context.Context, st *returnState, v returnsession.Vi
 				hold, v.SurrenderedBy)
 		}
 	}
+	// The destination declares the file handling it is actually running:
+	// the owner's recorded choice on the session. Cloud refuses a
+	// declaration that does not match, so an old or mismatched mover can
+	// never bind a file-inclusive return and drop the files.
+	d.FileMode = v.FileMode
 	_, code, msg, err := r.rcall(ctx, http.MethodPost, st.SessionURL+"/destination",
 		st.Grant, jsonBody(d), "application/json")
 	if err != nil {
@@ -760,6 +791,14 @@ func (r *returner) activate(ctx context.Context, st *returnState) error {
 }
 
 func (r *returner) reportActivated(ctx context.Context, st *returnState, proof string) error {
+	// The persona is active locally now — a service the file retarget
+	// stopped while it was staged can finally take the writer lease.
+	// The restart is owed before the activated report: a completed
+	// session must mean the install is actually serving the chosen
+	// store, not merely that the rows moved.
+	if err := r.convergeFileService(ctx, st); err != nil {
+		return err
+	}
 	_, code, _, err := r.rcall(ctx, http.MethodPost, st.SessionURL+"/activated",
 		st.Grant, jsonBody(struct {
 			ActivateProof string `json:"activate_proof"`
@@ -778,6 +817,22 @@ func (r *returner) reportActivated(ctx context.Context, st *returnState, proof s
 // install's own history stays — inert, held by the transfer that sent it
 // away — and the source unseals only on the retire proof.
 func (r *returner) retireStaged(ctx context.Context, st *returnState, personaID string) error {
+	// A staged import that is being retired may have already promoted part of
+	// the carried tree; restore the workspace before reporting the retire so
+	// an owner-initiated cancel observed via resume leaves authored bytes,
+	// displaced paths, and carried files consistent — the same guarantee the
+	// local `return-cancel` command gives. A journal that exists but cannot
+	// be read is not "no journal": the retire must not be reported over an
+	// unrestored tree, so the drive stays recoverable until it reads.
+	j, jerr := r.loadJournal(st)
+	if jerr != nil {
+		return jerr
+	}
+	if j != nil && j.Phase != "restored" {
+		if rerr := r.restoreWorkspace(st, j); rerr != nil {
+			return rerr
+		}
+	}
 	rec, err := r.m.src.Retire(ctx, personaID, st.SessionID, mustPlacement(ctx, r.m.src), "")
 	if err != nil {
 		return err
@@ -821,6 +876,25 @@ func (r *returner) finishActive(ctx context.Context, st *returnState) (int, bool
 			return exitPending, false, err
 		}
 	}
+	// File configuration is convergent: the seal-window phase already
+	// ran it, but a crash between activation and finish re-enters here —
+	// CredDone and the marker checks keep each step idempotent.
+	switch st.FileMode {
+	case "cloud":
+		if err := r.filesConfigCloud(ctx, st); err != nil {
+			return exitPending, false, err
+		}
+	case "local":
+		if err := r.filesConfigLocal(ctx, st); err != nil {
+			return exitPending, false, err
+		}
+	}
+	// A crash between local activation and the service restart leaves
+	// the owed restart recorded — converge it here too, since the
+	// activated report may already have reached Cloud.
+	if err := r.convergeFileService(ctx, st); err != nil {
+		return exitPending, false, err
+	}
 	if err := r.modelStep(ctx, st); err != nil {
 		return exitPending, false, err
 	}
@@ -829,8 +903,24 @@ func (r *returner) finishActive(ctx context.Context, st *returnState) (int, bool
 		return 0, false, err
 	}
 	r.m.say("The secretary is active on this Sumi Local install, and Sumi Cloud")
-	r.m.say("has stopped answering for it. Its state came with it; shared files")
-	r.m.say("did not — they stay in Cloud while that policy is decided.")
+	r.m.say("has stopped answering for it. Its state came with it.")
+	switch st.FileMode {
+	case "local":
+		r.m.say("Its files came too: %d file(s), %d byte(s) now live in this", st.FilesCopied, st.FilesBytes)
+		r.m.say("install's workspace. The Cloud copy is retained read-only — it is")
+		r.m.say("not synced and not a managed backup.")
+		if st.FilesQuarantined > 0 {
+			r.m.say("%d existing local file(s) with different content were moved aside", st.FilesQuarantined)
+			r.m.say("into the quarantine directory recorded in %s — nothing was overwritten.", filepath.Join(r.rdir, "files.json"))
+		}
+	case "cloud":
+		r.m.say("Its files stayed in Cloud — this install reads and writes the same")
+		r.m.say("Cloud workspace through a scoped credential, and the service was")
+		r.m.say("already pointed at it before the secretary started.")
+	default:
+		r.m.say("Shared files did not come with it — they stay in Cloud while that")
+		r.m.say("policy is decided.")
+	}
 	return exitDone, false, nil
 }
 
@@ -990,8 +1080,12 @@ func (r *returner) modelStep(ctx context.Context, st *returnState) error {
 // finishTerminal explains a session that ended without an active secretary
 // here: aborted (the source unsealed — the secretary is back on Cloud),
 // cancelled or expired (the seal never happened).
-func (r *returner) finishTerminal(st *returnState, v returnsession.View) (int, bool, error) {
+func (r *returner) finishTerminal(ctx context.Context, st *returnState, v returnsession.View) (int, bool, error) {
 	st.Outcome = v.Status
+	// A service the file retarget stopped is owed its restart whatever
+	// the terminal status — the cancel path converges it back onto the
+	// restored configuration.
+	r.restoreServiceAfterCancel(ctx, st)
 	if err := r.save(st); err != nil {
 		return 0, false, err
 	}
@@ -1094,6 +1188,14 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	if impErr == nil && imp.Status == "activated" {
 		return m.fail(errors.New("the secretary is already active on this install — it cannot be retired"))
 	}
+	// The restoration journal is read before Cloud is told anything: a
+	// journal that exists but cannot be read is not "no journal", and a
+	// cancel that cannot restore the tree must stay recoverable with the
+	// session untouched rather than announce a restore it skipped.
+	j, jerr := r.loadJournal(st)
+	if jerr != nil {
+		return m.fail(jerr)
+	}
 	_, code, _, err := r.rcall(ctx, http.MethodPost, st.SessionURL+"/cancel", st.Grant, nil, "")
 	if err != nil {
 		if errors.Is(err, errUnreachable) {
@@ -1105,6 +1207,26 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	if code != http.StatusOK {
 		return m.fail(fmt.Errorf("Cloud answered HTTP %d", code))
 	}
+	// A cancelled copy leaves no half-workspace: every file the journal
+	// placed is removed (unless edited since — then it is the operator's
+	// and stays), every displaced object goes back, directories the copy
+	// created are removed when empty, and staging scratch is dropped.
+	if j != nil && j.Phase != "restored" {
+		if rerr := r.restoreWorkspace(st, j); rerr != nil {
+			return m.fail(rerr)
+		}
+	}
+	// A cancelled cloud-mode return leaves no stale route: the scoped
+	// credential it minted is revoked on Cloud with the session, so the
+	// config keys it wrote are removed here and the service converges.
+	if st.CredDone && r.config != "" {
+		for _, k := range []string{"SUMI_FILESVC_URL", "SUMI_FILESVC_TOKEN"} {
+			if err := removeConfigKey(r.config, k); err != nil {
+				return m.fail(err)
+			}
+		}
+	}
+	r.restoreServiceAfterCancel(ctx, st)
 	// The session is now cancelled (pre-seal) or cancelling (post-seal).
 	// Drive settles it: retire + report, or record the terminal status.
 	st.Outcome = ""

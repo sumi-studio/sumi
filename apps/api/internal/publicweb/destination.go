@@ -54,3 +54,7 @@ func publicAddress(ip netip.Addr) bool {
 	}
 	return true
 }
+
+// IsPublicAddress is shared by host-side HTTP clients that must not reach
+// private service addresses on behalf of a user-supplied destination.
+func IsPublicAddress(ip netip.Addr) bool { return publicAddress(ip) }

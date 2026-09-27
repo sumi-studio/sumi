@@ -32,7 +32,7 @@ type VersionStore interface {
 	WithWriteKeyed(ctx context.Context, scope, path, op string, iv IfVersion, expectSHA string, idem OpIdentity, probe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
 	RenameKeyed(ctx context.Context, scope, from, to string, iv IfVersion, idem OpIdentity, casProbe, fromProbe FPProbe, fn func(intent) (FileInfo, bool, error)) (int64, FileInfo, error)
 	RemoveKeyed(ctx context.Context, scope, path string, iv IfVersion, idem OpIdentity, probe FPProbe, fn func(intent) (bool, error)) error
-	ObservedVersion(ctx context.Context, scope, path string) (int64, string, error)
+	ObservedVersion(ctx context.Context, scope, path string) (int64, string, string, error)
 	Changes(ctx context.Context, scope string, since int64, limit int) ([]Event, error)
 }
 
@@ -42,7 +42,13 @@ type Service struct {
 	root   *posixRoot
 	store  VersionStore
 	tokens map[string]map[string]bool // token -> allowed scopes ("*" = all)
+	cap    *CaptureService            // nil => capture endpoints refuse
 }
+
+// SetCapture wires the private immutable-capture service. Without it
+// every /v1/capture route refuses with capture_unconfigured — there is
+// no live-tree fallback path by design.
+func (s *Service) SetCapture(c *CaptureService) { s.cap = c }
 
 // RequireMount makes every file op fail with 503 while the namespace root is
 // not a live mountpoint. Without it a dead mount leaves the bare directory
@@ -50,6 +56,7 @@ type Service struct {
 func (s *Service) RequireMount() { s.root.requireMount = true }
 
 func New(root *posixRoot, store VersionStore, tokens map[string]map[string]bool) *Service {
+	wireLandingFence(root, store)
 	return &Service{root: root, store: store, tokens: tokens}
 }
 
@@ -59,7 +66,26 @@ func NewAt(root string, store VersionStore, tokens map[string]map[string]bool) (
 	if err != nil {
 		return nil, err
 	}
+	wireLandingFence(r, store)
 	return &Service{root: r, store: store, tokens: tokens}, nil
+}
+
+// wireLandingFence arms the root's deposition gate: while the store's
+// writer lock is lost, every public-path landing refuses. This is a
+// convergence aid, NOT the cut's proof — a goroutine already past the
+// gate can still land its syscall, which is exactly why the cut rests on
+// observed manifest equality rather than this flag.
+func wireLandingFence(root *posixRoot, store VersionStore) {
+	d, ok := store.(interface{ Deposed() bool })
+	if !ok {
+		return
+	}
+	root.fence = func() error {
+		if d.Deposed() {
+			return ErrUnavailable
+		}
+		return nil
+	}
 }
 
 // probe returns a filesystem probe the store calls under the row lock.
@@ -94,6 +120,18 @@ func (s *Service) authorized(r *http.Request, scope string) bool {
 	return scopes["*"] || scopes[scope]
 }
 
+// authorizedWildcard is the administrative check: only a wildcard-scoped
+// credential may freeze or unfreeze a scope. A scoped storage token can
+// never fence its own scope out from under other authorized users.
+func (s *Service) authorizedWildcard(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	scopes, ok := s.tokens[strings.TrimPrefix(auth, "Bearer ")]
+	return ok && scopes["*"]
+}
+
 type errBody struct {
 	Error string `json:"error"`
 	Code  string `json:"code"`
@@ -123,8 +161,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 		return
 	}
-	// /v1/files/{scope}/{op}
+	// /v1/files/{scope}/{op} or /v1/capture/{id}[/{op}]
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "v1" && parts[1] == "capture" {
+		s.routeCapture(w, r, parts[2:])
+		return
+	}
 	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "files" {
 		writeErr(w, 404, "not_found", "unknown route")
 		return
@@ -190,9 +232,95 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRemove(w, r, scope, path, q)
 	case op == "changes" && r.Method == "GET":
 		s.handleChanges(w, r, scope, q)
+	case op == "freeze" && r.Method == "POST":
+		s.handleFreeze(w, r, scope, true)
+	case op == "unfreeze" && r.Method == "POST":
+		s.handleFreeze(w, r, scope, false)
+	case op == "cut" && r.Method == "GET":
+		s.handleCut(w, r, scope)
+	case op == "capture" && r.Method == "POST":
+		s.handleCaptureCreate(w, r, scope)
 	default:
 		writeErr(w, 404, "not_found", "unknown op or method")
 	}
+}
+
+// freezerStore is the persisted mutation-barrier surface — implemented by
+// the PG store; fakes without it answer "not supported" rather than
+// silently pretending a fence exists.
+type freezerStore interface {
+	SetScopeFrozen(ctx context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error
+}
+
+// cutStore is the observational surface the mover verifies a copy
+// against — implemented by the PG store.
+type cutStore interface {
+	CutManifest(ctx context.Context, scope string) (CutManifest, error)
+}
+
+// handleFreeze persists (POST /v1/files/{scope}/freeze) or clears
+// (/unfreeze) the scope's mutation barrier. Wildcard credentials only —
+// the barrier belongs to the store's operator, not to scope callers.
+// A frozen scope refuses new mutation admissions with ErrFrozen; reads
+// are unaffected. The epoch parameter carries the caller's lineage order
+// so a stale session's assertion loses inside the barrier transaction.
+func (s *Service) handleFreeze(w http.ResponseWriter, r *http.Request, scope string, frozen bool) {
+	if !s.authorizedWildcard(r) {
+		writeErr(w, 403, "forbidden", "freeze requires the administrative credential")
+		return
+	}
+	st, ok := s.store.(freezerStore)
+	if !ok {
+		writeErr(w, 503, "store_unavailable", "store does not support scope fencing")
+		return
+	}
+	reason := r.URL.Query().Get("reason")
+	if len(reason) > 200 {
+		writeErr(w, 400, "bad_reason", "reason too long")
+		return
+	}
+	owner := r.URL.Query().Get("owner")
+	if len(owner) > 80 {
+		writeErr(w, 400, "bad_owner", "owner too long")
+		return
+	}
+	var epoch int64
+	if e := r.URL.Query().Get("epoch"); e != "" {
+		v, err := strconv.ParseInt(e, 10, 64)
+		if err != nil || v < 0 {
+			writeErr(w, 400, "bad_epoch", "epoch must be a non-negative integer")
+			return
+		}
+		epoch = v
+	}
+	if err := st.SetScopeFrozen(r.Context(), scope, owner, epoch, reason, frozen); err != nil {
+		s.mapErr(w, err)
+		return
+	}
+	writeJSON(w, map[string]any{"scope": scope, "frozen": frozen})
+}
+
+// handleCut serves GET /v1/files/{scope}/cut — the observed-stable
+// manifest the mover verifies its copy against. The store observes the
+// tree twice across a real interval and answers only when both walks
+// agree; a still-moving tree is 503 drain_pending (retry), not a
+// silently racy manifest.
+func (s *Service) handleCut(w http.ResponseWriter, r *http.Request, scope string) {
+	if !s.authorizedWildcard(r) {
+		writeErr(w, 403, "forbidden", "cut manifest requires the administrative credential")
+		return
+	}
+	st, ok := s.store.(cutStore)
+	if !ok {
+		writeErr(w, 503, "store_unavailable", "store does not support cut manifests")
+		return
+	}
+	m, err := st.CutManifest(r.Context(), scope)
+	if err != nil {
+		s.mapErr(w, err)
+		return
+	}
+	writeJSON(w, m)
 }
 
 func parseIfVersion(h string) (IfVersion, error) {
@@ -310,7 +438,7 @@ func (s *Service) handleStat(w http.ResponseWriter, r *http.Request, scope, path
 	}
 	// A store error must not degrade to version:0/external_change:false —
 	// that would report "clean" exactly when the record cannot be checked.
-	ver, recordedFP, verr := s.store.ObservedVersion(r.Context(), scope, path)
+	ver, recordedFP, recordedSHA, verr := s.store.ObservedVersion(r.Context(), scope, path)
 	if verr != nil {
 		writeErr(w, 503, "store_unavailable",
 			"version store unavailable; safe to retry")
@@ -323,6 +451,7 @@ func (s *Service) handleStat(w http.ResponseWriter, r *http.Request, scope, path
 		"mtime_ns":        info.MtimeNS,
 		"version":         ver,
 		"fingerprint":     info.Fingerprint,
+		"content_sha":     recordedSHA,
 		"external_change": changed,
 	})
 }
@@ -378,7 +507,7 @@ func (s *Service) handleRead(w http.ResponseWriter, r *http.Request, scope, path
 	if length >= 0 && length < n {
 		n = length
 	}
-	ver, recordedFP, verr := s.store.ObservedVersion(r.Context(), scope, path)
+	ver, recordedFP, _, verr := s.store.ObservedVersion(r.Context(), scope, path)
 	if verr != nil {
 		writeErr(w, 503, "store_unavailable",
 			"version store unavailable; safe to retry")
@@ -671,6 +800,13 @@ func (s *Service) mapErr(w http.ResponseWriter, err error) {
 		// filesystem could not be observed at all, the recorded stall
 		// cause — uncertainty is reported, not smoothed over (f119).
 		writeErr(w, 503, "pending_settlement", err.Error())
+	case errors.Is(err, ErrFrozen):
+		writeErr(w, 409, "scope_frozen",
+			"this scope's mutations are fenced (working copy moved or moving); reads are unaffected")
+	case errors.Is(err, ErrDrainPending):
+		// The barrier committed but admitted effects are still landing —
+		// retryable, like any other pending settlement.
+		writeErr(w, 503, "drain_pending", err.Error())
 	case errors.Is(err, ErrUnavailable):
 		writeErr(w, 503, "unavailable", "operation timed out; safe to retry")
 	case isStoreErr(err):

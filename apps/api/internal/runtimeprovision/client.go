@@ -106,6 +106,12 @@ func (client *Client) call(ctx context.Context, path string, input, output any) 
 				return fmt.Errorf("%w: %s", ErrConflict, protocolError.Message)
 			case "workspace_unavailable":
 				return fmt.Errorf("%w: %s", ErrProcessWorkspace, protocolError.Message)
+			case "not_interactive":
+				return fmt.Errorf("%w: %s", ErrProcessNotInteractive, protocolError.Message)
+			case "resize_unsupported":
+				return fmt.Errorf("%w: %s", ErrProcessResizeUnsupported, protocolError.Message)
+			case "invalid_request", "method_not_allowed", "not_found":
+				return fmt.Errorf("%w: %s", ErrInvalidProcessRequest, protocolError.Message)
 			}
 			return fmt.Errorf("provisioner %s: %s", protocolError.Code, protocolError.Message)
 		}

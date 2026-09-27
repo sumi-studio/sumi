@@ -39,6 +39,11 @@ type BrowserServer struct {
 	// Employer and the exact enabled Human-owned direct-chat AppInstallation. A
 	// nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
+	// TerminalAuthorizer is the same composite authority bound to the
+	// participant-owned 'terminal' AppInstallation for the /terminal/*
+	// routes and attach socket. A nil TerminalAuthorizer fails those routes
+	// closed — terminal authority never falls back to the chat installation.
+	TerminalAuthorizer TerminalAuthorizer
 	// LifecycleFence orders all effect-capable operations against app and
 	// Employer lifecycle commits in this single API process. Nil fails closed.
 	LifecycleFence *directchat.LifecycleFence
@@ -48,6 +53,19 @@ type BrowserServer struct {
 	// Files, when set, backs the /files/* person routes (RegisterFileRoutes).
 	// Nil fails those routes closed.
 	Files FileBackend
+	// Terminals, when set, backs the /terminal/* person routes and the
+	// attach socket (RegisterTerminalRoutes). Nil fails them closed.
+	Terminals TerminalBackend
+	// TerminalHealth, when set, adds the runtime's read-time output
+	// health to single-session responses (`output_attached`). Nil or a
+	// 'known=false' answer omits the field — the wire never guesses.
+	TerminalHealth TerminalHealthChecker
+	// WorkingStore optionally resolves where a persona's current working
+	// file store lives ("cloud" while files remain here, "local" after a
+	// local-mode return moved them). Nil leaves the routes unmarked; a
+	// lookup failure never blocks file access — the file service's own
+	// persisted barrier stays the real fence.
+	WorkingStore func(ctx context.Context, personaID string) (string, error)
 
 	AllowedOrigins []string
 	HelloTimeout   time.Duration
@@ -89,6 +107,13 @@ func (s *BrowserServer) SetAuthorizer(authorizer DirectChatAuthorizer) {
 	if s.commandIngress != nil {
 		s.commandIngress.Authorizer = authorizer
 	}
+}
+
+// SetTerminalAuthorizer installs the 'terminal'-app authority boundary for
+// the /terminal/* routes. It is independent of the direct-chat authorizer on
+// purpose: wiring one without the other must fail closed, never borrow.
+func (s *BrowserServer) SetTerminalAuthorizer(authorizer TerminalAuthorizer) {
+	s.TerminalAuthorizer = authorizer
 }
 
 // SetLifecycleFence installs the same single-process fence for both browser
@@ -463,6 +488,76 @@ func (s *BrowserServer) authorizeBrowserOperationUnderFence(
 	scope directChatScope,
 	operation func() error,
 ) error {
+	return s.authorizeBrowserAppUnderFence(ctx, claims, func(ctx context.Context) error {
+		return s.authorizeDirectChat(ctx, claims, scope)
+	}, operation)
+}
+
+// authorizeTerminal checks Current Employer plus the exact enabled
+// participant-owned 'terminal' AppInstallation — the same composite snapshot
+// shape as direct chat, bound to the terminal app's own installation.
+func (s *BrowserServer) authorizeTerminal(
+	ctx context.Context,
+	claims UserSessionClaims,
+	scope directChatScope,
+) error {
+	if s.TerminalAuthorizer == nil {
+		return ErrDirectChatAuthorizationUnavailable
+	}
+	if err := s.TerminalAuthorizer.AuthorizeTerminal(
+		ctx,
+		claims.UserID,
+		claims.PersonalityAgentID,
+		scope.InstallationID,
+		scope.AuthorityEpoch,
+	); err != nil {
+		return fmt.Errorf("authorize browser terminal: %w", err)
+	}
+	return nil
+}
+
+// authorizeBrowserTerminalOperation is the terminal twin of
+// authorizeBrowserOperation: the same session lease, lifecycle read permit,
+// and commit-before-effect ordering, bound to the terminal installation.
+func (s *BrowserServer) authorizeBrowserTerminalOperation(
+	ctx context.Context,
+	claims UserSessionClaims,
+	scope directChatScope,
+	operation func() error,
+) error {
+	if s.LifecycleFence == nil {
+		return ErrDirectChatAuthorizationUnavailable
+	}
+	releaseLifecycle, err := s.LifecycleFence.AcquireOperation(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: acquire terminal lifecycle operation: %v", ErrDirectChatAuthorizationUnavailable, err)
+	}
+	defer releaseLifecycle()
+	return s.authorizeBrowserTerminalOperationUnderFence(ctx, claims, scope, operation)
+}
+
+func (s *BrowserServer) authorizeBrowserTerminalOperationUnderFence(
+	ctx context.Context,
+	claims UserSessionClaims,
+	scope directChatScope,
+	operation func() error,
+) error {
+	return s.authorizeBrowserAppUnderFence(ctx, claims, func(ctx context.Context) error {
+		return s.authorizeTerminal(ctx, claims, scope)
+	}, operation)
+}
+
+// authorizeBrowserAppUnderFence is the shared boundary every browser app
+// surface wraps its effects in: the verified session's AuthorizeSession
+// lease holds across the app's composite authority commit and the effect,
+// so a logout or lifecycle mutation can never interleave between them. The
+// caller holds the lifecycle read permit.
+func (s *BrowserServer) authorizeBrowserAppUnderFence(
+	ctx context.Context,
+	claims UserSessionClaims,
+	authorize func(ctx context.Context) error,
+	operation func() error,
+) error {
 	if operation == nil {
 		return errors.New("browser authorization operation is required")
 	}
@@ -470,7 +565,7 @@ func (s *BrowserServer) authorizeBrowserOperationUnderFence(
 		// The composite PostgreSQL snapshot commits before the effect. The
 		// caller's lifecycle read permit and this session lease remain held across
 		// operation, so no database lock is claimed across filesystem/socket work.
-		if err := s.authorizeDirectChat(ctx, claims, scope); err != nil {
+		if err := authorize(ctx); err != nil {
 			return err
 		}
 		return operation()

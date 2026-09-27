@@ -26,7 +26,10 @@ export function AppShell() {
     workspaceId?: string;
     messagingPath?: string;
   }>({ scopeKey });
-  const personalApp = pathname === "/direct" || pathname === "/feedback";
+  const personalApp =
+    pathname === "/direct" ||
+    pathname === "/terminal" ||
+    pathname === "/feedback";
   const workspaceId =
     routeWorkspaceId ??
     (personalApp &&
@@ -70,9 +73,11 @@ export function AppShell() {
     ? "messaging"
     : pathname === "/direct"
       ? "direct-chat"
-      : pathname === "/feedback"
-        ? "feedback"
-        : "workspace";
+      : pathname === "/terminal"
+        ? "terminal"
+        : pathname === "/feedback"
+          ? "feedback"
+          : "workspace";
 
   return (
     <div className="flex h-dvh bg-background text-foreground">

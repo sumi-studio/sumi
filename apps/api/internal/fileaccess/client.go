@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -108,14 +109,22 @@ func (e *ServiceError) Error() string {
 // closes resp.Body. headers may carry If-Version; the Authorization header
 // is always this client's internal credential, never caller input.
 func (c *Client) ProxyOp(ctx context.Context, scope, op, method string, query url.Values, headers http.Header, body io.Reader) (*http.Response, error) {
-	if !scopeRe.MatchString(scope) {
-		return nil, fmt.Errorf("fileaccess: refusing non-canonical scope")
-	}
 	if !opsAllowed[op] {
 		return nil, fmt.Errorf("fileaccess: op %q is not exposed", op)
 	}
+	return c.send(ctx, scope, op, method, query, headers, body)
+}
+
+// send is the shared request path. The base URL's path prefix is
+// preserved: the service normally mounts filesvc at an origin root, but
+// the return-file proxy mounts it under /api/secretary-files on the API —
+// a discarded prefix would send those ops to routes that do not exist.
+func (c *Client) send(ctx context.Context, scope, op, method string, query url.Values, headers http.Header, body io.Reader) (*http.Response, error) {
+	if !scopeRe.MatchString(scope) {
+		return nil, fmt.Errorf("fileaccess: refusing non-canonical scope")
+	}
 	u := *c.base
-	u.Path = "/v1/files/" + scope + "/" + op
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/files/" + scope + "/" + op
 	if query != nil {
 		u.RawQuery = query.Encode()
 	}
@@ -130,6 +139,53 @@ func (c *Client) ProxyOp(ctx context.Context, scope, op, method string, query ur
 		}
 	}
 	return c.hc.Do(req)
+}
+
+// SetScopeFrozen persists or clears the scope's mutation barrier on the
+// service. It is an administrative op, not part of the delegated-op
+// allowlist — only the service's internal credential can carry it, and a
+// scoped storage token can never freeze its own scope. owner names the
+// lineage that set the barrier (a return session id) and ownerEpoch its
+// durable generation (the session's file_epoch): a freeze older than the
+// recorded lineage is refused, an unfreeze older than the barrier's
+// lineage is a no-op, and a newer lineage legitimately releases an older
+// retained barrier. A freeze returns once admitted effects have drained
+// and the public tree observed stable — 409 drain_pending means the
+// barrier stands but the cut is not yet certified; retry.
+func (c *Client) SetScopeFrozen(ctx context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error {
+	op := "unfreeze"
+	if frozen {
+		op = "freeze"
+	}
+	q := url.Values{}
+	if reason != "" {
+		q.Set("reason", reason)
+	}
+	if owner != "" {
+		q.Set("owner", owner)
+	}
+	q.Set("epoch", strconv.FormatInt(ownerEpoch, 10))
+	resp, err := c.send(ctx, scope, op, http.MethodPost, q, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return decodeServiceError(resp)
+	}
+	return nil
+}
+
+// CutManifest fetches the scope's verified-stable cut manifest (GET
+// /v1/files/{scope}/cut): the complete public-tree inventory — every
+// path's kind, size, fingerprint, durable identity and link target —
+// observed identical across two walks. The mover's copy verification
+// brackets its copy with this call: a manifest equal before and after
+// the copy means the copied bytes are a consistent snapshot; a
+// drain_pending answer means the tree is still moving — retry, never
+// copy a racy tree.
+func (c *Client) CutManifest(ctx context.Context, scope string) (*http.Response, error) {
+	return c.send(ctx, scope, "cut", http.MethodGet, nil, nil, nil)
 }
 
 // doJSON issues an op expecting a JSON object response.

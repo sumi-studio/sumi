@@ -46,6 +46,16 @@ type DockerBackend struct {
 	operationTimeout  time.Duration
 	processLogTimeout time.Duration
 	runner            commandRunner
+	// journalRoot caches the daemon's data root so the interactive
+	// output pump can resume the container's own json-file journal at
+	// a persisted byte offset — the only output source that survives
+	// a provisioner restart without duplicate or silent-loss replay.
+	// Only a successful resolution is cached: a transient `docker
+	// info` failure retries on a bounded backoff instead of
+	// disabling journal attach for the provisioner's lifetime.
+	journalRootMu      sync.Mutex
+	journalRoot        string
+	journalRootRetryAt time.Time
 }
 
 type commandRunner interface {

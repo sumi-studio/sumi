@@ -120,6 +120,85 @@ func TestDirectChatLifecycleUsesProcessFenceAndOtherAppsDoNot(t *testing.T) {
 	})
 }
 
+// Terminal installations ride the same single-process lifecycle fence as
+// direct chat: terminal REST/WS operations hold the read side through
+// authorization and effect, so an install/disable/enable/uninstall of the
+// 'terminal' app must wait for them — and must fail closed when the store
+// was built without the fence. Unrelated apps stay unfenced.
+func TestTerminalLifecycleUsesProcessFence(t *testing.T) {
+	w := newAppWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	owner := applicationapps.ParticipantOwner(w.owner)
+
+	// A store built without the fence cannot mutate a fenced app at all —
+	// there is no silent unordered path for terminal either.
+	withoutFence := applicationapps.New(w.pool, w.workspaces)
+	if _, err := withoutFence.InstallAtOperation(ctx, owner, w.owner, applicationapps.TerminalAppID, uuid.NewString()); !errors.Is(err, directchat.ErrLifecycleFenceUnavailable) {
+		t.Fatalf("terminal install without lifecycle fence = %v", err)
+	}
+
+	fence := directchat.NewLifecycleFence()
+	store := applicationapps.New(w.pool, w.workspaces, fence)
+
+	// A held operation permit — what authorizeBrowserTerminalOperation
+	// holds through its effect — blocks the terminal install.
+	releaseOperation, err := fence.AcquireOperation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type installResult struct {
+		installation applicationapps.Installation
+		err          error
+	}
+	terminalDone := make(chan installResult, 1)
+	go func() {
+		installation, installErr := store.InstallAtOperation(ctx, owner, w.owner, applicationapps.TerminalAppID, uuid.NewString())
+		terminalDone <- installResult{installation: installation, err: installErr}
+	}()
+	select {
+	case result := <-terminalDone:
+		t.Fatalf("terminal install crossed operation fence: %v", result.err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	releaseOperation()
+	result := <-terminalDone
+	if result.err != nil {
+		t.Fatalf("terminal install after operation: %v", result.err)
+	}
+
+	assertMutationWaits := func(name string, mutate func() error) {
+		t.Helper()
+		release, acquireErr := fence.AcquireOperation(ctx)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		done := make(chan error, 1)
+		go func() { done <- mutate() }()
+		select {
+		case err := <-done:
+			release()
+			t.Fatalf("%s crossed operation fence: %v", name, err)
+		case <-time.After(30 * time.Millisecond):
+		}
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("%s after operation: %v", name, err)
+		}
+	}
+	assertMutationWaits("disable", func() error {
+		_, err := store.SetEnabledByID(ctx, result.installation.InstallationID, w.owner, false)
+		return err
+	})
+	assertMutationWaits("enable", func() error {
+		_, err := store.SetEnabledByID(ctx, result.installation.InstallationID, w.owner, true)
+		return err
+	})
+	assertMutationWaits("uninstall", func() error {
+		return store.UninstallByID(ctx, result.installation.InstallationID, w.owner)
+	})
+}
+
 func newAppWorld(t *testing.T) appWorld {
 	t.Helper()
 	pool := testdb.Create(t)

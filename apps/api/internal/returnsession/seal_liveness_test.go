@@ -59,14 +59,14 @@ func rowStatus(t *testing.T, pool *pgxpool.Pool, sessionID string) string {
 func TestSealSucceedsAtPoolOne(t *testing.T) {
 	pool, svc, human, pid := livenessSetup(t, 1)
 	ctx := context.Background()
-	created, _, err := svc.Create(ctx, returnsession.Owner{HumanID: human, PersonaID: pid})
+	created, _, err := svc.Create(ctx, returnsession.Owner{HumanID: human, PersonaID: pid}, "cloud")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if _, err := svc.BindDestination(dctx, created.View.SessionID, created.Grant,
-		returnsession.Destination{PlacementID: newID(t), PersonaID: pid, SlotState: "absent"}); err != nil {
+		returnsession.Destination{PlacementID: newID(t), PersonaID: pid, SlotState: "absent", FileMode: "cloud"}); err != nil {
 		t.Fatalf("bind on a single-connection pool: %v", err)
 	}
 	if got := authority(t, placement{pool: pool}, pid); got != "sealed" {
@@ -84,11 +84,11 @@ func TestSealSucceedsAtPoolOne(t *testing.T) {
 func TestSealSucceedsWithOneHeldConn(t *testing.T) {
 	pool, svc, human, pid := livenessSetup(t, 2)
 	ctx := context.Background()
-	created, _, err := svc.Create(ctx, returnsession.Owner{HumanID: human, PersonaID: pid})
+	created, _, err := svc.Create(ctx, returnsession.Owner{HumanID: human, PersonaID: pid}, "cloud")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	dest := returnsession.Destination{PlacementID: newID(t), PersonaID: pid, SlotState: "absent"}
+	dest := returnsession.Destination{PlacementID: newID(t), PersonaID: pid, SlotState: "absent", FileMode: "cloud"}
 
 	// One unrelated held connection — the pool has exactly one left.
 	held, err := pool.Acquire(ctx)

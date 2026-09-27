@@ -22,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
+	"github.com/sumi-studio/sumi/apps/api/internal/browsertabs"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
@@ -34,6 +36,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/jobexec"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
+	"github.com/sumi-studio/sumi/apps/api/internal/mcpconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
 	"github.com/sumi-studio/sumi/apps/api/internal/modelconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
@@ -42,6 +45,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/returnsession"
 	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
+	"github.com/sumi-studio/sumi/apps/api/internal/termexec"
 	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 	"github.com/sumi-studio/sumi/apps/api/internal/usageview"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
@@ -112,6 +116,9 @@ func run(ctx context.Context) (runErr error) {
 	app.startFeedbackAttention()
 	app.startProcessAttention()
 	app.startJobExec()
+	app.startMCP()
+	app.startBrowserTabs()
+	app.startTermExec()
 	app.startChatGPTActivation()
 	app.startRuntimeRecovery()
 	app.startWarmReconciliation()
@@ -277,6 +284,9 @@ type application struct {
 	attentionWorkers           sync.WaitGroup
 	coreWaker                  *agentstate.RuntimeWaker
 	jobExec                    *jobexec.Driver
+	mcpRunner                  *mcpconnections.Runner
+	browserTabs                *browsertabs.Store
+	termExec                   *termexec.Driver
 	transferSessions           *transfersession.Service
 	returnSessions             *returnsession.Service
 	coreDirectChat             *agentevents.CoreDirectChat
@@ -795,6 +805,37 @@ func newApplicationFromEnv() (*application, error) {
 		browser.Files = filesClient
 		browser.RegisterFileRoutes(mux)
 		log.Print("person file routes ready (/files/*, session-scoped to canonical filesvc)")
+		if databasePool != nil {
+			// The person file surface marks the retained Cloud copy after
+			// a local-mode return: the persona's working store is wherever
+			// its latest completed return moved it.
+			browser.WorkingStore = func(ctx context.Context, personaID string) (string, error) {
+				var mode *string
+				err := databasePool.QueryRow(ctx, `SELECT file_mode FROM return_sessions
+					WHERE persona_id = $1 AND status = 'completed' AND file_mode IS NOT NULL
+					ORDER BY created_at DESC LIMIT 1`, personaID).Scan(&mode)
+				if err != nil {
+					if errors.Is(err, pgx.ErrNoRows) {
+						return "cloud", nil
+					}
+					return "", err
+				}
+				if mode == nil {
+					return "cloud", nil
+				}
+				return *mode, nil
+			}
+		}
+		if secretaryReturn != nil {
+			// Return file surfaces: the grant's copy-read route (local
+			// mode), the scoped-storage proxy (cloud mode) and the seal's
+			// mutation fence all reach the same canonical service.
+			secretaryReturn.service.SetFileStore(filesClient)
+			secretaryReturn.service.SetCaptureStore(filesClient)
+			secretaryReturn.server.SetFiles(filesClient)
+			secretaryReturn.server.RegisterFileProxy(mux)
+			log.Print("secretary-return file routes ready (/api/secretary-files/* scoped-token proxy)")
+		}
 		if coreServer != nil {
 			for tool, effect := range fileaccess.FileEffects(filesClient) {
 				if err := coreServer.RegisterToolEffect(tool, effect); err != nil {
@@ -805,6 +846,16 @@ func newApplicationFromEnv() (*application, error) {
 			coreServer.SetJobFileService(fileaccess.JobFileService(filesClient))
 			log.Print("core file tools ready (file.* effects scoped to the claiming persona; job file capability armed)")
 		}
+	}
+	browserTabs, err := wireBrowserTabs(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
+	mcpRunner, err := wireMCP(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	if err != nil {
+		closeOnError()
+		return nil, err
 	}
 	// Cloud Linux jobs: subprocess-kind core_jobs run on the root
 	// provisioner's durable process service, bind-mounted to the persona's
@@ -825,6 +876,48 @@ func newApplicationFromEnv() (*application, error) {
 		if jobExec != nil {
 			log.Printf("jobexec: Cloud subprocess jobs run through the runtime provisioner (runner %s, canonical files scope)", jobExec.Runner())
 		}
+	}
+	// Interactive terminal sessions: same Cloud execution environment and
+	// canonical files scope as subprocess jobs, but long-lived with a real
+	// PTY. Opt-in via SUMI_TERMEXEC_ENABLED (or implicitly with jobexec);
+	// a partial configuration is a startup error.
+	var termExec *termexec.Driver
+	{
+		var coreStore *agentstate.Store
+		if coreServer != nil {
+			coreStore = coreServer.Store()
+		}
+		var err error
+		termExec, err = termexecFromEnv(coreStore, filesClient)
+		if err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if termExec != nil {
+			log.Printf("termexec: Cloud interactive terminal sessions run through the runtime provisioner (runner %s, canonical files scope)", termExec.Runner())
+			if secretaryReturn != nil {
+				// The return seal's writer-cut gate consumes the same
+				// provisioner ops the driver claims: a session is only
+				// proven stopped when its op reports Quiesced.
+				secretaryReturn.service.SetTerminalProcesses(termExec.Processes())
+			}
+		}
+	}
+	// Person-facing terminal routes share the core state store — the
+	// verified browser session supplies the persona, so a caller can only
+	// ever reach its own secretary's sessions. Terminal requests authorize
+	// through the participant-owned 'terminal' AppInstallation, not the
+	// direct-chat installation the browser may also carry.
+	if coreServer != nil {
+		browser.Terminals = coreServer.Store()
+		if terminalAuth, ok := directChatAuthorizer.(agentevents.TerminalAuthorizer); ok {
+			browser.TerminalAuthorizer = terminalAuth
+		}
+		if termExec != nil {
+			browser.TerminalHealth = termExec
+		}
+		browser.RegisterTerminalRoutes(mux)
+		log.Print("person terminal routes ready (/terminal/*, session-scoped to the persona)")
 	}
 	mux.HandleFunc("GET /health", handler.Health)
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
@@ -949,6 +1042,9 @@ func newApplicationFromEnv() (*application, error) {
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,
 		jobExec:                    jobExec,
+		mcpRunner:                  mcpRunner,
+		browserTabs:                browserTabs,
+		termExec:                   termExec,
 		transferSessions:           transferSessions,
 		returnSessions:             returnSessions,
 		coreDirectChat:             coreDirectChat,

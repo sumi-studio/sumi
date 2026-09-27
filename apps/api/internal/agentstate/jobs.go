@@ -700,6 +700,8 @@ func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds
 		}
 	}
 
+	// Browser jobs require the separately authenticated, exact-tab host dispatch
+	// route. Generic persona runners must never consume those commands.
 	// The claim is gated on the persona being active: submission and the
 	// transfer seal are serialized so no claimable job can exist on a
 	// non-active persona, and this predicate keeps that true even if one
@@ -710,7 +712,7 @@ func (s *Store) ClaimJobs(ctx context.Context, personaID, runnerID string, kinds
 			started_at = COALESCE(started_at, now())
 		WHERE (persona_id, job_id) IN (
 			SELECT j.persona_id, j.job_id FROM core_jobs j
-			WHERE j.persona_id = $1 AND j.status = 'queued' AND j.kind = ANY($3::text[])
+			WHERE j.persona_id = $1 AND j.status = 'queued' AND j.kind = ANY($3::text[]) AND j.kind <> 'browser'
 				AND (CASE WHEN $6::text = '*' THEN true
 				          WHEN $6::text = 'cloud' THEN j.request->>'backend' = 'cloud'
 				          ELSE COALESCE(j.request->>'backend', 'local') = 'local' END)

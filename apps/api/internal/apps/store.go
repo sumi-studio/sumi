@@ -19,6 +19,10 @@ import (
 const (
 	workspaceManageAppsPermission     = "manage_apps"
 	appInstallationOwnerAppConstraint = "app_installations_owner_kind_owner_id_app_id_key"
+	// TerminalAppID is the shared interactive terminal's catalog identity.
+	// Terminal routes authorize against the participant-owned installation
+	// under this exact app id — never a caller-supplied substitute.
+	TerminalAppID = "terminal"
 )
 
 // WorkspaceAuthorizer keeps app lifecycle dependent on Workspace's canonical
@@ -52,8 +56,22 @@ func New(
 	}
 }
 
+// acquireLifecycleMutation takes the write side of the shared single-process
+// lifecycle fence for the applications whose effect-capable operations read
+// the same fence: direct-chat sockets/commands and terminal REST/WS
+// operations. Mutating either installation (install, disable, re-enable,
+// uninstall) then excludes in-flight operations of that app, so a stale
+// authority snapshot can never commit after the mutation it predates.
+//
+// Other apps take no permit: nothing outside this process orders their
+// effects on the fence, so fencing them would only serialize unrelated
+// lifecycle work. The fence itself is a per-API-process ordering boundary —
+// the durable cross-process guarantees remain the exact installation/epoch/
+// enabled checks inside each authorization transaction.
 func (s *Store) acquireLifecycleMutation(ctx context.Context, appID string) (func(), error) {
-	if appID != directchat.AppID {
+	switch appID {
+	case directchat.AppID, TerminalAppID:
+	default:
 		return func() {}, nil
 	}
 	if s == nil || s.directChatLifecycle == nil {

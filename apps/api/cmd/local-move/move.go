@@ -34,11 +34,13 @@ var (
 	errStalled       = errors.New("the connection stopped moving data")
 
 	// beforeComplete and afterComplete are failpoints around the source
-	// Complete transaction. They do nothing unless the binary is built with
-	// the movefailpoint tag (failpoint.go), which tests use to stop the real
-	// process there.
+	// Complete transaction. midPromote fires after each journaled
+	// placement in the return file promotion. They do nothing unless the
+	// binary is built with the movefailpoint tag (failpoint.go), which
+	// tests use to stop the real process there.
 	beforeComplete = func() {}
 	afterComplete  = func() {}
+	midPromote     = func() {}
 )
 
 // answerTimeout bounds the wait for a response after a request has been
@@ -48,7 +50,7 @@ var (
 const answerTimeout = 2 * time.Minute
 
 const (
-	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried."
+	msgTransferred = "Sumi moved to Sumi Cloud. This Local copy no longer answers. Choose a model connection in Sumi Cloud before the secretary can reply; files in the Local workspace were not carried. Open terminal sessions keep running on this install and their history stays here."
 	msgAborted     = "The move was cancelled. The secretary is active on Local again."
 )
 
@@ -136,6 +138,11 @@ type mover struct {
 	unreachable time.Duration
 	sealRetries int
 	sealDelay   time.Duration
+	// wsRoot is the install's local file store root (SUMI_WORKSPACE_ROOT):
+	// the directory whose children are persona scope directories. A
+	// local-mode return copies the Cloud workspace under it; unset is a
+	// provisioning gap reported only when a copy actually needs it.
+	wsRoot string
 	// stall bounds a silent upload: how long the connection may carry no
 	// bytes at all before this attempt is given up and retried. It is not a
 	// limit on the upload's total time — a large secretary on a slow link

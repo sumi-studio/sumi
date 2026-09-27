@@ -186,7 +186,7 @@ func asView(t *testing.T, raw []byte) returnsession.View {
 // create opens a session over HTTP and returns the return URL and grant.
 func (h *harness) create() (sessionID, returnURL, grant string) {
 	h.t.Helper()
-	code, raw := h.ownerReq(http.MethodPost, "/api/secretary-return/sessions", nil)
+	code, raw := h.ownerReq(http.MethodPost, "/api/secretary-return/sessions", jsonBody(map[string]string{"file_mode": "cloud"}))
 	if code != http.StatusCreated {
 		h.t.Fatalf("create: %d %s", code, raw)
 	}
@@ -213,7 +213,7 @@ func dest(t *testing.T, p placement, personaID, slot string) returnsession.Desti
 	if err != nil {
 		t.Fatal(err)
 	}
-	return returnsession.Destination{PlacementID: own, PersonaID: personaID, SlotState: slot}
+	return returnsession.Destination{PlacementID: own, PersonaID: personaID, SlotState: slot, FileMode: "cloud"}
 }
 
 // drive is the destination-side happy path the mover performs: bind+seal,
@@ -644,7 +644,7 @@ func TestReturnCreateRefusesUnownedAndDuplicate(t *testing.T) {
 	h := setup(t, returnsession.Config{})
 	// A claim pointing at a persona the account does not own refuses.
 	other := returnsession.Owner{HumanID: h.human, PersonaID: newID(t)}
-	if _, _, err := h.sessions.Create(h.ctx, other); !errors.Is(err, returnsession.ErrNoSecretary) {
+	if _, _, err := h.sessions.Create(h.ctx, other, "cloud"); !errors.Is(err, returnsession.ErrNoSecretary) {
 		t.Fatalf("unowned persona: %v", err)
 	}
 	stranger, strangerPersona := newID(t), newID(t)
@@ -653,12 +653,12 @@ func TestReturnCreateRefusesUnownedAndDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustExec(t, h.cloud.pool, `UPDATE core_personas SET human_id = $1 WHERE persona_id = $2`, stranger, strangerPersona)
-	if _, _, err := h.sessions.Create(h.ctx, returnsession.Owner{HumanID: h.human, PersonaID: strangerPersona}); !errors.Is(err, returnsession.ErrNotOwned) {
+	if _, _, err := h.sessions.Create(h.ctx, returnsession.Owner{HumanID: h.human, PersonaID: strangerPersona}, "cloud"); !errors.Is(err, returnsession.ErrNotOwned) {
 		t.Fatalf("someone else's persona: %v", err)
 	}
 	// One open session per secretary: the second create names the first.
 	h.create()
-	created2, open, err := h.sessions.Create(h.ctx, h.owner)
+	created2, open, err := h.sessions.Create(h.ctx, h.owner, "cloud")
 	if !errors.Is(err, returnsession.ErrOpenSession) || open == "" {
 		t.Fatalf("duplicate: %v %q %+v", err, open, created2)
 	}
@@ -743,7 +743,7 @@ func TestFilePolicyUndecidedRefusesNewMove(t *testing.T) {
 	// A session minted while the policy was enabled (the fixture service —
 	// the only way a session can exist) is still refused at the seal: the
 	// destination bind is the admission boundary, not the create alone.
-	created, _, err := h.sessions.Create(h.ctx, h.owner)
+	created, _, err := h.sessions.Create(h.ctx, h.owner, "cloud")
 	if err != nil {
 		t.Fatal(err)
 	}

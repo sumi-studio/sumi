@@ -22,12 +22,20 @@ export interface SecretaryReturnSession {
   admit_until: string;
   source_placement_id: string;
   surrendered_by?: string;
+  /**
+   * The owner's explicit file-handling choice for this return: "local"
+   * carries the Cloud workspace into the Local file store; "cloud" keeps
+   * Cloud as the working store the Local install reads and writes.
+   * Absent on sessions created before the choice existed.
+   */
+  file_mode?: "local" | "cloud";
   state_only: true;
   not_included: Array<{ name: string; owner: string; reason: string }>;
   preflight?: {
     active_jobs: number;
     model_intent_kind?: string;
     pending_approvals: number;
+    pending_file_effects?: number;
     files: string;
   };
   arrival?: {
@@ -166,12 +174,19 @@ function isReturnSession(value: unknown): value is SecretaryReturnSession {
 
 /**
  * Opens a return session for this account's secretary and returns the
- * one-time return URL the Local command asks for. A 409 answer means an
- * open session already exists — its status comes back on the error so the
+ * one-time return URL the Local command asks for. fileMode is the owner's
+ * explicit choice — there is no default: "local" carries the Cloud
+ * workspace into the Local file store, "cloud" keeps Cloud as the working
+ * store the Local install reads and writes. A 409 answer means an open
+ * session already exists — its status comes back on the error so the
  * owner can continue or cancel it; the grant is never repeated.
  */
-export async function createSecretaryReturn(): Promise<SecretaryReturnCreated> {
-  const body = await postReturn("/api/secretary-return/sessions", {});
+export async function createSecretaryReturn(
+  fileMode: "local" | "cloud",
+): Promise<SecretaryReturnCreated> {
+  const body = await postReturn("/api/secretary-return/sessions", {
+    file_mode: fileMode,
+  });
   const session = body.session;
   if (
     typeof body.return_url !== "string" ||

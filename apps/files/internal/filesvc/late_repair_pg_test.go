@@ -2626,7 +2626,7 @@ func TestLateRepairUnreadableCandidateNotElected(t *testing.T) {
 	}
 	// And it carries an ordinary version row.
 	rel := strings.TrimPrefix(surfaced, dir+"/ws/")
-	if v, _, _ := s.ObservedVersion(ctx, "ws", rel); v == 0 {
+	if v, _, _, _ := s.ObservedVersion(ctx, "ws", rel); v == 0 {
 		t.Fatalf("surfaced container %q has no version row", rel)
 	}
 }

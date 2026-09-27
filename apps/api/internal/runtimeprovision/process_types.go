@@ -18,6 +18,21 @@ var ErrProcessNotFound = errors.New("process operation not found")
 var ErrProcessBusy = errors.New("process capacity exhausted")
 var ErrInvalidProcessRequest = errors.New("invalid process request")
 
+// ErrProcessNotInteractive rejects input, resize, and signal calls on an
+// operation that was not launched in interactive mode. The failure is a
+// definite contract violation, not a transient backend error.
+var ErrProcessNotInteractive = errors.New("process operation is not interactive")
+
+// ErrProcessResizeUnsupported reports a daemon or backend that cannot
+// resize the container's TTY. Callers must surface the typed failure
+// rather than pretending a resize landed.
+var ErrProcessResizeUnsupported = errors.New("process resize unsupported by backend")
+
+// ErrProcessInputUnsupported reports a backend that cannot open a
+// container input stream — e.g. a daemon reachable only over a
+// non-unix DOCKER_HOST, which cannot serve the stdin hijack.
+var ErrProcessInputUnsupported = errors.New("process input attach unsupported by backend")
+
 // ErrProcessWorkspace marks a canonical files-scope launch that cannot be
 // fulfilled: the files volume is unconfigured, unmounted, the volume UUID
 // changed, the persona scope is missing, or the binding record refuses it.
@@ -39,6 +54,10 @@ const (
 func (s ProcessState) terminal() bool {
 	return s == ProcessSucceeded || s == ProcessFailed || s == ProcessCancelled || s == ProcessIndeterminate
 }
+
+// Terminal is the exported form for drivers in other packages that
+// observe process state (the interactive session driver).
+func (s ProcessState) Terminal() bool { return s.terminal() }
 
 type ProcessStartRequest struct {
 	PersonalityAgentID    string   `json:"personality_agent_id"`
@@ -62,6 +81,18 @@ type ProcessStartRequest struct {
 	// volume UUID check, binding record). A requester cannot name a path —
 	// it can only ask for the canonical scope or the legacy default.
 	Workspace string `json:"workspace,omitempty"`
+	// Interactive keeps the container's stdin open and accepts
+	// WriteProcessInput/ResizeProcess/SignalProcess calls for the
+	// operation's lifetime. One logical interactive operation is a
+	// single long-lived container, never a sequence of one-shot execs.
+	// The same launch contract applies: server-pinned image, resolved
+	// workspace, hardened container flags — interactivity only adds a
+	// held input/output stream to an otherwise identical environment.
+	Interactive bool `json:"interactive,omitempty"`
+	// TTY allocates a pseudo-terminal for the process (merged output
+	// stream, line discipline, resizable winsize). TTY requires
+	// Interactive; a plain interactive op gets pipes on all streams.
+	TTY bool `json:"tty,omitempty"`
 }
 
 func (r ProcessStartRequest) Validate() error {
@@ -92,8 +123,24 @@ func (r ProcessStartRequest) Validate() error {
 			return fmt.Errorf("%w: cwd escapes workspace", ErrInvalidProcessRequest)
 		}
 	}
-	if r.TimeoutSeconds < 0 || r.TimeoutSeconds > 3600 {
-		return fmt.Errorf("%w: timeout must be 1..3600 or zero for default", ErrInvalidProcessRequest)
+	if r.TTY && !r.Interactive {
+		return fmt.Errorf("%w: tty requires interactive mode", ErrInvalidProcessRequest)
+	}
+	if r.Interactive && !r.TTY {
+		// Every interactive consumer in this slice is a terminal —
+		// a real PTY. A piped interactive op would interleave two
+		// output streams with no winsize and no line discipline for
+		// zero product value; refusing keeps the contract honest.
+		return fmt.Errorf("%w: interactive mode requires a tty", ErrInvalidProcessRequest)
+	}
+	maxTimeout := 3600
+	if r.Interactive {
+		// Interactive sessions are bounded too, but the bound is a
+		// day-scale lifetime limit, not the one-shot job ceiling.
+		maxTimeout = 86400
+	}
+	if r.TimeoutSeconds < 0 || r.TimeoutSeconds > maxTimeout {
+		return fmt.Errorf("%w: timeout must be 1..%d or zero for default", ErrInvalidProcessRequest, maxTimeout)
 	}
 	if err := validateProcessEnv(r.Env); err != nil {
 		return err
@@ -157,6 +204,12 @@ func (r ProcessStartRequest) canonical() ProcessStartRequest {
 	}
 	if r.TimeoutSeconds == 0 {
 		r.TimeoutSeconds = 600
+		if r.Interactive {
+			// An interactive session defaults to an 8-hour lifetime; the
+			// deadline is enforced like any other process timeout and
+			// surfaces as a visible 'timeout' end reason.
+			r.TimeoutSeconds = 28800
+		}
 	}
 	if r.Args == nil {
 		r.Args = []string{}
@@ -252,8 +305,18 @@ type ProcessOperation struct {
 	// volume UUID checks pass. FilesVolumeUUID records which volume the
 	// bind was verified against. Both stay empty for backends without a
 	// canonical scope (e.g. the fake backend in tests).
-	WorkspaceBind   string       `json:"workspace_bind,omitempty"`
-	FilesVolumeUUID string       `json:"files_volume_uuid,omitempty"`
+	WorkspaceBind   string `json:"workspace_bind,omitempty"`
+	FilesVolumeUUID string `json:"files_volume_uuid,omitempty"`
+	// Interactive/TTY echo the launch mode recorded at accept time so a
+	// replayed or recovered operation keeps its input/output contract.
+	Interactive bool `json:"interactive,omitempty"`
+	TTY         bool `json:"tty,omitempty"`
+	// StdoutBase is the absolute byte offset of the earliest retained
+	// interactive output byte. StdoutBytes is the absolute emitted
+	// total, so the retained window is [StdoutBase, StdoutBytes). A
+	// read offset below StdoutBase is an explicit gap, never silent
+	// truncation. Zero for batch operations.
+	StdoutBase      int64        `json:"stdout_base,omitempty"`
 	State           ProcessState `json:"state"`
 	EventID         string       `json:"event_id"`
 	OccurredAt      time.Time    `json:"occurred_at"`
@@ -271,6 +334,18 @@ type ProcessOperation struct {
 	// "fenced before it existed"; a replayed StartProcess returns this
 	// record instead of launching.
 	Tombstone bool `json:"tombstone,omitempty"`
+	// Quiesced is computed evidence filled at read time, never journalled:
+	// the operation is terminal AND the runtime proves no physical writer
+	// remains — nothing ever launched, or the operation container was
+	// verifiably stopped and removed. Terminal state alone does NOT imply
+	// quiescence: an indeterminate op whose container outcome was never
+	// observed stays false until the reconcile loop confirms removal.
+	Quiesced bool `json:"quiesced,omitempty"`
+	// OutputAttached is computed at read time for interactive ops: the
+	// journal pump is attached to the daemon journal and appending
+	// records. False on a live op means output is degraded — the op may
+	// still accept input, but emitted bytes are not being captured.
+	OutputAttached bool `json:"output_attached,omitempty"`
 }
 type ProcessOutput struct {
 	OperationID string `json:"operation_id"`
@@ -280,6 +355,104 @@ type ProcessOutput struct {
 	Content     string `json:"content"`
 	EOF         bool   `json:"eof"`
 	Truncated   bool   `json:"truncated"`
+	// BaseOffset is the absolute offset of the earliest retained byte
+	// for interactive streams. When Gap is true, the requested offset
+	// was below BaseOffset: bytes [Offset, BaseOffset) are gone and the
+	// returned content starts at BaseOffset. Batch operations always
+	// report BaseOffset 0 / Gap false and keep their existing
+	// Truncated semantics.
+	BaseOffset int64 `json:"base_offset,omitempty"`
+	Gap        bool  `json:"gap,omitempty"`
+	// Gaps carries journaled loss boundaries (journal rotation/vanish,
+	// uncertified resume) at absolute offsets >= the requested offset.
+	// Each event marks a position where emitted bytes may have been
+	// lost — the window size is genuinely unknown, so the event is a
+	// boundary, never an invented byte range.
+	Gaps []ProcessOutputGap `json:"gaps,omitempty"`
+}
+
+// ProcessOutputGap is one journaled output-loss boundary.
+type ProcessOutputGap struct {
+	At   int64  `json:"at"`
+	Note string `json:"note,omitempty"`
+}
+
+// ProcessInputRequest writes bytes to an interactive operation's
+// stdin. For a TTY operation the bytes go through the line
+// discipline: an EOF keypress is the byte 0x04, an interrupt is 0x03 —
+// delivery semantics are real, not simulated. EOF asks the backend to
+// close the container's input stream where the transport allows it.
+type ProcessInputRequest struct {
+	ProcessLookupRequest
+	Data []byte `json:"data"`
+	EOF  bool   `json:"eof,omitempty"`
+}
+
+func (r ProcessInputRequest) Validate() error {
+	if e := r.ProcessLookupRequest.Validate(); e != nil {
+		return e
+	}
+	if len(r.Data) > 64<<10 {
+		return fmt.Errorf("%w: input payload exceeds 64 KiB", ErrInvalidProcessRequest)
+	}
+	if len(r.Data) == 0 && !r.EOF {
+		return fmt.Errorf("%w: empty input", ErrInvalidProcessRequest)
+	}
+	return nil
+}
+
+type ProcessResizeRequest struct {
+	ProcessLookupRequest
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
+}
+
+func (r ProcessResizeRequest) Validate() error {
+	if e := r.ProcessLookupRequest.Validate(); e != nil {
+		return e
+	}
+	if r.Cols < 2 || r.Cols > 1000 || r.Rows < 2 || r.Rows > 500 {
+		return fmt.Errorf("%w: terminal size out of range", ErrInvalidProcessRequest)
+	}
+	return nil
+}
+
+// processSignalAllowlist is the complete set of signals a caller may
+// send to an interactive container's process group. SIGKILL is
+// included deliberately: it is the honest way to stop a wedged
+// session, and the resulting exit still lands as an ordinary terminal
+// outcome. There is no free-form numeric signal path.
+var processSignalAllowlist = map[string]string{
+	"INT": "SIGINT", "TERM": "SIGTERM", "HUP": "SIGHUP",
+	"QUIT": "SIGQUIT", "KILL": "SIGKILL", "TSTP": "SIGTSTP",
+	"USR1": "SIGUSR1", "USR2": "SIGUSR2",
+}
+
+type ProcessSignalRequest struct {
+	ProcessLookupRequest
+	Signal string `json:"signal"`
+}
+
+func (r ProcessSignalRequest) Validate() error {
+	if e := r.ProcessLookupRequest.Validate(); e != nil {
+		return e
+	}
+	if _, ok := processSignalAllowlist[strings.ToUpper(r.Signal)]; !ok {
+		return fmt.Errorf("%w: signal not permitted", ErrInvalidProcessRequest)
+	}
+	return nil
+}
+
+// ProcessInputReceipt is the evidence for one input write.
+// Delivered means every byte was accepted by the container's input
+// stream. Indeterminate means the stream was lost mid-write — the
+// caller must not assume delivery or non-delivery and must not
+// blindly replay, because a partial prefix may already have taken
+// effect in the terminal.
+type ProcessInputReceipt struct {
+	Delivered     bool   `json:"delivered"`
+	Indeterminate bool   `json:"indeterminate,omitempty"`
+	Detail        string `json:"detail,omitempty"`
 }
 type ProcessCompletionReceipt struct {
 	PersonalityAgentID string `json:"personality_agent_id"`

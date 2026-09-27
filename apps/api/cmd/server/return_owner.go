@@ -71,12 +71,26 @@ func secretaryReturnFromEnv(
 	if sessions == nil || pool == nil {
 		return nil, fmt.Errorf("%s requires browser-session authentication and a control-plane database", transferPublicBaseURLEnv)
 	}
-	// The file policy is deliberately undecided: the shared-file question
-	// is still the user's open choice, so Config{} leaves new-move
-	// admission refused. The public base URL makes the routes reachable —
-	// it is not the policy answer, and no env var stands in for it. When
-	// the decision lands this Config gains its real FilePolicy value.
-	service := returnsession.New(pool, returnsession.Config{})
+	// The file policy defaults to undecided: without an explicit
+	// deployment choice, Config{} keeps new-move admission refused — the
+	// public base URL is reachability, not a policy answer. The modes are
+	// implemented; enabling them is the operator's deliberate act:
+	// SUMI_RETURN_FILE_MODES=local,cloud (or a subset) selects the file
+	// modes a new session may choose. Anything else is a startup error,
+	// never a silent partial gate.
+	var cfg returnsession.Config
+	if raw := strings.TrimSpace(os.Getenv(returnFileModesEnv)); raw != "" {
+		var modes []string
+		for _, m := range strings.Split(raw, ",") {
+			m = strings.TrimSpace(m)
+			if m != string(returnsession.FileModeLocal) && m != string(returnsession.FileModeCloud) {
+				return nil, fmt.Errorf("%s: %q is not a valid file mode (local|cloud)", returnFileModesEnv, m)
+			}
+			modes = append(modes, m)
+		}
+		cfg = returnsession.Config{FilePolicy: returnsession.FilePolicySelectable, FileModes: modes}
+	}
+	service := returnsession.New(pool, cfg)
 	server, err := returnsession.NewServer(service,
 		ownerSessionProof{sessions: sessions, origins: allowedOrigins}, base)
 	if err != nil {
@@ -84,3 +98,8 @@ func secretaryReturnFromEnv(
 	}
 	return &secretaryReturnMount{service: service, server: server}, nil
 }
+
+// returnFileModesEnv selects the file modes a new return session may
+// choose ("local,cloud"). Unset keeps the undecided gate: routes stay
+// reachable for recovery, but no new move is admitted.
+const returnFileModesEnv = "SUMI_RETURN_FILE_MODES"

@@ -37,6 +37,7 @@ job.start ──► core_jobs (queued, kind=subprocess)
                  ▼  docker create --network none --read-only --user 10002 …
  ghcr.io/sumi-studio/sumi-job:<pinned-revision>
                  │  bind <mountpoint>/<scope> → /workspace
+                 │  bind /run/sumi/egress → /run/sumi/egress (opt-in, below)
                  ▼
  output → process journal → job.result (bounded), files → canonical scope
 ```
@@ -77,16 +78,85 @@ The request can never name an image, a mount, a network, or a Docker flag.
 `image` is the server-side selector `"job"` (pinned via
 `SUMI_JOB_IMAGE_TAG`); `workspace` is the selector `"files-scope"` whose
 path is resolved and verified only by the provisioner. Containers run with
-`--network none` — there is no outbound or inbound networking in the
-initial environment — plus read-only rootfs, uid 10002, `cap-drop ALL`,
-`no-new-privileges`, 1 CPU / 384 MiB / 128 pids, a 32 MiB noexec `/tmp`,
-and exactly one bind: the verified scope directory at `/workspace`.
+`--network none` — the job process has no NIC, no route, and no DNS — plus
+read-only rootfs, uid 10002, `cap-drop ALL`, `no-new-privileges`,
+1 CPU / 384 MiB / 128 pids, a 32 MiB noexec `/tmp`, the verified scope
+directory bind at `/workspace`, and — only when egress is configured — the
+egress socket directory bind described below.
+
+## Job egress (opt-in)
+
+When the provisioner runs with `SUMI_JOB_EGRESS_DIR` set, job containers
+get a confined path to the public network — enough for ordinary package
+tools (`pip install`, `curl`, `git clone` over HTTPS) while keeping
+`--network none`:
+
+```text
+job container (--network none)          deployment side
+HTTP_PROXY=http://127.0.0.1:3128
+        │  sumi-egress-bridge (image binary, loopback listener)
+        ▼  splice per connection
+/run/sumi/egress/proxy.sock  ──bind──►  sumi-egress-proxy ──► public TCP only
+        (host dir bind-mounted)         (CONNECT :443, http :80; every
+                                         request re-resolves the host and
+                                         dials only public validated IPs)
+```
+
+- The proxy (`sumi-egress-proxy`, built into the provisioner image, run as
+  the `job-egress-proxy` service) listens **only** on the unix socket — it
+  has no TCP listener, no Docker socket, and no credentials, and in the
+  reference compose it is the sole member of a dedicated `job-egress`
+  bridge network (NAT egress, no control-plane service peers). The bridge
+  itself is not an outbound firewall; destination checks remain in the proxy. For every
+  request it resolves the destination fresh, requires every resolved
+  address to satisfy `publicweb.IsPublicAddress`, and dials the validated
+  IP literals — a DNS answer that turns private between requests is denied
+  on the next request, and the dialed set is exactly the checked set.
+  `CONNECT` is accepted for port 443 only; plain `http://` forwarding for
+  port 80 only; redirects are returned to the client, never followed by
+  the proxy. Everything else answers 403.
+- The bridge (`sumi-egress-bridge`, built into the job image) is spawned
+  by the launch wrapper under `setsid` — its own session and process
+  group, still inside the job's PID namespace. Foreground-group signals
+  (an idle-prompt Ctrl-C, the terminal's `SignalProcess` path) reach the
+  shell and its jobs but never the bridge; container teardown still reaps
+  it. A job that deliberately kills it only loses its own egress.
+- `SUMI_JOB_EGRESS_DIR` is the host directory containing `proxy.sock`.
+  `api-state-init` creates it owned by the proxy uid (mode 0755); the
+  socket itself is mode 0622 — connect needs write on the socket file.
+  The provisioner only names the directory to dockerd; it never opens
+  the socket. Unset/empty `SUMI_JOB_EGRESS_DIR` keeps the launch spec
+  byte-for-byte the old no-network contract, and the same wiring covers
+  interactive terminal ops, so the shared terminal can install into the
+  workspace too.
+- A down or missing proxy degrades honestly: tools see connection refused
+  and the job otherwise runs normally; workspace files are unaffected and
+  nothing is retried automatically.
+- Request-supplied `*_PROXY`/`NO_PROXY` variables are dropped when egress
+  is configured — the backend owns the proxy environment. It injects a
+  loopback-only bypass (`NO_PROXY=localhost,127.0.0.1,::1`) so a
+  job-local dev server stays reachable by ordinary tools while every
+  other destination still goes through the proxy. Egress-enabled job ops
+  also get `PATH=/workspace/.local/bin:…` — and the job image's
+  `/etc/profile.d` snippet restores it for `bash -l` login shells — so
+  `pip --user` console scripts are runnable by name in the installing
+  session and later ones.
 
 ## Job image
 
 `deploy/job/Dockerfile` builds `ghcr.io/sumi-studio/sumi-job` —
 debian-slim with bash/coreutils/findutils/grep/sed/gawk, make, gcc,
-libc6-dev and python3, running as uid/gid 10002. Tag it with the full
+libc6-dev, python3 + pip, and curl, running as uid/gid 10002, plus the
+`sumi-egress-bridge` binary and the `/run/sumi/egress` mountpoint.
+`PIP_BREAK_SYSTEM_PACKAGES=1` is set image-wide because the container is a
+single-purpose ephemeral toolchain — there is no system Python to protect,
+and Debian's pip otherwise refuses even `--user`/`--target` installs.
+Installing into the workspace persists across environments:
+`pip install --user pkg==ver` lands in `/workspace/.local` (HOME is
+/workspace) and is importable by later jobs with no extra flags; console
+scripts land in `/workspace/.local/bin`, which egress-enabled ops put on
+PATH (including login shells via `/etc/profile.d/sumi-egress-path.sh`);
+a pinned `pip install --target` works the same way. Tag it with the full
 40-hex revision of the source that produced it; the provisioner refuses a
 tag that is not a full revision and verifies the image ID before launch.
 
@@ -129,6 +199,7 @@ The root provisioner additionally reads:
 | Variable | Purpose |
 | --- | --- |
 | `SUMI_JOB_IMAGE_TAG` | Full 40-hex image revision for `image:"job"` launches. |
+| `SUMI_JOB_EGRESS_DIR` | Host directory holding the egress proxy unix socket (`/run/sumi/egress` in the reference compose). Set → job containers get the socket mount + loopback proxy env; empty/unset → jobs keep the exact no-network contract. Requires a job image containing `sumi-egress-bridge` and the `job-egress-proxy` service (or an equivalent `sumi-egress-proxy` process) serving `<dir>/proxy.sock`. |
 | `SUMI_FILES_MOUNTPOINT` | Canonical files mount root on the provisioner host. |
 | `SUMI_FILES_VOLUME_UUID` | Expected JuiceFS volume UUID. |
 | `SUMI_FILES_CHECK` | Path to `deploy/files/sumi-files-check`. |

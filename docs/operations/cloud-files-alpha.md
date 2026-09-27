@@ -132,7 +132,8 @@ JuiceFS's own metadata dump (`--backup-meta 0`).
 
 When the metadata database is a container on the same host's Docker daemon
 (the `sumi-dev` PostgreSQL publishes no port), write the host part of
-`SUMI_FILES_META_URL` — and `FILESV_DB_URL` — as a `{docker:CONTAINER}` (or
+`SUMI_FILES_META_URL` — and `FILESV_DB_URL`, and `FILESV_CAPTURE_META_URL` when
+capture is configured — as a `{docker:CONTAINER}` (or
 `{docker:CONTAINER@NETWORK}`) token, e.g.
 `postgres://sumi_files_meta@{docker:sumi-dev-postgres-1}:5432/sumi_files_meta?sslmode=disable`.
 `sumi-files-mount`, `sumi-files-format` and the `filesvc` unit resolve the
@@ -191,6 +192,25 @@ FILESV_DB_URL="postgres://sumi_files:<password>@<host>:5432/sumi_files?sslmode=d
 FILESV_TOKENS="<token>:<scope>;<probe-token>:<scope>"
 FILESV_REQUIRE_MOUNT=1
 ```
+
+The immutable capture used by the `local` Cloud→Local return file mode is
+optional; `apps/files/cmd/filesvc/main.go` lists its variables. Its metadata
+URL names the JuiceFS metadata database and, like `FILESV_DB_URL`, is resolved
+by the unit at every start:
+
+```sh
+FILESV_CAPTURE_META_URL="postgres://sumi_files_meta:<password>@<host>:5432/sumi_files_meta?sslmode=disable"
+FILESV_CAPTURE_OBJ_KIND=s3
+FILESV_CAPTURE_S3_ENDPOINT=https://sumi-fabric-obj.<subdomain>.workers.dev
+FILESV_CAPTURE_S3_BUCKET=<bucket>
+FILESV_CAPTURE_S3_PREFIX=<volume name>/
+FILESV_CAPTURE_S3_ACCESS_KEY=<s3-access-key>
+FILESV_CAPTURE_S3_SECRET_KEY=<s3-secret-key>
+```
+
+An existing install picks up a changed unit with
+`install -m 0644 deploy/files/systemd/sumi-filesvc.service ~/.config/systemd/user/`,
+`systemctl --user daemon-reload` and a restart of `sumi-filesvc.service`.
 
 ```sh
 systemctl --user daemon-reload

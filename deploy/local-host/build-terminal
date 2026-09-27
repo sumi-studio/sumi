@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[[ $# == 1 && $1 == /* ]] || { echo 'usage: build-terminal /absolute/output/directory' >&2; exit 1; }
+[[ -x $root/apps/web/node_modules/.bin/vite ]] || { echo 'Local terminal source builds require workspace frontend dependencies; run pnpm install, or install a prebuilt Local pack.' >&2; exit 1; }
+cd "$root/apps/web"
+SUMI_LOCAL_WEB_OUT="$1" node node_modules/vite/bin/vite.js build --config vite.local-terminal.config.ts
