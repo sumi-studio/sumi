@@ -56,6 +56,10 @@ type DockerBackend struct {
 	journalRootMu      sync.Mutex
 	journalRoot        string
 	journalRootRetryAt time.Time
+	// liveOutputs holds each just-launched TTY session's pre-start output
+	// attach (operation id -> io.ReadCloser) until the process store takes
+	// it for its live tail (process_interactive_live.go).
+	liveOutputs sync.Map
 }
 
 type commandRunner interface {

@@ -65,6 +65,9 @@ type interactiveIO struct {
 	// daemon journal open and is appending records. False on a live op
 	// means output is degraded even though input may still be accepted.
 	attached atomic.Bool
+	// live serves the not-yet-journaled tail of a TTY session's output
+	// (process_interactive_live.go).
+	live liveTail
 
 	mu     sync.Mutex
 	sink   *processSink
@@ -455,6 +458,7 @@ func (s *processStore) stopInteractive(io_ *interactiveIO) {
 	if !io_.closed {
 		io_.closed = true
 		close(io_.done)
+		io_.live.off()
 		if io_.sink != nil {
 			_ = io_.sink.Close()
 			io_.sink = nil

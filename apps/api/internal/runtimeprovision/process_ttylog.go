@@ -45,6 +45,13 @@ type ttyLog struct {
 	id    string
 	base  int64 // absolute offset of first retained byte
 	total int64 // absolute emitted bytes appended
+	// gapped is set once any gap event exists: offsets past it no
+	// longer equal raw container-stream offsets.
+	gapped bool
+	// onAppend/onGap observe commits for the live tail
+	// (process_interactive_live.go); called with mu held.
+	onAppend func(at int64, p []byte)
+	onGap    func()
 }
 
 func ttyLogPath(directory, operationID string) string {
@@ -70,7 +77,13 @@ func openTTYLog(directory, operationID string) (*ttyLog, error) {
 		f.Close()
 		return nil, err
 	}
-	return &ttyLog{log: f, ev: ev, dir: directory, id: operationID, base: base, total: base + info.Size()}, nil
+	evInfo, err := ev.Stat()
+	if err != nil {
+		f.Close()
+		ev.Close()
+		return nil, err
+	}
+	return &ttyLog{log: f, ev: ev, dir: directory, id: operationID, base: base, total: base + info.Size(), gapped: evInfo.Size() > 0}, nil
 }
 
 func (t *ttyLog) append(p []byte) error {
@@ -78,6 +91,9 @@ func (t *ttyLog) append(p []byte) error {
 	defer t.mu.Unlock()
 	if _, err := t.log.Write(p); err != nil {
 		return err
+	}
+	if t.onAppend != nil {
+		t.onAppend(t.total, p)
 	}
 	t.total += int64(len(p))
 	if err := t.log.Sync(); err != nil {
@@ -96,6 +112,10 @@ func (t *ttyLog) append(p []byte) error {
 func (t *ttyLog) recordGap(note string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.gapped = true
+	if t.onGap != nil {
+		t.onGap()
+	}
 	b, err := json.Marshal(ttyEvent{Kind: "gap", At: t.total, Note: note})
 	if err != nil {
 		return err

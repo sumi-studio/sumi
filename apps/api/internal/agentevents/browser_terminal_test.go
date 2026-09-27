@@ -821,3 +821,58 @@ loop:
 		t.Fatalf("gap frame missing event_seq: %v", gaps[0])
 	}
 }
+
+// flipHealth reports output detached until attachAt, then attached.
+type flipHealth struct{ attachAt time.Time }
+
+func (f flipHealth) OutputAttached(context.Context, string, string) (bool, bool) {
+	return time.Now().After(f.attachAt), true
+}
+
+// A just-started session's output capture comes up within a second; the
+// socket must not leave the client on output_attached=false until the
+// slow authorization tick (hosted acceptance: false for ~5.6 s, shown as
+// 「出力を受信できていません」 while the prompt was already on screen).
+func TestTerminalWSRechecksDetachedOutputPromptly(t *testing.T) {
+	verifier, server, backend, _, mux := newTerminalBrowserFixture(t)
+	server.AuthorizationPollInterval = time.Hour
+	server.TerminalHealth = flipHealth{attachAt: time.Now().Add(400 * time.Millisecond)}
+	cookie := terminalCookie(t, verifier)
+	backend.add(agentstate.TerminalSession{
+		SessionID: "0198f0f4-9b72-7000-8000-00000000bb09", PersonaID: testTerminalPersonaID,
+		Status: "active", Mode: "pty", Backend: "cloud", OperationID: "op-health",
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	header := http.Header{}
+	header.Add("Cookie", cookie.String())
+	header.Add("Origin", "https://sumi.example")
+	conn, _, err := websocket.DefaultDialer.Dial(
+		strings.Replace(httpServer.URL, "http", "ws", 1)+
+			"/terminal/ws?"+testTerminalScopeQuery+"&session_id=0198f0f4-9b72-7000-8000-00000000bb09",
+		header)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	var seen []any
+	_ = conn.SetReadDeadline(time.Now().Add(2500 * time.Millisecond))
+	for {
+		var frame map[string]any
+		if err := conn.ReadJSON(&frame); err != nil {
+			t.Fatalf("no output_attached=true frame within 2.5s; session frames: %v (%v)", seen, err)
+		}
+		if frame["type"] != "session" {
+			continue
+		}
+		sess, _ := frame["session"].(map[string]any)
+		seen = append(seen, sess["output_attached"])
+		if sess["output_attached"] == true {
+			if len(seen) < 2 || seen[0] != false {
+				t.Fatalf("expected an initial detached frame then attached: %v", seen)
+			}
+			return
+		}
+	}
+}

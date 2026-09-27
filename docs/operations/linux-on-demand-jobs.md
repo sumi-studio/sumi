@@ -121,6 +121,24 @@ HTTP_PROXY=http://127.0.0.1:3128
   (an idle-prompt Ctrl-C, the terminal's `SignalProcess` path) reach the
   shell and its jobs but never the bridge; container teardown still reaps
   it. A job that deliberately kills it only loses its own egress.
+  Its own log goes to `/tmp/sumi-egress-bridge.log` inside the container,
+  not to the job's stdout/stderr — in a shared terminal that stream is the
+  person's screen. If the bridge is missing or its listener does not come
+  up within 5 s, the wrapper prints `sumi-egress: … outbound network
+  disabled` to the job's stderr.
+- Interactive terminal output reaches readers without waiting for a
+  newline. dockerd's json-file copier keeps a line without `\n` in memory,
+  so a shell prompt or keystroke echo would otherwise stay invisible until
+  the next newline. The provisioner attaches the TTY's output stream before
+  `docker start` and serves the bytes the journal has not received yet
+  past the durable end of the scrollback. The journal remains the only
+  durable source; each committed byte is checked against the live stream,
+  and any disagreement journals a loss marker, including for readers
+  already ahead of that marker. After a provisioner restart, a lost live
+  connection, a journal gap or rotation, or either stream getting more
+  than 4 MiB ahead of the other, the session falls back to the durable
+  journal. A partial line then appears once it ends; any recorded loss
+  remains explicit. Ending supervision closes the live connection too.
 - `SUMI_JOB_EGRESS_DIR` is the host directory containing `proxy.sock`.
   `api-state-init` creates it owned by the proxy uid (mode 0755); the
   socket itself is mode 0622 — connect needs write on the socket file.
