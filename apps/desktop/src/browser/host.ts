@@ -229,6 +229,9 @@ export class BrowserHostAgent {
           this.options.credential.attachment.allow_actions
         ) {
           const request = parseGoalRequest(job.request);
+          // runGoal reports its own dispatch state; an unexpected throw after
+          // this point may follow a landed action, so it is recorded as unknown.
+          dispatched = true;
           const receipt = await runGoal({
             browser: this.options.browser,
             tab: this.options.tab,
@@ -267,10 +270,7 @@ export class BrowserHostAgent {
             "Browser operation did not return successfully; inspect its recorded outcome before any new action",
         };
       }
-      // JSONB cannot store NUL, which arbitrary website text can contain.
-      this.pending = JSON.parse(JSON.stringify(this.pending), (_key, value) =>
-        typeof value === "string" ? value.replaceAll("\0", "�") : value,
-      ) as Receipt;
+      this.pending = withoutNUL(this.pending);
       await this.sendReceipt();
     } finally {
       this.busy = false;
@@ -285,7 +285,7 @@ export class BrowserHostAgent {
     try {
       const { status } = await this.post<{ status: string }>("progress", {
         job_id: jobID,
-        progress,
+        progress: withoutNUL(progress),
       });
       return status === "running" ? "continue" : "cancel";
     } catch (error) {
@@ -309,6 +309,12 @@ export class BrowserHostAgent {
     }
     this.stop();
   }
+}
+// JSONB cannot store NUL, which arbitrary website text can contain.
+function withoutNUL<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value), (_key, v) =>
+    typeof v === "string" ? v.replaceAll("\0", "�") : v,
+  ) as T;
 }
 function sameTab(a: TabRef, b: TabRef): boolean {
   return (

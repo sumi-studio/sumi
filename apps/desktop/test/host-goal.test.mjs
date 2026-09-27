@@ -30,7 +30,7 @@ const page = () => {
     observe: async () => ({
       tab,
       binding: { revision: 0, observationId: `o${++n}`, url: "http://x.test/" },
-      title: "Pager",
+      title: "Pager\0with NUL",
       text: `page ${acts.length}`,
       truncated: false,
       targets: [
@@ -115,6 +115,9 @@ test("host declares Jev and cancels a running goal before its next action", asyn
   assert.ok(calls.progress[0].progress.next.target.includes("Next"));
   const everything = JSON.stringify(calls);
   assert.ok(!everything.includes(FIXTURE_KEY));
+  // Website text with NUL is sanitized before it reaches JSONB.
+  assert.ok(!everything.includes("\\u0000"));
+  assert.equal(calls.progress[0].progress.title, "Pager\uFFFDwith NUL");
 });
 
 test("a revoked grant (403 on progress) stops the goal; receipt is still sent", async (t) => {
