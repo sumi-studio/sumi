@@ -135,7 +135,7 @@ async function childMain() {
         yield { type: "done", usage: {} };
         return;
       }
-      const label = last.replace(/^\[\w+\] /, "").slice(0, 24);
+      const label = last.replace(/^\[Received [^\]]*\]\n/, "").replace(/^\[\w+\] /, "").slice(0, 24);
       yield { type: "text", delta: `ack ${label} ${pad}` };
       yield { type: "done", usage: {} };
     }
@@ -468,7 +468,7 @@ async function main() {
     first?.messages.map((m) => m.content.slice(0, 80)),
   );
   check(
-    !first?.messages.some((m) => /^\[human\] COLOR=amber/.test(m.content)),
+    !first?.messages.some((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] COLOR=amber/.test(m.content)),
     "the applied range's raw originals stay behind the fragment",
     first?.messages.map((m) => m.content.slice(0, 60)),
   );

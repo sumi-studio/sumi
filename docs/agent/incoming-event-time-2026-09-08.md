@@ -44,3 +44,15 @@ Chat Completions、Responses、Anthropicの各送信経路は、共通の整形�
 Codexの公開実装には、featureで有効になる `current_time_reminder` があり、モデルへ現在のUTC時刻を追加する。これは受信イベントごとの受信時刻・間隔とは異なる。[公開コード](https://github.com/openai/codex/blob/main/codex-rs/core/src/session/time_reminder.rs)
 
 Claude Codeの公式 `UserPromptSubmit` フックは、提出された入力に追加コンテキストを渡せる。フックで時刻情報を構成する余地はあるが、標準で各入力に時刻や間隔を添える機能までは確認していない。ログにある時刻を、モデルも見ているとは扱わない。[公式Hooks文書](https://code.claude.com/docs/en/hooks)
+
+## Sumi Coreでの扱い（2026-09-28）
+
+Rust実行環境からSumi Coreへ移ったとき、この受信時刻と間隔はモデルへの文脈から落ちていた。ホスト版で、10日前に失敗して未回答のまま残った依頼を、モデルが直前の依頼として扱った事例がある。Coreでも同じ表示を戻した。
+
+受信時刻は `core_inputs.created_at`（永続化された受付時刻）である。前回の受信時刻は、受付順（`admission_seq`）で直前に受け付けた入力の受信時刻とする。予定の起床、ジョブの終了、端末の終了のようにSumi自身が起こす入力は、受信した外部メッセージではない。そのためこれらには受信行を付けず、間隔の基準にもしない。
+
+両方の時刻は `input_received` の journal payload（`received_at`、`previous_received_at`）に一度だけ書く。Coreの確定経路とGoの途中受付経路は同じ値を書く。再起動やモデル変更の後、また圧縮の後でも、表示は同じになる。
+
+この値を持たない過去のjournal記録は `[Recorded <journal時刻> UTC]` と表示し、間隔は作らない。
+
+失敗で終わったターン（再試行しないもの）には `turn_failed` 記録を追加する。モデルには、その入力のターンが完成した返答なしに終わったことを示す。保存を拒否された完了ターンが失敗へ格下げされた場合も、他の記録を保存できず最小の失敗コミットになった場合も同じ記録を1件だけ残す。後者では、そのターンの記録を保存できなかったことも示す。再試行する失敗には付けない。

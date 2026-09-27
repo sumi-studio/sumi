@@ -202,7 +202,7 @@ async function childMain() {
         yield { type: "done", usage: {} };
         return;
       }
-      const label = last.replace(/^\[\w+\] /, "").slice(0, 24);
+      const label = last.replace(/^\[Received [^\]]*\]\n/, "").replace(/^\[\w+\] /, "").slice(0, 24);
       yield { type: "text", delta: `ack ${label} ${pad}` };
       yield { type: "done", usage: {} };
     }
@@ -433,7 +433,7 @@ async function main() {
   await say("CORRECTION=violet: I said amber, but it is violet");
   const during = turnRequestFor("CORRECTION=violet");
   assert(
-    during?.messages.some((m) => /^\[human\] COLOR=amber/.test(m.content)),
+    during?.messages.some((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] COLOR=amber/.test(m.content)),
     "the correction turn must see the raw original while chunk 1 prepares",
     during,
   );
@@ -475,8 +475,8 @@ async function main() {
   const after = turnRequestFor("sixth: which color");
   const at = (pred) => after.messages.findIndex(pred);
   const frag = at((m) => isFragment(m, 1));
-  const m2 = at((m) => /^\[human\] second topic/.test(m.content));
-  const corr = at((m) => /^\[human\] CORRECTION=violet/.test(m.content));
+  const m2 = at((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] second topic/.test(m.content));
+  const corr = at((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] CORRECTION=violet/.test(m.content));
   assert(
     frag > 0 && frag < m2 && m2 < corr,
     "replacement renders at chunk 1's original position, before later raw records and the correction",
@@ -488,7 +488,7 @@ async function main() {
     },
   );
   assert(
-    !after.messages.some((m) => /^\[human\] COLOR=amber/.test(m.content)),
+    !after.messages.some((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] COLOR=amber/.test(m.content)),
     "applied originals no longer render raw",
   );
 
