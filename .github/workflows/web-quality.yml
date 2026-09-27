@@ -42,6 +42,9 @@ jobs:
       - name: Run Web tests
         run: corepack pnpm --filter @sumi/web test
 
+      - name: Build the shared browser host
+        run: corepack pnpm --filter @sumi/desktop build
+
       - name: Check Cloud browser types
         run: corepack pnpm --filter @sumi/browser-cloud check-types
 
