@@ -471,7 +471,7 @@ test("F10: a reload or brief disconnect keeps the person's control; staying away
   assert.equal(pb.controlReturned.reason, "viewer_absent");
   assert.equal(goalStops, 1);
   assert.equal(pb.phase, "sleeping", "then the idle grace applies as usual");
-  // Explicit 秘書に戻す stays the ordinary path and leaves no absence note.
+  // Explicit 秘書に戻す stays the ordinary path; its reason is its own.
   const pb2 = w.browser();
   await wake(pb2, true);
   assert.equal(await pb2.ensureLive(), true);
@@ -479,7 +479,7 @@ test("F10: a reload or brief disconnect keeps the person's control; staying away
   await say(third, { type: "takeover" });
   await say(third, { type: "release" });
   assert.equal(pb2.control.mode, "agent");
-  assert.equal(pb2.controlReturned, undefined);
+  assert.equal(pb2.controlReturned.reason, "person_release");
   assert.ok(third.sent.some((m) => m.type === "control" && m.mode === "agent" && m.reason === "person_release"));
   third.close();
   assert.equal(pb2.humanHoldUntil, undefined, "no hold once control is the secretary's");

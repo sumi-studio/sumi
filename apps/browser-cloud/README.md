@@ -110,9 +110,28 @@ unchanged. After it, control returns to the secretary, the next viewer is told
 so (「接続が切れたまま 2 分たったため…秘書に戻しました」), and the idle grace
 applies. A goal stopped by the takeover is never restarted. Tradeoff: during
 the hold the secretary's actions are refused (`page_changed`) even though
-nobody is watching; 「秘書に戻す」 remains the ordinary way to hand back. A
-Worker deploy during the hold drops it (control starts as the secretary's in
-the new instance).
+nobody is watching; 「秘書に戻す」 remains the ordinary way to hand back, and
+the viewer then says so (「…『秘書に戻す』で操作を秘書に戻しました」).
+
+The takeover belongs to the profile and survives a Durable Object restart or
+Worker deploy. It is written to DO storage (`control`: mode, epoch, hold
+deadline, last return reason) only at transitions — takeover, hold start, hold
+cleared by a returning viewer, return to the secretary — never per input,
+frame or poll. The person's input that takes control is sent to the page only
+after that write; the secretary is fenced in memory at once. On restart:
+
+- viewers that were connected (their close may never have run) count as
+  disconnected: the hold starts at restore, so the secretary may wait up to
+  2 minutes from whenever the object next wakes;
+- a hold in progress keeps its original deadline, and one already past is
+  returned to the secretary (`viewer_absent`) before any secretary tick;
+- if the live browser is gone and a fresh one starts, the person keeps
+  control under the same hold. Stopped goals stay stopped.
+
+If the write fails, control stays with the person, viewers get a
+`control_not_saved` notice, and the alarm loop retries every 5 s; a restart
+before it lands loses the takeover. Sleep keeps the mode (new epoch); deleting
+the browser clears it.
 
 A Jev key saved or deleted while a tab's agent is mid-tick (polling or running
 a goal) reaches that agent when the tick ends. A key Jev refuses is reported
@@ -129,7 +148,8 @@ clipboard (pasting into it works), audio, extensions. Live View is not used.
 - `pnpm test` here: input mapping, tickets, tab port, the ProfileBrowser
   lifecycle (`test/profile.test.ts`: reconnect/checkpoint continuity,
   refused and failed starts, restore failure, save backoff, Jev key rotation,
-  input tab, control hold), checkpoint budget and restore isolation, and the
+  input tab, control hold), control persistence across restarts
+  (`test/control-persistence.test.ts`), checkpoint budget and restore isolation, and the
   checkpoint page scripts in real headless Chrome
   (`test/storage-scripts.chrome.test.ts`; skipped without google-chrome).
 - `apps/api`: `go test ./internal/cloudbrowser/ ./internal/browsertabs/`.

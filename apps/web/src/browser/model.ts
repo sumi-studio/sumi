@@ -163,7 +163,13 @@ export function reduceViewer(state: ViewerState, message: ServerMessage): Viewer
               inFlight: message.inFlight as { kind: string; label?: string } | undefined,
             },
           }
-        : { ...state, control: "agent", takeover: undefined };
+        : {
+            ...state,
+            control: "agent",
+            takeover: undefined,
+            controlReturned:
+              typeof message.reason === "string" ? { reason: message.reason, at: typeof message.at === "number" ? message.at : Date.now() } : state.controlReturned,
+          };
     case "agent":
       return message.phase === "start"
         ? {
@@ -305,7 +311,11 @@ export function controlHoldText(holdMs = 120_000): string {
   return `ページを再読み込みしたり接続が一時的に切れたりしても、${minutes(holdMs)} 分間はあなたの操作のままです。それより長く離れると秘書に戻ります。`;
 }
 
-export function controlReturnedText(returned: { at: number }, holdMs = 120_000): string {
+/** Why control is the secretary's again. The takeover survives reloads,
+ * brief disconnects and server restarts; only these two end it. */
+export function controlReturnedText(returned: { reason?: string; at: number }, holdMs = 120_000): string {
+  if (returned.reason === "person_release")
+    return `${time(returned.at)} に「秘書に戻す」で操作を秘書に戻しました。止めた秘書の作業は再開していません。`;
   return `接続が切れたまま ${minutes(holdMs)} 分たったため、${time(returned.at)} に操作を秘書に戻しました。止めた秘書の作業は再開していません。`;
 }
 
@@ -316,6 +326,7 @@ export const NOTICE_TEXT: Record<string, string> = {
   tab_limit: "開けるタブの上限に達しました。",
   tab_crashed: "タブが応答しなくなりました。閉じて開き直してください。",
   checkpoint_too_large: "Cookie と開いているタブだけで保存の上限を超えたため、今回は保存できませんでした。",
+  control_not_saved: "操作の交代を保存できませんでした。再試行しています。保存できるまでは、サーバーの再起動で秘書に戻る場合があります。",
   tab_changed: "表示中のタブが切り替わったため、その操作は送りませんでした。画面を確かめてからもう一度操作してください。",
   not_live: "ブラウザがまだ準備できていません。",
   navigation_failed: "ページを開けませんでした。",

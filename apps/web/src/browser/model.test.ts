@@ -100,6 +100,17 @@ describe("review follow-ups", () => {
     s = reduceViewer(s, { type: "control", mode: "human", goalStopped: false });
     expect(s.controlReturned).toBeUndefined();
   });
+
+  it("N1: every return to the secretary carries a truthful reason; restart keeps the person's control", () => {
+    let s = reduceViewer(initialViewerState, { type: "hello", phase: "live", control: { mode: "human", holdMs: 120_000 } });
+    s = reduceViewer(s, { type: "control", mode: "agent", reason: "person_release", at: 2_000 });
+    expect(s.controlReturned).toEqual({ reason: "person_release", at: 2_000 });
+    expect(controlReturnedText(s.controlReturned as { reason: string; at: number })).toContain("「秘書に戻す」で");
+    s = reduceViewer(s, { type: "hello", phase: "live", control: { mode: "agent", holdMs: 120_000, returned: { reason: "person_release", at: 2_000 } } });
+    expect(controlReturnedText(s.controlReturned as { reason: string; at: number })).toContain("「秘書に戻す」で");
+    expect(controlReturnedText({ reason: "viewer_absent", at: 3_000 })).toContain("接続が切れたまま 2 分");
+    expect(NOTICE_TEXT.control_not_saved).toContain("保存できませんでした");
+  });
 });
 
 describe("screen input mapping", () => {

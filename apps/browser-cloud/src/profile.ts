@@ -81,6 +81,19 @@ interface Recovery {
   failedRecords?: number;
 }
 
+type Returned = { reason: "viewer_absent" | "person_release"; at: number };
+
+/** The person's control, persisted at each transition (takeover, return,
+ * hold start/clear) so that a DO restart keeps it. Never written per input,
+ * frame or poll. */
+interface SavedControl {
+  mode: "agent" | "human";
+  epoch: number;
+  /** Set while the person has control and no viewer is connected. */
+  holdUntil?: number;
+  returned?: Returned;
+}
+
 interface Viewer {
   human: string;
   authUntil: number;
@@ -134,8 +147,12 @@ export class ProfileBrowser {
   private humanAt = 0;
   /** Set while the person has control but no viewer is connected. */
   private humanHoldUntil?: number;
-  /** Control went back to the secretary because the person stayed away. */
-  private controlReturned?: { reason: "viewer_absent"; at: number };
+  /** Why control last went back to the secretary (shown to the person). */
+  private controlReturned?: Returned;
+  private controlLoaded = false;
+  private controlWrite: Promise<void> = Promise.resolve();
+  private controlUnsaved = false;
+  private controlRetryAt = 0;
   private readonly viewers = new Map<ServerSocket, Viewer>();
   private readonly nonces = new Map<string, number>();
   /** The person's screen operations apply in arrival order (a new tab before
@@ -193,6 +210,10 @@ export class ProfileBrowser {
     this.meta ??= await this.ctx.storage.get<Meta>("meta");
     if (!this.meta && profile) this.meta = { profile, incarnation: 0, slots: {} };
     if (profile && this.meta && this.meta.profile !== profile) throw new Error("profile mismatch");
+    if (this.meta && !this.controlLoaded) {
+      this.controlLoaded = true;
+      await this.restoreControl();
+    }
     return this.meta;
   }
 
@@ -481,6 +502,16 @@ export class ProfileBrowser {
     meta.ready = false;
     this.lastCheckpoint = undefined;
     await this.saveMeta();
+    this.control = { mode: "agent", epoch: this.control.epoch + 1 };
+    this.humanHoldUntil = undefined;
+    this.controlReturned = undefined;
+    this.controlUnsaved = false;
+    // After any queued write, so an older put cannot bring the takeover back.
+    this.controlWrite = this.controlWrite.then(() => this.ctx.storage.delete("control")).then(
+      () => {},
+      () => {},
+    );
+    await this.controlWrite;
     this.setPhase("sleeping", "reset");
     for (const viewer of [...this.viewers.keys()]) viewer.close(4410, "profile_reset");
   }
@@ -505,7 +536,9 @@ export class ProfileBrowser {
     meta.ready = false;
     await this.saveMeta();
     await this.state.setState(meta.profile, incarnation, "sleeping").catch(() => {});
-    this.control = { mode: "agent", epoch: this.control.epoch + 1 };
+    // Observations of the closed browser are void; who has control does not
+    // change by closing it (idle sleep never happens while the person holds it).
+    this.control = { mode: this.control.mode, epoch: this.control.epoch + 1 };
     this.setPhase("sleeping", reason);
   }
 
@@ -544,6 +577,13 @@ export class ProfileBrowser {
         }
         this.wantLive = false;
         const now = Date.now();
+        // Expire the hold before the secretary's agents run.
+        const holding = this.control.mode === "human" && !this.viewers.size && this.humanHoldUntil !== undefined;
+        if (holding && now >= (this.humanHoldUntil ?? 0)) this.release("viewer_absent");
+        if (this.controlUnsaved && now >= this.controlRetryAt) {
+          this.controlRetryAt = now + 5_000;
+          void this.saveControl();
+        }
         let working = false;
         for (const [id, entry] of this.agents) {
           if (entry.ticking) {
@@ -570,8 +610,6 @@ export class ProfileBrowser {
         }
         const savedAt = Date.parse(this.lastCheckpointAt ?? "") || this.liveSince;
         if (this.dirty && now >= this.checkpointRetryAt && now - savedAt > PERIODIC_CHECKPOINT_MS) this.scheduleCheckpoint(0);
-        const holding = this.control.mode === "human" && !this.viewers.size && this.humanHoldUntil !== undefined;
-        if (holding && now >= (this.humanHoldUntil ?? 0)) this.release("viewer_absent");
         for (const [viewer, info] of this.viewers)
           if (info.authUntil < now) viewer.close(4401, "reauth_required");
         for (const [nonce, exp] of this.nonces) if (exp < now) this.nonces.delete(nonce);
@@ -688,29 +726,85 @@ export class ProfileBrowser {
   // ---------- control ----------
 
   /** The person's input or Take over: control moves to the person before
-   * the input is dispatched. The running goal stops before its next action
-   * (an action already handed to the page completes and is recorded). */
-  private takeControl(reason: string): void {
+   * the input is dispatched (in memory at once, so the secretary's next
+   * action is refused; durably before the person's input reaches the page).
+   * The running goal stops before its next action (an action already handed
+   * to the page completes and is recorded). Repeated input writes nothing. */
+  private async takeControl(reason: string): Promise<void> {
     this.humanAt = Date.now();
-    this.controlReturned = undefined;
     if (this.control.mode === "human") return;
     this.control = { mode: "human", epoch: this.control.epoch + 1 };
+    this.controlReturned = undefined;
     let stopped = 0;
     for (const entry of this.agents.values()) if (entry.agent.stopGoal()) stopped++;
     this.broadcast({ type: "control", mode: "human", reason, goalStopped: stopped > 0, inFlight: this.inFlight });
+    await this.saveControl();
   }
 
   /** Control returns to the secretary: 「秘書に戻す」, or the person stayed
    * disconnected past HUMAN_HOLD_MS. A goal stopped by the takeover stays
    * stopped; nothing is restarted here. */
-  private release(reason: "person_release" | "viewer_absent" = "person_release"): void {
+  private release(reason: Returned["reason"] = "person_release"): void {
+    const held = this.humanHoldUntil !== undefined;
     this.humanHoldUntil = undefined;
-    if (this.control.mode === "agent") return;
+    if (this.control.mode === "agent") {
+      if (held) void this.saveControl();
+      return;
+    }
     this.control = { mode: "agent", epoch: this.control.epoch + 1 };
-    this.controlReturned = reason === "viewer_absent" ? { reason, at: Date.now() } : undefined;
-    this.broadcast({ type: "control", mode: "agent", reason });
+    this.controlReturned = { reason, at: Date.now() };
+    this.broadcast({ type: "control", mode: "agent", reason, at: this.controlReturned.at });
+    void this.saveControl();
     this.dirty = true;
     this.scheduleCheckpoint(500);
+  }
+
+  /** Writes are serialized in transition order. A failed write keeps the
+   * in-memory state (control stays where the person put it), tells the
+   * viewers, and is retried by the loop every 5 s until it lands. */
+  private saveControl(): Promise<void> {
+    const record: SavedControl = {
+      mode: this.control.mode,
+      epoch: this.control.epoch,
+      holdUntil: this.humanHoldUntil,
+      returned: this.controlReturned,
+    };
+    this.controlWrite = this.controlWrite
+      .then(() => this.ctx.storage.put("control", record))
+      .then(
+        () => {
+          this.controlUnsaved = false;
+        },
+        (error: unknown) => {
+          if (!this.controlUnsaved) this.broadcast({ type: "notice", code: "control_not_saved" });
+          this.controlUnsaved = true;
+          console.error("cloud browser control not saved", error instanceof Error ? error.message.slice(0, 120) : "");
+        },
+      );
+    return this.controlWrite;
+  }
+
+  /** A new instance (deploy, DO restart) takes over the saved control. The
+   * person's sockets closed with the old instance, so a held control with no
+   * hold running starts its hold now; an expired hold returns control to the
+   * secretary with its reason. This applies to the same live browser and to
+   * a fresh one alike: the takeover belongs to the profile, not to a
+   * browser session. Goals the takeover stopped stay stopped. */
+  private async restoreControl(): Promise<void> {
+    const saved = await this.ctx.storage.get<SavedControl>("control").catch(() => undefined);
+    if (!saved) return;
+    this.control = { mode: saved.mode === "human" ? "human" : "agent", epoch: Number(saved.epoch) || 0 };
+    this.controlReturned = saved.returned;
+    if (this.control.mode !== "human") return;
+    this.humanAt = Date.now();
+    const now = Date.now();
+    if (saved.holdUntil !== undefined && saved.holdUntil <= now) {
+      this.humanHoldUntil = saved.holdUntil;
+      this.release("viewer_absent");
+      return;
+    }
+    this.humanHoldUntil = saved.holdUntil ?? now + HUMAN_HOLD_MS;
+    if (saved.holdUntil === undefined) await this.saveControl();
   }
 
   private inFlight?: { kind: string; label?: string };
@@ -750,7 +844,11 @@ export class ProfileBrowser {
     const server = pair[1];
     server.accept();
     this.viewers.set(server, { human: claims.h, authUntil: Date.now() + VIEWER_SESSION_MS });
-    this.humanHoldUntil = undefined;
+    if (this.humanHoldUntil !== undefined) {
+      // The person is back within the hold: control stays theirs.
+      this.humanHoldUntil = undefined;
+      await this.saveControl();
+    }
     this.viewerPersona.set(server, claims.p);
     server.addEventListener("message", (event) => {
       const fail = (error: { code?: string } | undefined) => this.send(server, { type: "error", code: error?.code ?? "failed" });
@@ -772,6 +870,7 @@ export class ProfileBrowser {
         // Save what the person did either way.
         if (this.control.mode === "human") {
           this.humanHoldUntil = Date.now() + HUMAN_HOLD_MS;
+          void this.saveControl();
           this.dirty = true;
           this.scheduleCheckpoint(500);
         }
@@ -876,7 +975,7 @@ export class ProfileBrowser {
         await this.kick();
         return;
       case "takeover":
-        this.takeControl("person_takeover");
+        await this.takeControl("person_takeover");
         return;
       case "release":
         this.release();
@@ -901,14 +1000,14 @@ export class ProfileBrowser {
           if (takesControl(input)) this.send(viewer, { type: "notice", code: "tab_changed", tab: remote.active });
           return;
         }
-        if (takesControl(input)) this.takeControl("person_input");
+        if (takesControl(input)) await this.takeControl("person_input");
         else if (this.control.mode !== "human") return;
         this.dirty = true;
         for (const command of commands) await remote.input(command.method, command.params);
         return;
       }
       case "tab": {
-        this.takeControl("person_tab");
+        await this.takeControl("person_tab");
         const op = String(message.op);
         const id = typeof message.id === "string" ? message.id : remote.active;
         if (op === "new") {
@@ -928,7 +1027,7 @@ export class ProfileBrowser {
         if (!this.dialog) return;
         const { tab } = this.dialog;
         this.dialog = undefined;
-        this.takeControl("person_dialog");
+        await this.takeControl("person_dialog");
         await remote.answerDialog(tab, message.accept === true, typeof message.text === "string" ? message.text.slice(0, 2000) : undefined);
         this.broadcast({ type: "dialog", closed: true });
         return;
