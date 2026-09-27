@@ -291,7 +291,7 @@ export async function startCloudBrowserStack(build: WorkspaceBrowserBuild, optio
         envFile,
         "--show-interactive-dev-session=false",
         "--log-level",
-        "warn",
+        "log",
       ];
     }
 

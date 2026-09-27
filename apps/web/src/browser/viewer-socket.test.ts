@@ -8,10 +8,12 @@ class FakeSocket {
   onopen: (() => void) | null = null;
   onmessage: ((e: { data: unknown }) => void) | null = null;
   onclose: ((e: { code: number }) => void) | null = null;
-  constructor(
-    readonly url: string,
-    readonly protocols: string[],
-  ) {}
+  readonly url: string;
+  readonly protocols: string[];
+  constructor(url: string, protocols: string[]) {
+    this.url = url;
+    this.protocols = protocols;
+  }
   send(data: string) {
     this.sent.push(data);
   }

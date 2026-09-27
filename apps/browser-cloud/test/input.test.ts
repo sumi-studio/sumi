@@ -13,7 +13,7 @@ test("pointer input maps to CDP inside the shared viewport only", () => {
   assert.equal(toCdp({ kind: "mouse", event: "down", x: Number.NaN, y: 10 }), null);
   assert.equal(toCdp({ kind: "mouse", event: "drag", x: 1, y: 1 }), null);
   const move = toCdp({ kind: "mouse", event: "move", x: 1, y: 1 });
-  assert.equal((move?.[0]?.params as { button: string }).button, "none");
+  assert.equal((move?.[0]?.params as { button: string } | undefined)?.button, "none");
   assert.deepEqual(toCdp({ kind: "wheel", x: 10, y: 10, dx: 0, dy: 240 })?.[0]?.params, {
     type: "mouseWheel", x: 10, y: 10, deltaX: 0, deltaY: 240, modifiers: 0,
   });

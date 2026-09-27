@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { type Browser, type BrowserContext, expect, type Page, test } from "@playwright/test";
 import { FIXTURE_KEY, fillDefaults, choice, startJevFixture } from "../../desktop/test/jev-fixture.mjs";
-import { CloudBrowserStack, PORTS, startCloudBrowserStack } from "./support/cloud-browser-stack";
+import { type CloudBrowserStack, PORTS, startCloudBrowserStack } from "./support/cloud-browser-stack";
 import { buildWorkspaceBrowserStack, removeWorkspaceBrowserBuild, type WorkspaceBrowserBuild } from "./support/real-agent-stack";
 
 /**
@@ -107,6 +107,7 @@ async function act(attachment: string, binding: Json, action: Json, guard = fals
     { attachment_id: attachment, binding, action, ...(guard ? { guard: true } : {}) },
     true,
   );
+  if (!result.job) throw new Error(`act was not queued: ${JSON.stringify(result).slice(0, 400)}`);
   return result.job;
 }
 
@@ -224,7 +225,6 @@ test("the person browses, signs in manually on the shared screen and shares the 
   await shot("03-person-signed-in");
 });
 
-let dashboardBinding: Json = {};
 
 test("direct path without Jev: the secretary acts on the tab the person sees (same viewport)", async () => {
   await handBack();
@@ -250,7 +250,6 @@ test("direct path without Jev: the secretary acts on the tab the person sees (sa
   // Same contract as Local: the page operation clicks the element (DOM click).
   expect(after.value.text).toMatch(/last target:\s*count \((?:trusted|synthetic)\)/);
   receipt("frame-vs-agent", { viewport: { w: 1280, h: 800 }, displayed: { w: box.width, h: box.height }, target: count, act: job.status });
-  dashboardBinding = after.value.binding;
   await shot("05-after-secretary-click");
 });
 
@@ -453,6 +452,8 @@ test("revocation withdraws the tab from the secretary at once", async () => {
   await expect(page.getByRole("button", { name: "共有中" })).toBeVisible({ timeout: 15_000 });
   await page.keyboard.press("Escape");
   const again = await sharedTab(/./, (t) => t.available && t.tab.tabId === appTab && t.attachment_id !== appAttachment);
+  // The read-only choice made for the docs tab did not carry over.
+  expect(again.allow_actions).toBe(true);
   appAttachment = again.attachment_id;
 });
 
@@ -500,6 +501,10 @@ test("an effect whose outcome is unknown after a browser loss is reported, never
 });
 
 test("close and recreate: cookies, two origins, IndexedDB and tabs return; stale tickets and observations are refused", async () => {
+  // The lost browser came back at its last checkpoint; go to the dashboard.
+  await addressBar(`${APP}/`);
+  await activeTabTitle(/dashboard/);
+  await handBack();
   const before = await observe(appAttachment);
   // A ticket used once cannot open a second viewer.
   const reuse = await page.evaluate(async () => {

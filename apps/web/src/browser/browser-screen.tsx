@@ -138,6 +138,9 @@ export const BrowserScreen = forwardRef<
 
   return (
     <div
+      // The remote screen is one interactive surface (pointer, keys, drops).
+      role="application"
+      aria-label="共有ブラウザ"
       className="relative"
       // Fit inside the parent's box (a size container) at the remote
       // viewport's aspect ratio, never above its native size.
@@ -171,7 +174,7 @@ export const BrowserScreen = forwardRef<
           画面を待っています…
         </div>
       )}
-      {agent && agent.bounds && agent.tab === activeTab ? (
+      {agent?.bounds && agent.tab === activeTab ? (
         <div
           aria-hidden
           className="pointer-events-none absolute rounded-sm border-2 border-sky-500 bg-sky-500/10"

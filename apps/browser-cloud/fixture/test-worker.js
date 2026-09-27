@@ -55,7 +55,7 @@ export class FixtureState extends DurableObject {
   }
 }
 
-const escape = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+const escapeHTML = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const cookie = (req, name) =>
   (req.headers.get("cookie") || "")
     .split(/;\s*/)
@@ -86,7 +86,7 @@ function appPage(name) {
   return html(
     "Fixture app – dashboard",
     `<h1>Fixture app</h1>
-<div class="box"><p id="auth">Signed in as <b id="user">${escape(name)}</b></p>
+<div class="box"><p id="auth">Signed in as <b id="user">${escapeHTML(name)}</b></p>
 <a id="memo-link" href="/memo">Memo</a> · <a id="pager-link" href="/pager?p=1">Pager</a> · <a id="new-order-link" href="/order">New order</a> ·
 <form method="post" action="/logout" style="display:inline"><button id="signout">Sign out</button></form></div>
 <div class="box"><h2>Saved preferences</h2>
@@ -125,7 +125,7 @@ function memoPage(last) {
   return html(
     "Fixture app – memo",
     `<h1>Memo</h1>
-<div class="box"><p>Saved memo: <span class="tag" id="saved">${last ? escape(last) : "(none)"}</span></p>
+<div class="box"><p>Saved memo: <span class="tag" id="saved">${last ? escapeHTML(last) : "(none)"}</span></p>
 <form method="post" action="/memo"><label for="memo">Memo</label><br>
 <textarea id="memo" name="memo" rows="3" cols="40"></textarea><br>
 <button id="save-memo" type="submit">Save memo</button></form>
@@ -227,10 +227,16 @@ export default {
     if (env.LOCAL_POOL && /\.sumi-fixture\.test$/.test(url.hostname)) return env.FIXTURE.fetch(request);
     // Test harness only, bearer-protected: the fixture site's server-side
     // record (orders, memos) to check effects without driving the browser.
-    if (url.pathname === "/__fixture/report") {
+    if (url.pathname === "/__fixture/report" || url.pathname === "/__fixture/limits") {
       const token = env.SUMI_BROWSER_CLOUD_TOKEN ?? "";
       if (!token || request.headers.get("authorization") !== `Bearer ${token}`)
         return new Response("unauthorized", { status: 401 });
+      // Browser Run quota and session history; reading them uses no browser time.
+      if (url.pathname === "/__fixture/limits") {
+        if (env.LOCAL_POOL) return Response.json({ local: true });
+        const safe = (run) => run().catch((error) => ({ error: String(error?.message ?? error).slice(0, 200) }));
+        return Response.json({ limits: await safe(() => env.BROWSER.limits()), history: await safe(() => env.BROWSER.history()) });
+      }
       const state = env.FIXTURE_STATE.get(env.FIXTURE_STATE.idFromName("site"));
       return Response.json(await state.report());
     }

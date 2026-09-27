@@ -356,7 +356,7 @@ export class ProfileBrowser {
       }
     }
     const agent = new BrowserHostAgent({
-      apiOrigin: new URL(this.env.SUMI_STATE_URL).origin + "/",
+      apiOrigin: `${new URL(this.env.SUMI_STATE_URL).origin}/`,
       credential,
       browser: this.port,
       tab: credential.attachment.tab as TabRef,

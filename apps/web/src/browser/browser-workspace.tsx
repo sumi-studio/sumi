@@ -175,6 +175,10 @@ function BrowserSession({
   const [recoveryDismissed, setRecoveryDismissed] = useState<number>();
   const screen = useRef<BrowserScreenHandle>(null);
   const socket = useRef<ViewerSocket | null>(null);
+  // The viewer lives exactly as long as the profile; it calls the latest
+  // overview refresh without reconnecting when that callback changes.
+  const refreshOverview = useRef(onChanged);
+  refreshOverview.current = onChanged;
 
   useEffect(() => {
     const viewer = new ViewerSocket({
@@ -185,7 +189,7 @@ function BrowserSession({
       onStatus: (status, reason) => {
         setSocketStatus(status);
         if (reason) setClosedReason(reason);
-        if (reason) onChanged();
+        if (reason) refreshOverview.current();
       },
     });
     socket.current = viewer;
@@ -205,8 +209,6 @@ function BrowserSession({
       viewer.stop();
       socket.current = null;
     };
-    // onChanged only refreshes the overview.
-    // biome-ignore lint/correctness/useExhaustiveDependencies: the viewer lives exactly as long as the profile.
   }, [api, profile.profileId]);
 
   const send = useCallback((message: Record<string, unknown>) => {
@@ -489,6 +491,7 @@ function ShareButton({
   disabled: boolean;
   onChanged(): void;
 }) {
+  const [open, setOpen] = useState(false);
   const [allowActions, setAllowActions] = useState(true);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -497,6 +500,7 @@ function ShareButton({
     setFailed(false);
     try {
       await effect();
+      setOpen(false);
       onChanged();
     } catch {
       setFailed(true);
@@ -505,7 +509,18 @@ function ShareButton({
     }
   };
   return (
-    <Popover>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        // Each share starts from the default; a choice made for one tab does
+        // not carry over to the next.
+        if (next) {
+          setAllowActions(true);
+          setFailed(false);
+        }
+        setOpen(next);
+      }}
+    >
       <PopoverTrigger
         render={
           <Button size="sm" variant={grant ? "secondary" : "outline"} className="h-8 shrink-0 gap-1.5" disabled={disabled || !tab} />

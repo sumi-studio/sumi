@@ -89,6 +89,9 @@ export class RemoteBrowser {
   lastFrame?: Frame;
   /** Slot ids to assign to pages opened during restoration, in order. */
   private pendingSlots: string[] = [];
+  /** targetId -> slot id kept by a reconnecting host; discovery events for
+   * existing pages arrive before init's own loop and must reuse them too. */
+  private known: Record<string, string> = {};
   private restoring = false;
 
   private readonly cdp: Cdp;
@@ -123,6 +126,7 @@ export class RemoteBrowser {
   /** Attach every open page. `known` maps targetIds to slot ids that a
    * reconnecting host kept (a fresh browser has none). */
   async init(known: Record<string, string> = {}): Promise<void> {
+    this.known = known;
     await this.cdp.send("Browser.setDownloadBehavior", {
       behavior: "deny",
       eventsEnabled: true,
@@ -197,7 +201,7 @@ export class RemoteBrowser {
       this.hooks.onNotice("tab_limit", { limit: LIMITS.tabs });
       return undefined;
     }
-    const id = slotId ?? this.pendingSlots.shift() ?? this.newId();
+    const id = slotId ?? this.known[targetId] ?? this.pendingSlots.shift() ?? this.newId();
     // Reserve before any await so concurrent targetCreated events agree.
     this.byTarget.set(targetId, id);
     const { sessionId } = await this.cdp.send<{ sessionId: string }>(

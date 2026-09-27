@@ -59,7 +59,7 @@ describe("Cloud browser API client", () => {
     expect(ticket.ticket).toBe("sbt1.a.b");
     const post = calls.find((c) => c.url.endsWith("/viewer-ticket"));
     expect(post?.init.method).toBe("POST");
-    expect((post?.init.headers as Record<string, string>)["X-CSRF-Token"]).toBe(CSRF);
+    expect((post?.init.headers as Record<string, string> | undefined)?.["X-CSRF-Token"]).toBe(CSRF);
     await expect(api.grant("b1", "t1", "Fixture", true)).rejects.toMatchObject({ code: "not_authorized" });
   });
 
