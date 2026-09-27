@@ -149,7 +149,7 @@ export class ProfileBrowser {
   private humanHoldUntil?: number;
   /** Why control last went back to the secretary (shown to the person). */
   private controlReturned?: Returned;
-  private controlLoaded = false;
+  private controlLoaded?: Promise<void>;
   private controlWrite: Promise<void> = Promise.resolve();
   private controlUnsaved = false;
   private controlRetryAt = 0;
@@ -210,9 +210,10 @@ export class ProfileBrowser {
     this.meta ??= await this.ctx.storage.get<Meta>("meta");
     if (!this.meta && profile) this.meta = { profile, incarnation: 0, slots: {} };
     if (profile && this.meta && this.meta.profile !== profile) throw new Error("profile mismatch");
-    if (this.meta && !this.controlLoaded) {
-      this.controlLoaded = true;
-      await this.restoreControl();
+    // Every caller waits for the restored control, not only the first.
+    if (this.meta) {
+      this.controlLoaded ??= this.restoreControl();
+      await this.controlLoaded;
     }
     return this.meta;
   }

@@ -363,3 +363,15 @@ test("N1: deleting the browser clears the takeover, even with a control write st
   await later.loadMeta();
   assert.equal(later.control.mode, "agent");
 });
+
+test("N1: concurrent first requests to a new instance all see the restored control", async () => {
+  const remote = fakeRemote();
+  const w = world(LIVE_META);
+  await takenOver(w, remote);
+  const after = w.browser();
+  // e.g. /wake, the alarm and a viewer arriving together after a deploy.
+  const first = after.loadMeta();
+  const second = after.loadMeta().then(() => after.control.mode);
+  await first;
+  assert.equal(await second, "human");
+});

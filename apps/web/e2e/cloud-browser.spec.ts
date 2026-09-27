@@ -67,6 +67,9 @@ async function addressBar(url: string) {
   await bar.click();
   await bar.fill(url);
   await bar.press("Enter");
+  // Typing an address is the person's operation; the title alone may already
+  // match (a restored tab), so wait for the control change it makes.
+  await expect(controlPill()).toContainText("あなたが操作中");
 }
 
 async function activeTabTitle(pattern: RegExp) {
