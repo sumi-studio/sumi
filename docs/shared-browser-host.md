@@ -418,3 +418,12 @@ not add a separate approval for each private destination. This is distinct from
 the API's server-side public-web/MCP proxy, which restricts private-network egress.
 Chromium origin and session isolation still apply. Non-web privileged protocols
 remain blocked, and malformed request URLs are cancelled with a completed callback.
+
+## Cloud shared browser
+
+Web Sumi can also host the shared tab in Cloudflare Browser Run: the person
+opens 「秘書のブラウザ」 (`/browser`), sees and drives the remote tab, and
+shares it with the same grant flow. The secretary uses the same
+`browser.observe` / `browser.act` / `browser.goal` tools; the Cloud host runs
+this document's `BrowserHostAgent` and goal code unchanged. Setup, limits,
+saved data and tests: [`apps/browser-cloud/README.md`](../apps/browser-cloud/README.md).

@@ -96,9 +96,18 @@ async function sharedTab(name: RegExp, want: (t: Json) => boolean = (t) => t.ava
 }
 
 async function observe(attachment: string): Promise<{ job: Json; value: Json }> {
-  const result = await stack.secretary!.call<Json>("browser.observe", { attachment_id: attachment }, true);
-  if (result.job?.status !== "done") throw new Error(`observe did not complete: ${result.job?.status} ${JSON.stringify(result.job?.result ?? result).slice(0, 800)}`);
-  return { job: result.job, value: result.job.result.value };
+  for (let attempt = 0; ; attempt++) {
+    const result = await stack.secretary!.call<Json>("browser.observe", { attachment_id: attachment }, true);
+    if (result.job?.status === "done") return { job: result.job, value: result.job.result.value };
+    // A page still navigating refuses observation; the secretary observes again.
+    const code = result.job?.result?.code;
+    if (attempt < 5 && (code === "stale_observation" || code === "tab_navigating")) {
+      stack.note(`[journey] observe retried after ${code}\n`);
+      await page.waitForTimeout(500);
+      continue;
+    }
+    throw new Error(`observe did not complete: ${result.job?.status} ${JSON.stringify(result.job?.result ?? result).slice(0, 800)}`);
+  }
 }
 
 async function act(attachment: string, binding: Json, action: Json, guard = false): Promise<Json> {
@@ -321,6 +330,8 @@ test("second origin, storage and scroll on a new tab (keyboard and wheel)", asyn
 
   await page.getByRole("button", { name: "新しいタブ" }).click();
   await expect(page.getByRole("tab")).toHaveCount(2, { timeout: 15_000 });
+  // Type the address once the new tab is the one shown, as a person would.
+  await expect(page.getByRole("tab", { selected: true })).toContainText(/about:blank|新しいタブ/, { timeout: 15_000 });
   await addressBar(`${DOCS}/`);
   await activeTabTitle(/Fixture docs/);
   // Share read-only so the secretary can find the button for the person.
