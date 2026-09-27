@@ -38,7 +38,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "browser.tabs",
     description:
-      "List the real browser tabs your person has granted you access to. Names, exact tab identities, availability, action permission, and operation_layers are returned. operation_layers.direct means you can use browser.observe/browser.act yourself; operation_layers.jev is available when that tab's host can run browser.goal through Jev, otherwise not_configured. Use an available attachment_id; never guess one. These are the same tabs visible on the attached host.",
+      "List the real browser tabs your person has granted you access to. Names, exact tab identities, availability, action permission, and operation_layers are returned. operation_layers.direct means you can use browser.observe/browser.act yourself; operation_layers.jev is available when that tab's host currently declares a usable Jev configuration, not_configured when it does not, and host_offline when the host is not connected. Use an available attachment_id; never guess one. These are the same tabs visible on the attached host.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -59,7 +59,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "browser.act",
     description:
-      "Act on the same visible tab with the standing action permission your person granted. Pass the exact binding and target from browser.observe, and an action: click {target}, fill {target,text}, scroll {x,y}, or navigate {url}. Returns a durable job. Read job.status for dispatch outcome, then observe the page to verify its effect. A lost/unknown result may already have changed the page: never blindly repeat the action. Revocation stops future dispatch; a previously admitted action may still complete.",
+      "Act on the same visible tab with the standing action permission your person granted. Pass the exact binding and target from browser.observe, and an action: click {target}, fill {target,text}, select {target,value} (a native dropdown option value listed in that target's options), scroll {x,y}, or navigate {url}. Returns a durable job. Read job.status for dispatch outcome, then observe the page to verify its effect. A lost/unknown result may already have changed the page: never blindly repeat the action. Revocation stops future dispatch; a previously admitted action may still complete.",
     parameters: {
       type: "object",
       properties: {
@@ -79,10 +79,11 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
           properties: {
             kind: {
               type: "string",
-              enum: ["click", "fill", "scroll", "navigate"],
+              enum: ["click", "fill", "select", "scroll", "navigate"],
             },
             target: { type: "string" },
             text: { type: "string" },
+            value: { type: "string" },
             x: { type: "number" },
             y: { type: "number" },
             url: { type: "string" },
@@ -101,7 +102,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "browser.goal",
     description:
-      "Delegate a browser goal on the same visible tab to the Jev operation layer (requires the action grant and operation_layers.jev available). You supply the purpose and any values it needs; Jev decides the individual clicks, fills from your inputs, scrolls, and URL opens, observing the page before each step. Jev chooses among typed options and never writes text or URLs: every typed value and navigation target must be one of your inputs (URLs as http(s) input values). Values named in private_inputs are typed but never sent to Jev. Returns a durable job; while it runs, job.status shows result.progress, and job.cancel stops it before its next action (an action already dispatched is not undone). The result reports goal_outcome (jev_reported_done, blocked, uncertain, step_limit, no_progress, page_changed_repeatedly, cancelled, or an error code such as jev_auth_failed/jev_rate_limited/jev_overloaded), the executed steps, and Jev usage. The page is shared with your person: when their input or the page's controls change after an observation, that step is refused and re-decided. jev_reported_done is Jev's judgment, not proof — observe the page to verify. If Jev is unavailable or stops, continue with browser.observe/browser.act directly; no other model is substituted. Supports ordinary links, buttons, checkboxes/radios and text fields in the top-level page; not frames, shadow DOM, select menus, uploads, or custom widgets.",
+      "Delegate a browser goal on the same visible tab to the Jev operation layer (requires the action grant and operation_layers.jev available). You supply the purpose and any values it needs; Jev decides the individual clicks, fills from your inputs, dropdown options, scrolls, and URL opens, observing the page before each step. Jev chooses among typed options and never writes text or URLs: every typed value and navigation target must be one of your inputs (URLs as http(s) input values). Values named in private_inputs are typed but never sent to Jev or stored in progress/results; where the page echoes them (text, title, URL, control values or labels) they appear as [private:name]. Returns a durable job; while it runs, job.status shows result.progress, and job.cancel stops it before its next action (an action already dispatched is not undone). The person sees the running goal in the tab's window and can press Stop there (goal_outcome stopped_by_person). The result reports goal_outcome (jev_reported_done, blocked, uncertain, step_limit, time_limit, no_progress, page_changed_repeatedly, cancelled, stopped_by_person, or an error code such as jev_auth_failed/jev_rate_limited/jev_overloaded/jev_too_slow), the executed steps, and Jev usage. The page is shared with your person: when their input, the page's controls, or the acted-on form's text change after an observation, or a decision arrives too late, that step is refused and re-decided. jev_claimed_complete means Jev chose DONE and judged the page complete; it is not verification (verified is always false) — observe the page to confirm. uncertain is not completion. If Jev is unavailable or stops, continue with browser.observe/browser.act directly; no other model is substituted. Supports ordinary links, buttons, checkboxes/radios, text fields and native dropdowns in the top-level page; not frames, shadow DOM, uploads, or custom widgets.",
     parameters: {
       type: "object",
       properties: {

@@ -16,6 +16,7 @@ export function pageOperation(request: {
     expires: number;
     targets: Map<string, Element>;
     signatures: Map<string, string>;
+    contexts: Map<string, string>;
   };
   const state = globalThis as typeof globalThis & {
     sumiBrowserSnapshot?: Snapshot;
@@ -65,9 +66,25 @@ export function pageOperation(request: {
       element.matches(":disabled,[aria-disabled=true]"),
       element instanceof HTMLInputElement ? element.checked : null,
     ]);
+  // Scoped guard, after browser-use/jev-ultrafast's snapshot guards (MIT):
+  // the acted-on control's enclosing form/dialog/row text must be unchanged.
+  // A control directly under <body> has no scope: page-wide live content
+  // (clocks, tickers) must not block every action.
+  const context = (element: Element) => {
+    const scope =
+      element.closest(
+        'form,dialog,[role="dialog"],article,li,tr,[role="row"]',
+      ) ?? element.parentElement;
+    return scope &&
+      scope !== document.body &&
+      scope !== document.documentElement
+      ? (scope.textContent ?? "").slice(0, 4000)
+      : "";
+  };
   if (request.kind === "observe") {
     const targets = new Map<string, Element>();
     const signatures = new Map<string, string>();
+    const contexts = new Map<string, string>();
     const result: VisibleTarget[] = [];
     const lines: string[] = [];
     let chars = 0;
@@ -123,6 +140,7 @@ export function pageOperation(request: {
       const id = `t${result.length}`;
       targets.set(id, node);
       signatures.set(id, signature(node));
+      contexts.set(id, context(node));
       const rect = node.getBoundingClientRect();
       const target: VisibleTarget = {
         id,
@@ -139,6 +157,16 @@ export function pageOperation(request: {
       if (node instanceof HTMLInputElement) target.type = node.type;
       const value = controlValue(node);
       if (value !== undefined) target.value = value;
+      if (node instanceof HTMLSelectElement)
+        target.options = [...node.options]
+          .slice(0, request.limits.options)
+          .map((option) => ({
+            value: option.value.slice(0, 512),
+            label: (option.label || option.text).trim().slice(0, 160),
+            ...(option.disabled || option.closest("optgroup[disabled]")
+              ? { disabled: true }
+              : {}),
+          }));
       result.push(target);
     }
     state.sumiBrowserSnapshot = {
@@ -146,6 +174,7 @@ export function pageOperation(request: {
       expires: Date.now() + request.limits.observationMs,
       targets,
       signatures,
+      contexts,
     };
     return {
       title: document.title.slice(0, 512),
@@ -175,9 +204,19 @@ export function pageOperation(request: {
     window.scrollBy({ left: action.x, top: action.y, behavior: "instant" });
     return { ok: true };
   }
-  if (action?.kind !== "click" && action?.kind !== "fill")
+  if (
+    action?.kind !== "click" &&
+    action?.kind !== "fill" &&
+    action?.kind !== "select"
+  )
     return { error: "invalid_request" };
   const element = snapshot.targets.get(action.target);
+  if (
+    request.guard &&
+    element &&
+    snapshot.contexts.get(action.target) !== context(element)
+  )
+    return { error: "page_changed" };
   if (
     !(element instanceof HTMLElement) ||
     !element.isConnected ||
@@ -199,6 +238,22 @@ export function pageOperation(request: {
     return { error: "target_unavailable" };
   if (action.kind === "click") {
     element.click();
+    return { ok: true };
+  }
+  if (action.kind === "select") {
+    if (!(element instanceof HTMLSelectElement))
+      return { error: "target_unavailable" };
+    const option = [...element.options].find(
+      (o) =>
+        o.value === action.value &&
+        !o.disabled &&
+        !o.closest("optgroup[disabled]"),
+    );
+    if (!option) return { error: "target_unavailable" };
+    element.focus();
+    option.selected = true;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    element.dispatchEvent(new Event("change", { bubbles: true }));
     return { ok: true };
   }
   if (

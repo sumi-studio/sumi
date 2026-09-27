@@ -128,9 +128,14 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 				return nil, e
 			}
 			// direct: browser.observe/act. jev: browser.goal, which also needs
-			// the action grant and a host that declared a configured Jev key.
+			// the action grant and a host that declared a usable Jev key on
+			// its latest poll. A host that stopped polling has no current
+			// declaration, so its last one is not repeated as availability.
 			layer := "not_configured"
-			if jev {
+			switch {
+			case !available:
+				layer = "host_offline"
+			case jev:
 				layer = "available"
 			}
 			out = append(out, map[string]any{"attachment_id": id, "name": name, "tab": tab, "allow_actions": write, "available": available, "operation_layers": map[string]any{"direct": true, "jev": layer}})
@@ -277,7 +282,7 @@ func validateAction(req map[string]any) error {
 		return bad
 	}
 	switch a["kind"] {
-	case "click", "fill", "scroll", "navigate":
+	case "click", "fill", "select", "scroll", "navigate":
 		return nil
 	}
 	return bad
@@ -338,7 +343,9 @@ func (s *Store) Progress(ctx context.Context, id, token, jobID string, progress 
 		return "", e
 	}
 	var status string
-	e = tx.QueryRow(ctx, `UPDATE core_jobs SET claim_expires_at=now()+interval '30 seconds',result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('progress',$4::jsonb)
+	// Only a running goal is renewed. After job.cancel the host has the
+	// remaining claim to report; a host that keeps going is swept lost.
+	e = tx.QueryRow(ctx, `UPDATE core_jobs SET claim_expires_at=CASE WHEN status='running' THEN now()+interval '30 seconds' ELSE claim_expires_at END,result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('progress',$4::jsonb)
  WHERE persona_id=$1 AND job_id=$2 AND kind='browser' AND claimed_by=$3 AND request->>'method'='goal' AND request->>'attachment_id'=$5 AND status IN('running','cancel_requested') AND started_at>now()-interval '6 minutes' RETURNING status`, a.PersonaID, jobID, "browser:"+id, raw, id).Scan(&status)
 	if errors.Is(e, pgx.ErrNoRows) {
 		return "", agentstate.ErrJobNotClaimed

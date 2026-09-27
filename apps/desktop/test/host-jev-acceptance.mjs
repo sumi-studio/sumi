@@ -7,6 +7,10 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { app, BaseWindow } from "electron";
+import {
+  CONTROL_HEIGHT,
+  GoalControlBar,
+} from "../dist/browser/goal-control.js";
 import { attachBrowserTab, BrowserHostAgent } from "../dist/browser/host.js";
 import { JevClient } from "../dist/browser/jev.js";
 import { SharedBrowserRuntime } from "../dist/browser/runtime.js";
@@ -49,8 +53,20 @@ app
       profileId: "sumi-jev-20260927-e2e",
     });
     const window = new BaseWindow({ width: 900, height: 650 });
-    const tab = await runtime.openTab(window, `${origin}/signup`);
-    const contents = window.contentView.children[0].webContents;
+    let bridge;
+    const bar = new GoalControlBar(
+      window,
+      () => bridge?.stopGoal(),
+      "Shared with your secretary · actions allowed",
+    );
+    const tab = await runtime.openTab(window, `${origin}/signup`, {
+      top: CONTROL_HEIGHT,
+    });
+    const contents = window.contentView.children.find(
+      (v) => v !== bar.view,
+    ).webContents;
+    let personDecisions = 0;
+    const strip = [];
     const js = (code) => contents.executeJavaScript(code);
 
     let interrupted = false;
@@ -65,6 +81,21 @@ app
         const ops = Object.keys(q.operation.criteria);
         if (body.state.goal.includes("Next")) {
           await delay(400);
+          if (body.state.goal.includes("I stop") && ++personDecisions === 3) {
+            // The person watches the strip and presses Stop (native click).
+            strip.push(bar.text);
+            const point = await bar.stopButtonPoint();
+            window.focus();
+            bar.view.webContents.focus();
+            for (const type of ["mouseDown", "mouseUp"])
+              bar.view.webContents.sendInputEvent({
+                type,
+                button: "left",
+                clickCount: 1,
+                ...point,
+              });
+            await delay(300);
+          }
           if (!body.state.page.url.includes("/pager"))
             return { ...fill(q), operation: choice(ops, "NAVIGATE") };
           return {
@@ -103,10 +134,12 @@ app
     });
     function fill(q) {
       return Object.fromEntries(
-        Object.entries(q).map(([id, v]) => [
-          id,
-          choice(Object.keys(v.criteria), Object.keys(v.criteria)[0]),
-        ]),
+        Object.entries(q)
+          .filter(([, v]) => v.type === "choice")
+          .map(([id, v]) => [
+            id,
+            choice(Object.keys(v.criteria), Object.keys(v.criteria)[0]),
+          ]),
       );
     }
     const credential = await attachBrowserTab(
@@ -119,7 +152,7 @@ app
         allow_actions: true,
       },
     );
-    const bridge = new BrowserHostAgent({
+    bridge = new BrowserHostAgent({
       apiOrigin: process.env.BROWSER_TEST_URL,
       credential,
       browser: runtime,
@@ -128,6 +161,10 @@ app
         apiKey: FIXTURE_KEY,
         endpoint: jevFixture.endpoint,
       }),
+      onGoal: (activity) => {
+        bar.show(activity);
+        if (activity.state === "ended") strip.push(activity);
+      },
     });
     await bridge.tick();
     writeFileSync(
@@ -157,6 +194,8 @@ app
             ...state,
             saved,
             errors,
+            strip,
+            jevDeclared: bridge.jevAvailable,
             jevRequests: jevFixture.requests.map((r) => r.raw),
           }),
         );

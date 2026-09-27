@@ -22,15 +22,36 @@ function validate(body) {
   }
 }
 
+/** A well-formed choice answer: the chosen option carries the largest
+ * probability (at least `confidence`), the rest share the remainder. */
 export function choice(options, chosen, confidence = 0.9) {
   const rest = options.filter((o) => o !== chosen);
+  const top = Math.max(confidence, 1 / options.length);
   const probabilities = Object.fromEntries(
     options.map((o) => [
       o,
-      o === chosen ? confidence : (1 - confidence) / Math.max(rest.length, 1),
+      o === chosen ? top : (1 - top) / Math.max(rest.length, 1),
     ]),
   );
   return { type: "choice", choice: chosen, probabilities, confidence };
+}
+
+/** Answers every question a policy left out: the first option of a choice,
+ * and for the completion noul, high only when the operation is DONE. */
+export function fillDefaults(questions, answers) {
+  for (const [id, q] of Object.entries(questions)) {
+    if (answers[id]) continue;
+    if (q.type === "noul")
+      answers[id] = {
+        type: "noul",
+        noul: answers.operation?.choice === "DONE" ? 0.95 : 0.05,
+      };
+    else {
+      const options = Object.keys(q.criteria);
+      answers[id] = choice(options, options[0], 0.5);
+    }
+  }
+  return answers;
 }
 
 /** Rule-based stand-in used by the Electron journeys: fill the first field
@@ -68,14 +89,7 @@ export function formPolicy({ doneText }) {
       );
     } else if (ops.includes("CLICK") && !q.click_target) op = "CLICK";
     answers.operation = choice(ops, op);
-    for (const id of Object.keys(q))
-      if (!answers[id])
-        answers[id] = choice(
-          Object.keys(q[id].criteria),
-          Object.keys(q[id].criteria)[0],
-          0.5,
-        );
-    return answers;
+    return fillDefaults(q, answers);
   };
 }
 
@@ -109,7 +123,10 @@ export async function startJevFixture({
         return reply(failure.status, failure.body ?? {}, failure.headers);
       reply(200, {
         model: "jev-fixture-double",
-        answers: await policy(body, requests.length),
+        answers: fillDefaults(
+          body.questions,
+          await policy(body, requests.length),
+        ),
         usage: { input_tokens: raw.length >> 2, output_tokens: 8 },
       });
     } catch (error) {

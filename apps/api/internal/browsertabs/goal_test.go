@@ -236,3 +236,63 @@ func TestGoalProgressRevocationBoundsAndLoss(t *testing.T) {
 		t.Fatal("late goal receipt", j.Status, e)
 	}
 }
+
+// Renewal and completion belong to the claiming host only; availability is a
+// current declaration, not a sticky flag; cancellation is not renewed.
+func TestGoalClaimOwnershipAndCurrentAvailability(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	a, token := f.attach(true)
+	b, btoken := f.attach(true)
+	f.store.Claim(ctx, a.ID, token, true)
+	f.store.Claim(ctx, b.ID, btoken, true)
+	out, e := f.tool("browser.goal", goalReq(a.ID))
+	if e != nil {
+		t.Fatal(e)
+	}
+	job := out["job"].(map[string]any)["job_id"].(string)
+	if c, _ := f.store.Claim(ctx, a.ID, token, true); c == nil || c.JobID != job {
+		t.Fatal("claim", c)
+	}
+	// Another live host of the same persona cannot renew or complete it,
+	// and a token only authenticates its own attachment.
+	if _, e = f.store.Progress(ctx, b.ID, btoken, job, map[string]any{}); !errors.Is(e, agentstate.ErrJobNotClaimed) {
+		t.Fatal("other host renewed the goal", e)
+	}
+	if _, e = f.store.Complete(ctx, b.ID, btoken, job, "done", map[string]any{"dispatched": false, "outcome": "not_dispatched"}, ""); !errors.Is(e, ErrUnavailable) {
+		t.Fatal("other host completed the goal", e)
+	}
+	if _, e = f.store.Progress(ctx, b.ID, token, job, map[string]any{}); !errors.Is(e, ErrUnavailable) {
+		t.Fatal("token crossed attachments", e)
+	}
+	// Cancellation is reported but no longer renews the claim.
+	f.store.Pool.Exec(ctx, `UPDATE core_jobs SET claim_expires_at=now()+interval '2 seconds' WHERE job_id=$1`, job)
+	if _, e = f.core.Store().CancelJob(ctx, persona, job); e != nil {
+		t.Fatal(e)
+	}
+	status, e := f.store.Progress(ctx, a.ID, token, job, map[string]any{"phase": "deciding"})
+	if e != nil || status != "cancel_requested" {
+		t.Fatal(status, e)
+	}
+	var renewed bool
+	f.store.Pool.QueryRow(ctx, `SELECT claim_expires_at>now()+interval '5 seconds' FROM core_jobs WHERE job_id=$1`, job).Scan(&renewed)
+	if renewed {
+		t.Fatal("cancel_requested goal was renewed")
+	}
+	// A host that withdraws Jev (e.g. its key was rejected) or stops polling
+	// is not reported or admitted as Jev-available.
+	if _, e = f.store.Claim(ctx, b.ID, btoken, false); e != nil {
+		t.Fatal(e)
+	}
+	if got := f.layer(b.ID); got != "not_configured" {
+		t.Fatal("withdrawn declaration", got)
+	}
+	f.store.Claim(ctx, b.ID, btoken, true)
+	f.store.Pool.Exec(ctx, `UPDATE browser_tab_attachments SET last_seen_at=now()-interval '2 minutes' WHERE attachment_id=$1`, b.ID)
+	if got := f.layer(b.ID); got != "host_offline" {
+		t.Fatal("stale declaration reported", got)
+	}
+	if _, e = f.tool("browser.goal", goalReq(b.ID)); !errors.Is(e, ErrUnavailable) {
+		t.Fatal("goal admitted for an offline host", e)
+	}
+}

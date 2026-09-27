@@ -1,5 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { app, BaseWindow } from "electron";
+import { CONTROL_HEIGHT, GoalControlBar } from "./browser/goal-control.js";
 import { attachBrowserTab, BrowserHostAgent } from "./browser/host.js";
 import { JevClient } from "./browser/jev.js";
 import { SharedBrowserRuntime } from "./browser/runtime.js";
@@ -85,7 +86,17 @@ app
       runtime.dispose();
     });
     app.on("window-all-closed", () => app.quit());
-    const tab = await runtime.openTab(window, config.url);
+    let host: BrowserHostAgent | undefined;
+    // The person's view of delegated goals and their Stop control live in the
+    // host window, outside the shared page.
+    const bar = new GoalControlBar(
+      window,
+      () => host?.stopGoal(),
+      `Shared with your secretary${config.allowActions ? " · actions allowed" : " · observe only"}${jev ? " · Jev goals available" : ""}`,
+    );
+    const tab = await runtime.openTab(window, config.url, {
+      top: CONTROL_HEIGHT,
+    });
     const credential = await attachBrowserTab(
       config.apiOrigin,
       config.humanHeaders,
@@ -98,13 +109,14 @@ app
     );
     // Do not retain the login header object in the running host bridge.
     config.humanHeaders = {};
-    const host = new BrowserHostAgent({
+    host = new BrowserHostAgent({
       apiOrigin: config.apiOrigin,
       credential,
       browser: runtime,
       tab,
       jev,
       minConfidence,
+      onGoal: (activity) => bar.show(activity),
     });
     console.log(
       JSON.stringify({

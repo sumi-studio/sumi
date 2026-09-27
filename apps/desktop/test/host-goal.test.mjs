@@ -56,8 +56,9 @@ async function readBody(req) {
   return s ? JSON.parse(s) : {};
 }
 
-async function run(t, { jev, progress }) {
-  const calls = { polls: [], progress: [], receipts: [] };
+async function run(t, { jev, progress, ticks = 1 }) {
+  const calls = { polls: [], progress: [], receipts: [], activity: [] };
+  let agent;
   let served = false;
   const server = createServer(async (req, res) => {
     const body = await readBody(req);
@@ -67,7 +68,7 @@ async function run(t, { jev, progress }) {
       served = true;
     } else if (req.url.endsWith("/progress")) {
       calls.progress.push(body);
-      const reply = progress(calls.progress.length);
+      const reply = progress(calls.progress.length, agent);
       res.statusCode = reply.statusCode ?? 200;
       res.end(JSON.stringify(reply.body ?? {}));
     } else {
@@ -81,15 +82,16 @@ async function run(t, { jev, progress }) {
     server.close();
   });
   const browser = page();
-  const agent = new BrowserHostAgent({
+  agent = new BrowserHostAgent({
     apiOrigin: `http://127.0.0.1:${server.address().port}`,
     credential,
     browser,
     tab,
     jev,
+    onGoal: (activity) => calls.activity.push(activity),
   });
-  await agent.tick();
-  return { calls, browser };
+  for (let i = 0; i < ticks; i++) await agent.tick();
+  return { calls, browser, agent };
 }
 
 test("host declares Jev and cancels a running goal before its next action", async (t) => {
@@ -113,7 +115,8 @@ test("host declares Jev and cancels a running goal before its next action", asyn
   assert.equal(receipt.result.dispatched, true);
   assert.equal(calls.progress[0].progress.phase, "acting");
   assert.ok(calls.progress[0].progress.next.target.includes("Next"));
-  const everything = JSON.stringify(calls);
+  const { activity: _local, ...sent } = calls;
+  const everything = JSON.stringify(sent);
   assert.ok(!everything.includes(FIXTURE_KEY));
   // Website text with NUL is sanitized before it reaches JSONB.
   assert.ok(!everything.includes("\\u0000"));
@@ -145,4 +148,56 @@ test("a host without Jev declares it and fails goals without touching the tab", 
   assert.equal(browser.acts.length, 0);
   assert.equal(calls.receipts[0].result.code, "jev_not_configured");
   assert.equal(calls.receipts[0].result.dispatched, false);
+});
+
+test("the person's Stop ends a running goal before its next action", async (t) => {
+  const fixture = await startJevFixture({ policy: nextPolicy });
+  t.after(fixture.close);
+  const jev = new JevClient({
+    apiKey: FIXTURE_KEY,
+    endpoint: fixture.endpoint,
+  });
+  const { calls, browser, agent } = await run(t, {
+    jev,
+    // The person presses Stop while the second action awaits admission.
+    progress: (n, host) => {
+      if (n === 2) assert.equal(host.stopGoal(), true);
+      return { body: { status: "running" } };
+    },
+  });
+  assert.equal(browser.acts.length, 1);
+  const [receipt] = calls.receipts;
+  assert.equal(receipt.status, "cancelled");
+  assert.equal(receipt.result.value.goal_outcome, "stopped_by_person");
+  assert.equal(calls.activity[0].state, "running");
+  assert.deepEqual(calls.activity.at(-1), {
+    state: "ended",
+    goal: "Press Next until the end",
+    outcome: "stopped_by_person",
+    status: "cancelled",
+  });
+  assert.equal(agent.stopGoal(), false, "nothing left to stop");
+});
+
+test("a rejected Jev key withdraws the Jev declaration; direct polls continue", async (t) => {
+  const fixture = await startJevFixture({
+    policy: nextPolicy,
+    fault: () => ({ status: 401, body: { error: "bad key" } }),
+  });
+  t.after(fixture.close);
+  const jev = new JevClient({
+    apiKey: FIXTURE_KEY,
+    endpoint: fixture.endpoint,
+  });
+  const { calls, agent } = await run(t, {
+    jev,
+    ticks: 2,
+    progress: () => ({ body: { status: "running" } }),
+  });
+  assert.equal(calls.receipts[0].result.code, "jev_auth_failed");
+  assert.deepEqual(
+    calls.polls.map((p) => p.jev),
+    [true, false],
+  );
+  assert.equal(agent.jevAvailable, false);
 });

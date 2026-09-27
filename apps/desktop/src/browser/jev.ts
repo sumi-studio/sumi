@@ -137,7 +137,7 @@ export class JevClient {
       } catch {
         if (signal?.aborted) throw new JevError("jev_cancelled", "Cancelled.");
         if (attempt < this.#retries) {
-          await backoff(attempt, undefined, signal);
+          await backoff(retryDelay(attempt) as number, signal);
           continue;
         }
         throw new JevError(
@@ -153,8 +153,13 @@ export class JevClient {
         (status === 408 || status === 429 || status >= 500) &&
         attempt < this.#retries
       ) {
-        await backoff(attempt, response.headers.get("retry-after"), signal);
-        continue;
+        const wait = retryDelay(attempt, response.headers);
+        // A server asking for a longer pause than a person should wait for a
+        // stop to take effect is reported, not slept through.
+        if (wait !== undefined) {
+          await backoff(wait, signal);
+          continue;
+        }
       }
       if (status === 401 || status === 403)
         throw new JevError(
@@ -226,23 +231,38 @@ export class JevClient {
         continue;
       }
       const options = Object.keys(question.criteria);
-      const raw = answer.probabilities as Record<string, unknown> | undefined;
-      const probabilities: Record<string, number> = {};
-      for (const option of options) {
-        const p = raw?.[option];
-        if (probability(p)) probabilities[option] = p;
-      }
+      const raw = answer.probabilities;
       const choice = answer.choice;
       if (typeof choice !== "string" || !options.includes(choice))
         throw new JevError(
           "jev_invalid_response",
           `Jev chose an option that was not offered for ${id}.`,
         );
+      // Same shape checks as browser-use/jev-ultrafast's validate_choice
+      // (MIT): exactly the offered options, a distribution, and the choice
+      // at its maximum. A malformed answer executes nothing.
+      const probabilities: Record<string, number> = {};
+      if (raw && typeof raw === "object" && !Array.isArray(raw))
+        for (const [option, p] of Object.entries(raw))
+          if (options.includes(option) && probability(p))
+            probabilities[option] = p;
+      const values = Object.values(probabilities);
+      if (
+        values.length !== options.length ||
+        Object.keys(raw as object).length !== options.length ||
+        Math.abs(values.reduce((a, b) => a + b, 0) - 1) > 0.02 ||
+        (probabilities[choice] as number) < Math.max(...values) - 1e-6 ||
+        !probability(answer.confidence)
+      )
+        throw new JevError(
+          "jev_invalid_response",
+          `Jev returned a malformed ${id} answer; nothing was executed.`,
+        );
       answers[id] = {
         type: "choice",
         choice,
         probabilities,
-        confidence: probability(answer.confidence) ? answer.confidence : 0,
+        confidence: answer.confidence,
       };
     }
     const usage = v.usage ?? { input_tokens: 0, output_tokens: 0 };
@@ -285,24 +305,39 @@ async function readBounded(response: Response): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function backoff(
+const MAX_RETRY_WAIT = 5_000;
+
+/** Delay before retry `attempt`, or undefined when the server's Retry-After
+ * exceeds what the goal loop may sleep while staying promptly stoppable. */
+export function retryDelay(
   attempt: number,
-  retryAfter: string | null | undefined,
-  signal?: AbortSignal,
-): Promise<void> {
-  let ms = Math.min(500 * 2 ** attempt, 5000) * (0.75 + Math.random() * 0.5);
-  const seconds = Number(retryAfter);
-  if (retryAfter && Number.isFinite(seconds) && seconds >= 0)
-    ms = Math.min(seconds * 1000, 5000);
+  headers?: Headers,
+): number | undefined {
+  const ms = Number(headers?.get("retry-after-ms") ?? Number.NaN);
+  const seconds = Number(headers?.get("retry-after") ?? Number.NaN);
+  const asked =
+    Number.isFinite(ms) && ms >= 0
+      ? ms
+      : Number.isFinite(seconds) && seconds >= 0
+        ? seconds * 1000
+        : undefined;
+  if (asked !== undefined) return asked <= MAX_RETRY_WAIT ? asked : undefined;
+  return (
+    Math.min(500 * 2 ** attempt, MAX_RETRY_WAIT) * (0.75 + Math.random() * 0.5)
+  );
+}
+
+async function backoff(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new JevError("jev_cancelled", "Cancelled.");
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(new JevError("jev_cancelled", "Cancelled."));
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new JevError("jev_cancelled", "Cancelled."));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }

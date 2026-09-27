@@ -92,7 +92,13 @@ export class SharedBrowserRuntime implements BrowserTabPort {
 
   /** Host attaches a tab to its real window. One tab per window in this first
    * slice; chrome/layout belongs to the host, not this runtime. */
-  async openTab(window: BaseWindow, url: string): Promise<TabRef> {
+  async openTab(
+    window: BaseWindow,
+    url: string,
+    /** Host-owned space above the page (for the host's own controls). */
+    layout: { top?: number } = {},
+  ): Promise<TabRef> {
+    const top = Math.max(0, Math.min(Math.round(layout.top ?? 0), 200));
     this.assertLive();
     const destination = navigationURL(url);
     if (
@@ -130,7 +136,12 @@ export class SharedBrowserRuntime implements BrowserTabPort {
     const resize = () => {
       if (window.isDestroyed()) return;
       const [width = 0, height = 0] = window.getContentSize();
-      view.setBounds({ x: 0, y: 0, width, height });
+      view.setBounds({
+        x: 0,
+        y: top,
+        width,
+        height: Math.max(0, height - top),
+      });
     };
     const close = () => this.closeTab(ref);
     const tab: Tab = {

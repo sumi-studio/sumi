@@ -18,8 +18,9 @@ import (
 
 // Actual Secretary → API/DB durable jobs → authenticated host → Jev test
 // double → same visible Electron tab. Covers delegated completion with a
-// person's concurrent edit, progress + cancellation of a running goal, a Jev
-// auth failure, and the unchanged direct path afterwards. The Jev endpoint is
+// person's concurrent edit, progress + cancellation of a running goal, the
+// person's Stop in the host strip, a Jev auth failure (Jev then withdrawn),
+// and the unchanged direct path afterwards. The Jev endpoint is
 // a contract-checking loopback double, not the live TypeSafe API.
 func TestSecretaryJevGoalRealBrowser(t *testing.T) {
 	if os.Getenv("SUMI_BROWSER_REAL_TEST") != "1" {
@@ -96,11 +97,12 @@ func TestSecretaryJevGoalRealBrowser(t *testing.T) {
 	if state.Saved.Result != "Saved Ada Lovelace <ada@example.test> x1" || state.Saved.Note != "person note" {
 		t.Fatalf("person-visible signup %+v", state.Saved)
 	}
-	// Cancellation stopped the pager goal well before its 30 steps; the only
-	// later click is the secretary's explicit direct action.
+	// Cancellation stopped the pager goal well before its 30 steps, the
+	// person's Stop after two more clicks; the only later click is the
+	// secretary's explicit direct action.
 	pages, e := strconv.Atoi(strings.TrimPrefix(state.Page, "Page "))
-	if e != nil || pages < 2 || pages > 6 {
-		t.Fatalf("pager after cancel + one direct click: %q", state.Page)
+	if e != nil || pages < 4 || pages > 9 {
+		t.Fatalf("pager after cancel + person stop + one direct click: %q", state.Page)
 	}
 	var jobs []agentstate.Job
 	jobs, e = f.core.Store().ListJobs(ctx, persona, nil, 50)
@@ -113,7 +115,7 @@ func TestSecretaryJevGoalRealBrowser(t *testing.T) {
 			goals[j.Status]++
 		}
 	}
-	if goals["done"] != 1 || goals["cancelled"] != 1 || goals["failed"] != 1 {
+	if goals["done"] != 1 || goals["cancelled"] != 2 || goals["failed"] != 1 {
 		t.Fatalf("goal jobs %v", goals)
 	}
 	// No credential reaches Jev, job records, or the tool path.
@@ -127,5 +129,5 @@ func TestSecretaryJevGoalRealBrowser(t *testing.T) {
 			t.Fatal("credential or identity sent to Jev")
 		}
 	}
-	t.Logf("PASS Secretary → browser.goal → host Jev loop (test double) → same tab: done with person edit, progress+cancel, auth failure, direct fallback (%d Jev requests)", len(state.JevRequests))
+	t.Logf("PASS Secretary → browser.goal → host Jev loop (test double) → same tab: done with person edit, progress+cancel, person Stop in host strip, auth failure → Jev withdrawn, direct fallback (%d Jev requests)", len(state.JevRequests))
 }
