@@ -135,11 +135,11 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 	if status != 403 {
 		t.Fatal(status)
 	}
-	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+	if _, e := f.store.Claim(ctx, a.ID, token, false); e != nil {
 		t.Fatal(e)
 	}
 	b, token2 := f.attach(false)
-	if _, e := f.store.Claim(ctx, b.ID, token2); e != nil {
+	if _, e := f.store.Claim(ctx, b.ID, token2, false); e != nil {
 		t.Fatal(e)
 	}
 	tx, _ := f.store.Pool.Begin(ctx)
@@ -168,11 +168,11 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 		t.Fatal("read-only grant acted")
 	}
 	job := f.enqueue(a, "act")
-	claimed, e := f.store.Claim(ctx, a.ID, token)
+	claimed, e := f.store.Claim(ctx, a.ID, token, false)
 	if e != nil || claimed == nil || claimed.JobID != job {
 		t.Fatal(claimed, e)
 	}
-	if duplicate, e := f.store.Claim(ctx, a.ID, token); e != nil || duplicate != nil {
+	if duplicate, e := f.store.Claim(ctx, a.ID, token, false); e != nil || duplicate != nil {
 		t.Fatal("dispatch replay", duplicate, e)
 	}
 	if _, e = f.store.Complete(ctx, b.ID, token2, job, "done", map[string]any{}, ""); e == nil {
@@ -181,7 +181,7 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 	if e = f.store.Revoke(ctx, owner, a.ID); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = f.store.Claim(ctx, a.ID, token); e == nil {
+	if _, e = f.store.Claim(ctx, a.ID, token, false); e == nil {
 		t.Fatal("revoked grant polled")
 	}
 	result := map[string]any{"dispatched": true, "outcome": "returned"}
@@ -196,9 +196,9 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 		t.Fatal("notification count", notes)
 	}
 	c, ct := f.attach(true)
-	f.store.Claim(ctx, c.ID, ct)
+	f.store.Claim(ctx, c.ID, ct, false)
 	lost := f.enqueue(c, "act")
-	f.store.Claim(ctx, c.ID, ct)
+	f.store.Claim(ctx, c.ID, ct, false)
 	f.store.Pool.Exec(ctx, `UPDATE core_jobs SET claim_expires_at=now()-interval '1 second' WHERE job_id=$1`, lost)
 	if e = f.store.Sweep(ctx); e != nil {
 		t.Fatal(e)
@@ -207,7 +207,7 @@ func TestBrowserAuthorizationDurability(t *testing.T) {
 	if j.Status != "lost" {
 		t.Fatal(j.Status)
 	}
-	if replay, e := f.store.Claim(ctx, c.ID, ct); e != nil || replay != nil {
+	if replay, e := f.store.Claim(ctx, c.ID, ct, false); e != nil || replay != nil {
 		t.Fatal("lost action replayed", replay, e)
 	}
 	queued := f.enqueue(c, "observe")
@@ -237,11 +237,11 @@ func TestLateLostCompletionAttachesObservedOutcome(t *testing.T) {
 	ctx := context.Background()
 	a, token := f.attach(true)
 	// The host heartbeat must be fresh for a dispatch to be enqueued.
-	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+	if _, e := f.store.Claim(ctx, a.ID, token, false); e != nil {
 		t.Fatal(e)
 	}
 	job := f.enqueue(a, "observe")
-	claimed, e := f.store.Claim(ctx, a.ID, token)
+	claimed, e := f.store.Claim(ctx, a.ID, token, false)
 	if e != nil || claimed == nil || claimed.JobID != job {
 		t.Fatal("claim", claimed, e)
 	}
@@ -296,13 +296,13 @@ func TestLateLostCompletionAttachesObservedOutcome(t *testing.T) {
 	}
 	// The lost job is never re-dispatched. The attachment is revoked, so a
 	// fresh attachment on the same persona keeps working normally.
-	if replay, e := f.store.Claim(ctx, a.ID, token); e == nil {
+	if replay, e := f.store.Claim(ctx, a.ID, token, false); e == nil {
 		t.Fatal("revoked host polled", replay)
 	}
 	c, ct := f.attach(true)
-	f.store.Claim(ctx, c.ID, ct)
+	f.store.Claim(ctx, c.ID, ct, false)
 	next := f.enqueue(c, "observe")
-	claimed2, e := f.store.Claim(ctx, c.ID, ct)
+	claimed2, e := f.store.Claim(ctx, c.ID, ct, false)
 	if e != nil || claimed2 == nil || claimed2.JobID != next {
 		t.Fatal("host stopped claiming after lost completion", claimed2, e)
 	}
@@ -316,11 +316,11 @@ func TestLateLostCompletionOversizedOutcome(t *testing.T) {
 	f := setup(t)
 	ctx := context.Background()
 	a, token := f.attach(true)
-	if _, e := f.store.Claim(ctx, a.ID, token); e != nil {
+	if _, e := f.store.Claim(ctx, a.ID, token, false); e != nil {
 		t.Fatal(e)
 	}
 	job := f.enqueue(a, "observe")
-	claimed, e := f.store.Claim(ctx, a.ID, token)
+	claimed, e := f.store.Claim(ctx, a.ID, token, false)
 	if e != nil || claimed == nil || claimed.JobID != job {
 		t.Fatal("claim", claimed, e)
 	}
@@ -374,7 +374,7 @@ func TestLateLostCompletionOversizedOutcome(t *testing.T) {
 	if notes != 1 {
 		t.Fatal("notification count", notes)
 	}
-	if replay, e := f.store.Claim(ctx, a.ID, token); e != nil || replay != nil {
+	if replay, e := f.store.Claim(ctx, a.ID, token, false); e != nil || replay != nil {
 		t.Fatal("lost job re-dispatched")
 	}
 }

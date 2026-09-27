@@ -3,17 +3,19 @@ import type { BrowserAction, LIMITS, VisibleTarget } from "./contract.js";
 /** Serialized into a dedicated isolated world. No page script, arbitrary expression,
  * selector, Electron object, or Node function is accepted from the caller. */
 export function pageOperation(request: {
-  kind: "observe" | "act";
+  kind: "observe" | "act" | "check";
   observationId: string;
   url: string;
   deadline: number;
   limits: typeof LIMITS;
   action?: BrowserAction;
+  guard?: boolean;
 }) {
   type Snapshot = {
     id: string;
     expires: number;
     targets: Map<string, Element>;
+    signatures: Map<string, string>;
   };
   const state = globalThis as typeof globalThis & {
     sumiBrowserSnapshot?: Snapshot;
@@ -33,8 +35,39 @@ export function pageOperation(request: {
       element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
     );
   };
+  const nameOf = (element: Element) =>
+    (
+      element.getAttribute("aria-label") ??
+      element.getAttribute("placeholder") ??
+      element.textContent ??
+      ""
+    )
+      .trim()
+      .slice(0, 256);
+  const controlValue = (element: Element) =>
+    (element instanceof HTMLInputElement &&
+      !["password", "file", "hidden"].includes(element.type)) ||
+    element instanceof HTMLTextAreaElement ||
+    element instanceof HTMLSelectElement
+      ? element.value.slice(0, 512)
+      : undefined;
+  // What a decision was based on: each observed control's identity, label,
+  // value, enabled state and visibility. Password contents are covered by length.
+  const signature = (element: Element) =>
+    JSON.stringify([
+      element.isConnected && visible(element),
+      element.tagName,
+      element.getAttribute("role"),
+      nameOf(element),
+      element instanceof HTMLInputElement && element.type === "password"
+        ? element.value.length
+        : controlValue(element),
+      element.matches(":disabled,[aria-disabled=true]"),
+      element instanceof HTMLInputElement ? element.checked : null,
+    ]);
   if (request.kind === "observe") {
     const targets = new Map<string, Element>();
+    const signatures = new Map<string, string>();
     const result: VisibleTarget[] = [];
     const lines: string[] = [];
     let chars = 0;
@@ -89,19 +122,13 @@ export function pageOperation(request: {
       }
       const id = `t${result.length}`;
       targets.set(id, node);
+      signatures.set(id, signature(node));
       const rect = node.getBoundingClientRect();
       const target: VisibleTarget = {
         id,
         tag: node.tagName.toLowerCase(),
         role: (node.getAttribute("role") ?? "").slice(0, 100),
-        name: (
-          node.getAttribute("aria-label") ??
-          node.getAttribute("placeholder") ??
-          node.textContent ??
-          ""
-        )
-          .trim()
-          .slice(0, 256),
+        name: nameOf(node),
         bounds: {
           x: rect.x,
           y: rect.y,
@@ -109,20 +136,16 @@ export function pageOperation(request: {
           height: rect.height,
         },
       };
-      if (
-        (node instanceof HTMLInputElement &&
-          !["password", "file", "hidden"].includes(node.type)) ||
-        node instanceof HTMLTextAreaElement ||
-        node instanceof HTMLSelectElement
-      ) {
-        target.value = node.value.slice(0, 512);
-      }
+      if (node instanceof HTMLInputElement) target.type = node.type;
+      const value = controlValue(node);
+      if (value !== undefined) target.value = value;
       result.push(target);
     }
     state.sumiBrowserSnapshot = {
       id: request.observationId,
       expires: Date.now() + request.limits.observationMs,
       targets,
+      signatures,
     };
     return {
       title: document.title.slice(0, 512),
@@ -141,6 +164,12 @@ export function pageOperation(request: {
     return { error: "stale_observation" };
   // A binding is single-use. Failed dispatches also require a fresh observation.
   delete state.sumiBrowserSnapshot;
+  if (request.guard || request.kind === "check") {
+    for (const [id, element] of snapshot.targets)
+      if (snapshot.signatures.get(id) !== signature(element))
+        return { error: "page_changed" };
+    if (request.kind === "check") return { ok: true };
+  }
   const action = request.action;
   if (action?.kind === "scroll") {
     window.scrollBy({ left: action.x, top: action.y, behavior: "instant" });

@@ -38,7 +38,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "browser.tabs",
     description:
-      "List the real browser tabs your person has granted you access to. Names, exact tab identities, availability, and action permission are returned. Use an available attachment_id; never guess one. These are the same tabs visible on the attached host.",
+      "List the real browser tabs your person has granted you access to. Names, exact tab identities, availability, action permission, and operation_layers are returned. operation_layers.direct means you can use browser.observe/browser.act yourself; operation_layers.jev is available when that tab's host can run browser.goal through Jev, otherwise not_configured. Use an available attachment_id; never guess one. These are the same tabs visible on the attached host.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -92,6 +92,45 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         },
       },
       required: ["attachment_id", "binding", "action"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    internal: true,
+    delegated: true,
+    name: "browser.goal",
+    description:
+      "Delegate a browser goal on the same visible tab to the Jev operation layer (requires the action grant and operation_layers.jev available). You supply the purpose and any values it needs; Jev decides the individual clicks, fills from your inputs, scrolls, and URL opens, observing the page before each step. Jev chooses among typed options and never writes text or URLs: every typed value and navigation target must be one of your inputs (URLs as http(s) input values). Values named in private_inputs are typed but never sent to Jev. Returns a durable job; while it runs, job.status shows result.progress, and job.cancel stops it before its next action (an action already dispatched is not undone). The result reports goal_outcome (jev_reported_done, blocked, uncertain, step_limit, no_progress, page_changed_repeatedly, cancelled, or an error code such as jev_auth_failed/jev_rate_limited/jev_overloaded), the executed steps, and Jev usage. The page is shared with your person: when their input or the page's controls change after an observation, that step is refused and re-decided. jev_reported_done is Jev's judgment, not proof — observe the page to verify. If Jev is unavailable or stops, continue with browser.observe/browser.act directly; no other model is substituted. Supports ordinary links, buttons, checkboxes/radios and text fields in the top-level page; not frames, shadow DOM, select menus, uploads, or custom widgets.",
+    parameters: {
+      type: "object",
+      properties: {
+        attachment_id: { type: "string" },
+        goal: {
+          type: "string",
+          description:
+            "What should be true when finished, stated concretely and observably (at most 2000 characters).",
+        },
+        inputs: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description:
+            'Named values Jev may type or open, e.g. {"email": "a@example.com", "start_url": "https://example.com"}. Names are lower_snake_case; at most 16.',
+        },
+        private_inputs: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Input names whose values must not be sent to Jev (for example a password).",
+        },
+        max_steps: {
+          type: "integer",
+          minimum: 1,
+          maximum: 40,
+          description: "Maximum browser actions (default 15).",
+        },
+      },
+      required: ["attachment_id", "goal"],
       additionalProperties: false,
     },
   },
@@ -751,7 +790,8 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
       properties: {
         name: {
           type: "string",
-          description: "short human-readable session name (max 80 chars), e.g. 'dev server'",
+          description:
+            "short human-readable session name (max 80 chars), e.g. 'dev server'",
         },
       },
     },
@@ -774,11 +814,15 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     parameters: {
       type: "object",
       properties: {
-        session_id: { type: "string", description: "id from terminal.open or terminal.list" },
+        session_id: {
+          type: "string",
+          description: "id from terminal.open or terminal.list",
+        },
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "absolute output offset to read from; omit for the latest tail",
+          description:
+            "absolute output offset to read from; omit for the latest tail",
         },
         event_cursor: {
           type: "integer",
@@ -788,7 +832,8 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         },
         tail: {
           type: "boolean",
-          description: "when true and no cursor is given, return only the recent end of the scrollback",
+          description:
+            "when true and no cursor is given, return only the recent end of the scrollback",
         },
       },
       required: ["session_id"],
@@ -823,7 +868,8 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         session_id: { type: "string" },
         data: {
           type: "string",
-          description: "input text as typed (max 64 KiB) — JSON escapes carry control bytes, e.g. \\u0003 for Ctrl-C, though terminal.signal is usually clearer",
+          description:
+            "input text as typed (max 64 KiB) — JSON escapes carry control bytes, e.g. \\u0003 for Ctrl-C, though terminal.signal is usually clearer",
         },
       },
       required: ["session_id", "data"],
@@ -976,7 +1022,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "file.list",
     description:
-      "List one directory in your private workspace. Returns a bounded page of entries; when next_cursor is present, call again with that cursor for the rest. Omit path or pass \"/\" for the workspace root. A read, not a side effect.",
+      'List one directory in your private workspace. Returns a bounded page of entries; when next_cursor is present, call again with that cursor for the rest. Omit path or pass "/" for the workspace root. A read, not a side effect.',
     parameters: {
       type: "object",
       properties: {
@@ -1022,7 +1068,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "file.write",
     description:
-      "Create or replace a file in your private workspace. Content is at most 2 MiB: pass it as content_text (UTF-8) or content_base64. Writes carry an explicit version predicate — expect_version \"none\" creates only (the default), or pass the version from file.stat/file.read to overwrite exactly that version. A stale version fails rather than silently clobbering; unconditional overwrites are refused because a retried write could not tell its own landed bytes from someone else's.",
+      'Create or replace a file in your private workspace. Content is at most 2 MiB: pass it as content_text (UTF-8) or content_base64. Writes carry an explicit version predicate — expect_version "none" creates only (the default), or pass the version from file.stat/file.read to overwrite exactly that version. A stale version fails rather than silently clobbering; unconditional overwrites are refused because a retried write could not tell its own landed bytes from someone else\'s.',
     parameters: {
       type: "object",
       properties: {
@@ -1038,7 +1084,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
         expect_version: {
           type: ["string", "integer"],
           description:
-            "\"none\" to create-only (default), or the version integer this write must replace",
+            '"none" to create-only (default), or the version integer this write must replace',
         },
       },
       required: ["path"],
@@ -1086,8 +1132,8 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
  * execute — are still withheld; a host must confirm them claimable first.
  */
 export function toolSpecs(available?: ReadonlySet<string>): ToolSpec[] {
-  return INTERNAL_TOOLS.filter(
-    (t) => (available ? available.has(t.name) : !t.delegated),
+  return INTERNAL_TOOLS.filter((t) =>
+    available ? available.has(t.name) : !t.delegated,
   ).map(({ name, description, parameters }) => ({
     name,
     description,

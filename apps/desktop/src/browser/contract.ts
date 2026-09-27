@@ -17,6 +17,8 @@ export interface VisibleTarget {
   tag: string;
   role: string;
   name: string;
+  /** Input element type (for example "text", "email", "checkbox"). */
+  type?: string;
   value?: string;
   bounds: { x: number; y: number; width: number; height: number };
 }
@@ -44,12 +46,21 @@ export interface ActionReceipt {
   revision: number;
 }
 
+/** `guard` refuses the action with `page_changed` when native human input
+ * reached the tab after the observation, or when an observed control's name,
+ * value or visibility changed. Used by delegated (Jev) goals, which decide from
+ * one observation and must not act on a page the person has since changed. */
+export interface ActOptions {
+  guard?: boolean;
+}
+
 export interface BrowserTabPort {
   observe(tab: TabRef): Promise<PageObservation>;
   act(
     tab: TabRef,
     binding: PageBinding,
     action: BrowserAction,
+    options?: ActOptions,
   ): Promise<ActionReceipt>;
 }
 
@@ -62,6 +73,7 @@ export type BrowserErrorCode =
   | "tab_busy"
   | "tab_navigating"
   | "stale_observation"
+  | "page_changed"
   | "target_unavailable"
   | "navigation_failed"
   | "operation_timed_out";

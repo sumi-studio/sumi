@@ -4,6 +4,8 @@ import type {
   PageBinding,
   TabRef,
 } from "./contract.js";
+import { type Admission, parseGoalRequest, runGoal } from "./goal.js";
+import type { JevClient } from "./jev.js";
 
 export interface BrowserAttachment {
   attachment_id: string;
@@ -12,6 +14,7 @@ export interface BrowserAttachment {
   tab: TabRef;
   allow_actions: boolean;
   available: boolean;
+  jev_available?: boolean;
 }
 export interface HostCredential {
   attachment: BrowserAttachment;
@@ -21,16 +24,20 @@ interface BrowserJob {
   job_id: string;
   claim_expires_at: string;
   request: {
-    method: "observe" | "act";
+    method: "observe" | "act" | "goal";
     attachment_id: string;
     tab: TabRef;
     binding?: PageBinding;
     action?: BrowserAction;
+    goal?: string;
+    inputs?: Record<string, string>;
+    private_inputs?: string[];
+    max_steps?: number;
   };
 }
 interface Receipt {
   job_id: string;
-  status: "done" | "failed";
+  status: "done" | "failed" | "cancelled";
   result: Record<string, unknown>;
   error: string;
 }
@@ -123,14 +130,20 @@ export class BrowserHostAgent {
       credential: HostCredential;
       browser: BrowserTabPort;
       tab: TabRef;
+      /** Optional Jev operation layer for delegated goals. Without it the
+       * direct observe/act path is unchanged and goals fail as not configured. */
+      jev?: JevClient;
+      minConfidence?: number;
     },
   ) {
     apiURL(options.apiOrigin, "/");
     if (!sameTab(options.credential.attachment.tab, options.tab))
       throw new Error("Attachment does not bind this live tab");
   }
+  private readonly shutdown = new AbortController();
   stop(): void {
     this.stopped = true;
+    this.shutdown.abort();
   }
   private async sendReceipt(): Promise<void> {
     if (!this.pending) return;
@@ -148,7 +161,10 @@ export class BrowserHostAgent {
       throw error;
     }
   }
-  private post<T>(operation: "poll" | "complete", body?: unknown): Promise<T> {
+  private post<T>(
+    operation: "poll" | "complete" | "progress",
+    body?: unknown,
+  ): Promise<T> {
     const c = this.options.credential;
     return request(
       this.options.apiOrigin,
@@ -168,7 +184,8 @@ export class BrowserHostAgent {
       if (this.stopped) return;
       let response: { job: BrowserJob | null };
       try {
-        response = await this.post("poll");
+        // Declares whether this host can run delegated Jev goals.
+        response = await this.post("poll", { jev: !!this.options.jev });
       } catch (error) {
         if (error instanceof HostHTTPError && error.status === 403)
           this.stopped = true;
@@ -207,8 +224,25 @@ export class BrowserHostAgent {
             job.request.binding,
             job.request.action,
           );
+        } else if (
+          job.request.method === "goal" &&
+          this.options.credential.attachment.allow_actions
+        ) {
+          const request = parseGoalRequest(job.request);
+          const receipt = await runGoal({
+            browser: this.options.browser,
+            tab: this.options.tab,
+            jev: this.options.jev,
+            request,
+            minConfidence: this.options.minConfidence,
+            session: {
+              signal: this.shutdown.signal,
+              report: (progress) => this.progress(job.job_id, progress),
+            },
+          });
+          this.pending = { job_id: job.job_id, ...receipt };
         } else throw new Error("Unsupported or unauthorized browser request");
-        this.pending = {
+        this.pending ??= {
           job_id: job.job_id,
           status: "done",
           result: { dispatched, outcome: "returned", value },
@@ -240,6 +274,25 @@ export class BrowserHostAgent {
       await this.sendReceipt();
     } finally {
       this.busy = false;
+    }
+  }
+  /** Claim renewal + progress for a running goal; the API answers with the
+   * job's status so cancellation and revocation stop the next action. */
+  private async progress(
+    jobID: string,
+    progress: Record<string, unknown>,
+  ): Promise<Admission> {
+    try {
+      const { status } = await this.post<{ status: string }>("progress", {
+        job_id: jobID,
+        progress,
+      });
+      return status === "running" ? "continue" : "cancel";
+    } catch (error) {
+      if (error instanceof HostHTTPError && error.status === 403)
+        return "revoked";
+      if (error instanceof HostHTTPError && error.status === 409) return "lost";
+      throw error;
     }
   }
   async run(

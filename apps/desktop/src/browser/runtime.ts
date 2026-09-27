@@ -3,6 +3,7 @@ import type { Session } from "electron";
 import { type BaseWindow, session, WebContentsView } from "electron";
 import type {
   ActionReceipt,
+  ActOptions,
   BrowserAction,
   BrowserErrorCode,
   BrowserTabPort,
@@ -21,6 +22,16 @@ import { filterBrowserRequest } from "./request-policy.js";
 
 const activeProfiles = new Set<string>();
 const WORLD = 1001;
+const HUMAN_INPUT = new Set([
+  "mouseDown",
+  "mouseWheel",
+  "rawKeyDown",
+  "keyDown",
+  "char",
+  "touchStart",
+  "gestureScrollBegin",
+  "gestureTap",
+]);
 
 interface Tab {
   ref: TabRef;
@@ -29,7 +40,9 @@ interface Tab {
   revision: number;
   busy: boolean;
   unavailable: boolean;
-  snapshot?: { binding: PageBinding; expires: number };
+  /** Last native person input (key/pointer down, wheel, touch) on this tab. */
+  humanInputAt: number;
+  snapshot?: { binding: PageBinding; expires: number; observedAt: number };
   detach: () => void;
 }
 
@@ -127,6 +140,7 @@ export class SharedBrowserRuntime implements BrowserTabPort {
       revision: 0,
       busy: false,
       unavailable: false,
+      humanInputAt: 0,
       detach: () => {
         window.removeListener("resize", resize);
         window.removeListener("closed", close);
@@ -157,6 +171,11 @@ export class SharedBrowserRuntime implements BrowserTabPort {
       allowNavigation(event, destination),
     );
     contents.on("will-attach-webview", (event) => event.preventDefault());
+    // Native input reaches the page through Chromium's input pipeline; the
+    // secretary's DOM operations do not, so this identifies the person's use.
+    contents.on("input-event", (_event, input) => {
+      if (HUMAN_INPUT.has(input.type)) tab.humanInputAt = Date.now();
+    });
     contents.on(
       "did-start-navigation",
       (_event, _url, _inPlace, isMainFrame) => {
@@ -206,6 +225,7 @@ export class SharedBrowserRuntime implements BrowserTabPort {
   async observe(ref: TabRef): Promise<PageObservation> {
     return this.exclusive(ref, async (tab) => {
       this.assertReady(tab);
+      const observedAt = Date.now();
       const binding = {
         revision: tab.revision,
         observationId: randomUUID(),
@@ -217,7 +237,11 @@ export class SharedBrowserRuntime implements BrowserTabPort {
         url: binding.url,
       });
       this.assertCurrent(tab, binding);
-      tab.snapshot = { binding, expires: Date.now() + LIMITS.observationMs };
+      tab.snapshot = {
+        binding,
+        expires: Date.now() + LIMITS.observationMs,
+        observedAt,
+      };
       return {
         tab: { ...tab.ref },
         binding: { ...binding },
@@ -233,8 +257,10 @@ export class SharedBrowserRuntime implements BrowserTabPort {
     ref: TabRef,
     binding: PageBinding,
     action: BrowserAction,
+    options: ActOptions = {},
   ): Promise<ActionReceipt> {
     validateAction(action);
+    const guard = options.guard === true;
     return this.exclusive(ref, async (tab) => {
       this.assertReady(tab);
       this.assertCurrent(tab, binding);
@@ -250,7 +276,20 @@ export class SharedBrowserRuntime implements BrowserTabPort {
         );
       }
       tab.snapshot = undefined;
+      if (guard && tab.humanInputAt >= snapshot.observedAt) {
+        throw new BrowserRuntimeError(
+          "page_changed",
+          "The person used this tab after the observation. Observe again.",
+        );
+      }
       if (action.kind === "navigate") {
+        // The page world checks the observed controls before navigation too.
+        if (guard)
+          await this.page(tab, {
+            kind: "check",
+            observationId: binding.observationId,
+            url: binding.url,
+          });
         // No asynchronous gap between checking the host-owned binding and
         // requesting this navigation on the exact WebContents.
         try {
@@ -270,6 +309,7 @@ export class SharedBrowserRuntime implements BrowserTabPort {
           observationId: binding.observationId,
           url: binding.url,
           action,
+          guard,
         });
       }
       this.getTab(ref);
@@ -396,10 +436,11 @@ export class SharedBrowserRuntime implements BrowserTabPort {
   private async page(
     tab: Tab,
     request: {
-      kind: "observe" | "act";
+      kind: "observe" | "act" | "check";
       observationId: string;
       url: string;
       action?: BrowserAction;
+      guard?: boolean;
     },
   ) {
     const full = {

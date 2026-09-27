@@ -23,6 +23,7 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/browser-tabs/{id}", s.human)
 	mux.HandleFunc("POST /api/browser-host/tabs/{id}/poll", s.host)
 	mux.HandleFunc("POST /api/browser-host/tabs/{id}/complete", s.host)
+	mux.HandleFunc("POST /api/browser-host/tabs/{id}/progress", s.host)
 }
 func reply(w http.ResponseWriter, status int, out any) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -107,12 +108,37 @@ func (s *Service) host(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if strings.HasSuffix(r.URL.Path, "/poll") {
-		j, e := s.Store.Claim(r.Context(), id, token)
+		// Optional body: the host declares whether it can run Jev goals.
+		var in struct {
+			Jev bool `json:"jev"`
+		}
+		if r.ContentLength != 0 && !decode(w, r, &in) {
+			problem(w, ErrInvalid)
+			return
+		}
+		j, e := s.Store.Claim(r.Context(), id, token, in.Jev)
 		if e != nil {
 			problem(w, e)
 			return
 		}
 		reply(w, 200, map[string]any{"job": j})
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/progress") {
+		var in struct {
+			JobID    string         `json:"job_id"`
+			Progress map[string]any `json:"progress"`
+		}
+		if !decode(w, r, &in) {
+			problem(w, ErrInvalid)
+			return
+		}
+		status, e := s.Store.Progress(r.Context(), id, token, in.JobID, in.Progress)
+		if e != nil {
+			problem(w, e)
+			return
+		}
+		reply(w, 200, map[string]any{"job_id": in.JobID, "status": status})
 		return
 	}
 	var in struct {

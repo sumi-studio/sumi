@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -22,6 +24,7 @@ import (
 
 var ErrInvalid = errors.New("invalid browser attachment request")
 var ErrUnavailable = errors.New("browser attachment unavailable or not authorized")
+var ErrJevUnavailable = errors.New("the Jev operation layer is not configured on this tab's browser host; use browser.observe and browser.act directly")
 
 type TabRef struct {
 	RuntimeID string `json:"runtimeId"`
@@ -111,7 +114,7 @@ func (s *Store) List(ctx context.Context, human string) ([]Attachment, error) {
 func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	effects := map[string]agentstate.ToolEffect{}
 	effects["browser.tabs"] = agentstate.ToolEffect{ReadOnly: agentstate.AlwaysReadOnly, Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
-		rows, e := tx.Query(ctx, `SELECT b.attachment_id,b.name,b.tab,b.allow_actions,b.last_seen_at>now()-interval '30 seconds' FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.persona_id=$1 AND p.authority='active' AND b.enabled ORDER BY b.last_seen_at DESC,b.created_at DESC LIMIT 100`, persona)
+		rows, e := tx.Query(ctx, `SELECT b.attachment_id,b.name,b.tab,b.allow_actions,b.last_seen_at>now()-interval '30 seconds',b.jev_available FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.persona_id=$1 AND p.authority='active' AND b.enabled ORDER BY b.last_seen_at DESC,b.created_at DESC LIMIT 100`, persona)
 		if e != nil {
 			return nil, e
 		}
@@ -120,15 +123,21 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 		for rows.Next() {
 			var id, name string
 			var tab TabRef
-			var write, available bool
-			if e := rows.Scan(&id, &name, &tab, &write, &available); e != nil {
+			var write, available, jev bool
+			if e := rows.Scan(&id, &name, &tab, &write, &available, &jev); e != nil {
 				return nil, e
 			}
-			out = append(out, map[string]any{"attachment_id": id, "name": name, "tab": tab, "allow_actions": write, "available": available})
+			// direct: browser.observe/act. jev: browser.goal, which also needs
+			// the action grant and a host that declared a configured Jev key.
+			layer := "not_configured"
+			if jev {
+				layer = "available"
+			}
+			out = append(out, map[string]any{"attachment_id": id, "name": name, "tab": tab, "allow_actions": write, "available": available, "operation_layers": map[string]any{"direct": true, "jev": layer}})
 		}
 		return map[string]any{"tabs": out}, rows.Err()
 	}}
-	for _, method := range []string{"observe", "act"} {
+	for _, method := range []string{"observe", "act", "goal"} {
 		method := method
 		effects["browser."+method] = agentstate.ToolEffect{Validate: func(req map[string]any) error {
 			return validateRequest(method, req)
@@ -138,18 +147,30 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			}
 			id, _ := req["attachment_id"].(string)
 			var tab TabRef
-			var allow bool
-			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND b.last_seen_at>now()-interval '30 seconds' FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow)
-			if errors.Is(e, pgx.ErrNoRows) || e == nil && method == "act" && !allow {
-				return nil, fmt.Errorf("%w: %v", agentstate.ErrBadRequest, ErrUnavailable)
+			var allow, jev bool
+			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions,b.jev_available FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND b.last_seen_at>now()-interval '30 seconds' FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow, &jev)
+			if errors.Is(e, pgx.ErrNoRows) || e == nil && method != "observe" && !allow {
+				return nil, fmt.Errorf("%w: %w", agentstate.ErrBadRequest, ErrUnavailable)
 			}
 			if e != nil {
 				return nil, e
 			}
+			if method == "goal" && !jev {
+				// Distinct from choosing the direct path: nothing was queued and
+				// no other model is substituted for the missing operation layer.
+				return nil, fmt.Errorf("%w: %w", agentstate.ErrBadRequest, ErrJevUnavailable)
+			}
 			request := map[string]any{"attachment_id": id, "tab": tab, "method": method}
-			if method == "act" {
+			switch method {
+			case "act":
 				request["binding"] = req["binding"]
 				request["action"] = req["action"]
+			case "goal":
+				for _, k := range []string{"goal", "inputs", "private_inputs", "max_steps"} {
+					if v, ok := req[k]; ok {
+						request[k] = v
+					}
+				}
 			}
 			jobID, e := agentstate.EffectJobID(idem)
 			if e != nil {
@@ -166,9 +187,62 @@ func validateRequest(method string, req map[string]any) error {
 	if _, e := uuid.Parse(id); e != nil {
 		return fmt.Errorf("%w: attachment_id required", agentstate.ErrBadRequest)
 	}
-	if method == "act" {
-		if e := validateAction(req); e != nil {
-			return e
+	switch method {
+	case "act":
+		return validateAction(req)
+	case "goal":
+		return validateGoal(req)
+	}
+	return nil
+}
+
+var inputName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,39}$`)
+
+// validateGoal mirrors the host's bounds so a malformed goal fails before it
+// is queued (and before an elevated call could ask a person to approve it).
+func validateGoal(req map[string]any) error {
+	bad := func(why string) error {
+		return fmt.Errorf("%w: invalid browser goal: %s", agentstate.ErrBadRequest, why)
+	}
+	raw, e := json.Marshal(req)
+	if e != nil || len(raw) > 32<<10 {
+		return bad("request exceeds 32 KiB")
+	}
+	if hasNUL(string(raw)) {
+		return bad("NUL characters are not allowed")
+	}
+	goal, _ := req["goal"].(string)
+	if n := utf8.RuneCountInString(strings.TrimSpace(goal)); n == 0 || len(goal) > 2000 {
+		return bad("goal text of at most 2000 characters is required")
+	}
+	inputs := map[string]any{}
+	if v, ok := req["inputs"]; ok {
+		if inputs, ok = v.(map[string]any); !ok || len(inputs) > 16 {
+			return bad("inputs must be an object with at most 16 entries")
+		}
+	}
+	for k, v := range inputs {
+		s, ok := v.(string)
+		if !inputName.MatchString(k) || !ok || utf8.RuneCountInString(s) > 8000 {
+			return bad("input names are lower_snake_case and values are text of at most 8000 characters")
+		}
+	}
+	if v, ok := req["private_inputs"]; ok {
+		list, ok := v.([]any)
+		if !ok {
+			return bad("private_inputs must be a list of input names")
+		}
+		for _, n := range list {
+			s, _ := n.(string)
+			if _, ok := inputs[s]; !ok {
+				return bad("private_inputs must name provided inputs")
+			}
+		}
+	}
+	if v, ok := req["max_steps"]; ok {
+		n, ok := v.(float64)
+		if !ok || n != float64(int64(n)) || n < 1 || n > 40 {
+			return bad("max_steps must be an integer from 1 to 40")
 		}
 	}
 	return nil
@@ -208,7 +282,7 @@ func validateAction(req map[string]any) error {
 
 // Claim is the dispatch-admission linearization point. Revocation stops future
 // admissions, not an already admitted remote action. A lost response is not retried.
-func (s *Store) Claim(ctx context.Context, id, token string) (*agentstate.Job, error) {
+func (s *Store) Claim(ctx context.Context, id, token string, jev bool) (*agentstate.Job, error) {
 	tx, e := s.Pool.Begin(ctx)
 	if e != nil {
 		return nil, e
@@ -218,7 +292,7 @@ func (s *Store) Claim(ctx context.Context, id, token string) (*agentstate.Job, e
 	if e != nil {
 		return nil, e
 	}
-	_, e = tx.Exec(ctx, `UPDATE browser_tab_attachments SET last_seen_at=now() WHERE attachment_id=$1`, id)
+	_, e = tx.Exec(ctx, `UPDATE browser_tab_attachments SET last_seen_at=now(),jev_available=$2 WHERE attachment_id=$1`, id, jev)
 	if e != nil {
 		return nil, e
 	}
@@ -237,6 +311,43 @@ func (s *Store) Claim(ctx context.Context, id, token string) (*agentstate.Job, e
 	j, e := s.Core.GetJob(ctx, a.PersonaID, jobID)
 	return &j, e
 }
+
+// Progress renews a running goal's claim and the tab's presence, and records
+// the host's latest progress under result.progress (terminal completion
+// replaces it). It returns the job status so the host stops before its next
+// action once cancellation was requested. A revoked grant fails
+// authentication; a lost/finished/over-budget goal is ErrJobNotClaimed.
+func (s *Store) Progress(ctx context.Context, id, token, jobID string, progress map[string]any) (string, error) {
+	raw, e := json.Marshal(progress)
+	if e != nil || len(raw) > 16<<10 || hasNUL(string(raw)) {
+		return "", ErrInvalid
+	}
+	tx, e := s.Pool.Begin(ctx)
+	if e != nil {
+		return "", e
+	}
+	defer tx.Rollback(ctx)
+	a, e := s.authenticate(ctx, tx, id, token, true)
+	if e != nil {
+		return "", e
+	}
+	if _, e = tx.Exec(ctx, `UPDATE browser_tab_attachments SET last_seen_at=now() WHERE attachment_id=$1`, id); e != nil {
+		return "", e
+	}
+	var status string
+	e = tx.QueryRow(ctx, `UPDATE core_jobs SET claim_expires_at=now()+interval '30 seconds',result=COALESCE(result,'{}'::jsonb)||jsonb_build_object('progress',$4::jsonb)
+ WHERE persona_id=$1 AND job_id=$2 AND kind='browser' AND claimed_by=$3 AND request->>'method'='goal' AND request->>'attachment_id'=$5 AND status IN('running','cancel_requested') AND started_at>now()-interval '6 minutes' RETURNING status`, a.PersonaID, jobID, "browser:"+id, raw, id).Scan(&status)
+	if errors.Is(e, pgx.ErrNoRows) {
+		return "", agentstate.ErrJobNotClaimed
+	}
+	if e != nil {
+		return "", e
+	}
+	return status, tx.Commit(ctx)
+}
+
+// hasNUL checks encoded JSON: jsonb cannot store NUL, which website text can contain.
+func hasNUL(s string) bool { return strings.ContainsRune(s, 0) || strings.Contains(s, `\u0000`) }
 func (s *Store) authenticate(ctx context.Context, tx pgx.Tx, id, token string, enabled bool) (Attachment, error) {
 	var a Attachment
 	if _, e := uuid.Parse(id); e != nil {
