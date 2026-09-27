@@ -15,6 +15,11 @@ import {
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
 import type { Event } from "../src/types.ts";
 
+// Incoming messages open with a receipt line (conversation-continuity
+// tests); these assertions are about what follows it.
+const afterReceipt = (c: string | undefined) =>
+  c?.replace(/^\[(?:Received|Recorded) [^\]]*\]\n/, "");
+
 const PERSONA = "01930e00-0000-7000-8000-0000000000b2";
 
 /** A provider scripted per call: call number → its event stream. */
@@ -101,20 +106,22 @@ test("recovery: a refused request retries on a reduced working view and complete
   const recovered = provider.requests[5]!;
   assert.equal(recovered.messages[0]!.role, "system");
   // The capacity notice names exactly the records left out and how to
-  // reread them — the oldest four records, dropped whole.
+  // reread them — the oldest records, dropped whole. The first receipt has
+  // no previous receipt time, so its record is slightly smaller than the
+  // later ones and halving the view reaches one record further.
   const notice = noticeOf(recovered);
   assert.ok(notice, "capacity notice present");
-  assert.match(notice!.content, /journal seq 1 through 4/);
+  assert.match(notice!.content, /journal seq 1 through 5/);
   assert.match(notice!.content, /conversation_history/);
   // The evicted text is gone from this send; the retained tail and the
   // current input are not.
   const bodies = recovered.messages.map((m) => m.content);
   assert.ok(!bodies.some((c) => c.includes("old-0")), "evicted records absent");
   assert.ok(
-    bodies.some((c) => c.includes("old-2")),
+    bodies.some((c) => c.includes("old-3")),
     "retained tail present",
   );
-  assert.equal(recovered.messages.at(-1)!.content, "[human] the live request");
+  assert.equal(afterReceipt(recovered.messages.at(-1)!.content), "[human] the live request");
   assert.equal(recovered.messages.at(-1)!.role, "user");
 
   // The journal itself was never touched: every record — including the
@@ -160,7 +167,7 @@ test("recovery: the in-turn assistant/tool suffix rides along; effects are not r
   const recovered = provider.requests[6]!;
   assert.ok(noticeOf(recovered), "capacity notice present");
   const suffix = recovered.messages.slice(-3);
-  assert.equal(suffix[0]!.content, "[human] please remember this");
+  assert.equal(afterReceipt(suffix[0]!.content), "[human] please remember this");
   assert.equal(suffix[1]!.role, "assistant");
   assert.equal(suffix[1]!.toolCalls?.length, 1);
   assert.equal(suffix[1]!.toolCalls![0]!.name, "journal.note");
@@ -196,8 +203,8 @@ test("recovery: persistent refusals end in a bounded, honest failure", async () 
   // 1 initial + 2 recoveries = 3 sends, then a recorded failure.
   assert.equal(provider.requests.length, 7);
   // Each recovery evicts more of the oldest records.
-  assert.match(noticeOf(provider.requests[5]!)!.content, /seq 1 through 4/);
-  assert.match(noticeOf(provider.requests[6]!)!.content, /seq 1 through 6/);
+  assert.match(noticeOf(provider.requests[5]!)!.content, /seq 1 through 5/);
+  assert.match(noticeOf(provider.requests[6]!)!.content, /seq 1 through 7/);
 
   const input = state.inputs.find((i) => i.input_id === "live")!;
   assert.equal(

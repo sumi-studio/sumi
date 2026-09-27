@@ -161,6 +161,12 @@ type Input struct {
 	// core's provider retry budget can exclude the human's thinking
 	// time — a long decision does not consume the model's retry window.
 	WaitedMs int64 `json:"waited_ms"`
+	// PreviousReceivedAt is the receipt time (created_at) of the incoming
+	// message admitted just before this one; nil for the first. Internal
+	// inputs (schedule, job, terminal) are not a baseline. Derived,
+	// never written: the core journals it with the receipt so the model
+	// sees the gap between messages.
+	PreviousReceivedAt *time.Time `json:"previous_received_at"`
 }
 
 type Turn struct {
@@ -871,7 +877,21 @@ func (s *Store) ReleaseWriter(ctx context.Context, personaID, holderID string, g
 const inputCols = `persona_id, input_id, kind, payload, actor_kind, actor_id,
 	source_surface, thread_id, occurred_at, attention, status,
 	claimed_generation, turn_id, created_at, done_at, not_before,
-	waiting_since, waited_ms`
+	waiting_since, waited_ms, ` + previousReceiptCol
+
+// previousReceiptCol is the receipt time of the incoming message admitted
+// just before this one (admission order), or NULL for a persona's first.
+// Inputs Sumi raises itself — schedule wakes, job and terminal endings —
+// are not incoming messages and never serve as the baseline. It derives
+// from rows fixed at admission, so every read of the same input — claim,
+// restart recovery, a mid-turn receipt — yields the same value; it is never
+// measured from what the context shows. Valid wherever core_inputs is the
+// queried or returned table.
+const previousReceiptCol = `(SELECT prev.created_at FROM core_inputs prev
+		WHERE prev.persona_id = core_inputs.persona_id
+			AND prev.admission_seq < core_inputs.admission_seq
+			AND prev.actor_kind NOT IN ('schedule', 'job', 'terminal')
+		ORDER BY prev.admission_seq DESC LIMIT 1)`
 
 type inputScanner interface {
 	Scan(dest ...any) error
@@ -883,7 +903,7 @@ func scanInput(row inputScanner) (Input, error) {
 		&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 		&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
 		&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore,
-		&in.WaitingSince, &in.WaitedMs)
+		&in.WaitingSince, &in.WaitedMs, &in.PreviousReceivedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return in, ErrInputNotFound
 	}
@@ -946,7 +966,7 @@ func (s *Store) SubmitInput(ctx context.Context, in *Input) (Input, bool, error)
 				&stored.ActorKind, &stored.ActorID, &stored.SourceSurface, &stored.ThreadID,
 				&stored.OccurredAt, &stored.Attention, &stored.Status, &stored.ClaimedGeneration,
 				&stored.TurnID, &stored.CreatedAt, &stored.DoneAt, &stored.NotBefore,
-				&stored.WaitingSince, &stored.WaitedMs)
+				&stored.WaitingSince, &stored.WaitedMs, &stored.PreviousReceivedAt)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Replay of an existing input_id is only valid when every caller-
@@ -1251,7 +1271,7 @@ func (s *Store) LoadTurn(ctx context.Context, personaID string, generation int64
 				&in.ActorKind, &in.ActorID, &in.SourceSurface, &in.ThreadID,
 				&in.OccurredAt, &in.Attention, &in.Status, &in.ClaimedGeneration,
 				&in.TurnID, &in.CreatedAt, &in.DoneAt, &in.NotBefore,
-				&in.WaitingSince, &in.WaitedMs)
+				&in.WaitingSince, &in.WaitedMs, &in.PreviousReceivedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
 			if err != nil {
@@ -2046,7 +2066,10 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 		"place_kind":     nil,
 		"attention":      in.Attention,
 		"occurred_at":    in.OccurredAt,
-		"attempt":        attempt,
+		"received_at":    in.CreatedAt,
+		// Pinned at receipt: a later compaction never re-measures the gap.
+		"previous_received_at": in.PreviousReceivedAt,
+		"attempt":              attempt,
 	}
 	if actor, ok := in.Payload["actor"].(map[string]any); ok {
 		payload["actor_display"] = actor["display_name"]

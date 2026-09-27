@@ -1,5 +1,12 @@
 import type { ModelEvent, ModelProvider, ModelRequest } from "../provider.ts";
 
+// Context assembly opens an input with a receipt line and an "[actor]"
+// marker; directives are read after them.
+const stripMarkers = (s: string) =>
+  s
+    .replace(/^\[(?:Received|Recorded) [^\]]*\]\n/, "")
+    .replace(/^\[[^\]]*\]\s*/, "");
+
 /**
  * MOCK PROVIDER — deterministic, no network. It exists for test and dev
  * coverage only; it is not a stand-in for a real model acceptance run.
@@ -35,9 +42,9 @@ export class MockProvider implements ModelProvider {
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
-    // Context assembly prefixes "[actor]" markers; directives come first after
-    // the marker so `!tool` still parses.
-    const text = lastUserText(request).replace(/^\[[^\]]*\]\s*/, "");
+    // Context assembly prefixes a receipt line and "[actor]" markers;
+    // directives come first after them so `!tool` still parses.
+    const text = stripMarkers(lastUserText(request));
     let reply = `echo: ${text}`;
     const toolCalls: {
       name: string;
@@ -56,7 +63,7 @@ export class MockProvider implements ModelProvider {
     if (request.round === 0) {
       for (const m of request.messages) {
         if (m.role !== "user") continue;
-        const t = m.content.replace(/^\[[^\]]*\]\s*/, "");
+        const t = stripMarkers(m.content);
         alwayspad = /^!alwayspad\s+(\d+)\s*(.*)$/s.exec(t);
         if (alwayspad) break;
       }

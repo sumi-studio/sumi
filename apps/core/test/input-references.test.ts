@@ -10,6 +10,11 @@ import type {
 import { assemble, Secretary } from "../src/secretary.ts";
 import type { Input } from "../src/types.ts";
 
+// Incoming messages open with a receipt line (conversation-continuity
+// tests); these assertions are about what follows it.
+const afterReceipt = (c: string | undefined) =>
+  c?.replace(/^\[(?:Received|Recorded) [^\]]*\]\n/, "");
+
 const PERSONA = "01930e00-0000-7000-8000-000000000001";
 
 class ObservingProvider implements ModelProvider {
@@ -191,5 +196,5 @@ test("reference metadata is scoped to its actual input surface", () => {
       exit_code: 0,
     },
   });
-  assert.equal(assemble([], input).at(-1)!.content, "[human] Hello");
+  assert.equal(afterReceipt(assemble([], input).at(-1)!.content), "[human] Hello");
 });
