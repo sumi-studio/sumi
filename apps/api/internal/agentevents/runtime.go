@@ -2849,7 +2849,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 	// a trusted, unchanged fingerprint proves the tail was folded from the
 	// file's current bytes, so re-reading the whole lifetime log is skipped.
 	if st.eventStatTrusted && g.now().UnixNano() >= st.eventStatVerifiedNS {
-		if current, ok := statEventFile(file); ok && current == st.eventStat {
+		if current, ok := statEventFile(file); ok && current == st.eventStat && current.size == st.eventSize {
 			return nil
 		}
 	}

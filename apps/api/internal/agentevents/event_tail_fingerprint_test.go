@@ -452,3 +452,56 @@ func TestTrustedEventTailAfterAppendRollback(t *testing.T) {
 		}
 	}
 }
+
+// Model a storage revert that restores the previously verified metadata
+// after this process has appended. The cached tail must be rebuilt before
+// the next append, otherwise it assigns a sequence number past a gap.
+func TestTrustedEventTailAfterOwnAppendAndStorageRevert(t *testing.T) {
+	g := openRuntimeGateway(t)
+	requireEventStatFastPath(t, g)
+	g.nowHook = agedClock
+	seedProjectedRun(t, g, historyPA, 1, 4)
+	ctx := context.Background()
+	if err := g.RefreshDurableEventTail(ctx, historyPA); err != nil {
+		t.Fatal(err)
+	}
+	path := g.eventPath(historyPA)
+	snapshot, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := g.observedEventTail(historyPA)
+	if !g.stateFor(historyPA).eventStatTrusted {
+		t.Fatal("expected an aged, verified fingerprint")
+	}
+	appendMessage := func(n int) {
+		t.Helper()
+		raw, err := json.Marshal(historyMessage(n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.AppendProjectedEvents(ctx, historyPA, []ProjectedEvent{{Event: raw}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendMessage(5)
+	if err := os.WriteFile(path, snapshot, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A normal write cannot restore ctime. Model the old metadata matching
+	// again by substituting the reverted file's ctime in the fingerprint.
+	changed := eventFileChangeTime(t, path)
+	g.mu.Lock()
+	g.stateFor(historyPA).eventStat.ctimeNS = changed.UnixNano()
+	g.mu.Unlock()
+	if err := g.RefreshDurableEventTail(ctx, historyPA); err != nil {
+		t.Fatal(err)
+	}
+	if got := g.observedEventTail(historyPA); got != before {
+		t.Fatalf("tail after storage revert = %+v, want %+v", got, before)
+	}
+	appendMessage(6)
+	if _, err := g.EventCatchUp(ctx, historyPA, 0); err != nil {
+		t.Fatalf("replay after storage revert and append: %v", err)
+	}
+}
