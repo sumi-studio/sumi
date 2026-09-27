@@ -477,3 +477,49 @@ describe("TerminalSessionView input ledger observer", () => {
     expect(attach.resizeCalls).toEqual([[80, 24]]);
   });
 });
+
+describe("TerminalSessionView output health", () => {
+  const warning = /出力を受信できていません/;
+
+  it("does not show the output warning during ordinary startup", () => {
+    vi.useFakeTimers();
+    const { attach } = mount(client(), session("requested"));
+    act(() => attach.events.onConnection("open"));
+    act(() =>
+      attach.events.onSession(session("active", { outputAttached: false })),
+    );
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    act(() =>
+      attach.events.onSession(session("active", { outputAttached: true })),
+    );
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+  });
+
+  it("still reports output that stays detached", () => {
+    vi.useFakeTimers();
+    const { attach } = mount(client(), session("requested"));
+    act(() => attach.events.onConnection("open"));
+    act(() =>
+      attach.events.onSession(session("active", { outputAttached: false })),
+    );
+    act(() => {
+      vi.advanceTimersByTime(2_999);
+    });
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(2);
+    });
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    act(() =>
+      attach.events.onSession(session("active", { outputAttached: true })),
+    );
+    expect(screen.queryByText(warning)).not.toBeInTheDocument();
+  });
+});

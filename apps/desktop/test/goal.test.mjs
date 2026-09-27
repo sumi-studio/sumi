@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   buildDecision,
   parseGoalRequest,
+  privateRedactor,
   runGoal,
 } from "../dist/browser/goal.js";
 import { JevClient, JevError } from "../dist/browser/jev.js";
@@ -473,6 +474,340 @@ test("private inputs echoed by the page never reach Jev, progress or results", a
   assert.ok(
     receipt.result.value.final_page.title.includes("[private:password]"),
   );
+});
+
+// Synthetic private values of the kinds the independent review found leaking:
+// multi-line, quoted/backslashed, longer than a shown value, and a value
+// straddling a truncation bound.
+const PRIVATE = {
+  address: "1 Quinzel Lane\nZephyrton 40417",
+  passphrase: 'correct "horse" \\ zygomatic-battery',
+  token: `tok_${"Q7x9Kp2Lm4".repeat(60)}`,
+  member: "MEMBER-4411-2233-9988",
+};
+const FRAGMENTS = [
+  "quinzel",
+  "zephyrton",
+  "horse",
+  "zygomatic",
+  "q7x9kp2lm4",
+  "member-4",
+];
+
+/** A page echoing every private value at a place where the head at review
+ * formatted or cut it before redaction, or where the page itself cut it. */
+function echoPage({ truncated }) {
+  const { address, passphrase, token, member } = PRIVATE;
+  let text = "Saved. ";
+  text += `${"q".repeat(1990 - text.length)} ${member} `; // straddles 2000
+  text += `${address.replace("\n", " ")} ${JSON.stringify(passphrase)} `;
+  text += `${"p".repeat(5991 - text.length)}${member} `; // straddles 6000
+  const observed = {
+    title: `Saved ${"T".repeat(500)} ${token}`.slice(0, 512),
+    // The page's own 16 000-character cut ends inside the token.
+    text: truncated ? `Saved. Reference ${token.slice(0, 40)}` : text,
+    truncated,
+    targets: [
+      {
+        id: "t0",
+        tag: "textarea",
+        role: "",
+        name: "Address",
+        value: address,
+        bounds: {},
+      },
+      {
+        id: "t1",
+        tag: "input",
+        type: "text",
+        role: "",
+        name: "Passphrase",
+        value: passphrase,
+        bounds: {},
+      },
+      // Page-capped at 512 characters: only the beginning of the token.
+      {
+        id: "t2",
+        tag: "input",
+        type: "text",
+        role: "",
+        name: "Token",
+        value: token.slice(0, 512),
+        bounds: {},
+      },
+      {
+        id: "t3",
+        tag: "input",
+        type: "text",
+        role: "",
+        name: "Reference",
+        value: `ref ${member}`,
+        bounds: {},
+      },
+      // "t4 " + name is cut at 160 in steps/progress: inside the member.
+      {
+        id: "t4",
+        tag: "button",
+        role: "",
+        name: `${"x".repeat(147)} ${member}`,
+        bounds: {},
+      },
+      // A name the page cut at 256 inside the passphrase.
+      {
+        id: "t5",
+        tag: "a",
+        role: "",
+        name: `${"y".repeat(245)} ${passphrase}`.slice(0, 256),
+        bounds: {},
+      },
+      {
+        id: "t6",
+        tag: "select",
+        role: "",
+        name: "Deliver to",
+        value: "home",
+        options: [
+          { value: "home", label: `Home: ${address}` },
+          { value: "work", label: "Work" },
+        ],
+        bounds: {},
+      },
+    ],
+  };
+  let n = 0;
+  return {
+    async observe() {
+      n++;
+      return {
+        tab,
+        binding: {
+          revision: 0,
+          observationId: `o${n}`,
+          url: `http://fixture.test/?${new URLSearchParams({ a: address, p: passphrase })}`,
+        },
+        ...structuredClone(observed),
+      };
+    },
+    async act() {
+      return { tab, status: "dispatched", revision: 0 };
+    },
+  };
+}
+
+test("private values are protected before escaping, shortening and at every truncation bound", async (t) => {
+  for (const truncated of [false, true]) {
+    const req = parseGoalRequest({
+      goal: "Check my delivery details are saved.",
+      inputs: PRIVATE,
+      private_inputs: Object.keys(PRIVATE),
+    });
+    let call = 0;
+    const { fixture, jev } = await jevFor(t, {
+      policy: (body) => {
+        const ops = Object.keys(body.questions.operation.criteria);
+        const targets = Object.keys(body.questions.click_target.criteria);
+        return ++call === 1
+          ? {
+              operation: choice(ops, "CLICK"),
+              click_target: choice(targets, "t4"),
+            }
+          : {
+              operation: choice(ops, "DONE"),
+              goal_complete: { type: "noul", noul: 0.95 },
+            };
+      },
+    });
+    const s = session();
+    const receipt = await runGoal({
+      browser: echoPage({ truncated }),
+      tab,
+      jev,
+      request: req,
+      session: s,
+    });
+    assert.equal(receipt.result.value.goal_outcome, "jev_reported_done");
+    const sent = fixture.requests.map((r) => r.raw);
+    assert.equal(sent.length, 2);
+    const kept = JSON.stringify({ receipt, reports: s.reports });
+    const label = truncated ? "page cut by the host" : "full page";
+    for (const [where, text] of [
+      ...sent.map((r, i) => [`Jev request ${i + 1}`, r]),
+      ["progress and result", kept],
+    ]) {
+      for (const [name, value] of Object.entries(PRIVATE))
+        for (const form of [
+          value,
+          JSON.stringify(value).slice(1, -1),
+          encodeURIComponent(value),
+          new URLSearchParams({ v: value }).toString().slice(2),
+        ])
+          assert.ok(!text.includes(form), `${label}: ${where} has ${name}`);
+      for (const fragment of FRAGMENTS)
+        assert.ok(
+          !text.toLowerCase().includes(fragment),
+          `${label}: ${where} has fragment ${fragment}`,
+        );
+    }
+    // What is not private stays visible to Jev.
+    const state = JSON.parse(sent[0]).state;
+    assert.match(state.page.text, /^Saved\. /);
+    assert.match(
+      state.controls,
+      /\[t0\] textarea "Address" · value "\[private:address\]" · already contains input `address`/,
+    );
+    assert.match(
+      state.controls,
+      /\[t2\] input\(text\) "Token" · value "\[private:token\]"/,
+    );
+    assert.match(
+      state.controls,
+      /\[t3\] input\(text\) "Reference" · value "\[private:member\]"/,
+    );
+    assert.match(state.controls, /selected "Home: \[private:address\]"/);
+    assert.ok(
+      s.reports.some((r) =>
+        r.next?.target?.startsWith(`t4 ${"x".repeat(147)} [priv`),
+      ),
+      "the next target is reported with the value protected",
+    );
+  }
+});
+
+test("capped private echoes with a public prefix stay out of decisions and saved observations", async (t) => {
+  const token = `tok_${"Q7w8E9r0T1".repeat(60)}`;
+  const req = parseGoalRequest({
+    goal: "Check my token is saved.",
+    inputs: { token },
+    private_inputs: ["token"],
+  });
+  for (const [name, echo] of [
+    ["control value", { value: `ref ${token}`.slice(0, 512) }],
+    ["role attribute", { role: `ref ${token}`.slice(0, 100) }],
+  ]) {
+    await t.test(name, () => {
+      const page = {
+        tab,
+        binding: {
+          revision: 0,
+          observationId: "o",
+          url: "http://fixture.test/",
+        },
+        title: "Token",
+        text: "Saved",
+        truncated: false,
+        targets: [
+          {
+            id: "t0",
+            tag: "input",
+            type: "text",
+            role: "",
+            name: "Reference",
+            bounds: {},
+            ...echo,
+          },
+          { id: "t1", tag: "button", role: "", name: "Save", bounds: {} },
+          { id: "t2", tag: "button", role: "", name: "Cancel", bounds: {} },
+        ],
+      };
+      const decision = buildDecision(page, req, []);
+      const wire = JSON.stringify({
+        state: decision.state,
+        questions: decision.questions,
+      });
+      const saved = JSON.stringify(privateRedactor(req).page(page));
+      for (const output of [wire, saved]) {
+        assert.ok(
+          !output.includes(token.slice(0, 40)),
+          "no private prefix leaves the host",
+        );
+        assert.ok(output.includes("[private:token]"));
+      }
+      assert.equal(
+        req.inputs.token,
+        token,
+        "the value available for filling stays intact",
+      );
+    });
+  }
+});
+
+test("the redactor keeps short values exact-only and leaves unrelated text alone", () => {
+  const scrub = privateRedactor(
+    parseGoalRequest({
+      goal: "g",
+      inputs: { pin: "42", code: "Save the whales" },
+      private_inputs: ["pin", "code"],
+    }),
+  );
+  assert.equal(scrub.field("42"), "[private:pin]");
+  assert.equal(scrub.text("Order 42 shipped"), "Order 42 shipped");
+  assert.equal(scrub.field("Save the"), "[private:code]", "begins the value");
+  assert.equal(scrub.text("Save"), "Save", "a short word is not a prefix leak");
+  assert.equal(
+    scrub.text("Please SAVE  THE\nwhales today"),
+    "Please [private:code] today",
+  );
+  assert.equal(scrub.text("abc Save the wh", 200, true), "abc [private:code]");
+  assert.equal(scrub.text("abc Save the wh", 200, false), "abc Save the wh");
+});
+
+test("a click whose effect lands asynchronously is not decided on (or repeated) too early", async (t) => {
+  let saves = 0;
+  let saved = false;
+  let n = 0;
+  const page = {
+    async observe() {
+      n++;
+      return {
+        tab,
+        binding: {
+          revision: 0,
+          observationId: `o${n}`,
+          url: "http://fixture.test/",
+        },
+        title: "Form",
+        text: saved ? "Saved." : "Not saved yet",
+        truncated: false,
+        targets: [
+          { id: "t0", tag: "button", role: "", name: "Save", bounds: {} },
+          { id: "t1", tag: "button", role: "", name: "Cancel", bounds: {} },
+        ],
+      };
+    },
+    async act() {
+      // No spinner, no disabled button: the save lands 600 ms later.
+      saves++;
+      setTimeout(() => {
+        saved = true;
+      }, 600);
+      return { tab, status: "dispatched", revision: 0 };
+    },
+  };
+  // Like the review's double: press Save whenever the page is not saved.
+  const { fixture, jev } = await jevFor(t, {
+    policy: (body) => {
+      const ops = Object.keys(body.questions.operation.criteria);
+      return body.state.page.text === "Saved."
+        ? {
+            operation: choice(ops, "DONE"),
+            goal_complete: { type: "noul", noul: 0.95 },
+          }
+        : {
+            operation: choice(ops, "CLICK"),
+            click_target: choice(["t0", "t1"], "t0"),
+          };
+    },
+  });
+  const receipt = await runGoal({
+    browser: page,
+    tab,
+    jev,
+    request: parseGoalRequest({ goal: "Save the form." }),
+    session: session(),
+  });
+  assert.equal(receipt.result.value.goal_outcome, "jev_reported_done");
+  assert.equal(saves, 1, "Save pressed once");
+  assert.equal(fixture.requests.length, 2, "no decision on the unsettled page");
 });
 
 test("a malformed or unbalanced Jev answer executes nothing", async (t) => {

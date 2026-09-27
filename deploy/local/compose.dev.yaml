@@ -333,6 +333,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
+          # dockerd requires rslave or rshared inside its data root and applies
+          # rslave when unset. Keep that choice explicit so rendered configs
+          # cannot accidentally use rprivate, which fails at container creation.
+          propagation: rslave
       - type: bind
         source: ${SUMI_DOCKER_CONFIG_FILE:?SUMI_DOCKER_CONFIG_FILE is required}
         target: /run/sumi/docker-config/config.json

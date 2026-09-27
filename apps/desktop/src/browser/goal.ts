@@ -37,6 +37,11 @@ export const GOAL_LIMITS = Object.freeze({
   heartbeatMs: 3_000,
   /** A decision older than this (observation → action) is discarded unused. */
   decisionMs: 8_000,
+  /** After a click or select, an unchanged page is re-observed (every settleStepMs)
+   * for up to this long before Jev decides again: effects such as a form
+   * saving over the network land asynchronously. */
+  settleMs: 2_000,
+  settleStepMs: 250,
   /** Private values at least this long are also redacted inside longer text. */
   privateMin: 3,
   pageText: 6_000,
@@ -136,6 +141,8 @@ export interface HistoryEntry {
 export interface DecisionSpace {
   questions: Record<string, JevQuestion>;
   state: Record<string, unknown>;
+  /** The observation with private values protected (for progress/results). */
+  view: PageObservation;
   click: Record<string, VisibleTarget>;
   fill: Record<string, { target: VisibleTarget; input: string }>;
   select: Record<string, { target: VisibleTarget; value: string }>;
@@ -159,66 +166,157 @@ const TEXT_INPUTS = new Set([
   "password",
 ]);
 
-function describe(t: VisibleTarget, request: GoalRequest): string {
+/** `t` is the observed control (for exact matching in code); `shown` is the
+ * same control with private values already replaced, the only one formatted. */
+function describe(
+  t: VisibleTarget,
+  shown: VisibleTarget,
+  request: GoalRequest,
+): string {
   const kind = t.tag === "input" ? `input(${t.type ?? "text"})` : t.tag;
-  const role = t.role ? ` role=${t.role}` : "";
-  const selected = t.options?.find((o) => o.value === t.value);
-  const value = selected
-    ? ` · selected ${JSON.stringify(selected.label.slice(0, 120))}`
-    : t.value === undefined
-      ? ""
-      : t.value === ""
-        ? " · empty"
-        : ` · value ${JSON.stringify(t.value.slice(0, 120))}`;
+  const role = shown.role ? ` role=${shown.role}` : "";
+  const selected = t.options?.findIndex((o) => o.value === t.value) ?? -1;
+  const value =
+    selected >= 0
+      ? ` · selected ${JSON.stringify(shown.options?.[selected]?.label.slice(0, 120))}`
+      : shown.value === undefined
+        ? ""
+        : shown.value === ""
+          ? " · empty"
+          : ` · value ${JSON.stringify(shown.value.slice(0, 120))}`;
   const matches = Object.entries(request.inputs)
     .filter(([, v]) => t.value !== undefined && v !== "" && t.value === v)
     .map(([name]) => name);
   const already = matches.length
     ? ` · already contains input ${matches.map((n) => `\`${n}\``).join(", ")}`
     : "";
-  return `[${t.id}] ${kind}${role} ${JSON.stringify(t.name || "(unnamed)")}${value}${already}`;
+  return `[${t.id}] ${kind}${role} ${JSON.stringify(shown.name || "(unnamed)")}${value}${already}`;
 }
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Replaces private input values wherever the page echoes them — control
- * values and labels, page text, title and URL (raw, URL- and form-encoded,
- * case-insensitive) — before anything is sent to Jev or recorded in progress
- * and results. Values shorter than `privateMin` are replaced only where a
- * whole string equals them. Transformed echoes (masked, reformatted, split
- * across elements) are not recognised. */
-export function privateRedactor(request: GoalRequest): <T>(value: T) => T {
+const SPACE = /\s/;
+
+/** Length of `form` (lower case) that `text` from `start` to its end spells
+ * out as a proper prefix, whitespace runs matching any whitespace run and
+ * case ignored; -1 when it is not such a prefix. */
+function prefixLength(text: string, start: number, form: string): number {
+  let a = start;
+  let b = 0;
+  while (a < text.length) {
+    if (b >= form.length) return -1;
+    const x = text[a] as string;
+    const y = form[b] as string;
+    if (SPACE.test(x) && SPACE.test(y)) {
+      while (a < text.length && SPACE.test(text[a] as string)) a++;
+      while (b < form.length && SPACE.test(form[b] as string)) b++;
+      continue;
+    }
+    if (x.toLowerCase() !== y) return -1;
+    a++;
+    b++;
+  }
+  return b;
+}
+
+export interface PrivateRedactor {
+  /** Replaces private values inside every string of a value (deep). */
+  <T>(value: T): T;
+  /** Page-derived text: private values are replaced before it is shortened
+   * to `max`; when the text was cut there or before it reached the host
+   * (`cut`), a trailing beginning of a private value is replaced as well. */
+  text(value: string, max?: number, cut?: boolean): string;
+  /** A control's own value: private as a whole when it contains a private
+   * value or is the beginning of one (a partial or capped echo). */
+  field(value: string): string;
+  /** The observation as it may leave the host: every page string protected
+   * at the page's own truncation bounds, before any formatting. */
+  page(page: PageObservation): PageObservation;
+}
+
+/** Protects private input values wherever the page echoes them — control
+ * values and labels, option labels, page text, title and URL — before
+ * anything is formatted, shortened, sent to Jev or recorded in progress and
+ * results. Recognised forms: the raw value with any whitespace between its
+ * words (case-insensitive), and its JSON-escaped, URL- and form-encoded
+ * forms. A control value containing or beginning a private value is replaced
+ * whole; text the page observation cut inside a private value loses that
+ * beginning (the goal's own shorter excerpts are cut only after replacement).
+ * Values shorter than `privateMin` are replaced
+ * only where a whole string equals them. Otherwise transformed echoes
+ * (masked, reformatted, split across elements) are not recognised. */
+export function privateRedactor(request: GoalRequest): PrivateRedactor {
   const exact = new Map<string, string>();
   const patterns: { re: RegExp; label: string; length: number }[] = [];
+  const prefixes: { form: string; label: string }[] = [];
   for (const name of request.private_inputs) {
     const value = request.inputs[name] ?? "";
-    if (!value.trim()) continue;
+    const core = value.trim();
+    if (!core) continue;
     const label = `[private:${name}]`;
     exact.set(value, label);
-    if (value.length < GOAL_LIMITS.privateMin) continue;
-    for (const form of new Set([
-      value,
-      encodeURIComponent(value),
-      new URLSearchParams({ v: value }).toString().slice(2),
-    ]))
+    exact.set(core, label);
+    if (core.length < GOAL_LIMITS.privateMin) continue;
+    const forms = new Set([
+      core,
+      JSON.stringify(core).slice(1, -1),
+      encodeURIComponent(core),
+      new URLSearchParams({ v: core }).toString().slice(2),
+    ]);
+    for (const form of forms) {
       patterns.push({
-        re: new RegExp(escapeRegExp(form), "gi"),
+        re: new RegExp(
+          form === core
+            ? core.split(/\s+/).map(escapeRegExp).join("\\s+")
+            : escapeRegExp(form),
+          "gi",
+        ),
         label,
         length: form.length,
       });
+      prefixes.push({ form: form.toLowerCase(), label });
+    }
   }
   patterns.sort((a, b) => b.length - a.length);
-  const text = (value: string): string => {
-    const whole = exact.get(value);
+  const replace = (value: string): string => {
+    const whole = exact.get(value) ?? exact.get(value.trim());
     if (whole) return whole;
     let out = value;
     for (const { re, label } of patterns) out = out.replace(re, label);
     return out;
   };
+  // The longest end of `value` that begins a private value, if any.
+  const trailing = (value: string): string => {
+    for (let i = 0; i < value.length; i++)
+      for (const { form, label } of prefixes)
+        if (
+          i >= value.length - 2 * form.length &&
+          (value[i] as string).toLowerCase() === form[0] &&
+          prefixLength(value, i, form) >= GOAL_LIMITS.privateMin
+        )
+          return value.slice(0, i) + label;
+    return value;
+  };
+  const text = (value: string, max = Infinity, cut = false): string => {
+    const out = replace(value);
+    return cut || out.length > max ? trailing(out.slice(0, max)) : out;
+  };
+  const field = (value: string): string => {
+    // page.ts caps control and option values at 512, possibly inside an echo.
+    const out = text(value, Infinity, value.length >= 512);
+    if (out !== value) {
+      const labels = out.match(/\[private:[a-z0-9_]+\]/g);
+      return labels ? [...new Set(labels)].join(" ") : out;
+    }
+    const start = value.trimStart();
+    for (const { form, label } of prefixes)
+      if (prefixLength(start, 0, form) >= GOAL_LIMITS.privateMin) return label;
+    return value;
+  };
   const deep = (value: unknown): unknown => {
-    if (typeof value === "string") return text(value);
+    if (typeof value === "string") return replace(value);
     if (Array.isArray(value)) return value.map(deep);
     if (value && typeof value === "object")
       return Object.fromEntries(
@@ -226,7 +324,37 @@ export function privateRedactor(request: GoalRequest): <T>(value: T) => T {
       );
     return value;
   };
-  return <T>(value: T) => (exact.size ? deep(value) : value) as T;
+  // The page's own bounds (page.ts): a string at its bound may have been cut.
+  const capped = (value: string, bound: number) =>
+    text(value, Infinity, value.length >= bound);
+  const page = (observed: PageObservation): PageObservation => ({
+    ...observed,
+    binding: { ...observed.binding, url: text(observed.binding.url) },
+    title: capped(observed.title, 512),
+    text: text(observed.text, Infinity, observed.truncated),
+    targets: observed.targets.map((t) => ({
+      ...t,
+      role: capped(t.role, 100),
+      name: capped(t.name, 256),
+      ...(t.value === undefined ? {} : { value: field(t.value) }),
+      ...(t.options
+        ? {
+            options: t.options.map((o) => ({
+              ...o,
+              value: field(o.value),
+              label: capped(o.label, 160),
+            })),
+          }
+        : {}),
+    })),
+  });
+  const active = exact.size > 0;
+  return Object.assign(<T>(value: T) => (active ? deep(value) : value) as T, {
+    text: (value: string, max?: number, cut?: boolean) =>
+      active ? text(value, max, cut) : value.slice(0, max),
+    field: (value: string) => (active ? field(value) : value),
+    page: (observed: PageObservation) => (active ? page(observed) : observed),
+  });
 }
 
 /** Identifies a fill into a field whose value the observation cannot show
@@ -250,8 +378,15 @@ export function buildDecision(
   const select: DecisionSpace["select"] = {};
   const fields: VisibleTarget[] = [];
   const rows: string[] = [];
+  // Private values are replaced in the observation itself, before any of it
+  // is escaped, shortened or formatted; decisions below use the original.
+  const scrub = privateRedactor(request);
+  const view = scrub.page(page);
+  const shown = new Map(view.targets.map((t) => [t.id, t]));
+  const show = (t: VisibleTarget) =>
+    describe(t, shown.get(t.id) as VisibleTarget, request);
   for (const t of page.targets) {
-    rows.push(describe(t, request));
+    rows.push(show(t));
     const type = t.type ?? "text";
     if (
       t.tag === "a" ||
@@ -344,9 +479,7 @@ export function buildDecision(
   head(
     "click_target",
     "Assume the next operation is CLICK. Which listed control should be clicked to advance the goal?",
-    Object.fromEntries(
-      Object.values(click).map((t) => [t.id, describe(t, request)]),
-    ),
+    Object.fromEntries(Object.values(click).map((t) => [t.id, show(t)])),
   );
   head(
     "fill_pair",
@@ -354,7 +487,7 @@ export function buildDecision(
     Object.fromEntries(
       Object.entries(fill).map(([key, { target, input }]) => [
         key,
-        `Type input \`${input}\` into ${describe(target, request)}`,
+        `Type input \`${input}\` into ${show(target)}`,
       ]),
     ),
   );
@@ -362,12 +495,15 @@ export function buildDecision(
     "select_option",
     "Assume the next operation is SELECT. Which option should be chosen in which listed dropdown?",
     Object.fromEntries(
-      Object.entries(select).map(([key, { target, value }]) => [
-        key,
-        `Choose ${JSON.stringify(
-          target.options?.find((o) => o.value === value)?.label ?? value,
-        )} in ${describe(target, request)}`,
-      ]),
+      Object.entries(select).map(([key, { target }]) => {
+        const option = shown.get(target.id)?.options?.[
+          Number(key.split(":")[1])
+        ] as { value: string; label: string };
+        return [
+          key,
+          `Choose ${JSON.stringify(option.label || option.value)} in ${show(target)}`,
+        ];
+      }),
     ),
   );
   head(
@@ -376,9 +512,9 @@ export function buildDecision(
     Object.fromEntries(navigate.map((n) => [n, `Open input \`${n}\``])),
   );
   const hidden = new Set(request.private_inputs);
-  const scrub = privateRedactor(request);
   return {
     questions: scrub(questions),
+    view,
     click,
     fill,
     select,
@@ -392,9 +528,9 @@ export function buildDecision(
         ]),
       ),
       page: {
-        url: page.binding.url,
-        title: page.title,
-        text: page.text.slice(0, GOAL_LIMITS.pageText),
+        url: view.binding.url,
+        title: view.title,
+        text: view.text.slice(0, GOAL_LIMITS.pageText),
         text_truncated:
           page.truncated || page.text.length > GOAL_LIMITS.pageText,
       },
@@ -594,6 +730,8 @@ export async function runGoal(options: GoalOptions): Promise<GoalReceipt> {
   let actions = 0;
   let attempted = false;
   let unknownEffect = false;
+  // The latest observation with private values protected; it is what
+  // progress and the result report.
   let lastPage: PageObservation | undefined;
   let pageAfterLastAction = true;
   let lastDecision: Record<string, unknown> | undefined;
@@ -655,7 +793,7 @@ export async function runGoal(options: GoalOptions): Promise<GoalReceipt> {
       !unknownEffect
     ) {
       try {
-        lastPage = await browser.observe(tab);
+        lastPage = scrub.page(await browser.observe(tab));
         pageAfterLastAction = true;
       } catch {}
     }
@@ -760,6 +898,7 @@ export async function runGoal(options: GoalOptions): Promise<GoalReceipt> {
   };
 
   let late = 0;
+  let settling = 0;
   for (;;) {
     if (halted()) return stopped();
     if (now() - started > GOAL_LIMITS.wallMs)
@@ -796,10 +935,22 @@ export async function runGoal(options: GoalOptions): Promise<GoalReceipt> {
         );
       }
     }
-    lastPage = page;
+    lastPage = scrub.page(page);
     pageAfterLastAction = true;
     const print = fingerprint(page);
     if (previous !== undefined && history.at(-1)?.result === "dispatched") {
+      // Not yet visibly changed: let a pending effect land before asking Jev
+      // (an unchanged-looking page invites repeating the action).
+      if (
+        print === previous &&
+        settling < GOAL_LIMITS.settleMs &&
+        ["CLICK", "SELECT"].includes(history.at(-1)?.operation as string)
+      ) {
+        settling += GOAL_LIMITS.settleStepMs;
+        await pause(GOAL_LIMITS.settleStepMs);
+        continue;
+      }
+      settling = 0;
       unchanged = print === previous ? unchanged + 1 : 0;
       if (unchanged >= GOAL_LIMITS.unchanged)
         return finish(
@@ -854,7 +1005,10 @@ export async function runGoal(options: GoalOptions): Promise<GoalReceipt> {
     const summary = {
       operation: decision.operation,
       target: decision.target
-        ? `${decision.target.id} ${decision.target.name}`.slice(0, 160)
+        ? `${decision.target.id} ${
+            space.view.targets.find((t) => t.id === decision.target?.id)
+              ?.name ?? ""
+          }`.slice(0, 160)
         : undefined,
       input: decision.input,
     };

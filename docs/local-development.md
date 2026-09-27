@@ -541,7 +541,10 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/sumi.conf
 ```
 
 `/run` is temporary. These definitions restore the socket directories and their
-owners before Docker starts; they do not remove saved data. The existing
+owners before Docker starts; they do not remove saved data. They include
+`/run/sumi/egress`, the job egress proxy's socket directory: job and terminal
+containers bind it with `--mount`, which fails when the path is missing, so a
+host that installed an older copy of this file must install it again. The existing
 `api-state-init` service still prepares persistent volume permissions when the
 stack is created.
 

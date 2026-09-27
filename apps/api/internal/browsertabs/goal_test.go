@@ -82,9 +82,14 @@ func TestGoalAdmissionFollowsDeclaredOperationLayer(t *testing.T) {
 	if j.Request["method"] != "goal" || j.Request["goal"] != "Sign up and save" || j.Request["inputs"].(map[string]any)["email"] != "ada@example.test" {
 		t.Fatalf("goal request %v", j.Request)
 	}
+	// An observe-only grant says so, both in browser.tabs and on refusal,
+	// even when its host has a Jev key.
 	r, rt := f.attach(false)
 	f.store.Claim(ctx, r.ID, rt, true)
-	if _, e := f.tool("browser.goal", goalReq(r.ID)); !errors.Is(e, ErrUnavailable) {
+	if got := f.layer(r.ID); got != "actions_not_allowed" {
+		t.Fatal("read-only grant layer", got)
+	}
+	if _, e := f.tool("browser.goal", goalReq(r.ID)); !errors.Is(e, ErrActionsNotAllowed) {
 		t.Fatal("read-only grant accepted a goal", e)
 	}
 	for name, req := range map[string]map[string]any{
@@ -294,5 +299,103 @@ func TestGoalClaimOwnershipAndCurrentAvailability(t *testing.T) {
 	}
 	if _, e = f.tool("browser.goal", goalReq(b.ID)); !errors.Is(e, ErrUnavailable) {
 		t.Fatal("goal admitted for an offline host", e)
+	}
+}
+
+// Jobs queued behind a running goal wait for the tab instead of expiring as
+// "host unavailable" after 60 s; they stay bounded, cancellable, and an
+// expiry says why nothing was dispatched.
+func TestQueuedJobsWaitForTabBusyWithGoal(t *testing.T) {
+	f := setup(t)
+	ctx := context.Background()
+	a, token := f.attach(true)
+	f.store.Claim(ctx, a.ID, token, true)
+	out, e := f.tool("browser.goal", goalReq(a.ID))
+	if e != nil {
+		t.Fatal(e)
+	}
+	goal := out["job"].(map[string]any)["job_id"].(string)
+	if c, _ := f.store.Claim(ctx, a.ID, token, true); c == nil || c.JobID != goal {
+		t.Fatal("goal not claimed")
+	}
+	obs, e := f.tool("browser.observe", map[string]any{"attachment_id": a.ID})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if w, _ := obs["waiting_for"].(map[string]any); w["job_id"] != goal || w["status"] != "running" || !strings.Contains(obs["note"].(string), "job.status") {
+		t.Fatal("queued observe not told it waits for the goal", obs)
+	}
+	observe := obs["job"].(map[string]any)["job_id"].(string)
+	cancelled := f.enqueue(a, "observe")
+	age := func(job, interval string) {
+		f.store.Pool.Exec(ctx, `UPDATE core_jobs SET created_at=now()-$2::interval WHERE job_id=$1`, job, interval)
+	}
+	sweep := func() {
+		if e := f.store.Sweep(ctx); e != nil {
+			t.Fatal(e)
+		}
+	}
+	status := func(job string) agentstate.Job {
+		j, _ := f.core.Store().GetJob(ctx, persona, job)
+		return j
+	}
+	// 61 s later the goal is still running and renewing: the observe waits.
+	age(observe, "61 seconds")
+	age(cancelled, "61 seconds")
+	if st, e := f.store.Progress(ctx, a.ID, token, goal, map[string]any{"phase": "deciding"}); e != nil || st != "running" {
+		t.Fatal(st, e)
+	}
+	sweep()
+	if j := status(observe); j.Status != "queued" {
+		t.Fatal("observe behind a live goal expired", j.Status, j.Error)
+	}
+	// A waiting job is still cancellable.
+	if j := f.cancelThroughCore(cancelled); j.Status != "cancelled" {
+		t.Fatal("waiting job not cancelled", j.Status)
+	}
+	// The goal ends; for 60 s after that the tab was just busy, so the
+	// observe still waits for the host's next poll, which dispatches it.
+	f.store.Complete(ctx, a.ID, token, goal, "done", map[string]any{"dispatched": true, "outcome": "returned"}, "")
+	sweep()
+	if j := status(observe); j.Status != "queued" {
+		t.Fatal("observe expired right after the goal ended", j.Status)
+	}
+	f.claimExpected(a, token, observe)
+	f.store.Complete(ctx, a.ID, token, observe, "done", map[string]any{"dispatched": true, "outcome": "returned"}, "")
+
+	// Bounded: a tab held past the queue bound fails the waiting job as busy.
+	f.store.Claim(ctx, a.ID, token, true)
+	out, _ = f.tool("browser.goal", goalReq(a.ID))
+	goal = out["job"].(map[string]any)["job_id"].(string)
+	f.store.Claim(ctx, a.ID, token, true)
+	stuck := f.enqueue(a, "act")
+	age(stuck, "7 minutes 1 second")
+	sweep()
+	j := status(stuck)
+	if j.Status != "failed" || j.Result["code"] != "tab_busy" || j.Result["blocked_by"] != goal || j.Result["dispatched"] != false || j.Error == nil || !strings.Contains(*j.Error, "running browser goal") {
+		t.Fatalf("bounded wait: %s %v %v", j.Status, j.Result, j.Error)
+	}
+	f.store.Complete(ctx, a.ID, token, goal, "done", map[string]any{"dispatched": true, "outcome": "returned"}, "")
+
+	// Without a busy tab the reason is the tab's actual state.
+	for name, c := range map[string]struct {
+		setup func(Attachment)
+		code  string
+	}{
+		"host stopped polling": {func(b Attachment) {
+			f.store.Pool.Exec(ctx, `UPDATE browser_tab_attachments SET last_seen_at=now()-interval '2 minutes' WHERE attachment_id=$1`, b.ID)
+		}, "host_offline"},
+		"grant revoked": {func(b Attachment) { f.store.Revoke(ctx, owner, b.ID) }, "grant_revoked"},
+		"host online":   {func(Attachment) {}, "not_claimed"},
+	} {
+		b, bt := f.attach(true)
+		f.store.Claim(ctx, b.ID, bt, false)
+		job := f.enqueue(b, "observe")
+		age(job, "61 seconds")
+		c.setup(b)
+		sweep()
+		if j := status(job); j.Status != "failed" || j.Result["code"] != c.code || j.Result["dispatched"] != false {
+			t.Fatalf("%s: %s %v %v", name, j.Status, j.Result, j.Error)
+		}
 	}
 }
