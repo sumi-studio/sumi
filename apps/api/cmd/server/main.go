@@ -29,6 +29,7 @@ import (
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/browsertabs"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/cloudbrowser"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/feedback"
@@ -118,6 +119,7 @@ func run(ctx context.Context) (runErr error) {
 	app.startJobExec()
 	app.startMCP()
 	app.startBrowserTabs()
+	app.startCloudBrowser()
 	app.startTermExec()
 	app.startChatGPTActivation()
 	app.startRuntimeRecovery()
@@ -286,6 +288,7 @@ type application struct {
 	jobExec                    *jobexec.Driver
 	mcpRunner                  *mcpconnections.Runner
 	browserTabs                *browsertabs.Store
+	cloudBrowser               *cloudbrowser.Service
 	termExec                   *termexec.Driver
 	transferSessions           *transfersession.Service
 	returnSessions             *returnsession.Service
@@ -852,6 +855,11 @@ func newApplicationFromEnv() (*application, error) {
 		closeOnError()
 		return nil, err
 	}
+	cloudBrowser, err := wireCloudBrowser(databasePool, browserTabs, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	if err != nil {
+		closeOnError()
+		return nil, err
+	}
 	mcpRunner, err := wireMCP(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
 	if err != nil {
 		closeOnError()
@@ -1044,6 +1052,7 @@ func newApplicationFromEnv() (*application, error) {
 		jobExec:                    jobExec,
 		mcpRunner:                  mcpRunner,
 		browserTabs:                browserTabs,
+		cloudBrowser:               cloudBrowser,
 		termExec:                   termExec,
 		transferSessions:           transferSessions,
 		returnSessions:             returnSessions,

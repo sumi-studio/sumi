@@ -24,8 +24,10 @@ import {
   participantInstallation,
   useParticipantApps,
 } from "../participant/app-store";
+import { useCloudBrowserAvailable } from "../browser/availability";
 import { useWorkspaceControl } from "../workspace/store";
 import {
+  BROWSER_RENDERER,
   DIRECT_CHAT_RENDERER,
   FEEDBACK_RENDERER,
   TERMINAL_RENDERER,
@@ -99,6 +101,10 @@ export function AppRail({
       terminalInstallation?.state === "enabled");
   const DirectIcon = DIRECT_CHAT_RENDERER.icon;
   const TerminalIcon = TERMINAL_RENDERER.icon;
+  const browserEnabled = useCloudBrowserAvailable(
+    authenticated && user && !preissuedSessionMode ? user.id : null,
+  );
+  const BrowserIcon = BROWSER_RENDERER.icon;
   const feedbackEnabled = Boolean(authenticated && user);
   const FeedbackIcon = FEEDBACK_RENDERER.icon;
 
@@ -229,7 +235,10 @@ export function AppRail({
           : null}
 
         {workspaceId &&
-        (directChatEnabled || terminalEnabled || feedbackEnabled) ? (
+        (directChatEnabled ||
+          terminalEnabled ||
+          browserEnabled ||
+          feedbackEnabled) ? (
           <hr className="mx-2 my-1 border-0 border-border border-t" />
         ) : null}
 
@@ -249,6 +258,15 @@ export function AppRail({
             onClick={() => void navigate({ to: TERMINAL_RENDERER.route })}
           >
             <TerminalIcon className="size-4" />
+          </RailButton>
+        ) : null}
+        {browserEnabled ? (
+          <RailButton
+            label={BROWSER_RENDERER.label}
+            active={activeAppId === BROWSER_RENDERER.appId}
+            onClick={() => void navigate({ to: BROWSER_RENDERER.route })}
+          >
+            <BrowserIcon className="size-4" />
           </RailButton>
         ) : null}
         {feedbackEnabled ? (

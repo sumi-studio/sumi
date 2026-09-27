@@ -49,9 +49,37 @@ type AttachInput struct {
 type Store struct {
 	Pool *pgxpool.Pool
 	Core *agentstate.Store
+	// Cloud is set when the Sumi-owned Cloud browser host is configured. Its
+	// tabs are available whenever their profile is enabled: queued work wakes
+	// the browser (cloudbrowser.Service), so no poll is required beforehand.
+	Cloud bool
 }
 
-func New(pool *pgxpool.Pool, core *agentstate.Store) *Store { return &Store{pool, core} }
+func New(pool *pgxpool.Pool, core *agentstate.Store) *Store { return &Store{Pool: pool, Core: core} }
+
+// cloudTab is the TabRef.profileId of Sumi-owned Cloud browser tabs.
+const cloudTab = "cloud"
+
+// availableSQL is true for a grant whose host can take work now: a host that
+// polled within 30 seconds, or an enabled Cloud profile the API can wake.
+func (s *Store) availableSQL() string {
+	live := `b.last_seen_at>now()-interval '30 seconds'`
+	if !s.Cloud {
+		return "(" + live + ")"
+	}
+	return `(` + live + ` OR (b.tab->>'profileId'='` + cloudTab + `' AND EXISTS(SELECT 1 FROM cloud_browser_profiles c WHERE c.profile_id::text=b.tab->>'runtimeId' AND c.enabled AND c.human_id=b.human_id AND c.persona_id=b.persona_id)))`
+}
+
+// jevSQL: a desktop host declares Jev on each poll; a Cloud tab has the Jev
+// layer when its person stored a Jev key that Jev has not rejected and, while
+// its browser runs, that browser has picked the key up (declared on its
+// latest poll). A sleeping browser receives the key when it starts.
+func (s *Store) jevSQL() string {
+	if !s.Cloud {
+		return "b.jev_available"
+	}
+	return `(CASE WHEN b.tab->>'profileId'='` + cloudTab + `' THEN EXISTS(SELECT 1 FROM cloud_browser_jev_credentials k WHERE k.human_id=b.human_id AND NOT k.rejected) AND (b.jev_available OR NOT EXISTS(SELECT 1 FROM cloud_browser_profiles c WHERE c.profile_id::text=b.tab->>'runtimeId' AND c.state='live')) ELSE b.jev_available END)`
+}
 
 func (s *Store) Attach(ctx context.Context, human string, in AttachInput) (Attachment, string, error) {
 	a := Attachment{ID: uuid.NewString(), PersonaID: in.PersonaID, Name: strings.TrimSpace(in.Name), Tab: in.Tab, AllowActions: in.AllowActions, Available: false}
@@ -60,7 +88,8 @@ func (s *Store) Attach(ctx context.Context, human string, in AttachInput) (Attac
 			return a, "", ErrInvalid
 		}
 	}
-	if a.Name == "" || len(a.Name) > 120 || len(in.Tab.ProfileID) == 0 || len(in.Tab.ProfileID) > 80 {
+	// Cloud tabs are granted through cloudbrowser, whose host is the Worker.
+	if a.Name == "" || len(a.Name) > 120 || len(in.Tab.ProfileID) == 0 || len(in.Tab.ProfileID) > 80 || in.Tab.ProfileID == cloudTab {
 		return a, "", ErrInvalid
 	}
 	tokenBytes := make([]byte, 32)
@@ -97,7 +126,7 @@ func (s *Store) Revoke(ctx context.Context, human, id string) error {
 	return e
 }
 func (s *Store) List(ctx context.Context, human string) ([]Attachment, error) {
-	rows, e := s.Pool.Query(ctx, `SELECT attachment_id,persona_id,name,tab,allow_actions,enabled AND last_seen_at>now()-interval '30 seconds' FROM browser_tab_attachments WHERE human_id=$1 AND enabled ORDER BY created_at LIMIT 100`, human)
+	rows, e := s.Pool.Query(ctx, `SELECT b.attachment_id,b.persona_id,b.name,b.tab,b.allow_actions,b.enabled AND `+s.availableSQL()+` FROM browser_tab_attachments b WHERE b.human_id=$1 AND b.enabled ORDER BY b.created_at LIMIT 100`, human)
 	if e != nil {
 		return nil, e
 	}
@@ -115,7 +144,7 @@ func (s *Store) List(ctx context.Context, human string) ([]Attachment, error) {
 func (s *Store) Effects() map[string]agentstate.ToolEffect {
 	effects := map[string]agentstate.ToolEffect{}
 	effects["browser.tabs"] = agentstate.ToolEffect{ReadOnly: agentstate.AlwaysReadOnly, Apply: func(ctx context.Context, tx pgx.Tx, persona, idem string, req map[string]any) (map[string]any, error) {
-		rows, e := tx.Query(ctx, `SELECT b.attachment_id,b.name,b.tab,b.allow_actions,b.last_seen_at>now()-interval '30 seconds',b.jev_available FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.persona_id=$1 AND p.authority='active' AND b.enabled ORDER BY b.last_seen_at DESC,b.created_at DESC LIMIT 100`, persona)
+		rows, e := tx.Query(ctx, `SELECT b.attachment_id,b.name,b.tab,b.allow_actions,`+s.availableSQL()+`,`+s.jevSQL()+` FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.persona_id=$1 AND p.authority='active' AND b.enabled ORDER BY b.last_seen_at DESC,b.created_at DESC LIMIT 100`, persona)
 		if e != nil {
 			return nil, e
 		}
@@ -156,7 +185,7 @@ func (s *Store) Effects() map[string]agentstate.ToolEffect {
 			id, _ := req["attachment_id"].(string)
 			var tab TabRef
 			var allow, jev bool
-			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions,b.jev_available FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND b.last_seen_at>now()-interval '30 seconds' FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow, &jev)
+			e := tx.QueryRow(ctx, `SELECT b.tab,b.allow_actions,`+s.jevSQL()+` FROM browser_tab_attachments b JOIN core_personas p ON p.persona_id=b.persona_id AND p.human_id=b.human_id WHERE b.attachment_id=$1 AND b.persona_id=$2 AND p.authority='active' AND b.enabled AND `+s.availableSQL()+` FOR SHARE OF b,p`, id, persona).Scan(&tab, &allow, &jev)
 			if errors.Is(e, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("%w: %w", agentstate.ErrBadRequest, ErrUnavailable)
 			}

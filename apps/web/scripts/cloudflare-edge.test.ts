@@ -229,6 +229,7 @@ test("the browser API, private transports, service worker, and SPA have distinct
     "/",
     "/direct",
     "/terminal",
+    "/browser",
     "/feedback",
     "/c/0198f3aa-1111-7222-8333-444455556666",
     "/unknown-api",
@@ -352,6 +353,75 @@ test("the shared terminal SPA page navigates while its API and WS reach origin",
     );
     assert.equal(actual, expected, path);
   }
+});
+
+test("the Cloud browser viewer reaches only its Worker binding, without cookies", async () => {
+  const switchingProtocols = {
+    status: 101,
+    webSocket: { accepted: true },
+  } as unknown as Response;
+  let forwarded: Request | undefined;
+  const environment = {
+    ASSETS: { fetch: () => assert.fail("viewer reached SPA assets") },
+    SUMI_BROWSER_CLOUD: {
+      fetch: async (request: Request) => {
+        forwarded = request;
+        return switchingProtocols;
+      },
+    },
+  };
+  const upgrade = new Request(
+    "https://workspace.example.com/browser-cloud/viewer?leak=1",
+    {
+      headers: {
+        Connection: "Upgrade",
+        Cookie: "sumi_session=private",
+        Authorization: "Bearer private",
+        Origin: "https://workspace.example.com",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Version": "13",
+        "Sec-WebSocket-Protocol": "sumi.browser.v1, sbt1.a.b",
+      },
+    },
+  );
+  const response = await handleRequest(upgrade, environment, async () =>
+    assert.fail("viewer reached the API origin"),
+  );
+  assert.equal(response, switchingProtocols);
+  assert.ok(forwarded);
+  assert.equal(new URL(forwarded.url).pathname, "/browser-cloud/viewer");
+  assert.equal(new URL(forwarded.url).search, "");
+  assert.equal(forwarded.headers.get("cookie"), null);
+  assert.equal(forwarded.headers.get("authorization"), null);
+  assert.equal(
+    forwarded.headers.get("sec-websocket-protocol"),
+    "sumi.browser.v1, sbt1.a.b",
+  );
+
+  // Plain requests, other methods and the Worker's own control routes are
+  // never exposed; without the binding the viewer is simply absent.
+  for (const [path, init] of [
+    ["/browser-cloud/viewer", {}],
+    ["/browser-cloud/viewer", { method: "POST", body: "{}" }],
+    ["/browser-cloud/profiles/x/wake", { method: "POST", body: "{}" }],
+    ["/api/cloud-browser-host/profiles/x/begin", { method: "POST", body: "{}" }],
+  ] as const) {
+    const denied = await handleRequest(
+      new Request(`https://workspace.example.com${path}`, init),
+      environment,
+      async () => assert.fail(`${path} reached the API origin`),
+    );
+    assert.equal(denied.status, 404, path);
+  }
+  const absent = await handleRequest(
+    upgrade,
+    { ASSETS: environment.ASSETS },
+    async () => assert.fail("viewer reached the API origin"),
+  );
+  assert.equal(absent.status, 404);
+  assert.equal(classifyPath("/api/cloud-browser"), "origin");
+  assert.equal(classifyPath("/api/cloud-browser/profiles/x/viewer-ticket"), "origin");
 });
 
 test("a WebSocket 101 response is returned by identity", async () => {
@@ -685,10 +755,12 @@ test("every production API registration has an explicit edge disposition", async
     const path = route.pattern.slice(route.pattern.indexOf(" ") + 1);
     // Server-only surfaces stay private at the front door: the
     // local-control transport, the readiness probe, the agent WebSocket,
-    // and the /internal/* state/provider namespace the secretary core
-    // reaches through its own service URL rather than this edge.
+    // the /internal/* state/provider namespace the secretary core
+    // reaches through its own service URL rather than this edge, and the
+    // Cloud browser Worker's host routes (reached over the private VPC).
     const expected =
       path === "/agent/ws" ||
+      path.startsWith("/api/cloud-browser-host/") ||
       path === "/ready" ||
       path === "/internal" ||
       path.startsWith("/internal/") ||

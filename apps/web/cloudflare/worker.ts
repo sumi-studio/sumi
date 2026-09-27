@@ -14,6 +14,10 @@ export interface CloudflareEnvironment {
   SUMI_ORIGIN_PROTOCOL?: "http" | "https";
   /** Firebase Hosting project that supplies the same-origin sign-in helpers. */
   SUMI_FIREBASE_AUTH_DOMAIN?: string;
+  /** Service binding to the Sumi Cloud browser Worker (shared screen). */
+  SUMI_BROWSER_CLOUD?: {
+    fetch(request: Request): Promise<Response>;
+  };
 }
 
 interface CloudflareRequestInit extends RequestInit {
@@ -312,6 +316,45 @@ async function serveNavigation(
   return isUnexpectedAssetResponse(asset) ? denied() : asset;
 }
 
+/** Forward the viewer WebSocket to the Cloud browser Worker. The ticket in
+ * Sec-WebSocket-Protocol is its only credential: Sumi session cookies and
+ * other ambient credentials are not passed to that Worker. */
+async function serveBrowserCloud(
+  request: Request,
+  canonicalPath: string,
+  environment: CloudflareEnvironment,
+): Promise<Response> {
+  const binding = environment.SUMI_BROWSER_CLOUD;
+  if (!binding) return denied();
+  if (
+    request.method !== "GET" ||
+    request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
+  )
+    return denied();
+  const url = new URL(request.url);
+  url.pathname = canonicalPath;
+  url.search = "";
+  const headers = new Headers();
+  for (const name of [
+    "upgrade",
+    "connection",
+    "origin",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+    "user-agent",
+  ]) {
+    const value = request.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  try {
+    return await binding.fetch(new Request(url, { method: "GET", headers }));
+  } catch {
+    return unavailable();
+  }
+}
+
 export async function handleRequest(
   request: Request,
   environment: CloudflareEnvironment,
@@ -341,6 +384,9 @@ export async function handleRequest(
   }
   if (route.disposition === "navigation") {
     return serveNavigation(request, route.canonicalPath, environment);
+  }
+  if (route.disposition === "browser-cloud") {
+    return serveBrowserCloud(request, route.canonicalPath, environment);
   }
 
   try {

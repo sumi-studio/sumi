@@ -9,7 +9,10 @@
   "exports": {
     "./browser": "./dist/browser/runtime.js",
     "./browser-contract": "./dist/browser/contract.js",
-    "./browser-host": "./dist/browser/host.js"
+    "./browser-host": "./dist/browser/host.js",
+    "./browser-goal": "./dist/browser/goal.js",
+    "./browser-jev": "./dist/browser/jev.js",
+    "./browser-page": "./dist/browser/page.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

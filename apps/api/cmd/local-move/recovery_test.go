@@ -102,8 +102,15 @@ func TestLostMoveURLIsRecoveredFromTheOpenSession(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			dup := c.mustRegistrant(uid, "/sessions", nil, http.StatusConflict)
 			if dup.SessionID != first || dup.view.Status != "awaiting_bundle" || dup.view.Arrival != nil ||
-				dup.view.Retired || dup.MoveURL != "" || strings.Contains(dup.raw, "grant") || strings.Contains(dup.raw, "proof") {
+				dup.view.Retired || dup.MoveURL != "" || dup.view.ActivateProof != "" || dup.view.RetireProof != "" {
 				t.Fatalf("retry %d: %s", i, dup.raw)
+			}
+			// Check credential field names, not explanatory prose such as
+			// "browser grants are not carried" in the portability exclusions.
+			for _, field := range []string{"grant", "proof", "activate_proof", "retire_proof"} {
+				if strings.Contains(dup.raw, `"`+field+`"`) {
+					t.Fatalf("retry %d leaked credential field %s: %s", i, field, dup.raw)
+				}
 			}
 		}
 		if s := c.sessionStatus(first); s != "awaiting_bundle" {

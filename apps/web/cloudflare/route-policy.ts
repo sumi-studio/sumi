@@ -5,12 +5,15 @@ export type RouteDisposition =
   | "service-worker"
   | "release-manifest"
   | "static-asset"
-  | "navigation";
+  | "navigation"
+  | "browser-cloud";
 
 export interface RouteDecision {
   canonicalPath: string | null;
   disposition: RouteDisposition;
 }
+
+export const BROWSER_CLOUD_VIEWER_PATH = "/browser-cloud/viewer";
 
 export const originRoutes = Object.freeze({
   exact: Object.freeze([
@@ -18,6 +21,7 @@ export const originRoutes = Object.freeze({
     "/api/model-connections",
     "/api/mcp-connections",
     "/api/browser-tabs",
+    "/api/cloud-browser",
     "/api/usage",
     "/workspaces",
     "/app-installations",
@@ -35,6 +39,9 @@ export const originRoutes = Object.freeze({
     "/api/mcp-connections/",
     "/api/browser-tabs/",
     "/api/browser-host/tabs/",
+    // The person's Cloud browser profiles, grants, viewer tickets and Jev
+    // key. The browser Worker's own host routes are never on this edge.
+    "/api/cloud-browser/",
     "/api/usage/",
     "/direct-chat/",
     "/messaging/",
@@ -128,6 +135,8 @@ export const deniedRoutes = Object.freeze({
     "/apps",
     "/api/browser-host",
     "/api/browser-host/tabs",
+    "/api/cloud-browser-host",
+    "/browser-cloud",
     "/api/secretary-transfer",
     "/api/secretary-return",
     "/api/secretary-files",
@@ -145,6 +154,8 @@ export const deniedRoutes = Object.freeze({
     "/.svn/",
     "/.wrangler/",
     "/agent/ws/",
+    "/api/cloud-browser-host/",
+    "/browser-cloud/",
     "/cloudflare/",
     "/contracts/",
     "/coverage/",
@@ -276,6 +287,11 @@ export function decidePath(pathname: string): RouteDecision {
   }
 
   const policyPath = canonicalPath.toLowerCase();
+  // The shared Cloud browser screen: a WebSocket to the browser Worker,
+  // authorized by an API-issued ticket. Only this exact path is forwarded.
+  if (canonicalPath === BROWSER_CLOUD_VIEWER_PATH) {
+    return { canonicalPath, disposition: "browser-cloud" };
+  }
   if (policyPath === "/sw.js") {
     return { canonicalPath, disposition: "service-worker" };
   }

@@ -92,6 +92,9 @@ export function createDevServerConfig(
   fsAllow: readonly string[] = [],
 ): ServerOptions {
   const target = new URL(apiOrigin);
+  const browserCloud = process.env.SUMI_DEV_BROWSER_CLOUD_ORIGIN?.trim();
+  if (browserCloud && new URL(browserCloud).origin !== browserCloud)
+    throw new Error("SUMI_DEV_BROWSER_CLOUD_ORIGIN must be an exact origin");
   if (
     target.origin !== apiOrigin ||
     target.protocol !== "http:" ||
@@ -143,6 +146,20 @@ export function createDevServerConfig(
       "/apps": apiProxy(target.origin),
       "/app-installations": apiProxy(target.origin),
       "/me/approvals": apiProxy(target.origin),
+      // Person routes only; the browser Worker's host routes are not part
+      // of the web origin.
+      "^/api/cloud-browser(?:/|\\?|$)": apiProxy(target.origin),
+      // The shared Cloud browser screen goes to the browser Worker, as the
+      // edge's SUMI_BROWSER_CLOUD binding does in production.
+      ...(browserCloud
+        ? {
+            "/browser-cloud/viewer": {
+              target: browserCloud,
+              changeOrigin: true,
+              ws: true,
+            },
+          }
+        : {}),
     },
   };
 }

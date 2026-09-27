@@ -810,6 +810,96 @@ test("a click whose effect lands asynchronously is not decided on (or repeated) 
   assert.equal(fixture.requests.length, 2, "no decision on the unsettled page");
 });
 
+test("each recent step names the page it was taken on, so Next on the following page is not a repeat", async (t) => {
+  let p = 1;
+  let n = 0;
+  const clicks = [];
+  const pager = {
+    async observe() {
+      n++;
+      return {
+        tab,
+        binding: {
+          revision: p,
+          observationId: `o${n}`,
+          url: `http://fixture.test/pager?p=${p}`,
+        },
+        title: `Pager – Page ${p}`,
+        text: `Page ${p}\nNext\nHome`,
+        truncated: false,
+        targets: [
+          { id: "t0", tag: "a", role: "button", name: "Next", bounds: {} },
+          { id: "t1", tag: "a", role: "link", name: "Home", bounds: {} },
+        ],
+      };
+    },
+    async act(_t, _b, action) {
+      clicks.push(action.target);
+      if (action.target === "t0") p++;
+      return { tab, status: "dispatched", revision: p };
+    },
+  };
+  // Like real Jev (Cloud acceptance 2026-09-28): a succeeded click is not
+  // taken again unless recent_steps shows it was taken on another page; a
+  // step without a page reads as taken on this one.
+  const { fixture, jev } = await jevFor(t, {
+    policy: (body) => {
+      const ops = Object.keys(body.questions.operation.criteria);
+      const { page, recent_steps } = body.state;
+      if (page.text.startsWith("Page 3"))
+        return {
+          operation: choice(ops, "DONE"),
+          goal_complete: { type: "noul", noul: 0.95 },
+        };
+      const repeat = recent_steps.some(
+        (s) => s.result === "dispatched" && (s.page?.url ?? page.url) === page.url,
+      );
+      return repeat
+        ? { operation: choice(ops, "WAIT") }
+        : {
+            operation: choice(ops, "CLICK"),
+            click_target: choice(["t0", "t1"], "t0"),
+          };
+    },
+  });
+  const receipt = await runGoal({
+    browser: pager,
+    tab,
+    jev,
+    request: parseGoalRequest({
+      goal: "Press Next until the page shows Page 3.",
+      max_steps: 4,
+    }),
+    session: session(),
+  });
+  const v = receipt.result.value;
+  assert.equal(v.goal_outcome, "jev_reported_done");
+  assert.equal(v.final_page.title, "Pager – Page 3");
+  assert.deepEqual(clicks, ["t0", "t0"], "Next once per page, nothing else");
+  const page = (q) => ({
+    url: `http://fixture.test/pager?p=${q}`,
+    title: `Pager – Page ${q}`,
+  });
+  const sent = fixture.requests.map((r) => r.body.state.recent_steps);
+  assert.deepEqual(sent[0], []);
+  assert.deepEqual(
+    sent[1].map((s) => [s.operation, s.target, s.result, s.page]),
+    [["CLICK", "t0 Next", "dispatched", page(1)]],
+  );
+  assert.deepEqual(
+    sent[2].map((s) => s.page),
+    [page(1), page(2)],
+  );
+  assert.match(
+    fixture.requests[1].body.questions.operation.instructions,
+    /page \(url and title\) it was taken on/,
+  );
+  assert.deepEqual(
+    v.steps.map((s) => s.page.title),
+    ["Pager – Page 1", "Pager – Page 2", "Pager – Page 3"],
+  );
+});
+
 test("a malformed or unbalanced Jev answer executes nothing", async (t) => {
   const page = new FakePage();
   const { jev } = await jevFor(t, {
