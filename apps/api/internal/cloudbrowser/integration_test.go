@@ -237,8 +237,8 @@ func TestProfileGrantAvailabilityAndJev(t *testing.T) {
 			t.Fatalf("live browser declaring jev=%v: %v", declared, layers)
 		}
 	}
-	if status, _ := f.call("POST", "/api/cloud-browser-host/profiles/"+profile+"/jev-rejected", runtime, nil); status != 200 {
-		t.Fatal("jev rejected")
+	if status, out := f.call("POST", "/api/cloud-browser-host/profiles/"+profile+"/jev-rejected", runtime, map[string]any{"key_version": s.JevKeyVersion}); status != 200 || out["rejected"] != true {
+		t.Fatalf("jev rejected %d %v", status, out)
 	}
 	if layers := f.browserTabs()[0]["operation_layers"].(map[string]any); layers["jev"] != "not_configured" {
 		t.Fatalf("a rejected key is not offered: %v", layers)

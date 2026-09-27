@@ -107,6 +107,9 @@ type HostSession struct {
 	SnapshotAt      *time.Time      `json:"snapshot_at,omitempty"`
 	SnapshotVersion int             `json:"snapshot_version"`
 	JevKey          string          `json:"jev_key,omitempty"`
+	// JevKeyVersion names the stored key JevKey is (its save time in
+	// microseconds); a rejection is recorded only against that version.
+	JevKeyVersion int64 `json:"jev_key_version,omitempty"`
 }
 
 type Store struct {
@@ -458,23 +461,27 @@ func (s *Store) DeleteJevKey(ctx context.Context, human string) error {
 	return tx.Commit(ctx)
 }
 
-func (s *Store) jevKey(ctx context.Context, q querier, human string) (string, error) {
+// jevKeyVersionSQL is a stored key's version: its save time in microseconds.
+const jevKeyVersionSQL = `(extract(epoch FROM updated_at)*1000000)::bigint`
+
+func (s *Store) jevKey(ctx context.Context, q querier, human string) (string, int64, error) {
 	var sealed []byte
 	var rejected bool
-	err := q.QueryRow(ctx, `SELECT sealed,rejected FROM cloud_browser_jev_credentials WHERE human_id=$1`, human).Scan(&sealed, &rejected)
+	var version int64
+	err := q.QueryRow(ctx, `SELECT sealed,rejected,`+jevKeyVersionSQL+` FROM cloud_browser_jev_credentials WHERE human_id=$1`, human).Scan(&sealed, &rejected, &version)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && rejected {
-		return "", nil
+		return "", 0, nil
 	}
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	key, err := s.open(jevDomain, human, human, sealed)
 	if err != nil {
 		// A key sealed under another master key is unusable, not fatal:
 		// the direct path continues without Jev.
-		return "", nil
+		return "", 0, nil
 	}
-	return string(key), nil
+	return string(key), version, nil
 }
 
 // ---------- viewer tickets ----------
@@ -583,7 +590,7 @@ func (s *Store) Begin(ctx context.Context, profileID string, fresh bool, incarna
 			}
 		}
 	}
-	if out.JevKey, err = s.jevKey(ctx, tx, p.humanID); err != nil {
+	if out.JevKey, out.JevKeyVersion, err = s.jevKey(ctx, tx, p.humanID); err != nil {
 		return HostSession{}, err
 	}
 	return out, tx.Commit(ctx)
@@ -631,7 +638,7 @@ func (s *Store) Refresh(ctx context.Context, profileID string, incarnation int64
 	if out.Attachments, err = s.rotate(ctx, tx, p, skip); err != nil {
 		return HostSession{}, err
 	}
-	if out.JevKey, err = s.jevKey(ctx, tx, p.humanID); err != nil {
+	if out.JevKey, out.JevKeyVersion, err = s.jevKey(ctx, tx, p.humanID); err != nil {
 		return HostSession{}, err
 	}
 	return out, tx.Commit(ctx)
@@ -736,12 +743,26 @@ func (s *Store) SetState(ctx context.Context, profileID string, incarnation int6
 
 // JevRejected marks the human's Jev key rejected after Jev refused it, so
 // browser.tabs stops offering the Jev layer until the person replaces it.
-func (s *Store) JevRejected(ctx context.Context, profileID string) error {
+// Only the refused version is marked: a key saved since then is untouched
+// (the result is false).
+func (s *Store) JevRejected(ctx context.Context, profileID string, version int64) (bool, error) {
+	profileID, ok := validUUID(profileID)
+	if !ok || version <= 0 {
+		return false, ErrNotFound
+	}
+	tag, err := s.Pool.Exec(ctx, `UPDATE cloud_browser_jev_credentials SET rejected=true WHERE human_id=(SELECT human_id FROM cloud_browser_profiles WHERE profile_id=$1) AND `+jevKeyVersionSQL+`=$2`, profileID, version)
+	return err == nil && tag.RowsAffected() > 0, err
+}
+
+// DropRefresh clears a pending grant/key delivery that the browser Worker
+// answered without a running browser (its next start receives everything).
+// A request newer than `asOf` (the one the wake was sent for) stays pending.
+func (s *Store) DropRefresh(ctx context.Context, profileID string, asOf time.Time) error {
 	profileID, ok := validUUID(profileID)
 	if !ok {
 		return ErrNotFound
 	}
-	_, err := s.Pool.Exec(ctx, `UPDATE cloud_browser_jev_credentials SET rejected=true WHERE human_id=(SELECT human_id FROM cloud_browser_profiles WHERE profile_id=$1)`, profileID)
+	_, err := s.Pool.Exec(ctx, `UPDATE cloud_browser_profiles SET refresh_requested_at=NULL WHERE profile_id=$1 AND refresh_requested_at<=$2`, profileID, asOf)
 	return err
 }
 
@@ -754,6 +775,8 @@ type Wake struct {
 	Work      bool   `json:"work"`
 	// Refresh: grant or key changes wait for a running browser.
 	Refresh bool `json:"refresh"`
+	// RefreshAt is the pending request's time (DropRefresh clears only it).
+	RefreshAt *time.Time `json:"-"`
 }
 
 // WakeCandidates lists profiles to wake. Refresh requests for a profile
@@ -762,9 +785,9 @@ func (s *Store) WakeCandidates(ctx context.Context, limit int) ([]Wake, error) {
 	if _, err := s.Pool.Exec(ctx, `UPDATE cloud_browser_profiles SET refresh_requested_at=NULL WHERE refresh_requested_at IS NOT NULL AND state<>'live'`); err != nil {
 		return nil, err
 	}
-	rows, err := s.Pool.Query(ctx, `SELECT profile_id,work,refresh FROM (SELECT c.profile_id::text AS profile_id,
+	rows, err := s.Pool.Query(ctx, `SELECT profile_id,work,refresh,refresh_at FROM (SELECT c.profile_id::text AS profile_id,
  c.enabled AND EXISTS(SELECT 1 FROM core_jobs j JOIN browser_tab_attachments b ON b.attachment_id::text=j.request->>'attachment_id' WHERE j.kind='browser' AND j.status='queued' AND b.enabled AND b.tab->>'profileId'=$2 AND b.tab->>'runtimeId'=c.profile_id::text AND b.persona_id=j.persona_id) AS work,
- c.refresh_requested_at IS NOT NULL AS refresh
+ c.refresh_requested_at IS NOT NULL AS refresh, c.refresh_requested_at AS refresh_at
  FROM cloud_browser_profiles c WHERE c.enabled OR c.refresh_requested_at IS NOT NULL) w WHERE work OR refresh ORDER BY profile_id LIMIT $1`, limit, TabProfile)
 	if err != nil {
 		return nil, err
@@ -773,7 +796,7 @@ func (s *Store) WakeCandidates(ctx context.Context, limit int) ([]Wake, error) {
 	out := []Wake{}
 	for rows.Next() {
 		var w Wake
-		if err := rows.Scan(&w.ProfileID, &w.Work, &w.Refresh); err != nil {
+		if err := rows.Scan(&w.ProfileID, &w.Work, &w.Refresh, &w.RefreshAt); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

@@ -11,6 +11,8 @@ export const HIDDEN_RELEASE_MS = 5 * 60_000;
 export type SocketStatus = "connecting" | "open" | "retrying" | "paused" | "closed";
 
 export interface FrameMessage {
+  /** The remote tab this frame shows; the person's input names it. */
+  tab?: string;
   data: string;
   width: number;
   height: number;
@@ -136,8 +138,8 @@ export class ViewerSocket {
         return;
       }
       if (message.type === "frame") {
-        const { data, width, height } = message as unknown as FrameMessage;
-        if (typeof data === "string") this.options.onFrame({ data, width, height });
+        const { tab, data, width, height } = message as unknown as FrameMessage;
+        if (typeof data === "string") this.options.onFrame({ tab: typeof tab === "string" ? tab : undefined, data, width, height });
         return;
       }
       this.options.onMessage(message);

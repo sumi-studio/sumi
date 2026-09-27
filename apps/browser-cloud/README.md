@@ -43,20 +43,46 @@ nothing here was deployed to production.
 - A connected viewer or a claimed browser job keeps the browser alive. With
   neither, the DO checkpoints and closes the session after the idle grace.
   Hidden pages release the viewer after 5 minutes.
-- The API wakes a sleeping profile only for queued work or undelivered
-  grant/key changes; idle profiles get no polling or heartbeats.
-- Durable writes: checkpoints (on load/idle, at most every 60 s while dirty),
-  the slot map when tabs change, and an intent record written before and
-  cleared after each dispatched action. No per-frame or per-heartbeat writes.
-- Browser Run limits (concurrency, daily browser time on Free) apply; a start
-  refused by Browser Run is shown as such and not retried in a loop.
+- The API wakes a profile only for queued work or undelivered grant/key
+  changes; idle profiles get no polling or heartbeats. A refresh wake that the
+  Worker answers without a running browser (`phase` other than
+  live/starting/restoring/saving) clears the pending refresh: the next start
+  receives everything. Such a wake arms no DO alarm.
+- Starting asks Browser Run first, then the API (`begin`, new incarnation). A
+  start refused by Browser Run changes nothing in the API. A start failing
+  after `begin` closes the acquired session and reports the incarnation
+  `sleeping`. Either way queued work retries only after a backoff (30 s,
+  doubling to 15 min; the Worker answers `retry_after_ms` and the API holds
+  its work wakes that long). The person's 「再開」 retries at once.
+- A session is reconnected to after a host restart only if its start
+  finished (`meta.ready`); a half-started or half-restored one is closed.
+  Reconnecting continues the stored checkpoint sequence and carried origins.
+- Durable writes: checkpoints (on load/idle, at most every 60 s while dirty;
+  a failed save is retried after 5 s, doubling to 5 min), the slot map when
+  tabs change, and an intent record written before and cleared after each
+  dispatched action. No per-frame or per-heartbeat writes.
 
 ## What survives a restart
 
 Saved (sealed, ≤2 MiB per profile, bound to profile, owner, incarnation and
-serializer version): cookies, `localStorage` strings, IndexedDB databases whose
-records survive JSON (others are counted as not saved and reported), open tabs
-with URL and scroll position, and grants (by stable tab slot).
+serializer version): cookies, `localStorage` strings, IndexedDB records whose
+key and value are plain JSON data, open tabs with URL and scroll position, and
+grants (by stable tab slot).
+
+- IndexedDB records holding anything else (Blob, File, Date, ArrayBuffer and
+  typed arrays, Map/Set, binary or Date keys) are skipped and counted, never
+  converted.
+- Cookies and tabs are always saved. Each origin's storage is added while it
+  fits the budget (the active tab's origin first, then other open tabs, then
+  origins carried from the previous checkpoint); one that does not fit is left
+  out whole and listed (`notSaved.oversizedOrigins`), as is one that could not
+  be read (`skippedOrigins`). The page script stops reading at the remaining
+  budget.
+- Restoring skips a record the new browser refuses and an origin whose
+  restore fails; the rest of the profile is restored and the person is told
+  which sites did not come back.
+- The UI shows, from the latest checkpoint, what was left out (footer and
+  「保存される内容と使えない機能」).
 
 Not saved: page memory, form drafts, `sessionStorage`, history, HTTP cache,
 service workers, Cache Storage, OPFS. The UI says so (「保存される内容と使えない機能」).
@@ -71,7 +97,27 @@ The person's input (except bare mouse moves) takes control before it is
 dispatched; the secretary's queued actions are then refused with
 `page_changed` and running Jev goals end `stopped_by_person`. 「秘書に戻す」
 hands control back. Admitted input that already reached the page finishes and
-is reported. Japanese IME: composition happens in the person's browser; the
+is reported.
+
+Input names the tab of the frame the person saw; if the active tab changed
+meanwhile (the secretary switched the screen), it is refused with a
+`tab_changed` notice instead of landing on another page.
+
+A page reload or a brief disconnect keeps the person's control: with no viewer
+connected, control stays with the person for 2 minutes (`HUMAN_HOLD_MS`) and
+the browser stays up. A viewer back within that time sees 「あなたが操作中」
+unchanged. After it, control returns to the secretary, the next viewer is told
+so (「接続が切れたまま 2 分たったため…秘書に戻しました」), and the idle grace
+applies. A goal stopped by the takeover is never restarted. Tradeoff: during
+the hold the secretary's actions are refused (`page_changed`) even though
+nobody is watching; 「秘書に戻す」 remains the ordinary way to hand back. A
+Worker deploy during the hold drops it (control starts as the secretary's in
+the new instance).
+
+A Jev key saved or deleted while a tab's agent is mid-tick (polling or running
+a goal) reaches that agent when the tick ends. A key Jev refuses is reported
+with its version (`jev_key_version`), and the API marks only that version
+rejected, so a key saved since is never withdrawn by an older key's failure. Japanese IME: composition happens in the person's browser; the
 committed text is inserted remotely.
 
 Not supported (listed in the UI): file upload including drag and drop (a drop
@@ -80,7 +126,12 @@ clipboard (pasting into it works), audio, extensions. Live View is not used.
 
 ## Tests
 
-- `pnpm test` here: input mapping, tickets, tab port.
+- `pnpm test` here: input mapping, tickets, tab port, the ProfileBrowser
+  lifecycle (`test/profile.test.ts`: reconnect/checkpoint continuity,
+  refused and failed starts, restore failure, save backoff, Jev key rotation,
+  input tab, control hold), checkpoint budget and restore isolation, and the
+  checkpoint page scripts in real headless Chrome
+  (`test/storage-scripts.chrome.test.ts`; skipped without google-chrome).
 - `apps/api`: `go test ./internal/cloudbrowser/ ./internal/browsertabs/`.
 - Journey (`apps/web/e2e/cloud-browser.spec.ts`), real API + Core secretary +
   Web UI + this Worker:

@@ -31,6 +31,9 @@ type Service struct {
 
 	mu    sync.Mutex
 	marks map[string]time.Time
+	// holds: the Worker refused a start (Browser Run limit, failure) and
+	// asked not to be woken for work before this time.
+	holds map[string]time.Time
 }
 
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {
@@ -186,6 +189,7 @@ func (s *Service) host(w http.ResponseWriter, r *http.Request) {
 		TabIDs      []string        `json:"tab_ids"`
 		Snapshot    json.RawMessage `json:"snapshot"`
 		State       string          `json:"state"`
+		KeyVersion  int64           `json:"key_version"`
 	}
 	if r.ContentLength != 0 && !decode(w, r, MaxSnapshotBytes+(64<<10), &in) {
 		problem(w, ErrInvalid)
@@ -207,8 +211,9 @@ func (s *Service) host(w http.ResponseWriter, r *http.Request) {
 		err = s.Store.SetState(ctx, id, in.Incarnation, in.State)
 		out = map[string]any{"state": in.State}
 	case "jev-rejected":
-		err = s.Store.JevRejected(ctx, id)
-		out = map[string]any{"rejected": err == nil}
+		var rejected bool
+		rejected, err = s.Store.JevRejected(ctx, id, in.KeyVersion)
+		out = map[string]any{"rejected": rejected}
 	default:
 		err = ErrNotFound
 	}
@@ -246,6 +251,26 @@ const wakeGap = 10 * time.Second
 // browser, which applies them at once; a start in progress picks them up too.
 const refreshGap = 2 * time.Second
 
+// maxHold bounds how long a Worker's retry_after_ms can pause work wakes.
+const maxHold = 15 * time.Minute
+
+// wakeReply is the Worker's answer to a wake.
+type wakeReply struct {
+	Accepted     bool   `json:"accepted"`
+	Phase        string `json:"phase"`
+	RetryAfterMS int64  `json:"retry_after_ms"`
+}
+
+// hosting: phases in which the Worker has, or is building, a browser that
+// will receive grant and key changes.
+func hosting(phase string) bool {
+	switch phase {
+	case "live", "starting", "restoring", "saving":
+		return true
+	}
+	return false
+}
+
 func (s *Service) Sweep(ctx context.Context) int {
 	wakes, err := s.Store.WakeCandidates(ctx, 64)
 	if err != nil {
@@ -258,10 +283,16 @@ func (s *Service) Sweep(ctx context.Context) int {
 	s.mu.Lock()
 	if s.marks == nil {
 		s.marks = map[string]time.Time{}
+		s.holds = map[string]time.Time{}
 	}
 	for id, at := range s.marks {
 		if now.Sub(at) > time.Minute {
 			delete(s.marks, id)
+		}
+	}
+	for id, until := range s.holds {
+		if !now.Before(until) {
+			delete(s.holds, id)
 		}
 	}
 	due := []Wake{}
@@ -273,43 +304,65 @@ func (s *Service) Sweep(ctx context.Context) int {
 		if at, ok := s.marks[w.ProfileID]; ok && now.Sub(at) < gap {
 			continue
 		}
+		if _, held := s.holds[w.ProfileID]; held && !w.Refresh {
+			continue
+		}
 		s.marks[w.ProfileID] = now
 		due = append(due, w)
 	}
 	s.mu.Unlock()
 	sent := 0
 	for _, w := range due {
-		if err := s.wake(ctx, w); err != nil {
+		answer, err := s.wake(ctx, w)
+		if err != nil {
 			if ctx.Err() == nil {
 				log.Printf("cloud browser wake %s failed: %v", w.ProfileID, err)
 			}
 			continue
 		}
 		sent++
+		// No browser to deliver changes to (never started, refused, or the
+		// Worker lost it): stop waking for them; the next start gets them.
+		if w.Refresh && w.RefreshAt != nil && !hosting(answer.Phase) {
+			if err := s.Store.DropRefresh(ctx, w.ProfileID, *w.RefreshAt); err != nil && ctx.Err() == nil {
+				log.Printf("cloud browser refresh drop %s failed: %v", w.ProfileID, err)
+			}
+		}
+		if w.Work && !answer.Accepted && answer.RetryAfterMS > 0 {
+			hold := min(time.Duration(answer.RetryAfterMS)*time.Millisecond, maxHold)
+			s.mu.Lock()
+			s.holds[w.ProfileID] = time.Now().Add(hold)
+			s.mu.Unlock()
+		}
 	}
 	return sent
 }
 
-func (s *Service) wake(ctx context.Context, w Wake) error {
+func (s *Service) wake(ctx context.Context, w Wake) (wakeReply, error) {
 	client := s.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	body, _ := json.Marshal(map[string]bool{"work": w.Work})
+	var answer wakeReply
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.WakeURL, "/")+"/profiles/"+url.PathEscape(w.ProfileID)+"/wake", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return answer, err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.RuntimeToken)
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.Do(req)
 	if err != nil {
-		return err
+		return answer, err
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
-	res.Body.Close()
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 	if res.StatusCode/100 != 2 {
-		return fmt.Errorf("wake returned %d", res.StatusCode)
+		return answer, fmt.Errorf("wake returned %d", res.StatusCode)
 	}
-	return nil
+	// An unreadable answer counts as "hosting" (nothing is dropped).
+	if json.Unmarshal(raw, &answer) != nil {
+		answer = wakeReply{Accepted: true, Phase: "live"}
+	}
+	return answer, nil
 }

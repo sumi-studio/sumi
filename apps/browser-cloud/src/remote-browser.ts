@@ -2,7 +2,7 @@ import { LIMITS } from "@sumi/desktop/browser-contract";
 import type { BrowserRunBinding } from "./browser-run.ts";
 import { openCdp } from "./browser-run.ts";
 import type { Cdp, CdpEvent } from "./cdp.ts";
-import { COLLECT, RESTORE, type OriginData } from "./storage-scripts.ts";
+import { COLLECT, type Collected, RESTORE, type OriginData } from "./storage-scripts.ts";
 
 /** Every tab uses this CSS viewport. The person's viewer scales frames of
  * exactly this size, and the secretary's observations report bounds in it,
@@ -38,6 +38,8 @@ export interface TabSummary {
 }
 
 export interface Frame {
+  /** Slot of the tab this frame shows. */
+  tab: string;
   data: string;
   width: number;
   height: number;
@@ -61,8 +63,25 @@ export interface Snapshot {
   cookies: Record<string, unknown>[];
   origins: Record<string, OriginData & { carried?: boolean }>;
   tabs: { slot: string; url: string; title: string; scroll: { x: number; y: number }; active: boolean }[];
-  notSaved: { nonJsonIdbValues: number; sessionStorageKeys: number; skippedOrigins: string[] };
+  notSaved: NotSaved;
 }
+
+export interface NotSaved {
+  /** IndexedDB records whose key or value is not plain JSON data. */
+  nonJsonIdbValues: number;
+  sessionStorageKeys: number;
+  /** Origins whose storage could not be read (page error, timeout). */
+  skippedOrigins: string[];
+  /** Origins whose storage did not fit the checkpoint budget. */
+  oversizedOrigins?: string[];
+}
+
+/** The API's sealed checkpoint limit (plaintext JSON bytes). */
+export const MAX_SNAPSHOT_BYTES = 2 << 20;
+/** Room kept for the not-saved lists and the envelope. */
+const SNAPSHOT_MARGIN_BYTES = 32 << 10;
+
+const jsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
 
 export class RemoteError extends Error {
   readonly code: string;
@@ -337,6 +356,7 @@ export class RemoteBrowser {
         if (event.sessionId !== this.screencastSession) return;
         const meta = params.metadata as { deviceWidth: number; deviceHeight: number; scrollOffsetX: number; scrollOffsetY: number };
         this.lastFrame = {
+          tab: slot.id,
           data: params.data as string,
           width: meta.deviceWidth,
           height: meta.deviceHeight,
@@ -521,44 +541,77 @@ export class RemoteBrowser {
 
   // ---------- semantic checkpoint ----------
 
-  async collect(previous: Snapshot | undefined): Promise<Snapshot> {
+  /** Cookies and tabs are always kept; each origin's storage is added while
+   * it fits the checkpoint budget (open tabs first, then origins carried
+   * from the previous checkpoint). An origin that does not fit is reported
+   * in notSaved.oversizedOrigins instead of dropping the whole checkpoint. */
+  async collect(previous: Snapshot | undefined, maxBytes = MAX_SNAPSHOT_BYTES): Promise<Snapshot> {
     const tabs: Snapshot["tabs"] = [];
     const origins: Snapshot["origins"] = {};
-    const notSaved = { nonJsonIdbValues: 0, sessionStorageKeys: 0, skippedOrigins: [] as string[] };
+    const notSaved: NotSaved = { nonJsonIdbValues: 0, sessionStorageKeys: 0, skippedOrigins: [], oversizedOrigins: [] };
+    const readable: { slot: Slot; origin: string }[] = [];
     for (const slot of this.slots.values()) {
       let scroll = { x: 0, y: 0 };
       if (HTTP.test(slot.url) && !slot.loading && !slot.crashed) {
+        const origin = new URL(slot.url).origin;
         try {
           scroll = await this.evaluate(slot.id, "({x: scrollX, y: scrollY})", false);
-          const origin = new URL(slot.url).origin;
-          if (!origins[origin]) {
-            const data = await this.evaluate<OriginData & { nonJsonValues: number; sessionStorageKeys: number }>(
-              slot.id,
-              COLLECT,
-              false,
-              10_000,
-            );
-            notSaved.nonJsonIdbValues += data.nonJsonValues;
-            notSaved.sessionStorageKeys += data.sessionStorageKeys;
-            origins[origin] = { localStorage: data.localStorage, indexedDB: data.indexedDB };
-          }
+          if (!readable.some((r) => r.origin === origin)) readable.push({ slot, origin });
         } catch {
-          notSaved.skippedOrigins.push(new URL(slot.url).origin);
+          if (!notSaved.skippedOrigins.includes(origin)) notSaved.skippedOrigins.push(origin);
         }
       }
       tabs.push({ slot: slot.id, url: slot.url, title: slot.title, scroll, active: slot.id === this.active });
     }
-    // Origins without an open tab cannot be read now: keep their last data.
-    for (const [origin, data] of Object.entries(previous?.origins ?? {}))
-      if (!origins[origin]) origins[origin] = { ...data, carried: true };
     const { cookies } = await this.cdp.send<{ cookies: Record<string, unknown>[] }>("Storage.getCookies", {});
+    let budget = maxBytes - SNAPSHOT_MARGIN_BYTES - jsonBytes({ v: 1, at: Date.now(), cookies, tabs });
+    const oversized = (origin: string) => notSaved.oversizedOrigins?.push(origin);
+    readable.sort((a, b) => Number(b.slot.id === this.active) - Number(a.slot.id === this.active));
+    for (const { slot, origin } of readable) {
+      if (budget <= 0) {
+        oversized(origin);
+        continue;
+      }
+      try {
+        const data = await this.evaluate<Collected>(slot.id, COLLECT(budget), false, 10_000);
+        if (data.tooLarge) {
+          oversized(origin);
+          continue;
+        }
+        const entry: OriginData = { localStorage: data.localStorage, indexedDB: data.indexedDB };
+        const bytes = jsonBytes(entry) + jsonBytes(origin) + 2;
+        if (bytes > budget) {
+          oversized(origin);
+          continue;
+        }
+        budget -= bytes;
+        notSaved.nonJsonIdbValues += data.nonJsonValues;
+        notSaved.sessionStorageKeys += data.sessionStorageKeys;
+        origins[origin] = entry;
+      } catch {
+        notSaved.skippedOrigins.push(origin);
+      }
+    }
+    // Origins without an open tab cannot be read now: keep their last data
+    // (never data that could not be read or did not fit just now).
+    for (const [origin, data] of Object.entries(previous?.origins ?? {})) {
+      if (origins[origin] || readable.some((r) => r.origin === origin) || notSaved.skippedOrigins.includes(origin)) continue;
+      const entry = { ...data, carried: true };
+      const bytes = jsonBytes(entry) + jsonBytes(origin) + 2;
+      if (bytes > budget) {
+        oversized(origin);
+        continue;
+      }
+      budget -= bytes;
+      origins[origin] = entry;
+    }
     return { v: 1, at: Date.now(), cookies, origins, tabs, notSaved };
   }
 
   /** Rebuild a checkpoint in this (fresh) browser: cookies, then each
    * origin's storage seeded on an intercepted stub document before any of
    * the origin's own scripts run, then the tabs in their stable slots. */
-  async restore(snapshot: Snapshot): Promise<{ origins: number; tabs: number }> {
+  async restore(snapshot: Snapshot): Promise<{ origins: number; tabs: number; failedOrigins: string[]; failedRecords: number }> {
     this.restoring = true;
     try {
       const first = this.slots.values().next().value;
@@ -574,6 +627,8 @@ export class RemoteBrowser {
       });
       if (cookies.length) await this.cdp.send("Storage.setCookies", { cookies });
       let origins = 0;
+      let failedRecords = 0;
+      const failedOrigins: string[] = [];
       const stub = btoa("<!doctype html><title>Sumi restore</title>");
       const onPaused = (event: CdpEvent) => {
         if (event.method === "Fetch.requestPaused" && event.sessionId === first.sessionId)
@@ -588,12 +643,17 @@ export class RemoteBrowser {
       try {
         for (const [origin, data] of Object.entries(snapshot.origins)) {
           if (!HTTP.test(origin)) continue;
-          await this.cdp.send("Fetch.enable", { patterns: [{ urlPattern: `${origin}/*` }] }, first.sessionId);
+          // One origin's storage failing to restore (blocked database,
+          // refused record, timeout) skips that origin only.
           try {
+            await this.cdp.send("Fetch.enable", { patterns: [{ urlPattern: `${origin}/*` }] }, first.sessionId);
             await this.navigate(first.id, `${origin}/__sumi_restore__`);
             await this.waitLoaded(first);
-            await this.evaluate(first.id, RESTORE(data), false, 15_000);
+            const result = await this.evaluate<{ failedRecords?: number }>(first.id, RESTORE(data), false, 15_000);
+            failedRecords += Number(result?.failedRecords) || 0;
             origins++;
+          } catch {
+            failedOrigins.push(origin);
           } finally {
             await this.cdp.send("Fetch.disable", {}, first.sessionId).catch(() => {});
           }
@@ -626,7 +686,7 @@ export class RemoteBrowser {
       }
       if (!this.active || !this.slots.has(this.active)) this.active = this.slots.keys().next().value;
       if (this.active) await this.activate(this.active);
-      return { origins, tabs: tabs.length };
+      return { origins, tabs: tabs.length, failedOrigins, failedRecords };
     } finally {
       this.restoring = false;
       this.pendingSlots = [];

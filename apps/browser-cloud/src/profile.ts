@@ -3,7 +3,7 @@ import { BrowserHostAgent, type GoalActivity, type HostCredential } from "@sumi/
 import { JevClient } from "@sumi/desktop/browser-jev";
 import { type BrowserRunBinding, localPool, MAX_KEEP_ALIVE_MS, sessionAlive } from "./browser-run.ts";
 import { takesControl, toCdp, type ViewerInput } from "./input.ts";
-import { type Frame, RemoteBrowser, type Snapshot, VIEWPORT } from "./remote-browser.ts";
+import { type Frame, MAX_SNAPSHOT_BYTES, RemoteBrowser, type Snapshot, VIEWPORT } from "./remote-browser.ts";
 import { type HostSession, StateClient, StateError, type FetcherLike } from "./state.ts";
 import { type AgentActivity, CloudTabPort, type Control } from "./tab-port.ts";
 import { type TicketClaims, verifyTicket } from "./ticket.ts";
@@ -55,6 +55,10 @@ interface Meta {
   incarnation: number;
   /** targetId -> stable tab slot id, for reconnecting after a host restart. */
   slots: Record<string, string>;
+  /** The session finished starting (restore included) for `incarnation`.
+   * A session that is not ready is closed, never reconnected to: it may
+   * hold a half-restored profile. */
+  ready?: boolean;
 }
 
 interface Intent {
@@ -73,6 +77,8 @@ interface Recovery {
   /** An action the secretary started whose result was never observed. */
   uncertain?: { kind: string; label?: string };
   skippedOrigins?: string[];
+  /** IndexedDB records the new browser refused while restoring. */
+  failedRecords?: number;
 }
 
 interface Viewer {
@@ -85,6 +91,8 @@ interface AgentEntry {
   credential: HostCredential;
   ticking?: Promise<void>;
   tickStarted: number;
+  /** The Jev key this agent was built with; replaced when it differs. */
+  jevKey?: string;
 }
 
 const VIEWER_SESSION_MS = 10 * 60_000;
@@ -92,6 +100,16 @@ const HEARTBEAT_MS = 20_000;
 const PERIODIC_CHECKPOINT_MS = 60_000;
 const LOOP_LIFETIME_MS = 14 * 60_000;
 const MAX_VIEWERS = 8;
+/** A refused or failed start is retried by queued work no sooner than this,
+ * doubling up to START_RETRY_MAX_MS (the person's 再開 always retries). */
+const START_RETRY_MS = 30_000;
+const START_RETRY_MAX_MS = 15 * 60_000;
+/** A failed checkpoint save is retried after this, doubling up to the max. */
+const CHECKPOINT_RETRY_MS = 5_000;
+const CHECKPOINT_RETRY_MAX_MS = 5 * 60_000;
+/** The person keeps control this long after their last viewer disconnects
+ * (reload, brief network loss); then control returns to the secretary. */
+export const HUMAN_HOLD_MS = 2 * 60_000;
 
 function number(value: string | undefined, fallback: number, max: number): number {
   const n = Number(value);
@@ -109,10 +127,15 @@ export class ProfileBrowser {
   private readonly port: CloudTabPort;
   private readonly agents = new Map<string, AgentEntry>();
   private jevKey?: string;
+  private jevKeyVersion?: number;
   private jevReported = false;
   private persona?: string;
   private control: Control = { mode: "agent", epoch: 0 };
   private humanAt = 0;
+  /** Set while the person has control but no viewer is connected. */
+  private humanHoldUntil?: number;
+  /** Control went back to the secretary because the person stayed away. */
+  private controlReturned?: { reason: "viewer_absent"; at: number };
   private readonly viewers = new Map<ServerSocket, Viewer>();
   private readonly nonces = new Map<string, number>();
   /** The person's screen operations apply in arrival order (a new tab before
@@ -123,6 +146,8 @@ export class ProfileBrowser {
   private starting?: Promise<void>;
   private loopRunning = false;
   private startFailed = false;
+  private startFailures = 0;
+  private startRetryAt = 0;
   private wantLive = false;
   private closingIntentionally = false;
   private lastActivity = Date.now();
@@ -130,6 +155,9 @@ export class ProfileBrowser {
   private checkpointSeq = 0;
   private lastCheckpoint?: Snapshot;
   private lastCheckpointAt?: string;
+  private liveSince = 0;
+  private checkpointFailures = 0;
+  private checkpointRetryAt = 0;
   private dirty = false;
   private checkpointTimer?: ReturnType<typeof setTimeout>;
   private checkpointing?: Promise<void>;
@@ -180,8 +208,17 @@ export class ProfileBrowser {
       const body = (await request.json().catch(() => ({}))) as { profile?: string; work?: boolean };
       if (!body.profile) return new Response("bad request", { status: 400 });
       await this.loadMeta(body.profile);
-      if (body.work) this.wantLive = true;
-      if (this.live()) void this.refresh().catch(() => {});
+      if (this.live()) {
+        void this.refresh().catch(() => {});
+        return Response.json({ accepted: true, phase: this.phase });
+      }
+      // Not live: grant/key changes wait for the next start, which receives
+      // everything; only queued work starts the browser, and not while a
+      // refused start is backing off.
+      if (!body.work) return Response.json({ accepted: false, phase: this.phase });
+      const wait = this.startRetryAt - Date.now();
+      if (wait > 0) return Response.json({ accepted: false, phase: this.phase, detail: this.phaseDetail, retry_after_ms: wait });
+      this.wantLive = true;
       await this.kick();
       return Response.json({ accepted: true, phase: this.phase });
     }
@@ -231,20 +268,26 @@ export class ProfileBrowser {
     const binding = this.binding();
     this.setPhase("starting");
     const intent = await this.ctx.storage.get<Intent>("intent");
+    let acquired: string | undefined;
+    let begun: number | undefined;
     try {
-      if (meta.session && (await sessionAlive(binding, meta.session).catch(() => false))) {
+      if (meta.session && meta.ready && (await sessionAlive(binding, meta.session).catch(() => false))) {
         try {
           const session = await this.state.begin(meta.profile, false, meta.incarnation);
           if (!session.enabled) return await this.retire(meta);
           await this.connect(meta.session, meta.slots);
+          // Continue the stored checkpoint sequence and its carried origins.
+          this.adoptCheckpoint(session);
           this.adopt(session, false);
           this.recovery = { kind: "reconnected", at: Date.now(), uncertain: intent ? { kind: intent.kind, label: intent.label } : undefined };
           if (intent) await this.ctx.storage.delete("intent");
           this.setPhase("live");
+          this.started();
           this.announce();
           return;
         } catch (error) {
           // A stale incarnation or broken connection: never reuse it.
+          this.closingIntentionally = true;
           this.remote?.close();
           this.remote = undefined;
           if (!(error instanceof StateError) || error.status !== 409) throw error;
@@ -253,28 +296,38 @@ export class ProfileBrowser {
       if (meta.session) {
         await binding.closeSession(meta.session).catch(() => {});
         meta.session = undefined;
+        meta.ready = false;
+        await this.saveMeta();
       }
-      const session = await this.state.begin(meta.profile, true);
-      if (!session.enabled) return await this.retire(meta);
+      // Browser Run first: a refused start leaves the profile's incarnation,
+      // tokens and state untouched.
       const outbound: Record<string, unknown> = {};
       if (this.env.FIXTURE && this.env.FIXTURE_HOSTS)
         for (const host of this.env.FIXTURE_HOSTS.split(",")) outbound[host.trim()] = this.env.FIXTURE;
-      const acquired = await binding.acquire({
-        keepAlive: number(this.env.SUMI_BROWSER_KEEPALIVE_MS, 60_000, MAX_KEEP_ALIVE_MS),
-        ...(Object.keys(outbound).length ? { outboundByHost: outbound } : {}),
-      });
-      meta.session = acquired.sessionId;
-      meta.incarnation = session.incarnation;
+      acquired = (
+        await binding.acquire({
+          keepAlive: number(this.env.SUMI_BROWSER_KEEPALIVE_MS, 60_000, MAX_KEEP_ALIVE_MS),
+          ...(Object.keys(outbound).length ? { outboundByHost: outbound } : {}),
+        })
+      ).sessionId;
+      meta.session = acquired;
+      meta.ready = false;
       meta.slots = {};
       await this.saveMeta();
-      await this.connect(acquired.sessionId, {});
-      this.checkpointSeq = session.snapshot_seq;
-      this.lastCheckpoint = session.snapshot ?? undefined;
-      this.lastCheckpointAt = session.snapshot_at;
+      const session = await this.state.begin(meta.profile, true);
+      if (!session.enabled) return await this.retire(meta);
+      begun = session.incarnation;
+      meta.incarnation = session.incarnation;
+      await this.saveMeta();
+      await this.connect(acquired, {});
+      this.adoptCheckpoint(session);
+      let restored: Awaited<ReturnType<RemoteBrowser["restore"]>> | undefined;
       if (session.snapshot) {
         this.setPhase("restoring", session.snapshot_at);
-        await this.remote?.restore(session.snapshot);
+        restored = await this.remote?.restore(session.snapshot);
       }
+      const notSaved = session.snapshot?.notSaved;
+      const skippedOrigins = [...new Set([...(notSaved?.skippedOrigins ?? []), ...(notSaved?.oversizedOrigins ?? []), ...(restored?.failedOrigins ?? [])])];
       this.recovery =
         session.snapshot || intent || session.incarnation > 1
           ? {
@@ -282,23 +335,55 @@ export class ProfileBrowser {
               at: Date.now(),
               checkpointAt: session.snapshot_at,
               uncertain: intent ? { kind: intent.kind, label: intent.label } : undefined,
-              skippedOrigins: session.snapshot?.notSaved.skippedOrigins,
+              skippedOrigins: skippedOrigins.length ? skippedOrigins : undefined,
+              failedRecords: restored?.failedRecords || undefined,
             }
           : undefined;
       if (intent) await this.ctx.storage.delete("intent");
       this.adopt(session, true);
+      meta.ready = true;
+      await this.saveMeta();
       this.setPhase("live");
+      this.started();
       this.announce();
       this.scheduleSlotSave();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.closingIntentionally = true;
       this.remote?.close();
       this.remote = undefined;
+      // Never leave a half-started browser behind: it would be reconnected
+      // to and checkpointed over the good state.
+      if (acquired) await binding.closeSession(acquired).catch(() => {});
+      if (acquired && meta.session === acquired) {
+        meta.session = undefined;
+        meta.ready = false;
+        await this.saveMeta().catch(() => {});
+      }
+      // The API marked the new incarnation live; say it is not.
+      if (begun !== undefined) await this.state.setState(meta.profile, begun, "sleeping").catch(() => {});
+      this.startFailures++;
+      this.startRetryAt = Date.now() + Math.min(START_RETRY_MAX_MS, START_RETRY_MS * 2 ** (this.startFailures - 1));
       // Quota, concurrency and plan limits come from Browser Run; say so.
       const limited = /limit|quota|too many|429|concurren/i.test(message);
       this.setPhase("unavailable", limited ? "browser_limit" : "start_failed");
       console.error("cloud browser start failed", limited ? "limit" : message.slice(0, 200));
     }
+  }
+
+  private started(): void {
+    this.startFailures = 0;
+    this.startRetryAt = 0;
+    this.liveSince = Date.now();
+  }
+
+  /** The stored checkpoint this browser continues from. */
+  private adoptCheckpoint(session: HostSession): void {
+    this.checkpointSeq = session.snapshot_seq;
+    this.lastCheckpoint = session.snapshot ?? undefined;
+    this.lastCheckpointAt = session.snapshot_at;
+    this.checkpointFailures = 0;
+    this.checkpointRetryAt = 0;
   }
 
   private async connect(sessionId: string, known: Record<string, string>): Promise<void> {
@@ -331,15 +416,16 @@ export class ProfileBrowser {
       for (const entry of this.agents.values()) entry.agent.stop();
       this.agents.clear();
     }
-    const keyChanged = (session.jev_key ?? undefined) !== this.jevKey;
-    this.jevKey = session.jev_key || undefined;
-    if (keyChanged) this.jevReported = false;
-    if (keyChanged)
-      for (const [id, entry] of this.agents)
-        if (!entry.ticking) {
-          entry.agent.stop();
-          this.agents.set(id, this.agent(entry.credential));
-        }
+    const key = session.jev_key || undefined;
+    if (key !== this.jevKey || session.jev_key_version !== this.jevKeyVersion) this.jevReported = false;
+    this.jevKey = key;
+    this.jevKeyVersion = session.jev_key_version;
+    // An agent in the middle of a tick is replaced when that tick ends.
+    for (const [id, entry] of this.agents)
+      if (entry.jevKey !== this.jevKey && !entry.ticking) {
+        entry.agent.stop();
+        this.agents.set(id, this.agent(entry.credential));
+      }
     for (const credential of session.attachments) this.agents.set(credential.attachment.attachment_id, this.agent(credential));
     for (const viewer of [...this.viewers.keys()])
       if (this.persona && this.viewerPersona.get(viewer) !== this.persona) viewer.close(4403, "not_authorized");
@@ -368,7 +454,7 @@ export class ProfileBrowser {
         if (activity.state === "ended") this.scheduleCheckpoint(2_000);
       },
     });
-    return { agent, credential, tickStarted: 0 };
+    return { agent, credential, tickStarted: 0, jevKey: this.jevKey };
   }
 
   private async refresh(): Promise<void> {
@@ -392,6 +478,7 @@ export class ProfileBrowser {
     this.remote = undefined;
     if (meta.session) await this.binding().closeSession(meta.session).catch(() => {});
     meta.session = undefined;
+    meta.ready = false;
     this.lastCheckpoint = undefined;
     await this.saveMeta();
     this.setPhase("sleeping", "reset");
@@ -415,6 +502,7 @@ export class ProfileBrowser {
     if (meta.session) await this.binding().closeSession(meta.session).catch(() => {});
     const incarnation = meta.incarnation;
     meta.session = undefined;
+    meta.ready = false;
     await this.saveMeta();
     await this.state.setState(meta.profile, incarnation, "sleeping").catch(() => {});
     this.control = { mode: "agent", epoch: this.control.epoch + 1 };
@@ -446,8 +534,8 @@ export class ProfileBrowser {
           if (!wanted) break;
           this.wantLive = false;
           if (!(await this.ensureLive())) {
-            // Unavailable: viewers see why and may press 再開; a later wake
-            // with work retries. Nothing re-arms on its own.
+            // Unavailable: viewers see why and may press 再開; queued work
+            // retries after the start backoff. Nothing re-arms on its own.
             this.startFailed = true;
             break;
           }
@@ -473,27 +561,22 @@ export class ProfileBrowser {
                 this.broadcastTabs();
               }
             })
-            .finally(() => {
-              entry.ticking = undefined;
-              // Jev refused the key (401): withdraw it for every tab until
-              // the person saves a new one.
-              if (this.jevKey && !entry.agent.jevAvailable && !this.jevReported && this.meta) {
-                this.jevReported = true;
-                void this.state.jevRejected(this.meta.profile).catch(() => {});
-              }
-            });
+            .finally(() => this.afterTick(id, entry));
         }
         if (working) this.lastActivity = now;
         if (now - this.lastHeartbeat > HEARTBEAT_MS) {
           this.lastHeartbeat = now;
           await this.remote?.heartbeat().catch(() => {});
         }
-        if (this.dirty && this.lastCheckpointAt && now - Date.parse(this.lastCheckpointAt) > PERIODIC_CHECKPOINT_MS)
-          this.scheduleCheckpoint(0);
+        const savedAt = Date.parse(this.lastCheckpointAt ?? "") || this.liveSince;
+        if (this.dirty && now >= this.checkpointRetryAt && now - savedAt > PERIODIC_CHECKPOINT_MS) this.scheduleCheckpoint(0);
+        const holding = this.control.mode === "human" && !this.viewers.size && this.humanHoldUntil !== undefined;
+        if (holding && now >= (this.humanHoldUntil ?? 0)) this.release("viewer_absent");
         for (const [viewer, info] of this.viewers)
           if (info.authUntil < now) viewer.close(4401, "reauth_required");
         for (const [nonce, exp] of this.nonces) if (exp < now) this.nonces.delete(nonce);
-        if (!this.viewers.size && !working && now - this.lastActivity > grace) {
+        const held = this.control.mode === "human" && this.humanHoldUntil !== undefined;
+        if (!this.viewers.size && !working && !held && now - this.lastActivity > grace) {
           await this.sleepNow("idle");
           break;
         }
@@ -507,6 +590,24 @@ export class ProfileBrowser {
     if (this.live() || (this.viewers.size && !this.startFailed)) await this.ctx.storage.setAlarm(Date.now() + 1_000);
   }
 
+  private afterTick(id: string, entry: AgentEntry): void {
+    entry.ticking = undefined;
+    if (this.agents.get(id) !== entry) return;
+    // The key changed during the tick: this agent still holds the old one,
+    // so its outcome says nothing about the new key.
+    if (entry.jevKey !== this.jevKey) {
+      entry.agent.stop();
+      this.agents.set(id, this.agent(entry.credential));
+      return;
+    }
+    // Jev refused the key (401): withdraw that key for every tab until the
+    // person saves a new one.
+    if (this.jevKey && this.jevKeyVersion !== undefined && !entry.agent.jevAvailable && !this.jevReported && this.meta) {
+      this.jevReported = true;
+      void this.state.jevRejected(this.meta.profile, this.jevKeyVersion).catch(() => {});
+    }
+  }
+
   // ---------- checkpoint ----------
 
   private scheduleCheckpoint(delay: number): void {
@@ -517,30 +618,39 @@ export class ProfileBrowser {
     }, delay);
   }
 
-  private async checkpoint(_reason: string): Promise<void> {
+  private async checkpoint(reason: string): Promise<void> {
     if (this.checkpointing) return this.checkpointing;
+    // After a failed save, wait (backing off) instead of re-collecting every
+    // storage on each loop pass; closing still tries once more.
+    if (reason !== "before_close" && Date.now() < this.checkpointRetryAt) return;
     const run = async () => {
       const meta = this.meta;
       const remote = this.remote;
       if (!meta || !remote || remote.closed) return;
-      const snapshot = await remote.collect(this.lastCheckpoint);
-      const size = new TextEncoder().encode(JSON.stringify(snapshot)).length;
-      if (size > 2 << 20) {
-        this.broadcast({ type: "notice", code: "checkpoint_too_large", bytes: size });
-        return;
-      }
       try {
+        const snapshot = await remote.collect(this.lastCheckpoint, MAX_SNAPSHOT_BYTES);
+        const size = new TextEncoder().encode(JSON.stringify(snapshot)).length;
+        if (size > MAX_SNAPSHOT_BYTES) {
+          // Cookies and tabs alone exceed the limit.
+          this.broadcast({ type: "notice", code: "checkpoint_too_large", bytes: size });
+          throw new Error("checkpoint too large");
+        }
         const saved = await this.state.saveSnapshot(meta.profile, meta.incarnation, this.checkpointSeq + 1, snapshot);
         this.checkpointSeq++;
         this.lastCheckpoint = snapshot;
         this.lastCheckpointAt = saved.saved_at;
+        this.checkpointFailures = 0;
+        this.checkpointRetryAt = 0;
         this.dirty = false;
         this.broadcast({ type: "checkpoint", at: saved.saved_at, notSaved: snapshot.notSaved });
       } catch (error) {
         if (error instanceof StateError && error.status === 409) {
           // Another incarnation owns the profile now; this browser is stale.
           await this.sleepNow("stale");
+          return;
         }
+        this.checkpointFailures++;
+        this.checkpointRetryAt = Date.now() + Math.min(CHECKPOINT_RETRY_MAX_MS, CHECKPOINT_RETRY_MS * 2 ** (this.checkpointFailures - 1));
       }
     };
     this.checkpointing = run().finally(() => {
@@ -582,6 +692,7 @@ export class ProfileBrowser {
    * (an action already handed to the page completes and is recorded). */
   private takeControl(reason: string): void {
     this.humanAt = Date.now();
+    this.controlReturned = undefined;
     if (this.control.mode === "human") return;
     this.control = { mode: "human", epoch: this.control.epoch + 1 };
     let stopped = 0;
@@ -589,10 +700,15 @@ export class ProfileBrowser {
     this.broadcast({ type: "control", mode: "human", reason, goalStopped: stopped > 0, inFlight: this.inFlight });
   }
 
-  private release(): void {
+  /** Control returns to the secretary: 「秘書に戻す」, or the person stayed
+   * disconnected past HUMAN_HOLD_MS. A goal stopped by the takeover stays
+   * stopped; nothing is restarted here. */
+  private release(reason: "person_release" | "viewer_absent" = "person_release"): void {
+    this.humanHoldUntil = undefined;
     if (this.control.mode === "agent") return;
     this.control = { mode: "agent", epoch: this.control.epoch + 1 };
-    this.broadcast({ type: "control", mode: "agent", reason: "person_release" });
+    this.controlReturned = reason === "viewer_absent" ? { reason, at: Date.now() } : undefined;
+    this.broadcast({ type: "control", mode: "agent", reason });
     this.dirty = true;
     this.scheduleCheckpoint(500);
   }
@@ -634,6 +750,7 @@ export class ProfileBrowser {
     const server = pair[1];
     server.accept();
     this.viewers.set(server, { human: claims.h, authUntil: Date.now() + VIEWER_SESSION_MS });
+    this.humanHoldUntil = undefined;
     this.viewerPersona.set(server, claims.p);
     server.addEventListener("message", (event) => {
       const fail = (error: { code?: string } | undefined) => this.send(server, { type: "error", code: error?.code ?? "failed" });
@@ -650,8 +767,14 @@ export class ProfileBrowser {
       this.lastActivity = Date.now();
       if (!this.viewers.size) {
         void this.remote?.stopScreencast();
-        // The person left: the secretary may continue; save what they did.
-        this.release();
+        // A reload or brief disconnect keeps the person's control; the loop
+        // returns it to the secretary if nobody is back in HUMAN_HOLD_MS.
+        // Save what the person did either way.
+        if (this.control.mode === "human") {
+          this.humanHoldUntil = Date.now() + HUMAN_HOLD_MS;
+          this.dirty = true;
+          this.scheduleCheckpoint(500);
+        }
       }
     };
     server.addEventListener("close", gone);
@@ -671,12 +794,13 @@ export class ProfileBrowser {
       viewport: VIEWPORT,
       phase: this.phase,
       detail: this.phaseDetail,
-      control: { mode: this.control.mode },
+      control: { mode: this.control.mode, holdMs: HUMAN_HOLD_MS, returned: this.controlReturned },
       tabs: this.remote?.tabs() ?? [],
       shared: this.sharedTabs(),
       goal: this.goal,
       recovery: this.recovery,
       checkpointAt: this.lastCheckpointAt,
+      notSaved: this.lastCheckpoint?.notSaved,
       dialog: this.dialog,
       unsupported: ["file_upload", "file_drag_drop", "download", "clipboard_copy_out", "audio", "extensions"],
     };
@@ -718,7 +842,7 @@ export class ProfileBrowser {
   }
 
   private sendFrame(frame: Frame, only?: ServerSocket): void {
-    const text = JSON.stringify({ type: "frame", tab: this.remote?.active, ...frame });
+    const text = JSON.stringify({ type: "frame", ...frame });
     for (const viewer of only ? [only] : [...this.viewers.keys()]) {
       try {
         viewer.send(text);
@@ -746,6 +870,8 @@ export class ProfileBrowser {
         return;
       }
       case "start":
+        // The person's 再開 retries at once, whatever the backoff.
+        this.startRetryAt = 0;
         this.wantLive = true;
         await this.kick();
         return;
@@ -766,9 +892,15 @@ export class ProfileBrowser {
     const remote = this.remote;
     switch (message.type) {
       case "input": {
-        const input = message as unknown as ViewerInput;
+        const input = message as unknown as ViewerInput & { tab?: unknown };
         const commands = toCdp(input);
         if (!commands) return;
+        // Input applies to the tab whose frame the person saw; if the active
+        // tab changed meanwhile (the secretary switched it), refuse it.
+        if (input.tab !== remote.active) {
+          if (takesControl(input)) this.send(viewer, { type: "notice", code: "tab_changed", tab: remote.active });
+          return;
+        }
         if (takesControl(input)) this.takeControl("person_input");
         else if (this.control.mode !== "human") return;
         this.dirty = true;

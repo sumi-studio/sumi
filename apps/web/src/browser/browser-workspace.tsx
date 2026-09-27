@@ -20,10 +20,13 @@ import { BrowserScreen, type BrowserScreenHandle, type ViewerInput } from "./bro
 import {
   actionText,
   checkpointText,
+  controlHoldText,
+  controlReturnedText,
   dismissNotice,
   goalText,
   initialViewerState,
   NOTICE_TEXT,
+  notSavedText,
   phaseText,
   recoveryText,
   reduceViewer,
@@ -173,7 +176,10 @@ function BrowserSession({
   const [socketStatus, setSocketStatus] = useState<SocketStatus>("connecting");
   const [closedReason, setClosedReason] = useState<string>();
   const [recoveryDismissed, setRecoveryDismissed] = useState<number>();
+  const [returnedDismissed, setReturnedDismissed] = useState<number>();
   const screen = useRef<BrowserScreenHandle>(null);
+  // The tab of the last painted frame: the person's input is for that tab.
+  const frameTab = useRef<string | undefined>(undefined);
   const socket = useRef<ViewerSocket | null>(null);
   // The viewer lives exactly as long as the profile; it calls the latest
   // overview refresh without reconnecting when that callback changes.
@@ -185,7 +191,10 @@ function BrowserSession({
       api,
       profileId: profile.profileId,
       onMessage: dispatch,
-      onFrame: (frame) => screen.current?.paint(frame),
+      onFrame: (frame) => {
+        frameTab.current = frame.tab;
+        screen.current?.paint(frame);
+      },
       onStatus: (status, reason) => {
         setSocketStatus(status);
         if (reason) setClosedReason(reason);
@@ -214,13 +223,14 @@ function BrowserSession({
   const send = useCallback((message: Record<string, unknown>) => {
     if (!socket.current?.send(message)) dispatch({ type: "notice", code: "not_live" });
   }, []);
-  const onInput = useCallback((input: ViewerInput) => send({ type: "input", ...input }), [send]);
+  const onInput = useCallback((input: ViewerInput) => send({ type: "input", ...input, tab: frameTab.current }), [send]);
   const onUnsupported = useCallback((code: string) => dispatch({ type: "notice", code }), []);
 
   const active = state.tabs.find((t) => t.active);
   const grant = active ? profile.grants.find((g) => g.tabId === active.id) : undefined;
   const live = state.phase === "live" && socketStatus === "open";
   const recoveryLines = useMemo(() => (state.recovery ? recoveryText(state.recovery) : []), [state.recovery]);
+  const notSavedLine = notSavedText(state.notSaved);
 
   if (closedReason === "reset" || closedReason === "forbidden")
     return (
@@ -265,13 +275,24 @@ function BrowserSession({
           </Button>
         </Banner>
       ) : null}
-      {state.control === "human" && state.takeover ? (
+      {state.control === "human" ? (
         <Banner tone="info" icon={<Hand className="size-3.5 shrink-0 text-muted-foreground" />}>
-          <span className="min-w-0 flex-1">
+          <span className="min-w-0 flex-1" data-testid="cloud-browser-human-control">
             あなたが操作中です。秘書は操作しません
-            {state.takeover.goalStopped ? "（秘書の作業は停止しました）" : ""}
-            {state.takeover.inFlight ? `。直前に始まっていた秘書の${actionText(state.takeover.inFlight)}は完了まで進みます` : ""}。
+            {state.takeover?.goalStopped ? "（秘書の作業は停止しました）" : ""}
+            {state.takeover?.inFlight ? `。直前に始まっていた秘書の${actionText(state.takeover.inFlight)}は完了まで進みます` : ""}。
+            {controlHoldText(state.controlHoldMs)}
           </span>
+        </Banner>
+      ) : null}
+      {state.control === "agent" && state.controlReturned && returnedDismissed !== state.controlReturned.at ? (
+        <Banner tone="info" icon={<Info className="size-3.5 shrink-0 text-muted-foreground" />}>
+          <span className="min-w-0 flex-1" data-testid="cloud-browser-control-returned">
+            {controlReturnedText(state.controlReturned, state.controlHoldMs)}
+          </span>
+          <Button size="icon" variant="ghost" className="size-7" aria-label="閉じる" onClick={() => setReturnedDismissed(state.controlReturned?.at)}>
+            <X className="size-3.5" />
+          </Button>
         </Banner>
       ) : null}
       {state.agent && state.control === "agent" ? (
@@ -331,7 +352,10 @@ function BrowserSession({
       </div>
 
       <footer className="flex flex-wrap items-center gap-x-3 gap-y-1 border-border border-t px-3 py-1.5 text-muted-foreground text-xs">
-        <span data-testid="cloud-browser-checkpoint">{checkpointText(state.checkpointAt ?? profile.checkpointAt ?? undefined)}</span>
+        <span data-testid="cloud-browser-checkpoint" title={notSavedLine}>
+          {checkpointText(state.checkpointAt ?? profile.checkpointAt ?? undefined)}
+          {notSavedLine ? "（一部は保存対象外）" : ""}
+        </span>
         <span className="hidden sm:inline">画面の大きさは {state.viewport.width}×{state.viewport.height} で固定です（表示だけ拡大縮小します）。</span>
         <Popover>
           <PopoverTrigger render={<button type="button" className="underline-offset-2 hover:underline" />}>
@@ -342,6 +366,16 @@ function BrowserSession({
             <p className="mt-1">
               Cookie、サイトごとの localStorage と IndexedDB（JSON で表せる値）、開いているタブと表示位置を、ページの読み込み後や交代時に保存します（合計{" "}
               2 MB まで）。ブラウザは使っていないと 1 分ほどで休止し、次に開くと保存した状態から再開します。ページ内の未送信の入力と sessionStorage は保存されません。
+              IndexedDB のファイル・日付・バイナリなどの値は保存せず件数だけ数えます。上限に収まらないサイトのデータは保存せず、Cookie・タブ・ほかのサイトは保存します。
+            </p>
+            {notSavedLine ? (
+              <p className="mt-1" data-testid="cloud-browser-not-saved">
+                {notSavedLine}
+              </p>
+            ) : null}
+            <p className="mt-2 font-medium text-foreground">操作の交代</p>
+            <p className="mt-1">
+              画面に触れるとあなたの操作になり、「秘書に戻す」で秘書に返します。{controlHoldText(state.controlHoldMs)}止めた秘書の作業は自動では再開しません。
             </p>
             <p className="mt-2 font-medium text-foreground">使えない機能</p>
             <p className="mt-1">{(state.unsupported.length ? state.unsupported : Object.keys(UNSUPPORTED_TEXT)).map((u) => UNSUPPORTED_TEXT[u] ?? u).join("、")}。</p>

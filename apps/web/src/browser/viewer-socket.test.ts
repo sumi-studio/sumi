@@ -66,6 +66,9 @@ describe("viewer socket", () => {
     s.open();
     s.onmessage?.({ data: JSON.stringify({ type: "frame", data: "AAA", width: 1280, height: 800 }) });
     expect(frames).toHaveLength(1);
+    // The frame's tab reaches the page, which names it in the person's input.
+    s.onmessage?.({ data: JSON.stringify({ type: "frame", tab: "slot-b", data: "BBB", width: 1280, height: 800 }) });
+    expect(frames[1]).toEqual({ tab: "slot-b", data: "BBB", width: 1280, height: 800 });
     await vi.advanceTimersByTimeAsync(4 * 60_000);
     expect(JSON.parse(s.sent[0] as string)).toEqual({ type: "reauth", ticket: "sbt1.t2.s" });
     viewer.stop();

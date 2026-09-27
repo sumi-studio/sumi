@@ -16,6 +16,9 @@ export interface HostSession {
   snapshot_at?: string;
   snapshot_version: number;
   jev_key?: string;
+  /** Which saved key `jev_key` is; a rejection names it so that a key
+   * saved later is never marked rejected by an older key's failure. */
+  jev_key_version?: number;
 }
 
 export class StateError extends Error {
@@ -87,7 +90,7 @@ export class StateClient {
     return this.call(profile, "state", { incarnation, state });
   }
 
-  jevRejected(profile: string): Promise<unknown> {
-    return this.call(profile, "jev-rejected", {});
+  jevRejected(profile: string, keyVersion: number): Promise<unknown> {
+    return this.call(profile, "jev-rejected", { key_version: keyVersion });
   }
 }

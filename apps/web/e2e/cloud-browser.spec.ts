@@ -485,6 +485,34 @@ test("the viewer reconnects to the live browser without losing page memory", asy
     receipt("host-reconnect", { counter: /In-memory counter \(not saved anywhere\):\s*(\d+)/.exec(String(same.value.text))?.[1] });
     expect(same.value.text).toMatch(/In-memory counter \(not saved anywhere\):\s*1/);
     await shot("11-reconnected");
+    // Review F2: the reconnected host's next checkpoint continues the stored
+    // sequence and the same live browser keeps running (it is not closed as
+    // stale): restart -> checkpoint -> still the same live tab.
+    const before = (await stack.profileState()).profiles[0] as Json;
+    const sessions = (await stack.poolSessions()).map((s) => s.sessionId);
+    expect((await act(appAttachment, same.value.binding, { kind: "click", target: target(same.value, /Count \+1/).id })).status).toBe("done");
+    await expect
+      .poll(async () => ((await stack.profileState()).profiles[0] as Json).checkpoint_at, { timeout: 30_000 })
+      .not.toBe(before.checkpoint_at);
+    // A refused save would close the browser right away; give it the time.
+    await page.waitForTimeout(3_000);
+    const after = (await stack.profileState()).profiles[0] as Json;
+    const still = await observe(appAttachment);
+    const tab = await sharedTab(/./, (t) => t.available && t.attachment_id === appAttachment);
+    receipt("host-reconnect-checkpoint", {
+      state: after.state,
+      incarnation: [before.incarnation, after.incarnation],
+      checkpointAdvanced: after.checkpoint_at !== before.checkpoint_at,
+      sameSession: JSON.stringify((await stack.poolSessions()).map((s) => s.sessionId)) === JSON.stringify(sessions),
+      sameTab: tab.tab.tabId === appTab,
+      counter: /In-memory counter \(not saved anywhere\):\s*(\d+)/.exec(String(still.value.text))?.[1],
+    });
+    expect(after.state).toBe("live");
+    expect(after.incarnation).toBe(before.incarnation);
+    expect((await stack.poolSessions()).map((s) => s.sessionId)).toEqual(sessions);
+    expect(tab.tab.tabId).toBe(appTab);
+    expect(still.value.text).toMatch(/In-memory counter \(not saved anywhere\):\s*2/);
+    await expect(page.getByTestId("cloud-browser-status")).toHaveCount(0);
   }
 });
 

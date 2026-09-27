@@ -20,6 +20,15 @@ export interface Recovery {
   checkpointAt?: string;
   uncertain?: { kind: string; label?: string };
   skippedOrigins?: string[];
+  failedRecords?: number;
+}
+
+/** What the latest checkpoint could not keep. */
+export interface NotSaved {
+  nonJsonIdbValues: number;
+  sessionStorageKeys: number;
+  skippedOrigins: string[];
+  oversizedOrigins?: string[];
 }
 
 export interface AgentAction {
@@ -43,6 +52,10 @@ export interface ViewerState {
   detail?: string;
   viewport: { width: number; height: number };
   control: "agent" | "human";
+  /** How long the person's control survives a disconnect (reload, network). */
+  controlHoldMs?: number;
+  /** Control went back to the secretary because the person stayed away. */
+  controlReturned?: { reason: string; at: number };
   /** Set when a takeover stopped the secretary; explains what happened. */
   takeover?: { goalStopped: boolean; inFlight?: { kind: string; label?: string } };
   tabs: RemoteTab[];
@@ -51,6 +64,7 @@ export interface ViewerState {
   agent?: AgentAction;
   recovery?: Recovery;
   checkpointAt?: string;
+  notSaved?: NotSaved;
   dialog?: { dialogType: string; message: string };
   unsupported: string[];
   notices: Notice[];
@@ -85,6 +99,18 @@ function shared(value: unknown): ViewerState["shared"] | undefined {
   return value.flatMap((s) => (s && typeof s.tab === "string" ? [{ tab: s.tab, allowActions: s.allowActions === true }] : []));
 }
 
+function notSaved(value: unknown): NotSaved | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  const origins = (list: unknown) => (Array.isArray(list) ? list.filter((o): o is string => typeof o === "string") : []);
+  return {
+    nonJsonIdbValues: Number(v.nonJsonIdbValues) || 0,
+    sessionStorageKeys: Number(v.sessionStorageKeys) || 0,
+    skippedOrigins: origins(v.skippedOrigins),
+    oversizedOrigins: origins(v.oversizedOrigins),
+  };
+}
+
 function phase(value: unknown, fallback: Phase): Phase {
   return typeof value === "string" && PHASES.has(value as Phase) ? (value as Phase) : fallback;
 }
@@ -93,19 +119,25 @@ export function reduceViewer(state: ViewerState, message: ServerMessage): Viewer
   switch (message.type) {
     case "hello": {
       const viewport = message.viewport as ViewerState["viewport"] | undefined;
-      const control = (message.control as { mode?: string } | undefined)?.mode === "human" ? "human" : "agent";
+      const info = message.control as { mode?: string; holdMs?: unknown; returned?: { reason?: unknown; at?: unknown } } | undefined;
+      const control = info?.mode === "human" ? "human" : "agent";
+      const returned = info?.returned;
       return {
         ...state,
         phase: phase(message.phase, state.phase),
         detail: typeof message.detail === "string" ? message.detail : undefined,
         viewport: viewport && viewport.width > 0 && viewport.height > 0 ? viewport : state.viewport,
         control,
+        controlHoldMs: typeof info?.holdMs === "number" ? info.holdMs : state.controlHoldMs,
+        controlReturned:
+          control === "agent" && returned && typeof returned.at === "number" ? { reason: String(returned.reason), at: returned.at } : undefined,
         takeover: control === "human" ? state.takeover : undefined,
         tabs: tabs(message.tabs) ?? state.tabs,
         shared: shared(message.shared) ?? state.shared,
         goal: (message.goal as GoalActivity | undefined) ?? state.goal,
         recovery: (message.recovery as Recovery | undefined) ?? state.recovery,
         checkpointAt: typeof message.checkpointAt === "string" ? message.checkpointAt : state.checkpointAt,
+        notSaved: notSaved(message.notSaved) ?? state.notSaved,
         dialog: message.dialog as ViewerState["dialog"],
         unsupported: Array.isArray(message.unsupported) ? message.unsupported.map(String) : state.unsupported,
       };
@@ -125,6 +157,7 @@ export function reduceViewer(state: ViewerState, message: ServerMessage): Viewer
         ? {
             ...state,
             control: "human",
+            controlReturned: undefined,
             takeover: {
               goalStopped: message.goalStopped === true,
               inFlight: message.inFlight as { kind: string; label?: string } | undefined,
@@ -146,7 +179,11 @@ export function reduceViewer(state: ViewerState, message: ServerMessage): Viewer
     case "goal":
       return { ...state, goal: message.activity as GoalActivity };
     case "checkpoint":
-      return { ...state, checkpointAt: typeof message.at === "string" ? message.at : state.checkpointAt };
+      return {
+        ...state,
+        checkpointAt: typeof message.at === "string" ? message.at : state.checkpointAt,
+        notSaved: notSaved(message.notSaved) ?? state.notSaved,
+      };
     case "dialog":
       return message.closed
         ? { ...state, dialog: undefined }
@@ -223,7 +260,11 @@ export function recoveryText(recovery: Recovery): string[] {
     );
   else lines.push("新しいブラウザで開始しました。復元できる保存状態はありませんでした。");
   if (recovery.skippedOrigins?.length)
-    lines.push(`${recovery.skippedOrigins.length} 件のサイトのデータは上限を超えたため保存されていません。`);
+    lines.push(
+      `${recovery.skippedOrigins.length} 件のサイト（${recovery.skippedOrigins.map(host).join("、")}）のデータは保存または復元できなかったため戻っていません。そのサイトでは再ログインなどが必要になることがあります。`,
+    );
+  if (recovery.failedRecords)
+    lines.push(`IndexedDB の ${recovery.failedRecords} 件のデータは新しいブラウザが受け付けなかったため戻っていません。`);
   if (recovery.uncertain)
     lines.push(
       `秘書の最後の操作「${actionText(recovery.uncertain)}」が相手のサイトに届いたかは確認できません。自動では再実行しません。サイト上で結果を確かめてください。`,
@@ -235,13 +276,47 @@ export function checkpointText(at?: string): string {
   return at ? `最終保存 ${time(at)}` : "未保存";
 }
 
+function host(origin: string): string {
+  try {
+    return new URL(origin).host;
+  } catch {
+    return origin;
+  }
+}
+
+/** What the latest checkpoint left out, or undefined when it kept everything
+ * it supports. */
+export function notSavedText(notSaved?: NotSaved): string | undefined {
+  if (!notSaved) return undefined;
+  const parts: string[] = [];
+  if (notSaved.oversizedOrigins?.length)
+    parts.push(`容量の上限（合計 2 MB）に収まらないサイトのデータ: ${notSaved.oversizedOrigins.map(host).join("、")}`);
+  if (notSaved.skippedOrigins.length) parts.push(`読み取れなかったサイトのデータ: ${notSaved.skippedOrigins.map(host).join("、")}`);
+  if (notSaved.nonJsonIdbValues)
+    parts.push(`IndexedDB のうち JSON で表せないデータ（ファイル・日付・バイナリなど） ${notSaved.nonJsonIdbValues} 件`);
+  if (notSaved.sessionStorageKeys) parts.push(`sessionStorage ${notSaved.sessionStorageKeys} 件`);
+  return parts.length ? `前回の保存に含まれていないもの — ${parts.join("／")}` : undefined;
+}
+
+const minutes = (ms: number) => Math.max(1, Math.round(ms / 60_000));
+
+/** How the person's control behaves when their page reloads or disconnects. */
+export function controlHoldText(holdMs = 120_000): string {
+  return `ページを再読み込みしたり接続が一時的に切れたりしても、${minutes(holdMs)} 分間はあなたの操作のままです。それより長く離れると秘書に戻ります。`;
+}
+
+export function controlReturnedText(returned: { at: number }, holdMs = 120_000): string {
+  return `接続が切れたまま ${minutes(holdMs)} 分たったため、${time(returned.at)} に操作を秘書に戻しました。止めた秘書の作業は再開していません。`;
+}
+
 export const NOTICE_TEXT: Record<string, string> = {
   upload_unsupported: "Cloud ブラウザではファイルを選んでアップロードできません。",
   file_drag_drop: "Cloud ブラウザにはファイルをドラッグ＆ドロップできません。",
   download_unsupported: "Cloud ブラウザではファイルをダウンロードできません。",
   tab_limit: "開けるタブの上限に達しました。",
   tab_crashed: "タブが応答しなくなりました。閉じて開き直してください。",
-  checkpoint_too_large: "サイトのデータが保存上限を超えたため、今回は保存できませんでした。",
+  checkpoint_too_large: "Cookie と開いているタブだけで保存の上限を超えたため、今回は保存できませんでした。",
+  tab_changed: "表示中のタブが切り替わったため、その操作は送りませんでした。画面を確かめてからもう一度操作してください。",
   not_live: "ブラウザがまだ準備できていません。",
   navigation_failed: "ページを開けませんでした。",
   invalid_url: "開けない URL です。",
