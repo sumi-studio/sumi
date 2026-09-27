@@ -2493,19 +2493,37 @@ export class FakeState implements StateClient {
    * fragments for oversized records.
    */
   private historyTool(persona: string, request: Json): Json {
+    // Validation mirrors Go parseHistoryArgs check for check and in the
+    // same order (contracts/conversation-history-fixtures.json): an absent
+    // key is unset; a present key — null included — must have its type.
+    const bad = (m: string) => new StateError(400, `bad request: ${m}`);
     const num = (k: string): number | null => {
+      if (!(k in request)) return null;
       const v = request[k];
-      return v === undefined ? null : (v as number);
+      if (typeof v !== "number" || !Number.isInteger(v)) {
+        throw bad(`${k} must be an integer`);
+      }
+      return v;
     };
-    const operation = request.operation as string | undefined;
+    const operation = request.operation;
+    if ("query" in request && typeof request.query !== "string") {
+      throw bad("query must be a string");
+    }
     const query = request.query as string | undefined;
     const seq = num("seq");
     const chunkSeq = num("chunk_seq");
     const fromSeq = num("from_seq");
     const afterSeq = num("after_seq");
     const contentOffset = num("content_offset");
-    const limit = (request.limit as number | undefined) ?? 5;
-    const bad = (m: string) => new StateError(400, `bad request: ${m}`);
+    const limit = "limit" in request ? request.limit : 5;
+    if (
+      typeof limit !== "number" ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 20
+    ) {
+      throw bad("limit must be an integer in [1, 20]");
+    }
     if (operation !== "search" && operation !== "read") {
       throw bad("operation must be search or read");
     }
@@ -2513,9 +2531,6 @@ export class FakeState implements StateClient {
       throw bad("search requires query and read must not carry one");
     }
     if (query === "") throw bad("search query must not be empty");
-    if (limit < 1 || limit > 20 || !Number.isInteger(limit)) {
-      throw bad("limit must be an integer in [1, 20]");
-    }
     if (contentOffset !== null && (operation !== "read" || seq === null)) {
       throw bad("content_offset is only valid with read + seq");
     }

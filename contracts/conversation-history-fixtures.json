@@ -1,0 +1,366 @@
+{
+  "_comment": "conversation_history request contract shared by the Go store (history.go parseHistoryArgs) and the Core FakeState double. Every case must be accepted or rejected with the same message by both. 'observed' cases are the exact requests gpt-5.6-luna sent on the hosted L1 acceptance (2026-09-28) when Responses had normalized the tool into strict mode.",
+  "openai_responses_strict_normalization": {
+    "_comment": "The conversation_history tool as the OpenAI Responses API echoed it in response.created (real gpt-5.6-luna call, 2026-09-28, tool definition identical to 289760b5 and b40fa578) when the request omitted `strict`: strict:true, and every property of the input object added to required.",
+    "strict": true,
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "enum": ["search", "read"]
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Required only for search; literal substring of stored text or serialized record."
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Read one exact stored record; cannot combine with after_seq."
+        },
+        "chunk_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Read the original records of one memory chunk's range; continue within that range by adding after_seq."
+        },
+        "from_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Read records starting at this inclusive sequence."
+        },
+        "after_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Continue after the last sequence returned on the preceding page."
+        },
+        "content_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Only with read + seq. Unicode character offset into the journal_event_v1 JSON, as returned by next_read."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 5
+        }
+      },
+      "required": [
+        "operation",
+        "query",
+        "seq",
+        "chunk_seq",
+        "from_seq",
+        "after_seq",
+        "content_offset",
+        "limit"
+      ],
+      "additionalProperties": false
+    },
+    "error": "search requires query and read must not carry one"
+  },
+  "cases": [
+    {
+      "name": "read one chunk's originals",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1
+      },
+      "ok": true
+    },
+    {
+      "name": "continue within a chunk",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1,
+        "after_seq": 3,
+        "limit": 20
+      },
+      "ok": true
+    },
+    {
+      "name": "browse from the beginning",
+      "request": {
+        "operation": "read"
+      },
+      "ok": true
+    },
+    {
+      "name": "read from an inclusive seq",
+      "request": {
+        "operation": "read",
+        "from_seq": 2,
+        "limit": 3
+      },
+      "ok": true
+    },
+    {
+      "name": "read one exact record",
+      "request": {
+        "operation": "read",
+        "seq": 2
+      },
+      "ok": true
+    },
+    {
+      "name": "read one record from a content offset",
+      "request": {
+        "operation": "read",
+        "seq": 2,
+        "content_offset": 0
+      },
+      "ok": true
+    },
+    {
+      "name": "search",
+      "request": {
+        "operation": "search",
+        "query": "Lume"
+      },
+      "ok": true
+    },
+    {
+      "name": "search continued",
+      "request": {
+        "operation": "search",
+        "query": "Lume",
+        "after_seq": 2
+      },
+      "ok": true
+    },
+    {
+      "name": "search within one chunk",
+      "request": {
+        "operation": "search",
+        "query": "Lume",
+        "chunk_seq": 1
+      },
+      "ok": true
+    },
+    {
+      "name": "read carrying a query",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1,
+        "query": "x"
+      },
+      "error": "search requires query and read must not carry one"
+    },
+    {
+      "name": "search without a query",
+      "request": {
+        "operation": "search"
+      },
+      "error": "search requires query and read must not carry one"
+    },
+    {
+      "name": "empty search query",
+      "request": {
+        "operation": "search",
+        "query": ""
+      },
+      "error": "search query must not be empty"
+    },
+    {
+      "name": "two locators",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1,
+        "from_seq": 1
+      },
+      "error": "seq, chunk_seq and from_seq are alternative locators"
+    },
+    {
+      "name": "three zero-valued locators",
+      "request": {
+        "operation": "read",
+        "seq": 0,
+        "chunk_seq": 1,
+        "from_seq": 0
+      },
+      "error": "seq, chunk_seq and from_seq are alternative locators"
+    },
+    {
+      "name": "seq with after_seq",
+      "request": {
+        "operation": "read",
+        "seq": 2,
+        "after_seq": 1
+      },
+      "error": "seq cannot combine with after_seq"
+    },
+    {
+      "name": "content_offset without seq",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1,
+        "content_offset": 0
+      },
+      "error": "content_offset is only valid with read + seq"
+    },
+    {
+      "name": "content_offset on search",
+      "request": {
+        "operation": "search",
+        "query": "Lume",
+        "seq": 2,
+        "content_offset": 0
+      },
+      "error": "content_offset is only valid with read + seq"
+    },
+    {
+      "name": "limit below range",
+      "request": {
+        "operation": "read",
+        "limit": 0
+      },
+      "error": "limit must be an integer in [1, 20]"
+    },
+    {
+      "name": "limit above range",
+      "request": {
+        "operation": "read",
+        "limit": 21
+      },
+      "error": "limit must be an integer in [1, 20]"
+    },
+    {
+      "name": "fractional limit",
+      "request": {
+        "operation": "read",
+        "limit": 2.5
+      },
+      "error": "limit must be an integer in [1, 20]"
+    },
+    {
+      "name": "unknown operation",
+      "request": {
+        "operation": "list"
+      },
+      "error": "operation must be search or read"
+    },
+    {
+      "name": "missing operation",
+      "request": {
+        "chunk_seq": 1
+      },
+      "error": "operation must be search or read"
+    },
+    {
+      "name": "non-string query",
+      "request": {
+        "operation": "search",
+        "query": 5
+      },
+      "error": "query must be a string"
+    },
+    {
+      "name": "null query",
+      "request": {
+        "operation": "read",
+        "query": null
+      },
+      "error": "query must be a string"
+    },
+    {
+      "name": "string seq",
+      "request": {
+        "operation": "read",
+        "seq": "2"
+      },
+      "error": "seq must be an integer"
+    },
+    {
+      "name": "fractional chunk_seq",
+      "request": {
+        "operation": "read",
+        "chunk_seq": 1.5
+      },
+      "error": "chunk_seq must be an integer"
+    },
+    {
+      "name": "null from_seq",
+      "request": {
+        "operation": "read",
+        "from_seq": null
+      },
+      "error": "from_seq must be an integer"
+    },
+    {
+      "name": "string after_seq",
+      "request": {
+        "operation": "read",
+        "after_seq": "1"
+      },
+      "error": "after_seq must be an integer"
+    },
+    {
+      "name": "null content_offset",
+      "request": {
+        "operation": "read",
+        "seq": 2,
+        "content_offset": null
+      },
+      "error": "content_offset must be an integer"
+    },
+    {
+      "name": "observed Responses strict-normalized call 1",
+      "request": {
+        "seq": 0,
+        "limit": 20,
+        "query": "」",
+        "from_seq": 0,
+        "after_seq": 0,
+        "chunk_seq": 1,
+        "operation": "read",
+        "content_offset": 0
+      },
+      "error": "search requires query and read must not carry one"
+    },
+    {
+      "name": "observed Responses strict-normalized call 2",
+      "request": {
+        "seq": 0,
+        "limit": 20,
+        "query": " ",
+        "from_seq": 0,
+        "after_seq": 0,
+        "chunk_seq": 1,
+        "operation": "read",
+        "content_offset": 0
+      },
+      "error": "search requires query and read must not carry one"
+    },
+    {
+      "name": "observed Responses strict-normalized call 3",
+      "request": {
+        "seq": 0,
+        "limit": 20,
+        "query": "x",
+        "from_seq": 0,
+        "after_seq": 0,
+        "chunk_seq": 1,
+        "operation": "read",
+        "content_offset": 0
+      },
+      "error": "search requires query and read must not carry one"
+    },
+    {
+      "name": "observed Responses strict-normalized call 4",
+      "request": {
+        "seq": 0,
+        "limit": 20,
+        "query": "unused",
+        "from_seq": 0,
+        "after_seq": 0,
+        "chunk_seq": 1,
+        "operation": "read",
+        "content_offset": 0
+      },
+      "error": "search requires query and read must not carry one"
+    }
+  ]
+}
