@@ -851,6 +851,11 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 				next.Operation.NotStarted = true
 				next.ContainerRemoved = true // none was ever created
 				_ = s.commitProcess(original, &next)
+				// An early output read may already have started a
+				// supervisor; end it (it records no loss boundary).
+				if io_ := s.interactiveIOFor(next.Operation.OperationID); io_ != nil {
+					s.stopInteractive(io_)
+				}
 				return
 			}
 			next.Operation.Error = "process launch could not be confirmed"

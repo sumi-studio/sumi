@@ -139,6 +139,11 @@ func (s *processStore) superviseInteractive(io_ *interactiveIO) {
 		alive := !s.interactiveTerminal(io_.op.OperationID)
 		path, err := ib.ProcessJournalPath(ctx, io_.op)
 		if err != nil {
+			if !alive && s.interactiveNeverStarted(io_.op.OperationID) {
+				// No container was ever created: there is no journal
+				// and no output to lose, so no loss boundary either.
+				return
+			}
 			if !alive {
 				misses++
 				if misses >= journalMissBound {
@@ -446,6 +451,18 @@ func (s *processStore) interactiveTerminal(opID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.Operation.State.terminal()
+}
+
+func (s *processStore) interactiveNeverStarted(opID string) bool {
+	s.mu.Lock()
+	r := s.records[opID]
+	s.mu.Unlock()
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Operation.NotStarted
 }
 
 // stopInteractive ends supervision. Called after the operation goes

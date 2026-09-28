@@ -56,9 +56,16 @@ func (b *DockerBackend) ResolveProcessImage(ctx context.Context) (string, error)
 	if err != nil {
 		return "", err
 	}
-	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", reference)
-	if err != nil {
-		return "", fmt.Errorf("pinned job image %s is not available locally: %w", reference, err)
+	raw, err := b.runDocker(ctx, "image", "inspect", "--format", "{{.Id}}", reference)
+	switch {
+	case err == nil:
+	case ctx.Err() != nil:
+		// A cancelled or timed-out check proves nothing about the image.
+		return "", fmt.Errorf("job image check did not complete: %w", ctx.Err())
+	case bytes.Contains(raw, []byte("No such image")):
+		return "", fmt.Errorf("pinned job image %s is not present locally (the provisioner never pulls)", reference)
+	default:
+		return "", fmt.Errorf("pinned job image %s could not be checked: %w", reference, err)
 	}
 	image := strings.TrimSpace(string(raw))
 	if !processImageID.MatchString(image) || (wantID != "" && image != wantID) {
@@ -70,13 +77,23 @@ func (b *DockerBackend) ResolveProcessImage(ctx context.Context) (string, error)
 // Process Docker calls execute only in the root provisioner. Callers provide
 // inert argv; all container authority and image selection remain server-owned.
 func (b *DockerBackend) processDocker(ctx context.Context, args ...string) ([]byte, error) {
+	out, err := b.runDocker(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// runDocker is processDocker that also returns the combined output on
+// failure, for callers that must tell "absent" from "check failed".
+func (b *DockerBackend) runDocker(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = b.baseEnvironment
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("process Docker operation failed: %w", err)
+		return out.Bytes(), fmt.Errorf("process Docker operation failed: %w", err)
 	}
 	return out.Bytes(), nil
 }
