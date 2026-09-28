@@ -1,3 +1,4 @@
+import { ModelError } from "./provider.ts";
 import type {
   Approval,
   ApprovalDecision,
@@ -237,18 +238,15 @@ export interface StateClient {
    * binding or report it unavailable; never substitute another provider.
    */
   modelBinding(persona: string): Promise<ModelBinding>;
-  /**
-   * Report that the provider rejected the credential the binding carried
-   * (HTTP 401 before any output) and receive the persona's current
-   * binding. For a subscription connection the state service refreshes
-   * the grant unless the rejected token (named by its SHA-256 hex, never
-   * sent back) was already replaced by a concurrent call.
-   */
-  refreshModelCredential(
+  /** One authenticated subscription HTTP attempt, with no transport retries. */
+  chatGPTResponses(
     persona: string,
     connectionId: string,
-    rejectedTokenSha256: string,
-  ): Promise<ModelBinding>;
+    version: string,
+    body: string,
+    signal: AbortSignal,
+    rejectedTokenSha256?: string,
+  ): Promise<Response>;
   completeOperation(
     persona: string,
     operationId: string,
@@ -400,6 +398,8 @@ type StateResponse = {
   status: number;
   json(): Promise<unknown>;
   text(): Promise<string>;
+  headers?: Headers;
+  body?: ReadableStream<Uint8Array> | null;
 };
 
 type FetchLike = (
@@ -409,6 +409,7 @@ type FetchLike = (
     headers?: Record<string, string>;
     body?: string;
     signal?: AbortSignal;
+    redirect?: "manual";
   },
 ) => Promise<StateResponse>;
 
@@ -427,9 +428,8 @@ type FetchLike = (
 export const STATE_CALL_TIMEOUT_MS = 10_000;
 
 /**
- * Deadline for the two model-credential calls (binding and
- * credential-refresh). Either may refresh a subscription grant at the
- * issuer. The service gives lock acquisition 5s, refresh 25s (its issuer
+ * Deadline for model-binding calls. Resolving a binding may refresh a
+ * subscription grant at the issuer. The service gives lock acquisition 5s, refresh 25s (its issuer
  * HTTP timeout is 20s), and persistence a fresh 5s, completing even if this
  * call is abandoned. Waiting longer than their sum lets a slow refresh finish
  * inside the turn instead of failing it and retrying against a row that is still
@@ -803,20 +803,65 @@ export class HttpStateClient implements StateClient {
       this.credentialTimeoutMs,
     );
   }
-  refreshModelCredential(
+  async chatGPTResponses(
     persona: string,
     connectionId: string,
-    rejectedTokenSha256: string,
-  ) {
-    return this.call<ModelBinding>(
-      "POST",
-      `/internal/core/personas/${persona}/model/credential-refresh`,
+    version: string,
+    body: string,
+    signal: AbortSignal,
+    rejectedTokenSha256?: string,
+  ): Promise<Response> {
+    // The model deadline covers the stream. The short JSON state deadline
+    // must not truncate it; neither this client nor Go replays on a network failure.
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/internal/core/personas/${persona}/model/chatgpt/responses`,
       {
-        connection_id: connectionId,
-        rejected_token_sha256: rejectedTokenSha256,
+        method: "POST",
+        redirect: "manual",
+        signal,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          connection_id: connectionId,
+          connection_version: version,
+          request: JSON.parse(body),
+          ...(rejectedTokenSha256
+            ? { rejected_token_sha256: rejectedTokenSha256 }
+            : {}),
+        }),
       },
-      this.credentialTimeoutMs,
     );
+    const code = res.headers?.get("X-Sumi-Model-Error");
+    if (code) {
+      await res.body?.cancel();
+      const cause =
+        code === "model_reconnect_required" ||
+        code === "model_connection_disabled"
+          ? code
+          : undefined;
+      throw new ModelError(
+        `ChatGPT transport: ${cause ?? (code === "binding_changed" ? "selected connection changed before dispatch" : code === "credential_unavailable" ? "credential unavailable before dispatch" : "request could not be completed")}`,
+        {
+          retryable:
+            code === "binding_changed" || code === "credential_unavailable",
+          unavailable: code !== "transport_ambiguous",
+          cause,
+        },
+      );
+    }
+    if (
+      res.status === 401 &&
+      !res.headers?.get("X-Sumi-ChatGPT-Rejected-Token")
+    ) {
+      await res.body?.cancel();
+      throw new ModelError("Core service authorization failed", {
+        retryable: false,
+        unavailable: true,
+      });
+    }
+    return new Response(res.body, { status: res.status, headers: res.headers });
   }
   async completeOperation(
     persona: string,

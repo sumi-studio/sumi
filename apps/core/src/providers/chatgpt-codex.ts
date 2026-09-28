@@ -18,23 +18,20 @@ import { ModelError } from "../provider.ts";
  */
 export const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-/** Access material for one call; refreshed by the state service. */
-export interface ChatGPTAccess {
-  accessToken: string;
+/** Core builds/interprets the model request; the API owns HTTP credentials. */
+export interface ChatGPTDialect {
+  /** Used only to scope encrypted continuation, never to set upstream headers. */
   accountId: string;
+  reasoningEffort?: string;
+  /** One transport attempt. A digest is supplied only after an explicit 401. */
+  send(
+    body: string,
+    signal: AbortSignal,
+    rejectedTokenSha256?: string,
+  ): Promise<Response>;
 }
 
-export interface ChatGPTDialect {
-  /** ChatGPT-Account-ID for the initial access token. */
-  accountId: string;
-  /** Requested reasoning effort; omitted when unset. */
-  reasoningEffort?: string;
-  /**
-   * Called at most once per call, after a 401 and before any output is
-   * read. Returns the replacement credential or throws a ModelError.
-   */
-  refresh(rejectedAccessToken: string): Promise<ChatGPTAccess>;
-}
+export const CHATGPT_REJECTED_HEADER = "X-Sumi-ChatGPT-Rejected-Token";
 
 /** Header the Codex client sets for "responses lite" models. */
 export const LITE_HEADER = "x-openai-internal-codex-responses-lite";

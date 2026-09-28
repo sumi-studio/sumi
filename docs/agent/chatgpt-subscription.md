@@ -101,11 +101,14 @@ The API-key routes cannot edit or resolve a subscription connection.
   with AES-GCM under `SUMI_MODEL_CONNECTION_KEY`. The authenticated data is
   bound to the person, the connection and the account.
 - The Core reads the person's model binding for every call. For a
-  subscription connection, the binding carries a short-lived access token and
-  the account id. The state service refreshes the token while holding the
+  subscription connection, the binding carries metadata and the account id
+  for continuation scoping, but no access or refresh token. Model HTTP
+  transport uses the existing authenticated Go API; all model request
+  construction, SSE interpretation, memory and tools remain in Core. The
+  state service refreshes the token while holding the
   connection's row lock, so concurrent turns and API processes refresh once.
   It refreshes when the token is within 5 minutes of expiry. A rotated
-  refresh token is stored before the new access token is handed out.
+  refresh token is stored before the new access token is used upstream.
 - Refresh has independent detached budgets: 5 seconds to acquire the
   connection lock, 25 seconds for the issuer, then 5 seconds for saving and
   commit. A contended caller that cannot acquire the lock leaves before
@@ -116,16 +119,19 @@ The API-key routes cannot edit or resolve a subscription connection.
   This is not a distributed transaction with the issuer: a lost issuer
   response after consumption, process crash or database failure can still
   require reconnection.
-- When the backend answers 401, the Core reports the rejected token by its
-  SHA-256 digest to
-  `POST /internal/core/personas/{persona}/model/credential-refresh`. It then
-  sends the identical request once more with the refreshed token. A second
-  401 ends the turn with `model_auth_rejected`: the refresh worked, so
-  reconnecting would only repeat it, and why ChatGPT refused is not known to
-  Sumi. The connection is not marked `reconnect_required`. The recorded
-  error keeps the response's `error.code`/`error.type` only when it has the
-  shape of an error identifier (lowercase letter words joined by `_`);
-  anything else is recorded as `unrecognized`. The body is never logged.
+- When the backend answers 401 before any streamed output, the Go transport
+  returns a SHA-256 digest of the rejected token in
+  `X-Sumi-ChatGPT-Rejected-Token`. Core may resend the same request once,
+  carrying `rejected_token_sha256`. Go refreshes under the existing row lock
+  unless another call already replaced that token. A second 401 ends the
+  turn with `model_auth_rejected`; it does not mark the grant revoked or
+  trigger another connection. This one-refresh limit also applies across
+  the explicit 400 continuation fallback. Refresh and upstream model
+  transport are not independently retried by the API.
+- Upstream HTTP error bodies are reduced to fixed status text, bounded
+  diagnostic identifiers and numeric usage-reset time. Arbitrary error
+  text, HTML, cookies and redirect targets are not forwarded. Core does
+  not log subscription credentials or raw stream-error messages.
 - A refresh failure the issuer marks permanent (expired, reused or
   invalidated refresh token, `invalid_grant`, 401), or a token for another
   account, marks that one connection `reconnect_required`. The turn fails
@@ -139,10 +145,54 @@ The API-key routes cannot edit or resolve a subscription connection.
 
 ## Model calls
 
-The Core posts to `https://chatgpt.com/backend-api/codex/responses` with
-`fetch` only. The same code runs under Node and workerd. The Core checks the
-binding's endpoint against that exact base URL before an access token is
-sent; any other endpoint fails the call before a request.
+Core sends subscription model HTTP requests through the existing Sumi Go
+API using its configured state-service URL and Core credential. No new
+process, per-account endpoint, WSL address or user gate is needed. Standard
+API-key model calls still use their existing direct transports.
+
+`POST /internal/core/personas/{persona}/model/chatgpt/responses` accepts:
+
+```json
+{
+  "connection_id": "selected connection UUID",
+  "connection_version": "version returned by GET .../model",
+  "request": { "model": "gpt-6-astra", "stream": true, "store": false },
+  "rejected_token_sha256": "optional digest, only after an explicit upstream 401"
+}
+```
+
+`request` contains the full Responses body built by Core, including input,
+reasoning effort, tools and encrypted continuation. The outer envelope has
+no URL or header override. The route accepts the existing persona-scoped
+Core capability, runtime service token or admin service token; a browser
+session cannot authenticate it. It checks the active persona's bound human,
+carried intent, current selection, subscription preset, fixed endpoint,
+credential version, model and effort before resolving a grant and again
+before dispatch after any refresh. A setting change after admission applies
+to the next request; it does not retroactively cancel an admitted stream.
+
+Go makes one ordinary `net/http` POST to the fixed
+`https://chatgpt.com/backend-api/codex/responses`, with redirects disabled.
+The API sets authorization and account headers from its encrypted grant,
+plus the truthful Sumi originator and persona session identity. It never
+accepts upstream credentials/headers from Core and never returns the grant
+to Core or the browser. Account identity in the binding is used only to bind
+continuation; the API independently sets the actual account header.
+
+Input is bounded at 4 MiB with a 15-second read deadline. The transport has
+a 120-second overall context and upstream HTTP timeout. Streaming copies
+through a 32 KiB buffer, flushes incrementally, permits at most 32 MiB of
+output, and bounds downstream writes at 15 seconds. Downstream cancellation
+closes upstream; refresh already in progress still finishes its detached
+save, then a cancelled caller cannot dispatch a model request. Truncation,
+network loss, or timeout has unknown acceptance and is not automatically
+replayed. Explicit 403 remains a failure, with no API-key fallback.
+
+The existing API deployment must support uncached, unbuffered SSE on this
+internal authenticated route and keep its normal Core-service authorization.
+Deploy API and Core together: the obsolete credential-refresh endpoint and
+subscription access tokens in bindings have been removed. No additional
+configuration switch is introduced.
 
 - Headers: `Authorization`, `ChatGPT-Account-ID`, `originator: sumi` and
   `session_id` (the persona).
@@ -194,10 +244,16 @@ use synthetic fixtures only. Root reported a separate live source-level
 probe on candidate `3816aed6bf3d1e4ba692b3f341553e0c25180e1f`: device approval,
 sealed grant, account match, three HTTP 200 model responses with
 `originator: sumi`, and two harmless tool rounds without API-key fallback.
-That probe returned no encrypted reasoning. It did not exercise the Sumi
-browser/API selection flow, live refresh, workerd or Cloudflare egress.
-Encrypted reasoning replay and those runtime paths remain unproven live;
-these repairs require acceptance on the final integrated candidate.
+That probe returned no encrypted reasoning. Root subsequently reported
+successful real refresh and Node model calls on `d162bd75`, while direct
+local workerd and Cloudflare Worker requests received HTTP 403 HTML. The
+same candidate-built request succeeded using ordinary Go `net/http` on the
+host, with the same account and `originator: sumi`. No cause for the runtime
+difference was established. These reports motivate this API transport; they
+do not prove the new Worker → API → OpenAI path. Current implementation
+tests use synthetic upstreams, including the real Core/Go HTTP boundary and
+a durable tool round. Root must verify the final integrated path live;
+encrypted reasoning replay remains unproven against the live backend.
 
 ## Policy status
 

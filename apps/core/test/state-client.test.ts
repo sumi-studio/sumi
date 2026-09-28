@@ -66,14 +66,13 @@ const TIMEOUT = 250; // test-scale deadline; production default is 10s
 const SLOW = 500; // a "slow-" path answers after this long
 
 test("model-credential calls wait out a slow issuer refresh; other calls keep the short deadline", async () => {
-  // The binding and credential-refresh calls may include an issuer refresh
+  // A binding call may include an issuer refresh
   // the service completes on its own bounded context; they get their own,
   // longer (still bounded) deadline so that refresh can finish in-turn.
   const { server, url } = await stallingServer();
   try {
     const client = new HttpStateClient(url, "tok", undefined, TIMEOUT, 5_000);
     await client.modelBinding("slow-p");
-    await client.refreshModelCredential("slow-p", "c", "d");
     await assert.rejects(client.personaState("slow-p"), (e: unknown) => {
       assert.ok(e instanceof StateError);
       assert.equal(e.status, 503);

@@ -32,11 +32,11 @@ func fakeJWT(account string, exp time.Time, tag string) string {
 	}) + ".sig"
 }
 
-// TestChatGPTBindingAndRejectedTokenRefresh: the core receives a
-// subscription connection's access token through the persona-scoped
-// binding, and a reported 401 refreshes the grant exactly once — a
+// TestChatGPTBindingKeepsCredentialsOnAPI: the core receives a
+// subscription metadata through the persona-scoped binding without the
+// access token; Go alone resolves and refreshes the grant — a
 // revoked grant becomes a classified reconnect_required binding.
-func TestChatGPTBindingAndRejectedTokenRefresh(t *testing.T) {
+func TestChatGPTBindingKeepsCredentialsOnAPI(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Create(t)
 	if err := db.Migrate(ctx, pool); err != nil {
@@ -117,42 +117,37 @@ func TestChatGPTBindingAndRejectedTokenRefresh(t *testing.T) {
 	b := decode(do(t, mux, "GET", "/internal/core/personas/"+pa+"/model", token, ""))
 	if b.Selection != "api" || b.Connection == nil || b.Connection.Preset != modelconnections.ChatGPTPreset ||
 		b.Connection.BaseURL != modelconnections.ChatGPTBaseURL || b.Connection.Model != "gpt-6-astra" ||
-		b.Connection.ReasoningEffort != "medium" || b.Connection.AccountID != "acct-1" || b.APIKey == "" || !b.CredentialAvailable {
+		b.Connection.ReasoningEffort != "medium" || b.Connection.AccountID != "acct-1" || b.APIKey != "" || !b.CredentialAvailable {
 		t.Fatalf("binding %+v", b)
 	}
-	first := b.APIKey
-	body := func(conn, tok string) string {
-		return fmt.Sprintf(`{"connection_id":%q,"rejected_token_sha256":%q}`, conn, modelconnections.TokenDigest(tok))
+	first, err := conns.ResolveChatGPT(ctx, human, done.Connection.ID, "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A rejection naming another connection does not refresh this one.
-	b = decode(do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", token, body("00000000-0000-4000-8000-000000000000", first)))
-	if b.APIKey != first || refreshes.Load() != 0 {
-		t.Fatal("unrelated rejection refreshed")
+	if _, err := conns.ResolveChatGPT(ctx, human, done.Connection.ID, modelconnections.TokenDigest(first.AccessToken)); err != nil {
+		t.Fatal(err)
 	}
-	b = decode(do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", token, body(b.Connection.ID, first)))
-	if b.APIKey == first || !b.CredentialAvailable || refreshes.Load() != 1 {
-		t.Fatalf("refresh %+v refreshes=%d", b, refreshes.Load())
+	b = decode(do(t, mux, "GET", "/internal/core/personas/"+pa+"/model", token, ""))
+	if b.APIKey != "" || !b.CredentialAvailable || refreshes.Load() != 1 {
+		t.Fatal("binding leaked/refreshed credential", b)
 	}
-	// The same stale rejection again: already replaced, no second rotation.
-	b = decode(do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", token, body(b.Connection.ID, first)))
-	if refreshes.Load() != 1 {
-		t.Fatal("stale rejection rotated again")
+	fresh, err := conns.ResolveChatGPT(ctx, human, done.Connection.ID, "")
+	if err != nil {
+		t.Fatal(err)
 	}
 	mu.Lock()
 	revoked = true
 	mu.Unlock()
-	b = decode(do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", token, body(b.Connection.ID, b.APIKey)))
-	if b.CredentialAvailable || b.APIKey != "" || b.CredentialState != "reconnect_required" || b.Connection == nil {
-		t.Fatalf("revoked binding %+v", b)
-	}
-	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", token, `{"connection_id":"x"}`); rec.Code != 400 {
-		t.Fatal("malformed refresh accepted", rec.Code)
+	_, _ = conns.ResolveChatGPT(ctx, human, done.Connection.ID, modelconnections.TokenDigest(fresh.AccessToken))
+	b = decode(do(t, mux, "GET", "/internal/core/personas/"+pa+"/model", token, ""))
+	if b.CredentialAvailable || b.APIKey != "" || b.CredentialState != "reconnect_required" {
+		t.Fatal("revoked binding", b)
 	}
 	pb := pid(t)
 	if _, _, err := srv.store.EnsurePersona(ctx, pb, &human, "other"); err != nil {
 		t.Fatal(err)
 	}
-	if rec := do(t, mux, "POST", "/internal/core/personas/"+pa+"/model/credential-refresh", srv.PersonaToken(pb), body(b.Connection.ID, first)); rec.Code != 401 {
-		t.Fatal("cross-persona refresh", rec.Code)
+	if rec := do(t, mux, "GET", "/internal/core/personas/"+pa+"/model", srv.PersonaToken(pb), ""); rec.Code != 401 {
+		t.Fatal("cross-persona binding", rec.Code)
 	}
 }

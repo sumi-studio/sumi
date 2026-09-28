@@ -12,8 +12,11 @@ import {
   type ModelRequest,
 } from "../src/provider.ts";
 import {
+  CHATGPT_BASE_URL,
+  CHATGPT_REJECTED_HEADER,
   continuationScope,
   safeDiagnosticCode,
+  usesResponsesLite,
   uuidV5,
 } from "../src/providers/chatgpt-codex.ts";
 import { OpenAIResponsesProvider } from "../src/providers/openai-responses.ts";
@@ -214,8 +217,89 @@ const TOOL = {
   },
 };
 
+// Synthetic API transport for protocol-unit tests. Actual Core -> Go HTTP
+// authorization/streaming is covered by chatgpt_transport_test.go.
+class TransportState extends FakeState {
+  modelCredentialRefresh?: () => ModelBinding;
+  modelCredentialRefreshCalls: {
+    persona: string;
+    connectionId: string;
+    rejectedTokenSha256: string;
+  }[] = [];
+  override async modelBinding(persona: string): Promise<ModelBinding> {
+    const b = await super.modelBinding(persona);
+    return {
+      ...b,
+      api_key: undefined,
+      connection: b.connection
+        ? {
+            ...b.connection,
+            base_url: b.connection.base_url.startsWith("http://127.0.0.1:")
+              ? CHATGPT_BASE_URL
+              : b.connection.base_url,
+          }
+        : undefined,
+    };
+  }
+  override chatGPTResponses = async (
+    persona: string,
+    id: string,
+    version: string,
+    body: string,
+    signal: AbortSignal,
+    rejected?: string,
+  ): Promise<Response> => {
+    let b = this.modelBindings.get(persona);
+    if (rejected) {
+      this.modelCredentialRefreshCalls.push({
+        persona,
+        connectionId: id,
+        rejectedTokenSha256: rejected,
+      });
+      b = this.modelCredentialRefresh?.() ?? b;
+      if (b) this.setModelBinding(persona, b);
+    }
+    const c = b?.connection;
+    if (!c || c.id !== id || c.version !== version)
+      throw new ModelError("selected connection changed", {
+        retryable: true,
+        unavailable: true,
+      });
+    if (!b?.credential_available)
+      throw new ModelError("credential unavailable", {
+        retryable: false,
+        cause: "model_reconnect_required",
+        unavailable: true,
+      });
+    const res = await fetch(`${c.base_url}/responses`, {
+      method: "POST",
+      body,
+      signal,
+      redirect: "manual",
+      headers: {
+        Authorization: `Bearer ${b.api_key}`,
+        "ChatGPT-Account-ID": c.account_id ?? "",
+        originator: "sumi",
+        session_id: persona,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "User-Agent": "sumi-secretary/alpha",
+        ...(usesResponsesLite(c.model)
+          ? { "x-openai-internal-codex-responses-lite": "true" }
+          : {}),
+      },
+    });
+    if (res.status === 401) {
+      const headers = new Headers(res.headers);
+      headers.set(CHATGPT_REJECTED_HEADER, sha(b.api_key ?? ""));
+      return new Response(res.body, { status: res.status, headers });
+    }
+    return res;
+  };
+}
+
 async function setup(personas: string[] = [PA]) {
-  const state = new FakeState();
+  const state = new TransportState();
   const gens = new Map<string, number>();
   for (const p of personas) {
     state.addPersona(p);
@@ -232,8 +316,6 @@ async function setup(personas: string[] = [PA]) {
         },
       },
       timeoutMs: 5_000,
-      // The fake backend listens on loopback.
-      chatgptEndpoint: (u) => u.startsWith("http://127.0.0.1:"),
     });
   const req = (
     persona: string,
@@ -496,6 +578,7 @@ test("a second 401, a revoked grant, or a changed selection end the call without
       },
     );
 
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-old"));
     state.modelCredentialRefresh = () =>
       chatgpt(baseUrl, "tok-x", { version: "v2" });
     await assert.rejects(
@@ -970,9 +1053,9 @@ test("a repeated 401 records only a safely shaped error code", async () => {
   });
 });
 
-test("a ChatGPT token is never sent to an endpoint other than the Codex backend", async () => {
-  await withBackend([textOnly], async (baseUrl, seen) => {
-    const state = new FakeState();
+test("a ChatGPT binding cannot select a non-Codex backend", async () => {
+  await withBackend([textOnly], async (_baseUrl, seen) => {
+    const state = new TransportState();
     state.addPersona(PA);
     const gen = (await state.acquireWriter(PA, "w", 60_000)).generation;
     // No test seam: the production endpoint rule applies.
@@ -987,7 +1070,10 @@ test("a ChatGPT token is never sent to an endpoint other than the Codex backend"
       },
       timeoutMs: 5_000,
     });
-    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    state.setModelBinding(
+      PA,
+      chatgpt("https://example.invalid/not-codex", "tok-1"),
+    );
     await assert.rejects(
       collect(p, {
         personaId: PA,

@@ -2500,40 +2500,10 @@ export class FakeState implements StateClient {
     return Promise.resolve({ selection: "unset" });
   }
 
-  /**
-   * Test fixture: how a reported credential rejection is answered. The
-   * default re-serves the persona's binding unchanged (no refresh).
-   */
-  modelCredentialRefresh?: (
-    persona: string,
-    connectionId: string,
-    rejectedTokenSha256: string,
-  ) => ModelBinding | Promise<ModelBinding>;
-  modelCredentialRefreshCalls: {
-    persona: string;
-    connectionId: string;
-    rejectedTokenSha256: string;
-  }[] = [];
-
-  async refreshModelCredential(
-    persona: string,
-    connectionId: string,
-    rejectedTokenSha256: string,
-  ): Promise<ModelBinding> {
-    this.modelCredentialRefreshCalls.push({
-      persona,
-      connectionId,
-      rejectedTokenSha256,
-    });
-    if (this.modelCredentialRefresh) {
-      return this.modelCredentialRefresh(
-        persona,
-        connectionId,
-        rejectedTokenSha256,
-      );
-    }
-    return this.modelBinding(persona);
-  }
+  /** Tests may provide a synthetic API transport; no live default exists. */
+  chatGPTResponses: StateClient["chatGPTResponses"] = async () => {
+    throw new Error("synthetic ChatGPT transport not configured");
+  };
 
   /**
    * conversation_history: opens this persona's stored journal records —

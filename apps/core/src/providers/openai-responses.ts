@@ -8,11 +8,11 @@ import {
   type ToolCall,
 } from "../provider.ts";
 import {
+  CHATGPT_REJECTED_HEADER,
   type ChatGPTDialect,
   continuationEntry,
   continuationScope,
   FUNCTION_NAMESPACE,
-  LITE_HEADER,
   litePrefix,
   MAX_CONTINUATION_BYTES,
   safeDiagnosticCode,
@@ -67,9 +67,9 @@ export interface ResponsesConfig {
    */
   sessionHeader?: string;
   /**
-   * ChatGPT subscription connection (Codex backend). `apiKey` is then the
-   * OAuth access token; requests carry ChatGPT-Account-ID, send no output
-   * bound, and a 401 before any output triggers one credential refresh.
+   * ChatGPT request dialect with an authenticated API transport. Core
+   * never receives its OAuth token. An explicit 401 permits one resend
+   * with the rejected digest; Go owns serialized grant refresh.
    */
   chatgpt?: ChatGPTDialect;
 }
@@ -165,48 +165,46 @@ export class OpenAIResponsesProvider implements ModelProvider {
               : {}),
             ...this.cfg.extra,
           });
-      let apiKey = this.cfg.apiKey;
-      let accountId = chatgpt?.accountId;
+      let rejectedDigest: string | undefined;
       let refreshed = false;
       let res: Response;
       for (;;) {
         try {
-          res = await this.fetchImpl(
-            `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
-            {
-              method: "POST",
-              headers: requestHeaders(
+          res = chatgpt
+            ? await chatgpt.send(body, deadline.signal, rejectedDigest)
+            : await this.fetchImpl(
+                `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
                 {
-                  Authorization: `Bearer ${apiKey}`,
-                  "Content-Type": "application/json",
-                  "User-Agent": SUMI_USER_AGENT,
-                  ...(chatgpt
-                    ? {
-                        Accept: "text/event-stream",
-                        "ChatGPT-Account-ID": accountId ?? "",
-                        // Identifies the calling client honestly; Sumi does
-                        // not present itself as a Codex first-party client.
-                        originator: "sumi",
-                        session_id: request.personaId,
-                        ...(usesResponsesLite(this.cfg.model)
-                          ? { [LITE_HEADER]: "true" }
-                          : {}),
-                      }
-                    : {}),
+                  method: "POST",
+                  headers: requestHeaders(
+                    {
+                      Authorization: `Bearer ${this.cfg.apiKey}`,
+                      "Content-Type": "application/json",
+                      "User-Agent": SUMI_USER_AGENT,
+                    },
+                    this.cfg.headers,
+                    this.cfg.sessionHeader
+                      ? {
+                          header: this.cfg.sessionHeader,
+                          value: request.personaId,
+                        }
+                      : undefined,
+                  ),
+                  signal: deadline.signal,
+                  // Never follow a redirect: this request carries credentials
+                  // and fetch forwards x-api-key/extra headers cross-origin.
+                  redirect: "manual",
+                  body,
                 },
-                this.cfg.headers,
-                this.cfg.sessionHeader
-                  ? { header: this.cfg.sessionHeader, value: request.personaId }
-                  : undefined,
-              ),
-              signal: deadline.signal,
-              // Never follow a redirect: this request carries credentials
-              // and fetch forwards x-api-key/extra headers cross-origin.
-              redirect: "manual",
-              body,
-            },
-          );
+              );
         } catch (e) {
+          if (chatgpt) {
+            if (e instanceof ModelError || request.signal?.aborted) throw e;
+            throw new ModelError(
+              "ChatGPT transport ended without a response; acceptance is unknown",
+              { retryable: false },
+            );
+          }
           throw networkError(e, request.signal);
         }
         // A subscription access token rejected before any output: refresh
@@ -214,9 +212,14 @@ export class OpenAIResponsesProvider implements ModelProvider {
         // resend the identical body. A second 401 is not retried.
         if (res.status === 401 && chatgpt && !refreshed) {
           await res.body?.cancel().catch(() => {});
-          const next = await chatgpt.refresh(apiKey);
-          apiKey = next.accessToken;
-          accountId = next.accountId;
+          const digest = res.headers.get(CHATGPT_REJECTED_HEADER);
+          if (!digest || !/^[a-f0-9]{64}$/.test(digest)) {
+            throw new ModelError("ChatGPT transport authorization failed", {
+              retryable: false,
+              unavailable: true,
+            });
+          }
+          rejectedDigest = digest;
           refreshed = true;
           continue;
         }
@@ -239,6 +242,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
             )
           ).body;
           replaying = false;
+          rejectedDigest = undefined; // The earlier refresh already persisted.
           continue;
         }
         break;
@@ -327,7 +331,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
           json = JSON.parse(data);
         } catch {
           throw new ModelError("malformed SSE data from provider", {
-            retryable: true,
+            retryable: !chatgpt,
           });
         }
         switch (json.type) {
@@ -473,14 +477,25 @@ export class OpenAIResponsesProvider implements ModelProvider {
                 retryable: false,
               });
             }
-            throw new ModelError(`provider stream incomplete: ${reason}`, {
-              retryable: true,
-            });
+            throw new ModelError(
+              chatgpt
+                ? "ChatGPT response incomplete"
+                : `provider stream incomplete: ${reason}`,
+              {
+                retryable: !chatgpt,
+              },
+            );
           }
           case "response.failed": {
             const err = json.response?.error;
-            const message = err?.message ?? "response failed";
-            const code = typeof err?.code === "string" ? err.code : undefined;
+            const message = chatgpt
+              ? "ChatGPT response failed"
+              : (err?.message ?? "response failed");
+            const code = chatgpt
+              ? safeDiagnosticCode(JSON.stringify({ error: err }))
+              : typeof err?.code === "string"
+                ? err.code
+                : undefined;
             throw new ModelError(`provider stream failed: ${message}`, {
               // A server-side failure is transient unless it reports a
               // definite permanent code.
@@ -494,8 +509,17 @@ export class OpenAIResponsesProvider implements ModelProvider {
             });
           }
           case "error": {
-            const message = json.message ?? "stream error";
-            const code = typeof json.code === "string" ? json.code : "";
+            const message = chatgpt
+              ? "ChatGPT stream error"
+              : (json.message ?? "stream error");
+            const code =
+              (chatgpt
+                ? safeDiagnosticCode(
+                    JSON.stringify({ error: { code: json.code } }),
+                  )
+                : typeof json.code === "string"
+                  ? json.code
+                  : "") ?? "";
             throw new ModelError(`provider stream error: ${message}`, {
               retryable: !/invalid|authentication|permission/i.test(code),
               refusal: isContextLengthRefusal(null, code, message)
@@ -516,7 +540,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
       if (!finished) {
         throw new ModelError(
           "provider stream ended before response.completed — incomplete response",
-          { retryable: true },
+          { retryable: !chatgpt },
         );
       }
 
@@ -552,6 +576,18 @@ export class OpenAIResponsesProvider implements ModelProvider {
             }
           : undefined;
       yield { type: "done", usage, ...(continuation ? { continuation } : {}) };
+    } catch (e) {
+      if (
+        this.cfg.chatgpt &&
+        !(e instanceof ModelError) &&
+        !request.signal?.aborted
+      ) {
+        throw new ModelError(
+          "ChatGPT stream interrupted; acceptance is unknown",
+          { retryable: false },
+        );
+      }
+      throw e;
     } finally {
       deadline.done();
       await events?.return(undefined).catch(() => {});

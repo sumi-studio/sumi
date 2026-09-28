@@ -56,11 +56,7 @@ import {
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
-import {
-  CHATGPT_BASE_URL,
-  type ChatGPTAccess,
-  tokenDigest,
-} from "../providers/chatgpt-codex.ts";
+import { CHATGPT_BASE_URL } from "../providers/chatgpt-codex.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
@@ -176,13 +172,6 @@ export class SelectedModelProvider implements ModelProvider {
     fallback: ModelProvider;
     timeoutMs: number;
     log?: (msg: string, fields?: Record<string, unknown>) => void;
-    /**
-     * Which endpoint a ChatGPT access token may be sent to. Only tests and
-     * the synthetic proof harness set this (to reach a local fake
-     * backend); hosts never do, so production accepts exactly
-     * CHATGPT_BASE_URL.
-     */
-    chatgptEndpoint?: (baseUrl: string) => boolean;
   };
 
   constructor(opts: SelectedModelProvider["opts"]) {
@@ -198,54 +187,6 @@ export class SelectedModelProvider implements ModelProvider {
    */
   async probe(): Promise<void> {
     await this.resolve();
-  }
-
-  /**
-   * The provider's one refresh after a 401: report the rejected token (by
-   * digest) and take the replacement from the state service, which owns
-   * the grant and serializes rotation. The call must stay on the same
-   * connection and version it was admitted under — a selection changed
-   * meanwhile retries the turn rather than finishing on another grant.
-   */
-  private async refreshChatGPT(
-    c: NonNullable<ModelBinding["connection"]>,
-    rejectedToken: string,
-  ): Promise<ChatGPTAccess> {
-    const { state, persona } = this.opts;
-    let next: ModelBinding;
-    try {
-      next = await state.refreshModelCredential(
-        persona,
-        c.id,
-        await tokenDigest(rejectedToken),
-      );
-    } catch (e) {
-      const definite =
-        e instanceof StateError &&
-        e.status >= 400 &&
-        e.status < 500 &&
-        e.status !== 429;
-      throw new ModelError(
-        `ChatGPT credential refresh failed: ${e instanceof Error ? e.message : String(e)}`,
-        { retryable: !definite, unavailable: true },
-      );
-    }
-    const nc = next.connection;
-    if (
-      next.selection !== "api" ||
-      !nc ||
-      nc.id !== c.id ||
-      nc.version !== c.version
-    ) {
-      throw new ModelError(
-        "the selected model connection changed during the call",
-        { retryable: true, unavailable: true },
-      );
-    }
-    if (!next.credential_available || !next.api_key || !nc.account_id) {
-      throw chatGPTUnavailable(nc.name, next);
-    }
-    return { accessToken: next.api_key, accountId: nc.account_id };
   }
 
   /**
@@ -510,27 +451,29 @@ export class SelectedModelProvider implements ModelProvider {
       version: c.version,
     };
     if (CHATGPT_PRESETS.has(c.preset)) {
-      if (!binding.credential_available || !binding.api_key || !c.account_id) {
+      if (!binding.credential_available || !c.account_id) {
         throw chatGPTUnavailable(c.name, binding);
       }
-      // The access token goes to the Codex backend and nowhere else, even
-      // if a binding ever named another endpoint.
-      const allowed =
-        this.opts.chatgptEndpoint ?? ((u: string) => u === CHATGPT_BASE_URL);
-      if (!allowed(c.base_url)) {
-        throw unusable(
-          `the ChatGPT connection ${c.name} names an endpoint other than the ChatGPT Codex backend; its sign-in is not sent there`,
-        );
+      if (c.base_url !== CHATGPT_BASE_URL) {
+        throw unusable("the ChatGPT connection names an unsupported backend");
       }
       const provider = new OpenAIResponsesProvider({
         baseUrl: c.base_url,
-        apiKey: binding.api_key,
+        apiKey: "", // Subscription credentials never leave the Go API.
         model: c.model,
         timeoutMs: this.opts.timeoutMs,
         chatgpt: {
           accountId: c.account_id,
           reasoningEffort: c.reasoning_effort || undefined,
-          refresh: (rejected) => this.refreshChatGPT(c, rejected),
+          send: (body, signal, rejected) =>
+            state.chatGPTResponses(
+              persona,
+              c.id,
+              c.version,
+              body,
+              signal,
+              rejected,
+            ),
         },
       });
       this.opts.log?.("model bound to selected connection", identity);

@@ -44,13 +44,14 @@ var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][
 // creation, human binding, approval decisions, transfers). The runtime that
 // parks a gated call can therefore never decide it.
 type Server struct {
-	store      *Store
-	secret     []byte
-	runtime    []byte
-	maxBody    int64
-	conns      *modelconnections.Store
-	callBridge CallBridge
-	jobFiles   JobFileService
+	store       *Store
+	secret      []byte
+	runtime     []byte
+	maxBody     int64
+	conns       *modelconnections.Store
+	callBridge  CallBridge
+	jobFiles    JobFileService
+	chatGPTHTTP *http.Client
 }
 
 func NewServer(pool *pgxpool.Pool, adminSecret string) *Server {
@@ -158,7 +159,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals/{approval}", s.getApproval)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/approvals/{approval}/decision", s.decideApproval)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/model", s.modelBinding)
-	mux.HandleFunc("POST /internal/core/personas/{persona}/model/credential-refresh", s.refreshModelCredential)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/model/chatgpt/responses", s.chatGPTResponses)
 	// Binding a carried persona to a destination human is an account-level
 	// act, not a persona-scoped one — admin-authenticated like persona
 	// creation and approval decisions. Works on staged (unbound import)

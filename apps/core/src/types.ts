@@ -259,17 +259,16 @@ export interface ModelBinding {
      */
     max_output_tokens?: number;
     /**
-     * ChatGPT subscription connections: the account the access token
-     * belongs to (sent as ChatGPT-Account-ID). Present only with
-     * credential material.
+     * ChatGPT subscription account used to scope continuation. The API
+     * owns its credentials and upstream account header.
      */
     account_id?: string;
     /** Requested reasoning effort (subscription connections). */
     reasoning_effort?: string;
   };
   /**
-   * The connection's credential for this call: an API key, or for a
-   * ChatGPT subscription connection its current OAuth access token.
+   * Standard API-key connection credential. Subscription tokens stay on
+   * the Go API and are never returned in the binding.
    */
   api_key?: string;
   credential_available?: boolean;
