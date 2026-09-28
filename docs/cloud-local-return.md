@@ -65,8 +65,11 @@ no source checkout or Go compiler is needed. This is not a native Mac receiver.
    | any other secretary | occupied | refused before any request reaches Cloud |
 
    It then tells Cloud which placement and slot it is (the destination
-   binding) — one return URL serves one Local placement; a second install
-   pasting it is refused — and only then does Cloud seal the secretary.
+   binding) — one return URL serves one Local placement. A second install
+   is refused while the move is pending; after completion it reports that
+   Cloud recorded the completion at another placement and exits 1 without
+   importing or changing its configuration. Only the bound destination can
+   proceed to seal.
    From that commit Cloud stops answering for it.
 3. The command downloads the sealed bundle, stages the import, activates
    it locally, and reports the activation proof. Cloud completes the
@@ -119,6 +122,21 @@ interruption. Exit status 3 means "not finished yet; resume later".
   activation is an explicit recovery limitation — recovery there needs
   its own authority proof and is not implemented.
 
+## File-service deployment assumptions
+
+The local file-copy path currently connects the API directly to filesvc over
+HTTP/1.1. Freeze and release use the filesvc request context for database work;
+the tested cancellation paths remove a timed-out release before a retry can
+lose its barrier. An intermediary that keeps an upstream request alive after
+the API disconnects changes that assumption. Reassess release/freeze ordering
+before adopting that topology; the direct-connection tests do not cover it.
+
+The background pass for stranded freezes visits waiting sessions in turn,
+with at most 50 candidates per pass and no new visit started after 10 seconds.
+A started visit also includes database operations and a file-service call, so
+this is not a hard deadline for the entire pass. Session reads and mover resume
+also attempt reconciliation without waiting for that background rotation.
+
 ## Model connection
 
 The carried model intent is enforced, not erased. If the secretary
@@ -140,7 +158,9 @@ stops and explains.
 
 | What happened | What converges it |
 | --- | --- |
-| Return URL pasted into a second Local | the second `return` is refused before Cloud seals; the first keeps the session |
+| Return URL pasted into a second Local while the move is pending | the destination binding is refused; the first install keeps the session |
+| Return URL pasted into a second Local after completion | `return` and `return-resume` re-read this install's import ledger and Cloud's session, report that Cloud recorded the completion at another placement and that this install holds no activated copy, and exit 1; nothing is imported or reconfigured. `return-status` succeeds as a query and says what this install's ledger holds. A run against the wrong database is not final: with `SUMI_DB_URL` corrected, `return-resume` finds the activated copy and finishes |
+| Unfinished Cloud work prevents sealing | the secretary stays active on Cloud. The attempted file freeze is avoided or released; `return` exits 3 with the reason. Finish the work and run `return-resume`, or use `return-cancel`. The release is decided under the session row lock, never on a cancelled attempt's word; one that could not run is retried by reconciliation and by a bounded sweep pass that visits waiting bound sessions in turn, after the sweep's lifecycle work |
 | Local occupied by a different live secretary | refused before any request reaches Cloud; nothing binds. An inert surrendered shell of another secretary is authored history — preserved, not disqualifying |
 | Cancel or the deadline lands while the bind's seal is in flight | the session goes `cancelling`, never terminal; the row lock serializes the seal — if it committed, the retire proof resolves to `aborted`; if it never did, the session closes `cancelled` (nothing ever moved) |
 | A tool approval is still pending when the return runs | `preflight.pending_approvals` shows it; the imported persona is unbound on a fresh Local so activation refuses until a human decides it — the command says to decide it on Cloud then `return-resume`, or `return-cancel` and return again once decided |

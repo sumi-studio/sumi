@@ -46,6 +46,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -201,6 +202,14 @@ type Service struct {
 	termWait   time.Duration
 	termPoll   time.Duration
 	logf       func(string, ...any)
+
+	// The sweep's stranded-fence pass (sweepStrandedFences): at most
+	// fenceBatch sessions per sweep, no new one started after fenceBudget,
+	// resumed after fenceCursor so every candidate is reached in turn.
+	fenceBatch  int
+	fenceBudget time.Duration
+	fenceMu     sync.Mutex
+	fenceCursor string
 }
 
 func New(pool *pgxpool.Pool, cfg Config) *Service {
@@ -212,7 +221,8 @@ func New(pool *pgxpool.Pool, cfg Config) *Service {
 	}
 	s := &Service{pool: pool, portable: portable.NewService(pool), admitTTL: cfg.AdmitTTL,
 		filePolicy: cfg.FilePolicy, fileModes: cfg.FileModes,
-		termWait: cfg.TerminalQuiesceTimeout, termPoll: cfg.TerminalQuiescePoll}
+		termWait: cfg.TerminalQuiesceTimeout, termPoll: cfg.TerminalQuiescePoll,
+		fenceBatch: fenceSweepBatch, fenceBudget: fenceSweepBudget}
 	if s.termWait <= 0 {
 		s.termWait = terminalQuiesceDeadline
 	}
@@ -657,24 +667,11 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	// Local mode: fence the source workspace BEFORE the seal commits. The
-	// persisted freeze is what makes the copy's snapshot provable — after
-	// it lands, no new file mutation can be admitted (readers are
-	// unaffected); mutations admitted earlier keep settling and stay
-	// visible to the copier's verification passes. Without a file service
-	// there is no fence and no local-mode copy, so the bind refuses
-	// rather than sealing unfenced.
-	if r.fileModeStr() == string(FileModeLocal) {
-		if s.files == nil {
-			return fmt.Errorf("%w: file_mode local requires the file service, which is not configured", ErrConflict)
-		}
-		scope, err := fileaccess.ScopeForPersona(personaID)
-		if err != nil {
-			return err
-		}
-		if err := s.files.SetScopeFrozen(ctx, scope, sessionID, r.fileEpoch, "return "+sessionID, true); err != nil {
-			return fmt.Errorf("fence source file scope before seal: %w", err)
-		}
+	local := r.fileModeStr() == string(FileModeLocal)
+	if local && s.files == nil {
+		// Without a file service there is no fence and no local-mode
+		// copy, so the bind refuses rather than sealing unfenced.
+		return fmt.Errorf("%w: file_mode local requires the file service, which is not configured", ErrConflict)
 	}
 	// The seal runs under the session row lock. That lock is the fence
 	// that makes "no export exists yet" decidable: a cancel, a reconcile
@@ -693,9 +690,26 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 		return err
 	}
 	switch status {
-	case StatusAwaitingDestination, StatusSealed:
-		// awaiting: the seal is still owed; sealed: a re-bind replays the
-		// recorded receipt below.
+	case StatusAwaitingDestination:
+		// The seal is still owed. Unfinished work the seal would refuse
+		// on is refused here, before the file fence or the terminal gate
+		// touch anything: the secretary stays active on Cloud and that
+		// work keeps its workspace. The seal re-checks under its own
+		// locks — this is the early answer, not the authority. A seal that
+		// already committed (its status write lost) replays below instead.
+		var exported bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM core_transfers WHERE direction = 'export' AND transfer_id = $1)`,
+			sessionID).Scan(&exported); err != nil {
+			return err
+		}
+		if !exported {
+			if err := s.portable.CheckSealable(ctx, tx, personaID); err != nil {
+				return err
+			}
+		}
+	case StatusSealed:
+		// A re-bind replays the recorded receipt below.
 	case StatusCancelling:
 		// The cancel won the window between the binding commit and this
 		// lock. Do not seal — the session resolves through the cancel
@@ -705,6 +719,56 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	default:
 		return fmt.Errorf("%w: the session is %s", ErrClosed, status)
 	}
+	if local {
+		// Local mode: fence the source workspace BEFORE the seal commits.
+		// The persisted freeze is what makes the copy's snapshot provable
+		// — after it lands, no new file mutation can be admitted (readers
+		// are unaffected); mutations admitted earlier keep settling and
+		// stay visible to the copier's verification passes.
+		//
+		// The fence is raised under the session row lock, and it is owed
+		// only to an attempt that can still seal: an attempt that ends
+		// without a committed seal ends its transaction and then decides
+		// the release again, from durable state, under a freshly taken
+		// lock (releaseUnsealedFence). A refused seal therefore never
+		// leaves the still-active secretary — or the person — with a
+		// read-only workspace, and no release ever relies on this
+		// attempt's lock still being held: a cancelled request can lose
+		// its connection, and with it the lock, mid-statement.
+		scope, err := fileaccess.ScopeForPersona(personaID)
+		if err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				s.releaseUnsealedFence(ctx, tx, r, scope)
+			}
+		}()
+		if err := s.files.SetScopeFrozen(ctx, scope, sessionID, r.fileEpoch, "return "+sessionID, true); err != nil {
+			return fmt.Errorf("fence source file scope before seal: %w", err)
+		}
+		if err := s.sealLocked(ctx, tx, sessionID, personaID, dest); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			// Committed, aborted or still committing: the release
+			// decision reads the outcome under a fresh lock, never
+			// guesses it.
+			return err
+		}
+		committed = true
+		return nil
+	}
+	if err := s.sealLocked(ctx, tx, sessionID, personaID, dest); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// sealLocked is the seal proper, on the transaction that holds the
+// session row lock.
+func (s *Service) sealLocked(ctx context.Context, tx pgx.Tx, sessionID, personaID string, dest Destination) error {
 	// The persona row lock serializes the terminal gate with terminal
 	// admission: session creation takes FOR SHARE on this row and the
 	// claim path re-checks authority under it, so the writer set the
@@ -729,11 +793,34 @@ func (s *Service) bindAndSeal(ctx context.Context, sessionID, personaID string, 
 	if _, err := s.portable.SealTx(ctx, tx, personaID, sessionID, dest.PlacementID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'sealed', updated_at = now()
-		WHERE session_id = $1 AND status = 'awaiting_destination'`, sessionID); err != nil {
-		return err
+	_, err := tx.Exec(ctx, `UPDATE return_sessions SET status = 'sealed', updated_at = now()
+		WHERE session_id = $1 AND status = 'awaiting_destination'`, sessionID)
+	return err
+}
+
+// releaseUnsealedFence takes down the local-mode fence of a seal attempt
+// that did not commit. It first ends the attempt's transaction — so no
+// second pooled connection is ever requested while the session row lock
+// is held — and then decides under a freshly taken lock
+// (releaseStrandedFence). The attempt's own transaction is no evidence
+// that no other attempt runs: a request cancelled mid-statement loses
+// its connection and, with it, the session row lock, and a retry of the
+// same session carries the same (session, epoch) barrier lineage, so
+// filesvc could not tell a late release from a current one. Under the
+// fresh lock the answer is exact: busy means another attempt now owns
+// the fence (or this attempt's own backend has not let go yet — the
+// fence then stays for the sweep); a sealed status or an export row
+// means the seal committed and the fence stays; otherwise nothing can
+// seal until the release call has returned. A release that cannot run
+// here is left to convergeFileState and the sweep. It runs on a context detached from the request, so a
+// caller that hung up mid-bind does not leave the barrier standing.
+func (s *Service) releaseUnsealedFence(ctx context.Context, tx pgx.Tx, r row, scope string) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	_ = tx.Rollback(rctx)
+	if err := s.releaseStrandedFence(rctx, r, scope); err != nil && s.logf != nil {
+		s.logf("return %s: unsealed fence release deferred: %v", r.id, err)
 	}
-	return tx.Commit(ctx)
 }
 
 // Status is the grant holder's view, after reconciling. It stays readable
@@ -1029,8 +1116,11 @@ func (s *Service) Reconcile(ctx context.Context, sessionID string) error {
 //     so Cloud file access ended with it.
 //   - The source scope's persisted mutation barrier is driven to its
 //     desired state for a bound local-mode move: frozen while the copy
-//     window is open (bound through completed), unfrozen when the session
-//     resolves any other way. The call is retried on every reconcile and
+//     window is open (sealed through completed), unfrozen when the session
+//     resolves any other way. A bound session that has not sealed owns no
+//     fence — only a seal attempt in flight does, under the session row
+//     lock — so a barrier left by a refused or crashed attempt is released
+//     (releaseStrandedFence). The call is retried on every reconcile and
 //     its failures are logged, never fatal: a stuck freeze is the safe
 //     side (reads keep working; the human sees refusals until it clears)
 //     and the session's own state must stay readable for recovery.
@@ -1121,13 +1211,69 @@ func (s *Service) convergeFileState(ctx context.Context, sessionID string) error
 		return err
 	}
 	bound := r.dstPlace != nil
-	want := bound && r.fileModeStr() == string(FileModeLocal) &&
-		(r.status == StatusAwaitingDestination || r.status == StatusSealed ||
-			r.status == StatusCancelling || r.status == StatusCompleted)
+	local := r.fileModeStr() == string(FileModeLocal)
+	if bound && local && r.status == StatusAwaitingDestination {
+		// Bound but not sealed: the fence belongs only to a seal attempt
+		// in flight, and that attempt holds the session row lock for as
+		// long as it needs it. Anything else — a refused seal, a crash
+		// between the freeze and the seal's rollback — leaves a barrier
+		// that fences nothing and must come down.
+		return s.releaseStrandedFence(ctx, r, scope)
+	}
+	// The copy window: sealed, a post-seal cancel still awaiting the
+	// destination's proof (a never-sealed cancel was already closed by
+	// Reconcile), and the retained read-only copy after completion.
+	want := bound && local &&
+		(r.status == StatusSealed || r.status == StatusCancelling || r.status == StatusCompleted)
 	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if ferr := s.files.SetScopeFrozen(fctx, scope, sessionID, r.fileEpoch, "return "+r.id, want); ferr != nil && s.logf != nil {
 		s.logf("return %s: file barrier convergence (frozen=%v) deferred: %v", r.id, want, ferr)
+	}
+	return nil
+}
+
+// releaseStrandedFence brings down the fence of a bound local-mode session
+// that has not sealed. It decides under the session row lock, taken
+// NOWAIT: a held lock is a seal attempt in flight (bindAndSeal raises
+// the fence and seals under it), which owns the fence and releases it
+// itself if its seal does not commit — so this pass leaves it alone.
+// With the lock, a still-awaiting session with no export row provably
+// has no copy to protect: the seal can only start behind this lock.
+func (s *Service) releaseStrandedFence(ctx context.Context, r row, scope string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var status string
+	err = tx.QueryRow(ctx, `SELECT status FROM return_sessions WHERE session_id = $1 FOR UPDATE NOWAIT`,
+		r.id).Scan(&status)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if status != StatusAwaitingDestination {
+		return nil
+	}
+	var hasExport bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM core_transfers WHERE direction = 'export' AND transfer_id = $1)`,
+		r.id).Scan(&hasExport); err != nil {
+		return err
+	}
+	if hasExport {
+		// The seal committed and its status write was lost; Reconcile
+		// records sealed on its next pass, and the fence stays.
+		return nil
+	}
+	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if ferr := s.files.SetScopeFrozen(fctx, scope, r.id, r.fileEpoch, "", false); ferr != nil && s.logf != nil {
+		s.logf("return %s: stranded fence release deferred: %v", r.id, ferr)
 	}
 	return nil
 }
@@ -1476,7 +1622,14 @@ func (s *Service) resolveNeverSealedCancel(ctx context.Context, sessionID string
 // committed 'cancelling' and crashed before its reconcile — the no-export
 // selection is only a work list; resolveNeverSealedCancel re-decides under
 // the session row lock, so an in-flight seal (which holds that lock) is
-// never misjudged by an unlocked export snapshot.
+// never misjudged by an unlocked export snapshot. Every one of those
+// sessions leaves the list once its step is done.
+//
+// Bound local-mode sessions that have not sealed are different: they stay
+// candidates for as long as they wait (a bound session never expires), and
+// most of them hold no fence at all. They are visited in a separate,
+// bounded pass after the lifecycle work (sweepStrandedFences), so however
+// many of them wait, they never displace a due lifecycle step.
 func (s *Service) Sweep(ctx context.Context) (int, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT session_id FROM return_sessions
@@ -1517,7 +1670,89 @@ func (s *Service) Sweep(ctx context.Context) (int, error) {
 			firstErr = fmt.Errorf("reconcile %s: %w", id, err)
 		}
 	}
-	return len(ids), firstErr
+	n, err := s.sweepStrandedFences(ctx)
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return len(ids) + n, firstErr
+}
+
+const (
+	// fenceSweepBatch bounds the stranded-fence candidates one sweep
+	// visits; fenceSweepBudget is the time after which it starts no new
+	// one. A started visit includes database steps plus the release
+	// call's 30 s timeout. The database steps have no separate deadline,
+	// so the budget is not an absolute bound on this pass's duration.
+	fenceSweepBatch  = 50
+	fenceSweepBudget = 10 * time.Second
+)
+
+// sweepStrandedFences visits bound local-mode sessions that have not
+// sealed and releases a barrier a refused or crashed seal attempt left
+// behind (convergeFileState → releaseStrandedFence, which decides under
+// the session row lock). Reads of the session release the same barrier;
+// this pass is for the session nobody reads. The candidates are walked
+// in session-id order from where the previous sweep stopped, wrapping at
+// the end, so a large or slow set is covered in turn rather than the
+// same subset every time.
+func (s *Service) sweepStrandedFences(ctx context.Context) (int, error) {
+	if s.files == nil {
+		return 0, nil
+	}
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	const candidates = `
+		SELECT session_id FROM return_sessions
+		WHERE status = 'awaiting_destination' AND destination_bound_at IS NOT NULL
+		  AND file_mode = 'local' AND session_id COLLATE "C" > $1
+		  AND NOT EXISTS (
+		    SELECT 1 FROM core_transfers t
+		    WHERE t.direction = 'export' AND t.transfer_id = return_sessions.session_id)
+		ORDER BY session_id COLLATE "C"
+		LIMIT $2`
+	collect := func(after string, limit int) ([]string, error) {
+		rows, err := s.pool.Query(ctx, candidates, after, limit)
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, pgx.RowTo[string])
+	}
+	ids, err := collect(s.fenceCursor, s.fenceBatch)
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) < s.fenceBatch && s.fenceCursor != "" {
+		// Wrap: the rest of the batch starts again from the beginning,
+		// up to (not including) where this pass began.
+		more, err := collect("", s.fenceBatch-len(ids))
+		if err != nil {
+			return 0, err
+		}
+		for _, id := range more {
+			if id >= s.fenceCursor {
+				break
+			}
+			ids = append(ids, id)
+		}
+	}
+	start := time.Now()
+	var firstErr error
+	n := 0
+	for _, id := range ids {
+		if n > 0 && time.Since(start) >= s.fenceBudget {
+			break
+		}
+		s.fenceCursor = id
+		n++
+		if err := s.convergeFileState(ctx, id); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("stranded fence %s: %w", id, err)
+		}
+	}
+	if n == len(ids) && len(ids) < s.fenceBatch {
+		// Everything was visited: the next pass starts from the top.
+		s.fenceCursor = ""
+	}
+	return n, firstErr
 }
 
 // Run sweeps every interval until ctx ends.

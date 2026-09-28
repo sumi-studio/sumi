@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
@@ -53,13 +54,67 @@ func unmarshal(t *testing.T, raw []byte, v any) {
 // can prove the local-mode fence actually fired (or did not), and that
 // unfreezes stay inside their owning lineage.
 type fakeFiles struct {
+	mu          sync.Mutex
 	frozenCalls []string
 	listErr     error
+	// freezeErr fails freeze (frozen=true) assertions after recording
+	// them — the barrier may or may not have landed, as with a lost
+	// answer or a drain that did not settle.
+	freezeErr error
+	// onFreeze runs inside a freeze assertion before it answers — the
+	// window where the fence is up and the seal has not run yet.
+	onFreeze func(owner string)
+	// onRelease runs inside a release (frozen=false) before it answers.
+	onRelease func(owner string)
 }
 
 func (f *fakeFiles) SetScopeFrozen(_ context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error {
+	f.mu.Lock()
 	f.frozenCalls = append(f.frozenCalls, fmt.Sprintf("%s|%s@%d=%v", owner, scope, ownerEpoch, frozen))
-	return nil
+	hook, ferr, rhook := f.onFreeze, f.freezeErr, f.onRelease
+	f.mu.Unlock()
+	if !frozen {
+		if rhook != nil {
+			rhook(owner)
+		}
+		return nil
+	}
+	if hook != nil {
+		hook(owner)
+	}
+	return ferr
+}
+
+// callsFor is a snapshot of the barrier calls made under one owner.
+func (f *fakeFiles) callsFor(owner string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.frozenCalls {
+		if strings.HasPrefix(c, owner+"|") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// fencedBy reports whether the last barrier call under owner left the
+// scope frozen — the barrier's effective state for that lineage.
+func (f *fakeFiles) fencedBy(owner string) bool {
+	c := f.callsFor(owner)
+	return len(c) > 0 && strings.HasSuffix(c[len(c)-1], "=true")
+}
+
+func (f *fakeFiles) reset() {
+	f.mu.Lock()
+	f.frozenCalls = nil
+	f.mu.Unlock()
+}
+
+func (f *fakeFiles) set(freezeErr error, onFreeze func(owner string)) {
+	f.mu.Lock()
+	f.freezeErr, f.onFreeze = freezeErr, onFreeze
+	f.mu.Unlock()
 }
 
 func (f *fakeFiles) List(_ context.Context, scope, path, cursor string, limit int) (fileaccess.ListResult, error) {
