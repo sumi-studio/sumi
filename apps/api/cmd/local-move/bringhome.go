@@ -1301,6 +1301,10 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	if st.Outcome == outcomeElsewhere {
 		// Checked after the ledger: the recorded outcome came from an
 		// absence, and an activated copy found now is answered above.
+		// A ledger that could not be read says nothing about absence.
+		if impErr != nil && !errors.Is(impErr, portable.ErrTransferNotFound) {
+			return m.fail(impErr)
+		}
 		return m.fail(errors.New("Sumi Cloud records this return as completed at another install, and this install holds no activated copy — there is nothing here to cancel"))
 	}
 	// The restoration journal is read before Cloud is told anything: a

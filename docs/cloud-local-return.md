@@ -122,6 +122,21 @@ interruption. Exit status 3 means "not finished yet; resume later".
   activation is an explicit recovery limitation — recovery there needs
   its own authority proof and is not implemented.
 
+## File-service deployment assumptions
+
+The local file-copy path currently connects the API directly to filesvc over
+HTTP/1.1. Freeze and release use the filesvc request context for database work;
+the tested cancellation paths remove a timed-out release before a retry can
+lose its barrier. An intermediary that keeps an upstream request alive after
+the API disconnects changes that assumption. Reassess release/freeze ordering
+before adopting that topology; the direct-connection tests do not cover it.
+
+The background pass for stranded freezes visits waiting sessions in turn,
+with at most 50 candidates per pass and no new visit started after 10 seconds.
+A started visit also includes database operations and a file-service call, so
+this is not a hard deadline for the entire pass. Session reads and mover resume
+also attempt reconciliation without waiting for that background rotation.
+
 ## Model connection
 
 The carried model intent is enforced, not erased. If the secretary

@@ -1680,8 +1680,9 @@ func (s *Service) Sweep(ctx context.Context) (int, error) {
 const (
 	// fenceSweepBatch bounds the stranded-fence candidates one sweep
 	// visits; fenceSweepBudget is the time after which it starts no new
-	// one. A visit that has started runs to its own bound (the release
-	// call's 30 s), so one sweep spends at most about budget + 30 s here.
+	// one. A started visit includes database steps plus the release
+	// call's 30 s timeout. The database steps have no separate deadline,
+	// so the budget is not an absolute bound on this pass's duration.
 	fenceSweepBatch  = 50
 	fenceSweepBudget = 10 * time.Second
 )
