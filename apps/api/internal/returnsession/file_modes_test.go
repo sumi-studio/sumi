@@ -64,14 +64,19 @@ type fakeFiles struct {
 	// onFreeze runs inside a freeze assertion before it answers — the
 	// window where the fence is up and the seal has not run yet.
 	onFreeze func(owner string)
+	// onRelease runs inside a release (frozen=false) before it answers.
+	onRelease func(owner string)
 }
 
 func (f *fakeFiles) SetScopeFrozen(_ context.Context, scope, owner string, ownerEpoch int64, reason string, frozen bool) error {
 	f.mu.Lock()
 	f.frozenCalls = append(f.frozenCalls, fmt.Sprintf("%s|%s@%d=%v", owner, scope, ownerEpoch, frozen))
-	hook, ferr := f.onFreeze, f.freezeErr
+	hook, ferr, rhook := f.onFreeze, f.freezeErr, f.onRelease
 	f.mu.Unlock()
 	if !frozen {
+		if rhook != nil {
+			rhook(owner)
+		}
 		return nil
 	}
 	if hook != nil {

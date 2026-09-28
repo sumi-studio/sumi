@@ -136,6 +136,82 @@ func TestReturnCompletedElsewhereIsNotReportedHere(t *testing.T) {
 	}
 }
 
+// completed_elsewhere is concluded from an absence — no activated import
+// in the ledger the run could read. A resume run against the wrong
+// database (the crash window: Cloud completed, the record never saved
+// "active") records it; once the database is right, return-status and
+// return-cancel answer from the ledger and return-resume reads it again
+// and finishes here, as `return <same URL>` does.
+//
+// Found by independent review 02 (F-C): return-resume kept repeating the
+// stored outcome and said this install held no activated copy.
+func TestResumeRechecksCompletedElsewhere(t *testing.T) {
+	h := setupReturn(t)
+	sessionID, returnURL := h.newReturn()
+	config := writeConfig(t, h.home, h.slot)
+	m, out := h.mover()
+	if code := m.ReturnStart(h.ctx, returnURL, h.local.pool, config, false); code != exitDone {
+		t.Fatalf("return: %d\n%s", code, out)
+	}
+	path := filepath.Join(h.home, "return", "state.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec map[string]any
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	delete(rec, "outcome")
+	if raw, err = json.Marshal(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wrong := h.secondInstall(t)
+	var wout bytes.Buffer
+	mw := newMover(h.home, h.slot, wrong.p.svc, wrong.p.state, &wout)
+	mw.wait, mw.poll, mw.unreachable, mw.sealRetries, mw.sealDelay = 0, 10*time.Millisecond, 300*time.Millisecond, 2, 10*time.Millisecond
+	if code := mw.ReturnResume(h.ctx, wrong.p.pool, config, false); code != exitError {
+		t.Fatalf("resume against the wrong database: %d\n%s", code, &wout)
+	}
+	if s := wout.String(); strings.Contains(s, "active there") || !strings.Contains(s, "return-resume") {
+		t.Errorf("the wrong-database answer claims where the secretary is, or gives no way on:\n%s", s)
+	}
+
+	out.Reset()
+	if code := m.ReturnStatus(h.ctx, h.local.pool, config); code != exitDone || !strings.Contains(out.String(), "activated copy after all") {
+		t.Errorf("status with the right database: %d\n%s", code, out)
+	}
+	out.Reset()
+	if code := m.ReturnCancel(h.ctx, h.local.pool, config); code != exitError || !strings.Contains(out.String(), "already active on this install") {
+		t.Errorf("cancel with the right database: %d\n%s", code, out)
+	}
+	out.Reset()
+	if code := m.ReturnResume(h.ctx, h.local.pool, config, false); code != exitDone || !strings.Contains(out.String(), "active on this") {
+		t.Fatalf("resume with the right database: %d\n%s", code, out)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st returnState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Outcome != "active" || st.CompletedAt != "" {
+		t.Fatalf("record after the recheck: %q at %q", st.Outcome, st.CompletedAt)
+	}
+	if got := authority(t, h.local, h.pid); got != "active" {
+		t.Fatalf("local authority %s", got)
+	}
+	if got := h.sessionStatus(sessionID); got != returnsession.StatusCompleted {
+		t.Fatalf("session %s", got)
+	}
+}
+
 // The report of a real activation is lost after Cloud committed it: the
 // install that holds the secretary still settles as active on resume —
 // the completed-elsewhere answer is only for installs without the import.

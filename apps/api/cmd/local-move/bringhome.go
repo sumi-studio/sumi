@@ -332,7 +332,11 @@ func (m *mover) ReturnResume(ctx context.Context, pool *pgxpool.Pool, config str
 		m.say("No return is recorded on this install.")
 		return exitDone
 	}
-	if st.Outcome != "" {
+	// completed_elsewhere was concluded from an absence — no activated
+	// import in the ledger that run could read, possibly the wrong
+	// database — so it is re-read, exactly as `return <same URL>` does.
+	// Every other outcome is settled evidence.
+	if st.Outcome != "" && st.Outcome != outcomeElsewhere {
 		return r.explainOutcome(ctx, st)
 	}
 	return r.drive(ctx, st)
@@ -927,7 +931,7 @@ func (r *returner) finishActive(ctx context.Context, st *returnState) (int, bool
 	if err := r.modelStep(ctx, st); err != nil {
 		return exitPending, false, err
 	}
-	st.Outcome = "active"
+	st.Outcome, st.CompletedAt = "active", ""
 	if err := r.save(st); err != nil {
 		return 0, false, err
 	}
@@ -986,13 +990,18 @@ func (r *returner) explainOutcome(ctx context.Context, st *returnState) int {
 			r.m.say("Nothing here was changed.")
 			return exitError
 		}
+		// Cloud's record says where the return completed, not where the
+		// secretary is now; this install's ledger, just read, is what
+		// says it is not here.
 		where := "another Sumi Local install"
 		if st.CompletedAt != "" {
 			where += " (placement " + st.CompletedAt + ")"
 		}
-		r.m.say("This return already finished on %s.", where)
-		r.m.say("The secretary is active there, not here: nothing was imported into")
-		r.m.say("this install and its configuration was not changed.")
+		r.m.say("Sumi Cloud records this return as completed at %s.", where)
+		r.m.say("This install's database holds no activated copy of the secretary:")
+		r.m.say("nothing was imported into this install and its configuration was not")
+		r.m.say("changed. If SUMI_DB_URL pointed at the wrong database, correct it and")
+		r.m.say("run `sumi-local-move return-resume`.")
 		return exitError
 	case returnsession.StatusAborted:
 		r.m.say("The recorded return was cancelled; the secretary is active on Sumi Cloud.")
@@ -1200,12 +1209,14 @@ func (m *mover) ReturnStatus(ctx context.Context, pool *pgxpool.Pool, config str
 		m.say("Outcome recorded here: %s", st.Outcome)
 		if st.Outcome == outcomeElsewhere {
 			// A status query succeeds; the return it describes did not
-			// bring the secretary here, and the line says so.
+			// bring the secretary here. Cloud's record names where it
+			// completed; the ledger lines below say what this install
+			// holds now.
 			where := "another Sumi Local install"
 			if st.CompletedAt != "" {
 				where = "placement " + st.CompletedAt
 			}
-			m.say("The return completed at %s; the secretary is not on this install.", where)
+			m.say("Sumi Cloud records this return as completed at %s.", where)
 		}
 	}
 	imp, impErr := r.m.src.Status(ctx, "import", st.SessionID)
@@ -1216,8 +1227,16 @@ func (m *mover) ReturnStatus(ctx context.Context, pool *pgxpool.Pool, config str
 			line += fmt.Sprintf(" (reclaim over transfer %s)", imp.Supersedes)
 		}
 		m.say("%s", line)
+		if st.Outcome == outcomeElsewhere && imp.Status == "activated" {
+			m.say("This database holds the activated copy after all (the recorded outcome")
+			m.say("came from a run that could not see it): run `sumi-local-move return-resume`.")
+		}
 	case errors.Is(impErr, portable.ErrTransferNotFound):
-		m.say("This install: nothing imported yet")
+		if st.Outcome == outcomeElsewhere {
+			m.say("This install: nothing imported — the secretary is not on this install")
+		} else {
+			m.say("This install: nothing imported yet")
+		}
 	default:
 		return m.fail(impErr)
 	}
@@ -1275,12 +1294,14 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	if st.Outcome == "active" {
 		return m.fail(errors.New("the secretary is active on this install — there is no return left to cancel"))
 	}
-	if st.Outcome == outcomeElsewhere {
-		return m.fail(errors.New("this return already completed on another install — the secretary is active there, and nothing here needs cancelling"))
-	}
 	imp, impErr := r.m.src.Status(ctx, "import", st.SessionID)
 	if impErr == nil && imp.Status == "activated" {
 		return m.fail(errors.New("the secretary is already active on this install — it cannot be retired"))
+	}
+	if st.Outcome == outcomeElsewhere {
+		// Checked after the ledger: the recorded outcome came from an
+		// absence, and an activated copy found now is answered above.
+		return m.fail(errors.New("Sumi Cloud records this return as completed at another install, and this install holds no activated copy — there is nothing here to cancel"))
 	}
 	// The restoration journal is read before Cloud is told anything: a
 	// journal that exists but cannot be read is not "no journal", and a
