@@ -210,6 +210,27 @@ export interface ApprovalDecision {
  * credential store is armed — the decrypted key. Never a substituted
  * model/provider.
  */
+/**
+ * Bounded failure classifications a surface may render (see error_kind).
+ * "model_reconnect_required": the selected ChatGPT subscription sign-in
+ * expired or was revoked — the person must reconnect ChatGPT.
+ * "model_auth_rejected": ChatGPT rejected a just-refreshed sign-in for
+ * the selected connection. The refresh itself succeeded, so the cause is
+ * on ChatGPT's side and not known to Sumi; reconnecting is not implied.
+ * "model_connection_disabled": the selected connection's kind (a ChatGPT
+ * subscription) is turned off on this server — a connection IS selected.
+ * "model_usage_limit": the subscription's usage limit is reached (or the
+ * plan does not include this use) — waiting or a different connection
+ * is the fix, not a resend.
+ */
+export type FailureKind =
+  | "no_model_connection"
+  | "oversize_plan"
+  | "model_reconnect_required"
+  | "model_auth_rejected"
+  | "model_connection_disabled"
+  | "model_usage_limit";
+
 export interface ModelBinding {
   // "needs_rebinding": the persona arrived by transfer carrying a model
   // selection intent; no model may run until the destination's bound
@@ -237,9 +258,26 @@ export interface ModelBinding {
      * default.
      */
     max_output_tokens?: number;
+    /**
+     * ChatGPT subscription account used to scope continuation. The API
+     * owns its credentials and upstream account header.
+     */
+    account_id?: string;
+    /** Requested reasoning effort (subscription connections). */
+    reasoning_effort?: string;
   };
+  /**
+   * Standard API-key connection credential. Subscription tokens stay on
+   * the Go API and are never returned in the binding.
+   */
   api_key?: string;
   credential_available?: boolean;
+  /**
+   * Why a subscription credential is unavailable: "reconnect_required"
+   * (the person must sign in to ChatGPT again) or "disabled" (the server
+   * does not offer subscription connections).
+   */
+  credential_state?: "reconnect_required" | "disabled";
   reason?: string;
 }
 
@@ -252,6 +290,11 @@ export interface Decision {
   text: string;
   calls: PlanCall[];
   usage: Json;
+  /**
+   * Opaque provider continuation of this round (ProviderContinuation in
+   * provider.ts), replayed with the round on the next consultation.
+   */
+  continuation?: { scope: string; output: Json[] };
 }
 
 /**
@@ -429,7 +472,7 @@ export interface CommitRequest {
    * size limit and could not be recorded). Anything without a certain cause
    * stays absent rather than guessing at a provider-error taxonomy.
    */
-  error_kind?: "no_model_connection" | "oversize_plan";
+  error_kind?: FailureKind;
   /**
    * Provider-supplied retry pacing (Retry-After) for a retryable
    * failure: the requeue's not_before is at least now+retry_after_ms

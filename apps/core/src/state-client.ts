@@ -1,8 +1,10 @@
+import { ModelError } from "./provider.ts";
 import type {
   Approval,
   ApprovalDecision,
   ClaimedMemoryChunk,
   CommitRequest,
+  Decision,
   Event,
   FundingRef,
   Job,
@@ -178,6 +180,7 @@ export interface StateClient {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     },
   ): Promise<{ plan: TurnPlan; created: boolean }>;
   commitTurn(
@@ -235,6 +238,21 @@ export interface StateClient {
    * binding or report it unavailable; never substitute another provider.
    */
   modelBinding(persona: string): Promise<ModelBinding>;
+  /**
+   * One authenticated subscription HTTP attempt, with no transport retries.
+   * `timeoutMs` is the caller's remaining model deadline; the API applies
+   * the same budget (bounded server-side) to admission, refresh and the
+   * upstream exchange.
+   */
+  chatGPTResponses(
+    persona: string,
+    connectionId: string,
+    version: string,
+    body: string,
+    signal: AbortSignal,
+    rejectedTokenSha256?: string,
+    timeoutMs?: number,
+  ): Promise<Response>;
   completeOperation(
     persona: string,
     operationId: string,
@@ -386,6 +404,8 @@ type StateResponse = {
   status: number;
   json(): Promise<unknown>;
   text(): Promise<string>;
+  headers?: Headers;
+  body?: ReadableStream<Uint8Array> | null;
 };
 
 type FetchLike = (
@@ -395,6 +415,7 @@ type FetchLike = (
     headers?: Record<string, string>;
     body?: string;
     signal?: AbortSignal;
+    redirect?: "manual";
   },
 ) => Promise<StateResponse>;
 
@@ -411,6 +432,16 @@ type FetchLike = (
  * uncertain outcomes.
  */
 export const STATE_CALL_TIMEOUT_MS = 10_000;
+
+/**
+ * Deadline for model-binding calls. Resolving a binding may refresh a
+ * subscription grant at the issuer. The service gives lock acquisition 5s, refresh 25s (its issuer
+ * HTTP timeout is 20s), and persistence a fresh 5s, completing even if this
+ * call is abandoned. Waiting longer than their sum lets a slow refresh finish
+ * inside the turn instead of failing it and retrying against a row that is still
+ * locked; the call stays bounded.
+ */
+export const MODEL_CREDENTIAL_CALL_TIMEOUT_MS = 40_000;
 
 /**
  * The deadline's rejection shape. call() passes only its own timeout
@@ -441,6 +472,7 @@ export class HttpStateClient implements StateClient {
   private readonly token: string;
   private readonly fetchImpl: FetchLike;
   private readonly timeoutMs: number;
+  private readonly credentialTimeoutMs: number;
 
   constructor(
     baseUrl: string,
@@ -450,17 +482,20 @@ export class HttpStateClient implements StateClient {
     fetchImpl: FetchLike = (input, init) =>
       fetch(input, init) as ReturnType<FetchLike>,
     timeoutMs = STATE_CALL_TIMEOUT_MS,
+    credentialTimeoutMs = MODEL_CREDENTIAL_CALL_TIMEOUT_MS,
   ) {
     this.baseUrl = baseUrl;
     this.token = token;
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
+    this.credentialTimeoutMs = credentialTimeoutMs;
   }
 
   private async call<T>(
     method: string,
     path: string,
     body?: unknown,
+    timeoutMs = this.timeoutMs,
   ): Promise<T> {
     // One signal bounds the whole request: a service that accepts but never
     // answers, or answers headers and stalls mid-body, fails here instead
@@ -472,7 +507,7 @@ export class HttpStateClient implements StateClient {
     // clearTimeout on every exit releases the deadline once the body has
     // settled; a still-pending call keeps its bound.
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), this.timeoutMs);
+    const timer = setTimeout(() => deadline.abort(), timeoutMs);
     try {
       let res: StateResponse;
       try {
@@ -486,13 +521,13 @@ export class HttpStateClient implements StateClient {
           signal: deadline.signal,
         });
       } catch (e) {
-        throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
+        throw callDeadlineError(e, method, path, timeoutMs) ?? e;
       }
       if (res.ok) {
         try {
           return (await res.json()) as T;
         } catch (e) {
-          const timeout = callDeadlineError(e, method, path, this.timeoutMs);
+          const timeout = callDeadlineError(e, method, path, timeoutMs);
           if (timeout) throw timeout;
           // A 200 with an unreadable body is an infrastructure blip — a
           // truncated proxy/middlebox response or a service bug — not a
@@ -676,6 +711,7 @@ export class HttpStateClient implements StateClient {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     },
   ) {
     return this.call<{ plan: TurnPlan; created: boolean }>(
@@ -688,6 +724,7 @@ export class HttpStateClient implements StateClient {
         text: req.text,
         calls: req.calls,
         usage: req.usage,
+        ...(req.continuation ? { continuation: req.continuation } : {}),
       },
     );
   }
@@ -768,7 +805,95 @@ export class HttpStateClient implements StateClient {
     return this.call<ModelBinding>(
       "GET",
       `/internal/core/personas/${persona}/model`,
+      undefined,
+      this.credentialTimeoutMs,
     );
+  }
+  async chatGPTResponses(
+    persona: string,
+    connectionId: string,
+    version: string,
+    body: string,
+    signal: AbortSignal,
+    rejectedTokenSha256?: string,
+    timeoutMs?: number,
+  ): Promise<Response> {
+    // The model deadline covers the stream. The short JSON state deadline
+    // must not truncate it; neither this client nor Go replays on a network failure.
+    // `body` is the provider's JSON.stringify output. Splicing it in avoids
+    // holding a parsed copy of a multi-megabyte context in the isolate; the
+    // API still decodes and validates the whole envelope before dispatch.
+    const envelope = `{${[
+      `"connection_id":${JSON.stringify(connectionId)}`,
+      `"connection_version":${JSON.stringify(version)}`,
+      ...(rejectedTokenSha256
+        ? [`"rejected_token_sha256":${JSON.stringify(rejectedTokenSha256)}`]
+        : []),
+      ...(timeoutMs !== undefined
+        ? [`"timeout_ms":${Math.max(1, Math.ceil(timeoutMs))}`]
+        : []),
+      `"request":${body}`,
+    ].join(",")}}`;
+    const res = await this.fetchImpl(
+      `${this.baseUrl}/internal/core/personas/${persona}/model/chatgpt/responses`,
+      {
+        method: "POST",
+        redirect: "manual",
+        signal,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+        },
+        body: envelope,
+      },
+    );
+    // Only a response the API authored is interpreted. Anything else (a
+    // tunnel/VPC 5xx after the API may already have dispatched, a missing
+    // route) has unknown acceptance and is never replayed automatically.
+    if (!res.headers?.get("X-Sumi-Model-Transport")) {
+      await res.body?.cancel().catch(() => {});
+      throw new ModelError(
+        `ChatGPT transport: HTTP ${res.status} did not come from the Sumi API; acceptance is unknown`,
+        { retryable: false },
+      );
+    }
+    const code = res.headers.get("X-Sumi-Model-Error");
+    if (code) {
+      await res.body?.cancel().catch(() => {});
+      if (code === "request_too_large") {
+        // Nothing was sent. Deterministic for this request, so the turn
+        // may continue with a smaller working view like any size refusal.
+        throw new ModelError(
+          "ChatGPT transport: request exceeds the transport size limit; it was not sent",
+          { retryable: false, refusal: "context_length" },
+        );
+      }
+      const cause =
+        code === "model_reconnect_required" ||
+        code === "model_connection_disabled"
+          ? code
+          : undefined;
+      throw new ModelError(
+        `ChatGPT transport: ${cause ?? (code === "binding_changed" ? "selected connection changed before dispatch" : code === "credential_unavailable" ? "credential unavailable before dispatch" : "request could not be completed")}`,
+        {
+          retryable:
+            code === "binding_changed" || code === "credential_unavailable",
+          unavailable: code !== "transport_ambiguous",
+          cause,
+        },
+      );
+    }
+    if (
+      res.status === 401 &&
+      !res.headers.get("X-Sumi-ChatGPT-Rejected-Token")
+    ) {
+      await res.body?.cancel().catch(() => {});
+      throw new ModelError("Core service authorization failed", {
+        retryable: false,
+        unavailable: true,
+      });
+    }
+    return new Response(res.body, { status: res.status, headers: res.headers });
   }
   async completeOperation(
     persona: string,

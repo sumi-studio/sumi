@@ -60,6 +60,9 @@ type interactiveIO struct {
 	op   ProcessOperation
 	tty  *ttyLog
 	done chan struct{}
+	// supervised is closed when the supervisor goroutine has returned and
+	// will write nothing more; nil when no supervisor was started.
+	supervised chan struct{}
 
 	// attached reports whether the journal pump currently has the
 	// daemon journal open and is appending records. False on a live op
@@ -103,7 +106,11 @@ func (s *processStore) ensureInteractive(r *processRecord) (*interactiveIO, erro
 	io_ := &interactiveIO{op: r.Operation, tty: tty, done: make(chan struct{})}
 	r.interactive = io_
 	if !r.Operation.State.terminal() {
-		go s.superviseInteractive(io_)
+		io_.supervised = make(chan struct{})
+		go func() {
+			defer close(io_.supervised)
+			s.superviseInteractive(io_)
+		}()
 	}
 	return io_, nil
 }

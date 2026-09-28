@@ -39,6 +39,31 @@ func liveIO(t *testing.T) *interactiveIO {
 	return io_
 }
 
+// stopSupervisorAtCleanup ends a service-started live op and waits for its
+// supervisor goroutine to return. Otherwise it keeps committing ttylog
+// cursors under the state directory while that TempDir is being removed
+// ("TempDir RemoveAll cleanup: directory not empty").
+func stopSupervisorAtCleanup(t *testing.T, svc *Service, opID string, io_ *interactiveIO) {
+	t.Helper()
+	if io_.supervised == nil {
+		t.Fatal("no interactive supervisor")
+	}
+	t.Cleanup(func() {
+		svc.processes.mu.Lock()
+		rec := svc.processes.records[opID]
+		svc.processes.mu.Unlock()
+		rec.mu.Lock()
+		rec.Operation.State = ProcessSucceeded
+		rec.mu.Unlock()
+		svc.processes.stopInteractive(io_)
+		select {
+		case <-io_.supervised:
+		case <-time.After(5 * time.Second):
+			t.Error("interactive supervisor did not stop")
+		}
+	})
+}
+
 func mustRead(t *testing.T, io_ *interactiveIO, off int64) string {
 	t.Helper()
 	b, ok := io_.live.read(off, 1<<20)
@@ -205,6 +230,7 @@ func TestReadProcessOutputLiveTailThenJournalNoDuplicate(t *testing.T) {
 	if io_ == nil {
 		t.Fatal("no interactive supervisor")
 	}
+	stopSupervisorAtCleanup(t, svc, op.OperationID, io_)
 	io_.startLive(&blockingStream{closed: make(chan struct{})})
 	io_.live.delivered([]byte("a$ "))
 	read := func(off int64) ProcessOutput {

@@ -9,7 +9,7 @@ import {
 import { Button } from "@sumi/ui/components/button";
 import { Marker, MarkerContent } from "@sumi/ui/components/marker";
 import { useCallback, useState } from "react";
-import type { ChatItem } from "../agent/model";
+import type { ChatItem, ModelFailureCause } from "../agent/model";
 import { userItemSourceLabel, userItemText } from "../lib/user-item-text";
 import { ApprovalConfirmation } from "./approval-confirmation";
 import { ModelProviderSettings } from "./model-provider-settings";
@@ -147,8 +147,8 @@ export function ChatItemView({
         </Marker>
       );
     case "error":
-      if (item.cause === "no_model_connection") {
-        return <NoModelConnectionError />;
+      if (item.cause) {
+        return <ModelConnectionError cause={item.cause} />;
       }
       return (
         <div
@@ -161,25 +161,54 @@ export function ChatItemView({
   }
 }
 
+const MODEL_FAILURE_COPY: Record<
+  ModelFailureCause,
+  { cause: string; next: string }
+> = {
+  no_model_connection: {
+    cause: "モデル接続が選択されていないため、応答できませんでした。",
+    next: "「AIの接続」で使う接続を選ぶと、次のメッセージに応答できるようになります。",
+  },
+  model_reconnect_required: {
+    cause:
+      "ChatGPTへのログインが期限切れか取り消されたため、応答できませんでした。",
+    next: "「AIの接続」でChatGPTに再接続すると、次のメッセージに応答できるようになります。",
+  },
+  model_auth_rejected: {
+    cause:
+      "ChatGPTが、更新したばかりのログインでもこの接続からの利用を受け付けなかったため、応答できませんでした。理由はChatGPT側からは示されていません。",
+    next: "時間をおいてもう一度お試しいただくか、「AIの接続」で別の接続を選んでください。",
+  },
+  model_connection_disabled: {
+    cause:
+      "選択中のChatGPT接続は、このサーバーでは現在使えないため、応答できませんでした。",
+    next: "「AIの接続」で別の接続を選ぶと、次のメッセージに応答できるようになります。",
+  },
+  model_usage_limit: {
+    cause: "ChatGPTのプランの利用上限に達したため、応答できませんでした。",
+    next: "上限がリセットされるまで待つか、「AIの接続」で別の接続を選んでください。",
+  },
+};
+
 /**
- * The one classified failure the user can fix themselves: no model
- * connection is selected. States the cause in Japanese and opens the
- * existing connection settings — the committed turn stays visible above,
- * so the copy says nothing about resending and nothing about work already
- * applied.
+ * The classified failures the user can act on: no usable model
+ * connection, an expired or refused ChatGPT sign-in, a connection kind
+ * this server has turned off, or a reached plan limit. States
+ * the cause in Japanese and opens the existing connection settings — the
+ * committed turn stays visible above, so the copy says nothing about
+ * resending and nothing about work already applied.
  */
-function NoModelConnectionError() {
+function ModelConnectionError({ cause }: { cause: ModelFailureCause }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const copy = MODEL_FAILURE_COPY[cause];
   return (
     <>
       <div
         role="alert"
         className="my-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-red-700 text-sm"
       >
-        <p>モデル接続が選択されていないため、応答できませんでした。</p>
-        <p className="mt-1">
-          「AIの接続」で使う接続を選ぶと、次のメッセージに応答できるようになります。
-        </p>
+        <p>{copy.cause}</p>
+        <p className="mt-1">{copy.next}</p>
         <Button
           variant="outline"
           size="sm"

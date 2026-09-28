@@ -132,6 +132,14 @@ func failureNoticeCause(f agentstate.TerminalFailure) string {
 		return "モデル接続が選択されていないため、応答できませんでした。"
 	case "oversize_plan":
 		return "回答が大きすぎて記録できませんでした（1リクエストのサイズ上限を超えました）。"
+	case "model_reconnect_required":
+		return "ChatGPTへのログインが期限切れか取り消されたため、応答できませんでした。"
+	case "model_auth_rejected":
+		return "ChatGPTが、更新したばかりのログインでもこの接続からの利用を受け付けなかったため、応答できませんでした。理由はChatGPT側からは示されていません。"
+	case "model_connection_disabled":
+		return "選択中のChatGPT接続は、このサーバーでは現在使えないため、応答できませんでした。"
+	case "model_usage_limit":
+		return "ChatGPTのプランの利用上限に達したため、応答できませんでした。"
 	}
 	return "予期しない問題が発生しました。"
 }
@@ -150,6 +158,14 @@ func failureNoticeNext(f agentstate.TerminalFailure, effectsCommitted bool) stri
 			return "一部の処理はすでに実行された可能性があります。「AIの接続」で使う接続を選んでから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
 		case "oversize_plan":
 			return "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを分けて、新しいメッセージでお知らせください。"
+		case "model_reconnect_required":
+			return "一部の処理はすでに実行された可能性があります。「AIの接続」でChatGPTに再接続してから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
+		case "model_auth_rejected":
+			return "一部の処理はすでに実行された可能性があります。時間をおくか「AIの接続」で別の接続を選んでから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
+		case "model_connection_disabled":
+			return "一部の処理はすでに実行された可能性があります。「AIの接続」で別の接続を選んでから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
+		case "model_usage_limit":
+			return "一部の処理はすでに実行された可能性があります。上限がリセットされるか別の接続を選んでから、状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
 		}
 		return "一部の処理はすでに実行された可能性があります。状態を確認のうえ、まだ必要なことを新しいメッセージでお知らせください。"
 	}
@@ -158,6 +174,14 @@ func failureNoticeNext(f agentstate.TerminalFailure, effectsCommitted bool) stri
 		return "このリクエストによる送信や変更は行われていません。「AIの接続」で使う接続を選んでから、もう一度お尋ねください。"
 	case "oversize_plan":
 		return "このリクエストによる送信や変更は行われていません。内容を分けて、もう一度お尋ねください。"
+	case "model_reconnect_required":
+		return "このリクエストによる送信や変更は行われていません。「AIの接続」でChatGPTに再接続してから、もう一度お尋ねください。"
+	case "model_auth_rejected":
+		return "このリクエストによる送信や変更は行われていません。時間をおいてもう一度お尋ねいただくか、「AIの接続」で別の接続を選んでください。"
+	case "model_connection_disabled":
+		return "このリクエストによる送信や変更は行われていません。「AIの接続」で別の接続を選んでから、もう一度お尋ねください。"
+	case "model_usage_limit":
+		return "このリクエストによる送信や変更は行われていません。上限がリセットされてから、または「AIの接続」で別の接続を選んでから、もう一度お尋ねください。"
 	}
 	return "このリクエストによる送信や変更は行われていません。もう一度お尋ねください。"
 }

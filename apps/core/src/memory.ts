@@ -308,6 +308,13 @@ export const isInternalActor = (actorKind: unknown): boolean =>
 const FAILURE_REASONS: Record<string, string> = {
   no_model_connection: "no model connection was selected",
   oversize_plan: "the reply exceeded the size that can be recorded",
+  model_reconnect_required:
+    "the ChatGPT sign-in for the selected connection expired or was revoked",
+  model_auth_rejected:
+    "ChatGPT rejected the refreshed sign-in of the selected connection",
+  model_connection_disabled:
+    "the selected connection's kind is not enabled on this server",
+  model_usage_limit: "the selected subscription's usage limit was reached",
 };
 
 /** Map one journal event to the model-visible message, or null for kinds

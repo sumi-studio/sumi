@@ -16,6 +16,30 @@ export interface ChatMessage {
    * calls — used to feed committed tool results back to the model.
    */
   toolCalls?: ToolCall[];
+  /**
+   * Opaque provider continuation recorded with this assistant round (see
+   * ProviderContinuation); a provider replays it only when its scope
+   * matches the connection it is about to call.
+   */
+  continuation?: ProviderContinuation;
+}
+
+/**
+ * Opaque provider data that continues a model's work across the tool
+ * rounds of one turn — the encrypted reasoning items of the Responses API.
+ * It is not readable reasoning and not conversation content: the bytes are
+ * sealed by the provider, stored with the round in the durable plan, and
+ * resent unchanged on the next round's request so the model continues
+ * rather than restarts its reasoning. `scope` names the provider account
+ * and model that produced it (a digest, not an identifier); another
+ * connection or model never receives it. `output` keeps the round's output
+ * order: reasoning items verbatim, and references (type + ids) to the
+ * function calls, and each message's own assistant text. These bounded
+ * message snapshots preserve positions that the round's combined text loses.
+ */
+export interface ProviderContinuation {
+  scope: string;
+  output: Record<string, unknown>[];
 }
 
 export interface ToolSpec {
@@ -39,7 +63,12 @@ export interface ToolCall {
 export type ModelEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; call: ToolCall }
-  | { type: "done"; usage: Record<string, unknown> };
+  | {
+      type: "done";
+      usage: Record<string, unknown>;
+      /** Present when the provider returned continuation data. */
+      continuation?: ProviderContinuation;
+    };
 
 export interface ModelRequest {
   personaId: string;
@@ -121,12 +150,20 @@ export interface ModelProvider {
  * settings. It is set only where the cause is certain; everything else
  * stays unclassified rather than guessing at a provider taxonomy.
  */
+/** The model-side subset of the bounded failure classifications. */
+export type ModelFailureCause =
+  | "no_model_connection"
+  | "model_reconnect_required"
+  | "model_auth_rejected"
+  | "model_connection_disabled"
+  | "model_usage_limit";
+
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
   readonly refusal?: "context_length";
   readonly unavailable?: boolean;
-  readonly cause?: "no_model_connection";
+  readonly cause?: ModelFailureCause;
   constructor(
     message: string,
     opts: {
@@ -134,7 +171,7 @@ export class ModelError extends Error {
       retryAfterMs?: number;
       refusal?: "context_length";
       unavailable?: boolean;
-      cause?: "no_model_connection";
+      cause?: ModelFailureCause;
     },
   ) {
     super(message);

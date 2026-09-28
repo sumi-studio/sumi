@@ -140,6 +140,7 @@ func TestLiveTailLossMarkerReachesReaderAlreadyAhead(t *testing.T) {
 		t.Fatal(err)
 	}
 	io_ := svc.processes.interactiveIOFor(op.OperationID)
+	stopSupervisorAtCleanup(t, svc, op.OperationID, io_)
 	io_.startLive(&blockingStream{closed: make(chan struct{})})
 	t.Cleanup(io_.live.off)
 	io_.live.delivered([]byte("abcdef"))
