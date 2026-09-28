@@ -20,7 +20,7 @@ func TestReviewCopytruncateInPlaceLosesSilently(t *testing.T) {
 	dir := t.TempDir()
 	journal := journalFile(t, dir, "old\r\n")
 	b := &interactiveTestBackend{
-		processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()},
+		processTestBackend: &processTestBackend{},
 		journal:            journal,
 	}
 	s, err := newProcessStore(dir+"/state", b)
@@ -100,7 +100,7 @@ func TestReviewCopytruncateSingleAppend(t *testing.T) {
 	dir := t.TempDir()
 	journal := journalFile(t, dir, "old\r\n")
 	b := &interactiveTestBackend{
-		processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()},
+		processTestBackend: &processTestBackend{},
 		journal:            journal,
 	}
 	s, err := newProcessStore(dir+"/state", b)

@@ -1,5 +1,0 @@
-data: {"id":"glm-1","model":"glm-5.2","choices":[{"delta":{"reasoning":"think","tool_calls":[{"index":0,"id":"call-2","function":{"name":"bash","arguments":"{\"route\":\"normal\",\"input\":{\"command\":\"pwd\"}}"}}]},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-
-: fixture eof

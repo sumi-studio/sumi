@@ -3,7 +3,7 @@ const CanonicalUUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Mirrors Rust `Uuid::new_v5(USER_MESSAGE_ID_NAMESPACE,
+ * Uses UUIDv5 with `USER_MESSAGE_ID_NAMESPACE` and
  * command_id.as_uuid().as_bytes())`.
  */
 export function userMessageIdFromCommandId(commandId: string): string {

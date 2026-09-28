@@ -3,37 +3,15 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
-	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 )
-
-const chatGPTAccessPath = "/internal/providers/chatgpt/access"
-
-type chatGPTConnectionStore interface {
-	Status(context.Context, string) (chatgpt.Status, error)
-	ResolveAccess(context.Context, string, string, string, chatgpt.RefreshFunc) (chatgpt.Access, error)
-}
-type chatGPTEmployerAuthority interface {
-	CurrentEmployer(context.Context, string) (string, string, error)
-	AuthorizeCurrentHumanEmployer(context.Context, string, string, func() error) error
-}
-type chatGPTRuntime struct {
-	selection   userModelStore
-	connections chatGPTConnectionStore
-	employers   chatGPTEmployerAuthority
-	refresh     chatgpt.RefreshFunc
-}
-type runtimeActivationResolver func(context.Context, string, runtimeprovision.ActivationConfig) (runtimeprovision.ActivationConfig, error)
 
 func chatGPTStoreFromEnv(pool *pgxpool.Pool) (*chatgpt.Store, error) {
 	raw := strings.TrimSpace(os.Getenv("SUMI_CHATGPT_CREDENTIAL_KEY"))
@@ -49,109 +27,6 @@ func chatGPTStoreFromEnv(pool *pgxpool.Pool) (*chatgpt.Store, error) {
 		return nil, errors.New("ChatGPT connections require the control-plane database")
 	}
 	return chatgpt.New(pool, key)
-}
-
-func (c *chatGPTRuntime) authorizeSelection(ctx context.Context, human string) error {
-	if c.selection == nil {
-		return nil
-	}
-	selected, exists, err := c.selection.Selected(ctx, human)
-	if err != nil {
-		return err
-	}
-	if exists && selected.Kind != "chatgpt" {
-		return errors.New("ChatGPT is no longer the selected connection")
-	}
-	return nil
-}
-
-func (c *chatGPTRuntime) withHuman(ctx context.Context, pa string, operation func(string) error) error {
-	kind, human, err := c.employers.CurrentEmployer(ctx, pa)
-	if err != nil {
-		return err
-	}
-	if kind != "human" {
-		return errors.New("ChatGPT connection requires a current Human employer")
-	}
-	return c.employers.AuthorizeCurrentHumanEmployer(ctx, human, pa, func() error {
-		if err := c.authorizeSelection(ctx, human); err != nil {
-			return err
-		}
-		return operation(human)
-	})
-}
-
-func (c *chatGPTRuntime) activation(ctx context.Context, pa string, base runtimeprovision.ActivationConfig) (runtimeprovision.ActivationConfig, error) {
-	kind, human, err := c.employers.CurrentEmployer(ctx, pa)
-	if err != nil {
-		return base, err
-	}
-	if kind != "human" {
-		return base, nil
-	}
-	err = c.employers.AuthorizeCurrentHumanEmployer(ctx, human, pa, func() error {
-		if err := c.authorizeSelection(ctx, human); err != nil {
-			return err
-		}
-		status, err := c.connections.Status(ctx, human)
-		if err != nil {
-			return err
-		}
-		if !status.Connected {
-			return nil
-		}
-		if status.ReconnectRequired {
-			return chatgpt.ErrReconnectRequired
-		}
-		base.ModelPreset = "chatgpt-responses"
-		base.ModelID = status.Model
-		base.ModelReasoningEffort = status.Effort
-		base.ModelAccountScope = status.AccountID
-		base.ChatGPTConnectionID = status.ConnectionID
-		base.ProviderAPIKey = ""
-		return nil
-	})
-	return base, err
-}
-
-func (c *chatGPTRuntime) register(control *agentevents.LocalControlServer) error {
-	return control.RegisterAuthorizedRoute("POST "+chatGPTAccessPath, c.access)
-}
-func (c *chatGPTRuntime) access(w http.ResponseWriter, r *http.Request, authorization agentevents.LocalRuntimeAuthorization) {
-	w.Header().Set("Cache-Control", "no-store")
-	var request struct {
-		ConnectionID  string `json:"connection_id"`
-		RejectedToken string `json:"rejected_access_token,omitempty"`
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 70<<10))
-	if err != nil || agentevents.DecodeStrictJSON(body, &request) != nil || request.ConnectionID == "" || len(request.ConnectionID) > 256 || len(request.RejectedToken) > 65536 {
-		http.Error(w, "invalid ChatGPT access request", http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	committed := false
-	err = c.withHuman(ctx, authorization.PersonalityAgentID, func(human string) error {
-		access, err := c.connections.ResolveAccess(ctx, human, request.ConnectionID, request.RejectedToken, c.refresh)
-		if err != nil {
-			return err
-		}
-		// Secret disclosure remains inside the current-employer lease.
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
-		w.Header().Set("Content-Type", "application/json")
-		committed = true
-		return json.NewEncoder(w).Encode(struct {
-			ConnectionID string    `json:"connection_id"`
-			AccountID    string    `json:"account_id"`
-			AccessToken  string    `json:"access_token"`
-			ExpiresAt    time.Time `json:"expires_at"`
-			Model        string    `json:"model"`
-			Effort       string    `json:"effort"`
-		}{access.ConnectionID, access.AccountID, access.Token, access.ExpiresAt, access.Model, access.Effort})
-	})
-	if err != nil && !committed {
-		http.Error(w, "ChatGPT connection unavailable; reconnect or retry", http.StatusServiceUnavailable)
-	}
 }
 
 func chatGPTBrowserIdentity(sessions agentevents.UserSessionAuthorizer, origins []string) func(*http.Request) (chatgpt.LoginIdentity, error) {

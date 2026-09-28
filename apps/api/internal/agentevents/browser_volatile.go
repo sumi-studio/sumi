@@ -1,6 +1,9 @@
 package agentevents
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"errors"
+)
 
 const (
 	maxBrowserVolatileEvents   = 64
@@ -69,4 +72,18 @@ func mergeBrowserDelta(previous, next Envelope) (Envelope, bool) {
 	}
 	previous.Event = raw
 	return previous, true
+}
+
+// PublishVolatile broadcasts a validated transient browser update without persisting it.
+func (g *BrowserJournal) PublishVolatile(envelope Envelope) error {
+	if err := validateEnvelope(envelope); err != nil {
+		return err
+	}
+	if envelope.Seq != nil {
+		return errors.New("volatile events cannot have a durable sequence")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.publishVolatileLocked(envelope.PersonalityAgentID, envelope)
+	return nil
 }

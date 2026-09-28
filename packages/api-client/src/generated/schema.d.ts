@@ -584,29 +584,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/agent/ws": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Agent-facing WebSocket
-         * @description Upgrades to a WebSocket for agent workers. After the handshake the agent
-         *     sends `AgentHello` followed by `OutboundFrame` messages, and the server
-         *     replies with `ApiHello` followed by `CommandEnvelope` messages. The
-         *     caller is authenticated by a short-lived `Authorization: Bearer` token.
-         */
-        get: operations["agentWebSocket"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -894,11 +871,6 @@ export interface components {
         /** @description non-negative integer representable exactly by JavaScript number clients */
         JsonSafeInteger: number;
         /**
-         * Format: canonical-process-generation
-         * @description canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
-         */
-        ProcessGeneration: string;
-        /**
          * Format: canonical-decimal-u64
          * @description canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
          */
@@ -936,28 +908,6 @@ export interface components {
                 /** @constant */
                 surface: "direct_chat";
             };
-        };
-        AgentHello: {
-            personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            generation: components["schemas"]["ProcessGeneration"];
-            last_sent_event_seq: components["schemas"]["CanonicalDecimalU64"];
-            last_received_command_seq: components["schemas"]["CanonicalDecimalU64"];
-            last_applied_command_seq: components["schemas"]["CanonicalDecimalU64"];
-        };
-        ApiHello: {
-            personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            accepted_generation: components["schemas"]["ProcessGeneration"];
-            last_received_event_seq: components["schemas"]["CanonicalDecimalU64"];
-            next_command_seq: components["schemas"]["CanonicalDecimalU64"];
-        };
-        OutboundFrame: {
-            /** @constant */
-            frame_type: "event";
-            envelope: components["schemas"]["Envelope"];
-        } | {
-            /** @constant */
-            frame_type: "command_ack";
-            ack: components["schemas"]["CommandAck"];
         };
         BrowserClientFrame: components["schemas"]["BrowserHello"] | components["schemas"]["BrowserCommandFrame"];
         BrowserServerFrame: components["schemas"]["BrowserEventFrame"] | components["schemas"]["BrowserCommandAcceptedFrame"] | components["schemas"]["BrowserCommandRejectedFrame"] | components["schemas"]["DirectChatStatusFrame"];
@@ -1775,27 +1725,6 @@ export interface components {
             content: string;
         };
         IncomingProvenance: components["schemas"]["DirectChatProvenanceV1"] | components["schemas"]["ExternalProvenanceV2"] | components["schemas"]["ApprovalOperationProvenanceV2"];
-        DurableEnvelope: {
-            personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            audience: components["schemas"]["OutputAudience"];
-            event: components["schemas"]["DurableAgentEvent"];
-            seq: components["schemas"]["JsonSafeInteger"];
-        };
-        VolatileEnvelope: {
-            personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            audience: components["schemas"]["OutputAudience"];
-            event: components["schemas"]["VolatileAgentEvent"];
-        };
-        Envelope: components["schemas"]["DurableEnvelope"] | components["schemas"]["VolatileEnvelope"];
-        CommandAck: {
-            seq: components["schemas"]["JsonSafeInteger"];
-            /** Format: uuid */
-            command_id: string;
-            personality_agent_id: components["schemas"]["PersonalityAgentId"];
-            /** @enum {string} */
-            status: "received" | "applied" | "superseded" | "rejected";
-            reject_reason?: components["schemas"]["CommandRejectReason"];
-        };
     };
     responses: {
         /** @description Strict JSON or domain validation failed */
@@ -3358,45 +3287,6 @@ export interface operations {
             };
             /** @description App or Employer authority store unavailable */
             503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    agentWebSocket: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** @description The first WebSocket frame (AgentHello) */
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["AgentHello"];
-            };
-        };
-        responses: {
-            /** @description WebSocket upgrade */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiHello"];
-                };
-            };
-            /** @description Missing or invalid agent token */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Origin not allowed */
-            403: {
                 headers: {
                     [name: string]: unknown;
                 };

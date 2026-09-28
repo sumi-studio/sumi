@@ -18,7 +18,7 @@ func agedClock() time.Time { return time.Now().Add(time.Hour) }
 
 // requireEventStatFastPath skips tests of the metadata fast path on a test
 // filesystem outside its contract, where every refresh re-verifies in full.
-func requireEventStatFastPath(t *testing.T, g *DurableGateway) {
+func requireEventStatFastPath(t *testing.T, g *BrowserJournal) {
 	t.Helper()
 	if !g.eventStatFastPath {
 		t.Skip("test directory filesystem is outside the event-log metadata fast path contract")
@@ -37,7 +37,7 @@ func eventFileChangeTime(t *testing.T, path string) time.Time {
 
 // countEventLogReads counts bytes read from personalityAgentID's event log
 // through g from now on.
-func countEventLogReads(g *DurableGateway, personalityAgentID string) *atomic.Int64 {
+func countEventLogReads(g *BrowserJournal, personalityAgentID string) *atomic.Int64 {
 	var n atomic.Int64
 	open := g.newFile
 	path := g.eventPath(personalityAgentID)
@@ -53,7 +53,7 @@ func countEventLogReads(g *DurableGateway, personalityAgentID string) *atomic.In
 
 // seedProjectedRun commits one closed run of n messages through the
 // projection append path.
-func seedProjectedRun(t *testing.T, g *DurableGateway, personalityAgentID string, first, n int) {
+func seedProjectedRun(t *testing.T, g *BrowserJournal, personalityAgentID string, first, n int) {
 	t.Helper()
 	batch := []ProjectedEvent{{RunMarker: RunMarkerStart}}
 	for i := first; i < first+n; i++ {
@@ -123,7 +123,7 @@ func TestTrustedEventTailStillSeesOtherWritersAndRewrites(t *testing.T) {
 
 	// Another API process over the same durable directory commits a pending
 	// approval inside a run.
-	other, err := OpenDurableGateway(g.dir, g.commands)
+	other, err := OpenBrowserJournal(g.dir, g.commands)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,7 +369,7 @@ func TestTrustedEventTailRefusesStaleIfTail(t *testing.T) {
 	}
 	mark := g.observedEventTail(historyPA)
 
-	other, err := OpenDurableGateway(g.dir, g.commands)
+	other, err := OpenBrowserJournal(g.dir, g.commands)
 	if err != nil {
 		t.Fatal(err)
 	}

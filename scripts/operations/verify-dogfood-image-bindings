@@ -10,7 +10,7 @@ import {
 import { inspectDockerObject } from "./dogfood-docker.mjs";
 
 const SOURCE = "https://github.com/sumi-studio/sumi";
-const ROLES = ["api", "agent", "provisioner", "web"];
+const ROLES = ["api", "core", "job", "provisioner", "web"];
 const REPOSITORIES = Object.fromEntries(
   ROLES.map((role) => [role, `ghcr.io/sumi-studio/sumi-${role}`]),
 );

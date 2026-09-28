@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -45,15 +46,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := agentevents.OpenDurableGateway(filepath.Join(dir, "runtime"), store)
+	gateway, err := agentevents.OpenBrowserJournal(filepath.Join(dir, "runtime"), store)
 	if err != nil {
 		log.Fatal(err)
 	}
 	gateway.PollInterval = 5 * time.Millisecond
-	receipt := "browser-e2e-ready"
-	if err := gateway.PublishRuntimeState("018f47a2-9b3c-7def-8abc-0123456789ab", 1, &receipt); err != nil {
-		log.Fatal(err)
-	}
 	browserSessions, err := agentevents.NewHMACUserSessionVerifier(
 		secret,
 		"",
@@ -78,12 +75,10 @@ func main() {
 	// Use the same production router as cmd/server so the E2E journey exercises
 	// production wiring. We do not expose the agent WebSocket boundary in this
 	// fixture; nil TokenVerifier makes it fail-closed.
-	mux, browser, _, err := agentevents.NewProductionMux(
+	mux, browser, err := agentevents.NewProductionMux(
 		store,
 		gateway,
-		nil,
 		browserSessions,
-		nil,
 		[]string{"http://127.0.0.1:4173"},
 		fixtureDirectChatAuthorizer{},
 		directchat.NewLifecycleFence(),
@@ -142,7 +137,7 @@ func main() {
 
 type fixture struct {
 	store   *agentevents.CommandStore
-	gateway *agentevents.DurableGateway
+	gateway *agentevents.BrowserJournal
 	mu      sync.Mutex
 	seq     uint64
 	from    uint64
@@ -151,7 +146,7 @@ type fixture struct {
 	once    sync.Once
 }
 
-func newFixture(store *agentevents.CommandStore, gateway *agentevents.DurableGateway) *fixture {
+func newFixture(store *agentevents.CommandStore, gateway *agentevents.BrowserJournal) *fixture {
 	f := &fixture{store: store, gateway: gateway, aborted: make(chan struct{})}
 	go f.run()
 	return f
@@ -240,15 +235,14 @@ func (f *fixture) emitTerminalEvent() error {
 
 func (f *fixture) durable(event string) {
 	f.seq++
-	seq := f.seq
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Audience: agentevents.AudienceDirectChat, Seq: &seq, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
+	err := f.gateway.AppendProjectedEvents(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab", []agentevents.ProjectedEvent{{Event: json.RawMessage(event), DedupKey: sha256.Sum256([]byte(fmt.Sprintf("%d:%s", f.seq, event)))}})
 	if err != nil {
 		log.Printf("fixture durable event: %v", err)
 	}
 }
 
 func (f *fixture) volatile(event string) {
-	err := f.gateway.Receive(context.Background(), agentevents.TokenClaims{TenantID: "tenant", PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Generation: 1}, agentevents.Envelope{Audience: agentevents.AudienceDirectChat, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
+	err := f.gateway.PublishVolatile(agentevents.Envelope{Audience: agentevents.AudienceDirectChat, PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab", Event: json.RawMessage(event)})
 	if err != nil {
 		log.Printf("fixture volatile event: %v", err)
 	}

@@ -491,19 +491,6 @@ export type CommandEnvelope =
     };
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "OutboundFrame".
- */
-export type OutboundFrame =
-  | {
-      frame_type: "event";
-      envelope: Envelope;
-    }
-  | {
-      frame_type: "command_ack";
-      ack: CommandAck;
-    };
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "BrowserClientFrame".
  */
 export type BrowserClientFrame = BrowserHello | BrowserCommandFrame;
@@ -541,13 +528,6 @@ export type DirectChatStatusFrame =
  */
 export type BrowserServerFrame =
   BrowserEventFrame | BrowserCommandAcceptedFrame | BrowserCommandRejectedFrame | DirectChatStatusFrame;
-/**
- * canonical decimal process generation in 0..=9223372036854775807; encoded as a string to preserve it losslessly in JavaScript
- *
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ProcessGeneration".
- */
-export type ProcessGeneration = string;
 /**
  * canonical decimal u64 encoded as a string to preserve it losslessly in JavaScript
  *
@@ -1015,17 +995,6 @@ export interface ExternalEventCommand {
 }
 /**
  * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "CommandAck".
- */
-export interface CommandAck {
-  seq: JsonSafeInteger;
-  command_id: string;
-  personality_agent_id: PersonalityAgentId;
-  status: "received" | "applied" | "superseded" | "rejected";
-  reject_reason?: CommandRejectReason;
-}
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
  * via the `definition` "BrowserHello".
  */
 export interface BrowserHello {
@@ -1108,25 +1077,4 @@ export interface BrowserCommandRejectedFrame {
  */
 export interface Attachment {
   [k: string]: unknown;
-}
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "AgentHello".
- */
-export interface AgentHello {
-  personality_agent_id: PersonalityAgentId;
-  generation: ProcessGeneration;
-  last_sent_event_seq: CanonicalDecimalU64;
-  last_received_command_seq: CanonicalDecimalU64;
-  last_applied_command_seq: CanonicalDecimalU64;
-}
-/**
- * This interface was referenced by `HttpsSumiDevContractsAgentEventsYaml`'s JSON-Schema
- * via the `definition` "ApiHello".
- */
-export interface ApiHello {
-  personality_agent_id: PersonalityAgentId;
-  accepted_generation: ProcessGeneration;
-  last_received_event_seq: CanonicalDecimalU64;
-  next_command_seq: CanonicalDecimalU64;
 }

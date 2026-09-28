@@ -225,8 +225,6 @@ ensure_runtime_env_file() {
     (
       umask 077
       {
-        printf 'SUMI_APPROVAL_SECRET_DIGEST_KEY=%s\n' "$(random_token)"
-        printf 'SUMI_AGENT_TOKEN_SECRET=%s\n' "$(random_base64)"
         printf 'SUMI_BROWSER_SESSION_SECRET=%s\n' "$(random_base64)"
       } > "${temporary}"
     )
@@ -392,7 +390,9 @@ fi
 ensure_runtime_env_file
 lock_runtime_env_file
 load_env_file "${RUNTIME_ENV_FILE}"
-ensure_persisted_runtime_secret SUMI_BROWSER_SESSION_SECRET
+for name in SUMI_BROWSER_SESSION_SECRET SUMI_CORE_STATE_TOKEN SUMI_CORE_RUNTIME_TOKEN SUMI_CORE_WAKE_TOKEN; do
+  ensure_persisted_runtime_secret "${name}"
+done
 
 # Bind only one exact host address. Accept the existing real-stack listen
 # setting when it uses the full-stack API port so the same ignored env file can
@@ -411,28 +411,7 @@ else
 fi
 export SUMI_DEV_WEB_ORIGIN="http://${SUMI_DEV_BROWSER_HOST}:5173"
 
-# Use a stable dev PAID. The API and the agent container share it. The API
-# grants the legacy env-agent authorization so the container can connect.
-export SUMI_PERSONALITY_AGENT_ID="0198f0f4-9b72-7000-8000-00000000000d"
-export SUMI_RPC_NONCE="dev-compose-0001"
-
-# Provide compose-scoped defaults if not already set by the env file.
 export SUMI_DB_URL="${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}"
-export SUMI_MODEL_PRESET="${SUMI_MODEL_PRESET:-kimi-k3}"
-export SUMI_AGENT_WRAPPING_KEY_ID="${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}"
-# How lazily provisioned PersonalityAgent runtimes obtain the agent image.
-# `always` (default) pulls ghcr.io on every spawn; `missing` reuses a locally
-# built image and pulls only when absent — for verifying a branch build without
-# pushing to the registry.
-export SUMI_AGENT_IMAGE_PULL_POLICY="${SUMI_AGENT_IMAGE_PULL_POLICY:-always}"
-[[ "${SUMI_AGENT_IMAGE_PULL_POLICY}" =~ ^(always|missing|never)$ ]] ||
-  fail "SUMI_AGENT_IMAGE_PULL_POLICY must be always, missing, or never"
-# Reusing a local image only makes sense for an explicitly pinned build tag;
-# the floating `latest` tag would still resolve to whatever was pulled last.
-if [[ "${ACTION}" != "down" && "${SUMI_AGENT_IMAGE_PULL_POLICY}" != "always" &&
-  ( -z "${SUMI_AGENT_IMAGE_TAG:-}" || "${SUMI_AGENT_IMAGE_TAG}" == "latest" ) ]]; then
-  fail "SUMI_AGENT_IMAGE_PULL_POLICY=${SUMI_AGENT_IMAGE_PULL_POLICY} requires SUMI_AGENT_IMAGE_TAG to name a specific local build (not latest)"
-fi
 export SUMI_AUTH_TENANT_ID="${SUMI_AUTH_TENANT_ID:-sumi-dev}"
 export SUMI_AUTH_FIREBASE_PROJECT_ID="${SUMI_AUTH_FIREBASE_PROJECT_ID:-sumi-studio}"
 export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-${SUMI_AUTH_FIREBASE_PROJECT_ID}}"
@@ -483,64 +462,11 @@ export SUMI_DEV_ALLOWED_HOSTS
 export SUMI_BROWSER_WS_ALLOWED_ORIGINS="${browser_origins}"
 export SUMI_AUTH_ALLOW_INSECURE_COOKIES="true"
 configure_calls
+COMPOSE_PROFILES_ARGUMENTS+=(--profile local-core)
 
 # The only mutable compatibility upgrade is complete. Release the advisory
 # lock before Docker Compose runs so a foreground stack does not block `down`.
 unlock_runtime_env_file
-
-# Runtime activation secrets stay in the API until they cross the typed
-# provisioner activation request for one exact prepared epoch.
-export SUMI_APPROVAL_SECRET_DIGEST_KEY="${SUMI_APPROVAL_SECRET_DIGEST_KEY:-$(random_token)}"
-
-# Agent token and local-control signing secrets stay in the API. Browser auth
-# uses the persisted session secret; Firebase Admin uses the emulator or ADC.
-export SUMI_AGENT_TOKEN_SECRET="${SUMI_AGENT_TOKEN_SECRET:-$(random_base64)}"
-export SUMI_LOCAL_CONTROL_TENANT_ID="${SUMI_LOCAL_CONTROL_TENANT_ID:-${SUMI_AUTH_TENANT_ID:-sumi-dev}}"
-export SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION="${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}"
-
-# An explicit Firebase web configuration is forwarded as a complete set from
-# the ignored env file. When it is entirely absent, Vite development uses the
-# checked-in local public configuration rather than receiving a partial set.
-# Resolve the configured provider credential exactly as the host real-stack
-# launcher does. A placeholder is allowed only when no credential variable was
-# configured at all, so compose/config smoke checks remain available without a
-# live model account.
-if [[ -n "${SUMI_MODEL_API_KEY_ENV:-}" ]]; then
-  [[ "${SUMI_MODEL_API_KEY_ENV}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-    fail "SUMI_MODEL_API_KEY_ENV must name one environment variable"
-  provider_api_key="${!SUMI_MODEL_API_KEY_ENV:-}"
-  [[ -n "${provider_api_key}" ]] ||
-    fail "${SUMI_MODEL_API_KEY_ENV} is required by the configured model provider"
-  [[ "${provider_api_key}" != *$'\n'* && "${provider_api_key}" != *$'\r'* ]] ||
-    fail "${SUMI_MODEL_API_KEY_ENV} must be one line"
-  export SUMI_PROVIDER_API_KEY="${provider_api_key}"
-else
-  export SUMI_PROVIDER_API_KEY="${SUMI_PROVIDER_API_KEY:-dummy}"
-fi
-
-if [[ "${SUMI_PROVIDER_API_KEY}" == "dummy" ]]; then
-  log "warning: SUMI_PROVIDER_API_KEY is unset; model provider calls will fail"
-fi
-
-for reviewer in EXECUTION ESCALATION; do
-  preset_name="SUMI_${reviewer}_REVIEWER_MODEL_PRESET"
-  key_env_name="SUMI_${reviewer}_REVIEWER_MODEL_API_KEY_ENV"
-  activation_key_name="SUMI_${reviewer}_REVIEWER_API_KEY"
-  export "${preset_name}=${!preset_name:-${SUMI_MODEL_PRESET}}"
-  credential_name="${!key_env_name:-}"
-  if [[ -n "${credential_name}" ]]; then
-    [[ "${credential_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-      fail "${key_env_name} must name one environment variable"
-    reviewer_api_key="${!credential_name:-}"
-    [[ -n "${reviewer_api_key}" ]] ||
-      fail "${credential_name} is required by the configured reviewer provider"
-  else
-    reviewer_api_key="${SUMI_PROVIDER_API_KEY}"
-  fi
-  [[ "${reviewer_api_key}" != *$'\n'* && "${reviewer_api_key}" != *$'\r'* ]] ||
-    fail "reviewer provider credential must be one line"
-  export "${activation_key_name}=${reviewer_api_key}"
-done
 
 case "${ACTION}" in
   up)

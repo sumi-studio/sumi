@@ -43,6 +43,8 @@ test("real Firebase mode selects both Compose files without rendering credential
       baseCompose,
       "-f",
       realCompose,
+      "--profile",
+      "local-core",
       "config",
       "--quiet",
     ]);
@@ -61,6 +63,8 @@ test("config remains quiet without a Docker credential file", async () => {
       "sumi-dev",
       "-f",
       baseCompose,
+      "--profile",
+      "local-core",
       "config",
       "--quiet",
     ]);
@@ -81,6 +85,8 @@ test("up validates and forwards a file-scoped Docker config", async () => {
       "sumi-dev",
       "-f",
       baseCompose,
+      "--profile",
+      "local-core",
       "up",
       "runtime-provisioner",
     ]);
@@ -158,6 +164,8 @@ test("down remains available without a Docker credential file", async () => {
       baseCompose,
       "--profile",
       "calls",
+      "--profile",
+      "local-core",
       "down",
     ]);
   } finally {
@@ -211,6 +219,8 @@ test("an unconfigured stack starts no media server", async () => {
       "sumi-dev",
       "-f",
       baseCompose,
+      "--profile",
+      "local-core",
       "up",
     ]);
   } finally {
@@ -238,6 +248,8 @@ test("both LiveKit credentials select the calls profile", async () => {
       baseCompose,
       "--profile",
       "calls",
+      "--profile",
+      "local-core",
       "up",
     ]);
   } finally {
@@ -272,6 +284,8 @@ test("half a LiveKit credential is refused, but teardown still runs", async (t) 
           baseCompose,
           "--profile",
           "calls",
+          "--profile",
+          "local-core",
           "down",
         ]);
       } finally {

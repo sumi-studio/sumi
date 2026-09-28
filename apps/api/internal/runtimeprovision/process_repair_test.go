@@ -77,7 +77,7 @@ func statusOf(t *testing.T, s *Service, ctx context.Context, op ProcessOperation
 // Quiesced may only become true once removal is verified.
 func TestTerminalIndeterminateKillsDelayedContainer(t *testing.T) {
 	ctx := context.Background()
-	b := &quiescenceBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &quiescenceBackend{processTestBackend: &processTestBackend{}}
 	s := newTestService(t, b)
 	op := startOp(t, s, ctx)
 	s.observeProcesses(ctx) // launch lands: running
@@ -113,7 +113,7 @@ func TestTerminalIndeterminateKillsDelayedContainer(t *testing.T) {
 // instead of certifying a writer that may still be alive.
 func TestTerminalStopFailureStaysNonQuiesced(t *testing.T) {
 	ctx := context.Background()
-	b := &quiescenceBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &quiescenceBackend{processTestBackend: &processTestBackend{}}
 	s := newTestService(t, b)
 	op := startOp(t, s, ctx)
 	s.observeProcesses(ctx)
@@ -140,7 +140,7 @@ func TestTerminalStopFailureStaysNonQuiesced(t *testing.T) {
 // A never-launched tombstone has no possible writer: quiesced at once.
 func TestTombstoneIsQuiesced(t *testing.T) {
 	ctx := context.Background()
-	b := &quiescenceBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &quiescenceBackend{processTestBackend: &processTestBackend{}}
 	s := newTestService(t, b)
 	paid := uuid.NewString()
 	op, err := s.CancelProcess(ctx, ProcessLookupRequest{
@@ -171,7 +171,7 @@ func TestTombstoneIsQuiesced(t *testing.T) {
 // and stops it — no writer survives the cut.
 func TestCancelledLaunchInFlightIsStopped(t *testing.T) {
 	ctx := context.Background()
-	b := &quiescenceBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &quiescenceBackend{processTestBackend: &processTestBackend{}}
 	s := newTestService(t, b)
 	op := startOp(t, s, ctx)
 	// Cancel before the first observe: the launch branch sees
@@ -330,7 +330,7 @@ func TestRecoverSourceDivergentTail(t *testing.T) {
 // must bound its retries and record a gap — not spin forever.
 func TestSuperviseTerminalReadFaultIsBounded(t *testing.T) {
 	ctx := context.Background()
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: filepath.Join(t.TempDir(), "nonexistent-json.log")}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: filepath.Join(t.TempDir(), "nonexistent-json.log")}
 	s := newTestService(t, b)
 	op := startOp(t, s, ctx)
 	s.observeProcesses(ctx)
@@ -504,7 +504,6 @@ echo "/var/lib/docker"
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	b := &DockerBackend{
 		baseEnvironment: []string{"COUNT_FILE=" + counter},
-		runner:          execCommandRunner{},
 	}
 	ctx := context.Background()
 

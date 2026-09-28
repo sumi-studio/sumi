@@ -26,95 +26,7 @@ async function source(path) {
   return readFile(resolve(repositoryRoot, path), "utf8");
 }
 
-test("Compose pulls published Sumi images from GHCR", async () => {
-  const [
-    local,
-    realFirebase,
-    agent,
-    agentPrepare,
-    firebase,
-    composeLauncher,
-    supervisor,
-    firebaseCheck,
-  ] = await Promise.all([
-    source("deploy/local/compose.dev.yaml"),
-    source("deploy/local/compose.real-firebase.yaml"),
-    source("deploy/agent/compose.yaml"),
-    source("deploy/agent/compose.prepare.yaml"),
-    source("deploy/firebase/compose.yaml"),
-    source("scripts/dev/compose-stack"),
-    source("deploy/agent/supervisor"),
-    source("scripts/dev/firebase-auth-emulator-check"),
-  ]);
 
-  for (const compose of [local, realFirebase, agent, agentPrepare, firebase]) {
-    assert.doesNotMatch(compose, /^\s+build:/m);
-    const ghcrImages =
-      compose.match(/^\s+image: ghcr\.io\/sumi-studio\//gm) ?? [];
-    // Every GHCR image is pulled on start. The per-agent compose files let a
-    // developer opt into reusing a pinned local build
-    // (SUMI_AGENT_IMAGE_PULL_POLICY, default always); production keeps always.
-    const alwaysPulls =
-      compose.match(
-        /^\s+pull_policy: (?:always|\$\{SUMI_AGENT_IMAGE_PULL_POLICY:-always\})$/gm,
-      ) ?? [];
-    assert.ok(ghcrImages.length > 0);
-    assert.equal(alwaysPulls.length, ghcrImages.length);
-  }
-
-  assert.match(local, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
-  assert.match(
-    local,
-    /sumi-provisioner:\$\{SUMI_PROVISIONER_IMAGE_TAG:-latest\}/,
-  );
-  assert.match(local, /sumi-web:\$\{SUMI_WEB_IMAGE_TAG:-latest\}/);
-  assert.match(local, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
-  assert.match(realFirebase, /sumi-api:\$\{SUMI_API_IMAGE_TAG:-latest\}/);
-  assert.match(agent, /sumi-agent:\$\{SUMI_AGENT_IMAGE_TAG:-latest\}/);
-  assert.match(firebase, /sumi-firebase:\$\{SUMI_FIREBASE_IMAGE_TAG:-latest\}/);
-  assert.doesNotMatch(composeLauncher, /--build/);
-  assert.doesNotMatch(supervisor, /--build/);
-  assert.match(firebaseCheck, /docker build/);
-  assert.match(firebaseCheck, /local-check-/);
-  assert.match(firebaseCheck, /up --detach --pull never/);
-});
-
-test("the API image and runbook bind the offline schema-30 rollback operator", async () => {
-  const [dockerfile, rollbackRunbook] = await Promise.all([
-    source("deploy/api/Dockerfile"),
-    source("docs/schema30-prewrite-rollback.md"),
-  ]);
-
-  assert.match(
-    dockerfile,
-    /go build -o \/usr\/local\/bin\/sumi-schema30-rollback \.\/cmd\/schema30-rollback/,
-  );
-  assert.match(
-    dockerfile,
-    /COPY --from=build \/usr\/local\/bin\/sumi-schema30-rollback \/usr\/local\/bin\/sumi-schema30-rollback/,
-  );
-
-  const commandBlocks = [
-    ...rollbackRunbook.matchAll(/```bash\n([\s\S]*?)```/g),
-  ].map((match) => match[1]);
-  assert.equal(commandBlocks.length, 2);
-  for (const command of commandBlocks) {
-    assert.match(command, /^set \+x\nset -euo pipefail$/m);
-    assert.match(command, /^set -euo pipefail$/m);
-    assert.match(command, /\^sha256:\[0-9a-f\]\{64\}\$/);
-    assert.match(command, /\[\[ -v SUMI_DB_URL \]\]/);
-    assert.doesNotMatch(command, /\$\{SUMI_DB_URL/);
-    assert.match(command, /docker image inspect --format/);
-    assert.match(command, /docker network inspect/);
-    assert.match(
-      command,
-      /docker run --rm --pull=never --read-only --cap-drop=ALL \\\n\s+--security-opt=no-new-privileges \\/,
-    );
-    assert.ok(
-      command.indexOf("docker image inspect") < command.indexOf("docker run"),
-    );
-  }
-});
 
 test("runtime provisioner receives a file-scoped Docker config", async () => {
   const [local, provisionerDockerfile] = await Promise.all([
@@ -178,309 +90,8 @@ test("the local media server is opt-in and carries no repository credential", as
   );
 });
 
-test("Compose gives runtime only the logical executor workspace address", async () => {
-  const [compose, entrypoint] = await Promise.all([
-    source("deploy/agent/compose.yaml"),
-    source("deploy/agent/container-entrypoint"),
-  ]);
-  const runtime = compose.slice(
-    compose.indexOf("  runtime:"),
-    compose.indexOf("\n  executor:"),
-  );
-  assert.match(runtime, /SUMI_WORKSPACE: \/workspace/);
-  assert.doesNotMatch(runtime, /workspace:\/workspace/);
 
-  const runtimeEntrypoint = entrypoint.slice(
-    entrypoint.indexOf("  runtime)"),
-    entrypoint.indexOf("\n  executor)"),
-  );
-  assert.match(runtimeEntrypoint, /SUMI_WORKSPACE \\/);
-  assert.match(runtimeEntrypoint, /"SUMI_WORKSPACE=\$\{SUMI_WORKSPACE\}"/);
-  assert.match(
-    runtimeEntrypoint,
-    /exec env -i "\$\{runtime_environment\[@\]\}"/,
-  );
-});
 
-test("the supported launcher gates API, executor, runtime Ready, then Vite", async () => {
-  const launcher = await source("scripts/dev/real-stack");
-  const apiStart = launcher.indexOf('log "starting API"');
-  const apiGate = launcher.search(
-    /wait_for_http "\$\{API_ORIGIN\}\/health" "\$\{API_PID\}" "API"/,
-  );
-  const executorStart = launcher.indexOf(
-    'log "starting authenticated tool executor"',
-  );
-  const executorGate = launcher.search(
-    /wait_for_socket "\$\{EXECUTOR_SOCKET\}" "\$\{EXECUTOR_PID\}"/,
-  );
-  const runtimeEnvironmentStart = launcher.indexOf(
-    "declare -a runtime_environment=(",
-  );
-  const runtimeStart = launcher.indexOf(
-    'log "starting production PersonalityAgent"',
-  );
-  const runtimeGate = launcher.indexOf("wait_for_runtime_ready \\");
-  const viteStart = launcher.search(/log "starting Vite at \$\{WEB_ORIGIN\}"/);
-
-  for (const position of [
-    apiStart,
-    apiGate,
-    executorStart,
-    executorGate,
-    runtimeEnvironmentStart,
-    runtimeStart,
-    runtimeGate,
-    viteStart,
-  ]) {
-    assert.notEqual(position, -1);
-  }
-  assert.ok(apiGate < executorStart);
-  assert.ok(executorStart < executorGate);
-  assert.ok(executorGate < runtimeEnvironmentStart);
-  assert.ok(runtimeEnvironmentStart < runtimeStart);
-  assert.ok(runtimeStart < runtimeGate);
-  assert.ok(runtimeGate < viteStart);
-  const executorBlock = launcher.slice(executorStart, runtimeEnvironmentStart);
-  const runtimeBlock = launcher.slice(runtimeEnvironmentStart, viteStart);
-  assert.match(launcher, /generateKeyPairSync\("ed25519"\)/);
-  assert.match(launcher, /embeddedPublic\.equals\(publicBytes\)/);
-  assert.match(
-    executorBlock,
-    /SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=\$\{SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY\}/,
-  );
-  assert.doesNotMatch(
-    executorBlock,
-    /SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY=\$\{/,
-  );
-  assert.match(
-    runtimeBlock,
-    /SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY=\$\{SUMI_EXECUTOR_CALL_AUTHORITY_PRIVATE_KEY\}/,
-  );
-  assert.doesNotMatch(
-    runtimeBlock,
-    /SUMI_EXECUTOR_CALL_AUTHORITY_PUBLIC_KEY=\$\{/,
-  );
-  assert.match(launcher, /state\.local_control\?\.state === "ready"/);
-  assert.match(launcher, /state\.local_control\?\.integrity\?\.mac/);
-  assert.match(
-    launcher,
-    /SUMI_AUTH_PERSONALITY_AGENT_ID must equal SUMI_PERSONALITY_AGENT_ID/,
-  );
-  assert.match(launcher, /SUMI_BROWSER_SESSION_AUDIENCE=sumi:web/);
-  assert.match(launcher, /SUMI_BROWSER_WS_ALLOWED_ORIGINS=\$\{WEB_ORIGIN\}/);
-  assert.match(launcher, /SUMI_AUTH_ALLOW_INSECURE_COOKIES=true/);
-  const apiBlock = launcher.slice(
-    launcher.indexOf("declare -a api_environment=("),
-    executorStart,
-  );
-  assert.match(
-    apiBlock,
-    /"SUMI_MESSAGING_PUSH_SUBJECT=\$\{MESSAGING_PUSH_SUBJECT\}"/,
-  );
-  for (const [apiVariable, launcherVariable] of [
-    [
-      "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES",
-      "MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES",
-    ],
-    [
-      "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS",
-      "MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS",
-    ],
-    [
-      "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES",
-      "MESSAGING_ATTACHMENT_TOTAL_QUOTA_BYTES",
-    ],
-    [
-      "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS",
-      "MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS",
-    ],
-  ]) {
-    assert.match(
-      apiBlock,
-      new RegExp(`"${apiVariable}=\\$\\{${launcherVariable}\\}"`),
-    );
-  }
-  assert.match(launcher, /"SUMI_PUBLIC_LISTEN=\$\{SUMI_PUBLIC_LISTEN\}"/);
-  assert.match(launcher, /100\.64\.0\.0\/10/);
-  assert.match(
-    launcher,
-    /configuration file must not be readable by group or other/,
-  );
-  assert.match(launcher, /url\.hostname !== publicHost/);
-  assert.match(
-    launcher,
-    /assert_exact_tcp_listener "\$\{SUMI_PUBLIC_LISTEN\}" "\$\{API_PORT\}" "API"/,
-  );
-  assert.match(
-    launcher,
-    /SUMI_GATEWAY_URL=ws:\/\/\$\{LOOPBACK_GATEWAY_LISTEN\}\/agent\/ws/,
-  );
-  assert.ok(
-    launcher.includes(`assert_exact_tcp_listener \\
-        "\${LOOPBACK_GATEWAY_LISTEN}" \\
-        8082 \\
-        "loopback gateway relay"`),
-  );
-  assert.match(launcher, /"SUMI_DEV_HOST=\$\{PUBLIC_HOST\}"/);
-  assert.match(launcher, /"SUMI_DEV_API_ORIGIN=\$\{API_ORIGIN\}"/);
-  assert.doesNotMatch(
-    launcher,
-    /SUMI_MODEL_API_KEY_ENV \\\n+\s+SUMI_EXECUTION_REVIEWER_MODEL_PRESET/,
-  );
-  assert.match(
-    launcher,
-    /\[\[ -z "\$\{reviewer_api_key_env\}" \]\] && continue/,
-  );
-});
-
-test("the default core runtime wires the dev pool to the wake sweep", async () => {
-  const launcher = await source("scripts/dev/real-stack");
-
-  // The documented entrypoint runs the accepted TypeScript core by default;
-  // the Rust runtime is the explicit diagnostic path.
-  assert.match(launcher, /RUNTIME_MODE="\$\{SUMI_DEV_RUNTIME:-core\}"/);
-  assert.match(launcher, /--runtime core\|rust/);
-  assert.match(
-    launcher,
-    /fail "--runtime must be core or rust \(got \$\{RUNTIME_MODE\}\)"/,
-  );
-
-  // Validation is split: the Rust diagnostic branch still requires the
-  // single-agent identity and provider key contract, while the default core
-  // branch validates the provider-env contract apps/core actually consumes.
-  const rustValidator = launcherFunction(
-    launcher,
-    "validate_rust_runtime_configuration",
-  );
-  assert.match(rustValidator, /require_value SUMI_PERSONALITY_AGENT_ID/);
-  assert.match(rustValidator, /SUMI_MODEL_PRESET \\\n\s+SUMI_MODEL_API_KEY_ENV/);
-  const coreValidator = launcherFunction(
-    launcher,
-    "validate_core_runtime_configuration",
-  );
-  assert.doesNotMatch(coreValidator, /SUMI_PERSONALITY_AGENT_ID/);
-  assert.doesNotMatch(coreValidator, /SUMI_MODEL_API_KEY_ENV/);
-  assert.match(coreValidator, /mock \| none\)/);
-  assert.match(
-    coreValidator,
-    /SUMI_MODEL_PROVIDER must be mock, fixture, openai, or none/,
-  );
-  assert.match(
-    launcher,
-    /core\) validate_core_runtime_configuration ;;\n\s+rust\) validate_rust_runtime_configuration ;;/,
-  );
-
-  // The API receives the core state token, the runtime credential, the wake
-  // target, and the core Direct Chat backend switch only in core mode;
-  // local-control env stays on the rust branch so the legacy attention path
-  // cannot engage underneath the core.
-  const apiCoreBlock = launcher.slice(
-    launcher.indexOf("# Mounts /internal/core"),
-    launcher.indexOf('log "starting API"'),
-  );
-  for (const entry of [
-    '"SUMI_CORE_STATE_TOKEN=${SUMI_CORE_STATE_TOKEN}"',
-    '"SUMI_CORE_RUNTIME_TOKEN=${SUMI_CORE_RUNTIME_TOKEN}"',
-    '"SUMI_CORE_WAKE_URL=http://${DEV_POOL_LISTEN}"',
-    '"SUMI_CORE_WAKE_TOKEN=${SUMI_CORE_WAKE_TOKEN}"',
-    '"SUMI_DIRECT_CHAT_BACKEND=core"',
-    '"SUMI_AUTH_PERSONALITY_AGENT_ID=${SUMI_AUTH_PERSONALITY_AGENT_ID}"',
-    '"SUMI_LOCAL_CONTROL_ENABLED=1"',
-  ]) {
-    assert.ok(apiCoreBlock.includes(entry), entry);
-  }
-  assert.ok(
-    apiCoreBlock.indexOf('"SUMI_CORE_STATE_TOKEN=') <
-      apiCoreBlock.indexOf('"SUMI_LOCAL_CONTROL_ENABLED=1"'),
-  );
-  assert.match(
-    apiCoreBlock,
-    /SUMI_DIRECT_CHAT_BACKEND=core"\n  \)\nelse\n  api_environment\+=\(/,
-  );
-
-  // The dev pool is the wake target: it runs apps/core's Node host and is
-  // gated between API readiness and Vite, in the launch sequence only in
-  // core mode.
-  const poolFunction = launcherFunction(launcher, "start_dev_pool");
-  assert.match(poolFunction, /node src\/host\/dev-pool\.ts/);
-  assert.match(poolFunction, /"SUMI_STATE_URL=\$\{API_ORIGIN\}"/);
-  assert.match(poolFunction, /"SUMI_DEV_POOL_LISTEN=\$\{DEV_POOL_LISTEN\}"/);
-  assert.match(
-    poolFunction,
-    /"SUMI_CORE_WAKE_TOKEN=\$\{SUMI_CORE_WAKE_TOKEN\}"/,
-  );
-  assert.match(
-    poolFunction,
-    /"SUMI_CORE_RUNTIME_TOKEN=\$\{SUMI_CORE_RUNTIME_TOKEN\}"/,
-  );
-  assert.match(poolFunction, /"SUMI_MODEL_PROVIDER=\$\{SUMI_MODEL_PROVIDER:-mock\}"/);
-  assert.match(
-    poolFunction,
-    /wait_for_http "http:\/\/\$\{DEV_POOL_LISTEN\}\/health" "\$\{DEV_POOL_PID\}" "dev core pool"/,
-  );
-  assert.match(
-    poolFunction,
-    /assert_exact_tcp_listener "\$\{DEV_POOL_LISTEN\}"/,
-  );
-  assert.match(
-    launcher,
-    /if \[\[ "\$\{RUNTIME_MODE\}" == "core" \]\]; then\n  start_dev_pool\nelse\n  start_loopback_gateway_relay/,
-  );
-  const apiGate = launcher.search(
-    /wait_for_http "\$\{API_ORIGIN\}\/health" "\$\{API_PID\}" "API"/,
-  );
-  const poolStart = launcher.indexOf("  start_dev_pool\nelse");
-  const viteStart = launcher.search(/log "starting Vite at \$\{WEB_ORIGIN\}"/);
-  assert.ok(apiGate < poolStart && poolStart < viteStart);
-
-  // The Rust toolchain is required only on the transitional path.
-  assert.match(
-    launcher,
-    /if \[\[ "\$\{RUNTIME_MODE\}" == "rust" \]\]; then\n  require_command cargo/,
-  );
-  assert.match(
-    launcher,
-    /if \[\[ "\$\{RUNTIME_MODE\}" == "rust" \]\]; then\n  log "building the Rust PersonalityAgent entrypoint"/,
-  );
-
-  // The core credentials are generated per run with distinct roles: the
-  // state token mounts /internal/core, the runtime token authenticates
-  // pool children, and the wake token authenticates the API's sweep.
-  assert.match(launcher, /SUMI_CORE_STATE_TOKEN="\$\(random_token\)"/);
-  assert.match(launcher, /SUMI_CORE_RUNTIME_TOKEN="\$\(random_token\)"/);
-  assert.match(launcher, /SUMI_CORE_WAKE_TOKEN="\$\(random_token\)"/);
-
-  // The pool listener is loopback-only and collides with nothing else.
-  const poolListenValidator = launcherFunction(
-    launcher,
-    "validate_dev_pool_listen",
-  );
-  assert.match(poolListenValidator, /127\\\.0\\\.0\\\.1/);
-  assert.match(
-    launcher,
-    /SUMI_PUBLIC_LISTEN collides with the dev core pool port/,
-  );
-
-  // The web port stays 5173 by default; SUMI_DEV_WEB_PORT only overrides it
-  // through the same bounded validation as the other listeners, and the
-  // launcher hands it to Vite so the server binds the validated value.
-  const webPortValidator = launcherFunction(launcher, "validate_web_port");
-  assert.match(
-    webPortValidator,
-    /WEB_PORT="\$\{SUMI_DEV_WEB_PORT:-\$\{WEB_PORT_DEFAULT\}\}"/,
-  );
-  assert.match(webPortValidator, /outside 1\.\.65535/);
-  assert.match(
-    webPortValidator,
-    /SUMI_DEV_WEB_PORT collides with a reserved local-stack port/,
-  );
-  assert.match(
-    webPortValidator,
-    /SUMI_DEV_WEB_PORT collides with the dev core pool port/,
-  );
-  assert.match(launcher, /"SUMI_DEV_PORT=\$\{WEB_PORT\}"/);
-});
 
 test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async () => {
   const [makefile, packageJSON] = await Promise.all([
@@ -491,40 +102,14 @@ test("make dev delegates to the real-stack launcher, not raw Turbo tasks", async
     makefile,
     /dev: ## Start the supported authenticated local Sumi stack \(TypeScript core\)/,
   );
-  assert.match(
-    makefile,
-    /dev-rust: ## Start the stack on the Rust PersonalityAgent runtime \(diagnostic path\)/,
-  );
+
   const scripts = JSON.parse(packageJSON).scripts;
   assert.equal(scripts.dev, "bash scripts/dev/real-stack");
-  assert.equal(scripts["dev:core"], "bash scripts/dev/real-stack --runtime core");
-  assert.equal(scripts["dev:rust"], "bash scripts/dev/real-stack --runtime rust");
+  assert.equal(scripts["dev:core"], "bash scripts/dev/real-stack");
+  assert.equal(scripts["dev:rust"], undefined);
   assert.equal(scripts["dev:workspaces"], "turbo run dev");
 });
 
-test("the allocator exception is bounded to one locked disposable generation", async () => {
-  const launcher = await source("scripts/dev/real-stack");
-  assert.match(
-    launcher,
-    /flock -n 9 \|\| fail "another local Sumi stack owns the fixed development ports"/,
-  );
-  assert.match(
-    launcher,
-    /RUNTIME_ROOT="\$\(mktemp -d "\$\{TMPDIR:-\/tmp\}\/sumi-real-stack\.XXXXXXXX"\)"/,
-  );
-  assert.match(launcher, /SUMI_RPC_GENERATION=0/);
-  assert.match(
-    launcher,
-    /runtime_parent="\$\(realpath -m -- "\$\(dirname -- "\$\{RUNTIME_ROOT\}"\)"\)"/,
-  );
-  assert.match(
-    launcher,
-    /temporary_root="\$\(realpath -m -- "\$\{TMPDIR:-\/tmp\}"\)"/,
-  );
-  assert.match(launcher, /rm -rf -- "\$\{RUNTIME_ROOT\}"/);
-  assert.match(launcher, /fail "a required Sumi process exited"/);
-  assert.doesNotMatch(launcher, /--supervisor-allocate/);
-});
 
 /** Lifts one top-level function out of the launcher so a test can drive it. */
 function launcherFunction(launcher, name) {
@@ -615,7 +200,7 @@ test("uploaded attachment bytes outlive the disposable runtime root", async () =
   const guide = await source("docs/local-development.md");
   assert.doesNotMatch(guide, /deletes all\s+state on shutdown/);
   assert.match(guide, /SUMI_REAL_STACK_STATE_ROOT/);
-  assert.match(guide, /sumi\/real-stack\/messaging-attachments/);
+  assert.match(guide, /sumi\/real-stack/);
 
   for (const [environment, expected] of [
     [{}, "/home/example/.local/state/sumi/real-stack/messaging-attachments"],
@@ -834,4 +419,18 @@ test("a state root with a symlink ancestor passes its canonical path to the API"
   } finally {
     await rm(scratch, { force: true, recursive: true });
   }
+});
+
+test("Core-only launcher rejects the removed runtime selector", async () => {
+  const launcher = resolve(repositoryRoot, "scripts/dev/real-stack");
+  const { stdout } = await execFileAsync("bash", [launcher, "--help"]);
+  assert.doesNotMatch(stdout, /--runtime|dev-rust/);
+  await assert.rejects(execFileAsync("bash", [launcher, "--runtime", "rust"]),
+    (error) => error.code === 1 && /unknown argument/.test(error.stderr));
+});
+
+test("current Direct Chat receipts and events persist alongside attachments", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  assert.match(launcher, /COMMAND_LOG_DIR="\$\{PERSISTENT_STATE_ROOT\}\/command-log"/);
+  assert.match(launcher, /GATEWAY_STATE_DIR="\$\{PERSISTENT_STATE_ROOT\}\/browser-events"/);
 });

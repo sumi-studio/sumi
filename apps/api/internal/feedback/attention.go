@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
@@ -32,55 +31,6 @@ type AttentionDelivery interface {
 // transferred off this placement and can accept no further input here, or
 // the durable input under this event id already carries different content.
 var ErrDeliverySuppressed = errors.New("feedback attention is permanently undeliverable")
-
-type AttentionGateway struct {
-	Gateway  *agentevents.DurableGateway
-	Spawner  agentevents.DirectChatSpawner
-	TenantID string
-}
-
-func (a *AttentionGateway) Prepare(ctx context.Context, id string) (func(), error) {
-	if a.Gateway == nil {
-		return nil, errors.New("feedback attention gateway unavailable")
-	}
-	return a.Gateway.PrepareAttention(ctx, a.Spawner, id)
-}
-func (a *AttentionGateway) input(e AttentionEvent) (agentevents.IncomingProvenance, json.RawMessage, error) {
-	actorID := e.Actor.Participant.HumanID
-	if e.Actor.Participant.Kind == participant.KindPersonalityAgent {
-		actorID = e.Actor.Participant.PersonalityAgentID
-	}
-	p := agentevents.IncomingProvenance{Version: 2, TenantID: a.TenantID, PersonalityAgentID: e.PersonalityAgentID,
-		Actor:  agentevents.ProvenanceActor{Kind: string(e.Actor.Participant.Kind), PrincipalID: actorID, DisplayName: e.Actor.DisplayName},
-		Source: agentevents.ProvenanceSource{Surface: "feedback", Kind: e.Kind, EventID: e.EventID, ThreadID: e.ThreadID, Title: e.Title, Revision: uint64(e.Revision), OccurredAt: e.OccurredAt.UTC().Format(time.RFC3339Nano)}}
-	if err := p.Validate(); err != nil {
-		return p, nil, err
-	}
-	command, err := json.Marshal(agentevents.ExternalEventCommand{Type: "external_event", Content: e.Body})
-	return p, command, err
-}
-func (a *AttentionGateway) Lookup(ctx context.Context, key string, e AttentionEvent) (bool, error) {
-	if a.Gateway == nil {
-		return false, errors.New("feedback attention gateway unavailable")
-	}
-	p, c, err := a.input(e)
-	if err != nil {
-		return false, err
-	}
-	_, found, err := a.Gateway.LookupAdmission(ctx, p, key, c)
-	return found, err
-}
-func (a *AttentionGateway) Admit(ctx context.Context, key string, e AttentionEvent) error {
-	if a.Gateway == nil {
-		return errors.New("feedback attention gateway unavailable")
-	}
-	p, c, err := a.input(e)
-	if err != nil {
-		return err
-	}
-	_, err = a.Gateway.Append(ctx, p, key, c)
-	return err
-}
 
 func (s *Store) enqueue(ctx context.Context, tx pgx.Tx, actor participant.Ref, threadID, eventID string, revision int64) error {
 	var e AttentionEvent

@@ -18,7 +18,7 @@ crashes, and reinstalls.
 
 ## Requirements
 
-- Linux (the supported target; see [ADR 0004](adr/0004-agent-local-platform-support.md)).
+- Linux (the supported target; see [ADR 0004](core-architecture.md)).
   Process identity is verified through `/proc` (recorded start-time +
   absolute-path cmdline match before any signal), so lifecycle commands
   require Linux and fail clearly elsewhere. Native Windows is unsupported;

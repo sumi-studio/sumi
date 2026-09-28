@@ -22,7 +22,7 @@ func authFlowStore(t *testing.T) (*Store, context.Context) {
 	if err := db.Migrate(ctx, pool); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	return NewWithWrappingKeyID(pool, "test-wrapping/v1"), ctx
+	return New(pool), ctx
 }
 
 func testNonce(t *testing.T) string {
@@ -95,9 +95,6 @@ func TestAuthFlowFourIntentExistenceCombinations(t *testing.T) {
 		}
 		if got, err := store.AgentForHuman(ctx, result.HumanID); err != nil || got != result.AgentID {
 			t.Fatalf("Secretary: %q %v", got, err)
-		}
-		if _, err := store.AgentWrappingKey(ctx, result.AgentID); err != nil {
-			t.Fatalf("wrapping key: %v", err)
 		}
 		if got, _ := store.HumanDisplayName(ctx, result.HumanID); got != "New Human" {
 			t.Fatalf("new account display name = %q", got)

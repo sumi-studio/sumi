@@ -73,7 +73,7 @@ func TestProviderMethodsHealDoesNotRetireConcurrentRelink(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "methods-heal-race-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -143,7 +143,7 @@ func TestProviderMethodsLocalReadPrecedesRemoteRead(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "methods-order-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -194,7 +194,7 @@ func TestProviderMethodsHealStillRetiresConfirmedAbsence(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "methods-heal-gone-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestProviderMethodsHealRetiresSubjectMismatch(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "methods-heal-drift-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {

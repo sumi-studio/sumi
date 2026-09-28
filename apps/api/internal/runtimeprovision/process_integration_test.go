@@ -47,7 +47,7 @@ func TestProcessDockerIntegration(t *testing.T) {
 		}
 	})
 	docker("run", "--rm", "--network", "none", "--user", "0:0", "--mount", "type=volume,src="+volume+",dst=/workspace", "--entrypoint", "/bin/chown", image, "10002:10002", "/workspace")
-	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "SUMI_AGENT_IMAGE_TAG=" + revision}
+	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "SUMI_JOB_IMAGE_TAG=" + revision}
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONFIG"} {
 		if v := os.Getenv(key); v != "" {
 			environment = append(environment, key+"="+v)

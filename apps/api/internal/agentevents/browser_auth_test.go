@@ -564,7 +564,7 @@ func TestBrowserAuthLogoutRetainsValidCookieWhenDurableRevocationIsUnavailable(t
 		t.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
+	gateway, err := OpenBrowserJournal(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,17 +758,17 @@ func TestBrowserAuthReplacementRetiresOldSessionBeforePublishingNewAuthority(t *
 
 func TestBrowserAuthReplacementIsSingleUseAcrossGateways(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := privateRuntimeDir(t)
+	journalDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	firstGateway, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondGateway, err := OpenDurableGateway(runtimeDir, store)
+	secondGateway, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -999,37 +999,5 @@ func TestBrowserAuthRejectsDuplicateSessionCookies(t *testing.T) {
 				t.Fatalf("got %d, want 400", recorder.Code)
 			}
 		})
-	}
-}
-
-func TestStaticIdentityBindingResolverAllowsOnlyConfiguredUID(t *testing.T) {
-	claims := UserSessionClaims{
-		TenantID:           "tenant-1",
-		UserID:             "user-1",
-		PersonalityAgentID: "018f47a2-9b3c-7def-8abc-0123456789ab",
-	}
-	resolver, err := NewStaticIdentityBindingResolver("allowed-uid", claims)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := resolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid"})
-	if err != nil || got != claims {
-		t.Fatalf("resolve allowed UID: %+v, %v", got, err)
-	}
-	if _, err := resolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "other-uid"}); err == nil {
-		t.Fatal("expected all unconfigured UIDs to be denied")
-	}
-	if _, err := resolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid", TenantID: "tenant-auth"}); err == nil {
-		t.Fatal("tenant token must be denied without an explicit Firebase tenant binding")
-	}
-	tenantResolver, err := NewStaticIdentityBindingResolverForTenant("allowed-uid", "tenant-auth", claims)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tenantResolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid"}); err == nil {
-		t.Fatal("non-tenant token must not satisfy an explicit Firebase tenant binding")
-	}
-	if _, err := tenantResolver.ResolveIdentity(context.Background(), FirebaseIdentity{UID: "allowed-uid", TenantID: "tenant-auth"}); err != nil {
-		t.Fatalf("explicit tenant binding rejected: %v", err)
 	}
 }

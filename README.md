@@ -66,9 +66,9 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 ## Run the Web app from source
 
-`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — and Vite. `make dev-rust` keeps the Rust agent runtime and tool executor (`apps/agent`) as an explicit diagnostic path.
+`make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — and Vite.
 
-Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. The default core runtime needs no model credential (deterministic `mock` provider); `make dev-rust` additionally requires Rust stable and model-provider credentials for the conversation model and two separate review models.
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. The default core runtime needs no model credential (deterministic `mock` provider);
 
 ```sh
 make setup
@@ -91,7 +91,6 @@ apps/
                       model connections, usage, and the state service the secretary core uses
   core/               TypeScript secretary core: Node.js hosts and the Cloudflare Durable Object host
   desktop/            Engineering Electron shared browser runtime and authenticated Core host connection
-  agent/              Rust agent runtime and isolated tool executor used by `make dev-rust`
 packages/
   ui/                 @sumi/ui component catalog (based on shadcn/ui)
   sdui/               @sumi/sdui declarative UI schema (zod) and renderer
@@ -113,7 +112,6 @@ CONTEXT.md            domain glossary (Japanese)
 | Sign-in | Firebase Authentication, with sessions issued by the Go API |
 | API and canonical state | Go, PostgreSQL |
 | Secretary core | TypeScript on Node.js (Local) and Cloudflare Workers Durable Objects (Cloud) |
-| Transitional agent runtime (`make dev-rust`) | Rust |
 | Calls | LiveKit |
 | Contracts | OpenAPI, JSON Schema |
 | Monorepo and tooling | pnpm workspaces, Turborepo, Biome |
@@ -132,11 +130,11 @@ make migrate   # apply API schema migrations (requires SUMI_DB_URL)
 
 After editing `contracts/openapi.yaml` or `contracts/agent-events.yaml`, regenerate the TypeScript types with `pnpm --filter @sumi/api-client generate`. `make dev-workspaces` only runs each package's raw dev task; it does not start a usable Sumi.
 
-The workflows in `.github/workflows/` are configured to run on every pull request and on pushes to `main`: Web and shared TypeScript checks, Web edge contracts, API contracts against PostgreSQL, the secretary core, and the Rust agent.
+The workflows in `.github/workflows/` are configured to run on every pull request and on pushes to `main`: Web and shared TypeScript checks, Web edge contracts, API contracts against PostgreSQL, and the secretary Core.
 
 ## Design principles
 
-- **People and secretaries use the same apps.** A secretary works through the same applications, operations and authorization checks as people, not through a separate agent-only copy of the product ([ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md), [ADR 0011 (proposed)](docs/adr/0011-messaging-surface-and-agent-participation.md), [ADR 0013](docs/adr/0013-tool-invocation-routes-and-authority-provenance.md)).
+- **People and secretaries use the same apps.** A secretary works through the same applications, operations and authorization checks as people, not through a separate agent-only copy of the product ([ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md), [ADR 0011 (proposed)](docs/adr/0011-messaging-surface-and-agent-participation.md), [ADR 0013](docs/core-architecture.md)).
 - **A secretary is one continuing individual.** People and secretaries are registered in the same identity registry. Starting or stopping the process that runs a secretary is resource management; it is not the secretary sleeping or ending ([ADR 0009](docs/adr/0009-human-koseki-and-multi-user-auth.md), [CONTEXT.md](CONTEXT.md)).
 - **Canonical state lives behind the API.** The processes that run a secretary keep no canonical state, so they can be stopped, restarted or replaced, and the next process recovers from what was saved.
 - **A person's model choice is authoritative.** The new secretary core does not substitute an operator model for the connection a person selected.

@@ -85,7 +85,7 @@ func TestEntrypointFileSliceE2E(t *testing.T) {
 	for k, v := range map[string]string{
 		"SUMI_DB_URL":                      appDSN,
 		"SUMI_COMMAND_LOG_DIR":             t.TempDir(),
-		"SUMI_AGENT_RUNTIME_STATE_DIR":     runtimeDir,
+		"SUMI_BROWSER_EVENT_DIR":           runtimeDir,
 		"SUMI_BROWSER_SESSION_SECRET":      secretB64,
 		"SUMI_BROWSER_SESSION_AUDIENCE":    "e2e-browser",
 		"SUMI_BROWSER_WS_ALLOWED_ORIGINS":  "https://app.example",
@@ -107,7 +107,7 @@ func TestEntrypointFileSliceE2E(t *testing.T) {
 
 	// Seed a real human + secretary + employment + direct-chat installation
 	// through the same store the sign-in flow uses.
-	ks := koseki.NewWithWrappingKeyID(app.database.Pool, "e2e-wrap-key")
+	ks := koseki.New(app.database.Pool)
 	reg, err := ks.AutoRegisterWithDisplayName(ctx, "firebase", "e2e-uid-"+dbName, "Entrypoint E2E")
 	if err != nil {
 		t.Fatalf("auto-register: %v", err)

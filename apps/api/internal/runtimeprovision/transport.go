@@ -35,88 +35,7 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	if handler.serveProcess(response, request) {
 		return
 	}
-	switch request.URL.Path {
-	case "/v1/recover-local-control":
-		var input RecoverLocalControlRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		recovered, err := handler.service.RecoverLocalControl(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		response.Header().Set("Cache-Control", "no-store")
-		writeJSON(response, http.StatusOK, recovered)
-	case "/v1/prepare":
-		var input PrepareRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		epoch, err := handler.service.Prepare(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, epoch)
-	case "/v1/activate":
-		var input ActivateRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		inspection, err := handler.service.Activate(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, OperationResponse{Inspection: inspection})
-	case "/v1/abort":
-		var input AbortRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		inspection, err := handler.service.Abort(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, OperationResponse{Inspection: inspection})
-	case "/v1/inspect":
-		var input InspectRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		inspection, err := handler.service.Inspect(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, OperationResponse{Inspection: inspection})
-	case "/v1/stop":
-		var input StopRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		inspection, err := handler.service.Stop(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, OperationResponse{Inspection: inspection})
-	case "/v1/reconcile":
-		var input ReconcileRequest
-		if !decodeRequest(response, request, &input) {
-			return
-		}
-		inspection, err := handler.service.Reconcile(request.Context(), input)
-		if err != nil {
-			writeServiceError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusOK, OperationResponse{Inspection: inspection})
-	default:
-		writeError(response, http.StatusNotFound, "not_found", "unknown provisioner operation")
-	}
+	writeError(response, http.StatusNotFound, "not_found", "unknown process operation")
 }
 
 func decodeRequest(response http.ResponseWriter, request *http.Request, destination any) bool {
@@ -137,14 +56,6 @@ func decodeRequest(response http.ResponseWriter, request *http.Request, destinat
 type errorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
-}
-
-func writeServiceError(response http.ResponseWriter, err error) {
-	if errors.Is(err, ErrConflict) {
-		writeError(response, http.StatusConflict, "conflict", err.Error())
-		return
-	}
-	writeError(response, http.StatusBadRequest, "operation_failed", err.Error())
 }
 
 func writeError(response http.ResponseWriter, status int, code, message string) {

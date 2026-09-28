@@ -945,3 +945,5 @@ func attentionSourceUnavailable(err error) bool {
 		errors.Is(err, applicationapps.ErrInstallationNotFound) ||
 		errors.Is(err, applicationapps.ErrAppDisabled) || errors.Is(err, applicationapps.ErrAuthorityEpochStale)
 }
+
+var errUnsupportedAttentionEvent = errors.New("attention event is not representable on this delivery route")

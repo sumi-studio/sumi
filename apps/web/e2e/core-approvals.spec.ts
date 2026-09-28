@@ -3,7 +3,7 @@ import {
   buildWorkspaceBrowserStack,
   removeWorkspaceBrowserBuild,
   type WorkspaceBrowserBuild,
-} from "./support/real-agent-stack";
+} from "./support/workspace-stack";
 import { startCoreApprovalStack } from "./support/core-approval-stack";
 
 /**

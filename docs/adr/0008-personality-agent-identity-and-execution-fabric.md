@@ -4,13 +4,13 @@
 - Date: 2026-07-28
 - Last amended: 2026-08-10
 - Amends:
-  - [ADR 0002](0002-agent-stack.md)
-  - [ADR 0004](0004-agent-local-platform-support.md)
-  - [ADR 0007](0007-production-runtime-bootstrap-boundary.md)
-  - [エージェントワークスペース設計](../agent/workspace.md)
-  - [3層メモリ設計](../agent/memory.md)
-  - [エージェント実装計画](../agent/implementation-plan.md)
-  - [実装タスク](../../apps/agent/TASKS.md)
+  - [ADR 0002](../core-architecture.md)
+  - [ADR 0004](../core-architecture.md)
+  - [ADR 0007](../core-architecture.md)
+  - [エージェントワークスペース設計](../core-architecture.md)
+  - [3層メモリ設計](../core-architecture.md)
+  - [エージェント実装計画](../core-architecture.md)
+  - [実装タスク](../core-architecture.md)
 - Related:
   - [#74](https://github.com/sumi-studio/sumi/issues/74)
   - [#75](https://github.com/sumi-studio/sumi/issues/75)
@@ -394,7 +394,7 @@ process epochを識別する。VM boot、runtime generation、RPC process boot�
 みなさない。T26は後続のauthority verifierを差し込める明示的なseamを保つ。
 exact action、scope、audience、lifetime、idempotencyへ束縛する具体contractは
 [#77](https://github.com/sumi-studio/sumi/issues/77)で実装する。その意味論は
-[ADR 0013](0013-tool-invocation-routes-and-authority-provenance.md)に従い、
+[ADR 0013](../core-architecture.md)に従い、
 人格agent自身のauthorityで行う`Normal`と、認証済みHumanのaccount/authorityを
 exact call一件だけ借りるauthority provenanceを混同しない。
 

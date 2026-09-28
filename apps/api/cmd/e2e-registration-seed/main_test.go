@@ -123,7 +123,7 @@ func TestResolveSyntheticOwnedFlowSucceeds(t *testing.T) {
 
 	// The production confirm path still works on the bootstrapped flow and
 	// consumes the invite for real.
-	confirmed, err := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1").ConfirmAuthFlow(ctx, flow.FlowID, nonce, "create_account")
+	confirmed, err := koseki.New(pool).ConfirmAuthFlow(ctx, flow.FlowID, nonce, "create_account")
 	if err != nil {
 		t.Fatalf("production confirm after synthetic resolve: %v", err)
 	}

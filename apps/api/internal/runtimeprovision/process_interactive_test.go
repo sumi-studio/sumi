@@ -158,7 +158,7 @@ func TestProcessStartInteractiveRequiresTTY(t *testing.T) {
 func TestInteractiveJournalResumeNoDuplicate(t *testing.T) {
 	dir := t.TempDir()
 	journal := journalFile(t, dir, "first\r\n", "second\r\n")
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journal}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journal}
 	s, err := newProcessStore(dir+"/state", b)
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestInteractiveJournalResumeNoDuplicate(t *testing.T) {
 func TestInteractiveJournalRotationGap(t *testing.T) {
 	dir := t.TempDir()
 	journal := journalFile(t, dir, "old\r\n")
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journal}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journal}
 	s, err := newProcessStore(dir+"/state", b)
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +234,7 @@ func TestInteractiveJournalPartialLine(t *testing.T) {
 	}
 	f.Close()
 
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journal}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journal}
 	s, err := newProcessStore(dir+"/state", b)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +322,7 @@ func TestInteractiveEOFIsEOTByte(t *testing.T) {
 // delivery; the service returns delivery evidence, not just a bare
 // error.
 func TestInteractiveSignalAndResizeService(t *testing.T) {
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}}
 	svc := newTestService(t, b)
 	ctx := context.Background()
 	op, err := svc.StartProcess(ctx, ProcessStartRequest{
@@ -374,7 +374,7 @@ func TestInteractiveSignalAndResizeService(t *testing.T) {
 func TestInteractiveTerminalDrain(t *testing.T) {
 	dir := t.TempDir()
 	journal := journalFile(t, dir, "early\r\n")
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journal}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journal}
 	s, err := newProcessStore(dir+"/state", b)
 	if err != nil {
 		t.Fatal(err)
@@ -475,14 +475,13 @@ func TestInteractiveDockerE2E(t *testing.T) {
 	})
 	backend := &DockerBackend{
 		baseEnvironment: []string{"PATH=/usr/local/bin:/usr/bin:/bin", "DOCKER_HOST=unix:///var/run/docker.sock", "SUMI_JOB_IMAGE_TAG=" + tag},
-		runner:          execCommandRunner{},
 	}
 	stateDir := t.TempDir() + "/state"
 	s, err := newProcessStore(stateDir, backend)
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{backend: backend, processes: s}
+	service := &Service{processes: s}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go service.RunProcessObserver(ctx)
@@ -596,7 +595,7 @@ func TestInteractiveDockerE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart reload: %v", err)
 	}
-	service2 := &Service{backend: backend, processes: s2}
+	service2 := &Service{processes: s2}
 	go service2.RunProcessObserver(ctx)
 	var io2 *interactiveIO
 	for i := 0; i < 50 && io2 == nil; i++ {
@@ -643,12 +642,12 @@ func TestInteractiveDockerE2E(t *testing.T) {
 // terminal sessions is refused at 4 and the store at 8, but those same
 // sessions never consume the persona's single batch slot.
 func TestInteractiveCapacitySplit(t *testing.T) {
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}}
 	s, err := newProcessStore(t.TempDir()+"/state", b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{backend: b, processes: s}
+	service := &Service{processes: s}
 	persona := uuid.NewString()
 	seed := func(personaID string, interactive bool, n int) {
 		s.mu.Lock()

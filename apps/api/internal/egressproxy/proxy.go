@@ -9,7 +9,7 @@
 //
 // Every proxied request is authorized at connection time: the destination
 // host is resolved fresh, every resolved address must satisfy
-// publicweb.IsPublicAddress, and the proxy then dials only the validated
+// netpolicy.IsPublicAddress, and the proxy then dials only the validated
 // IP literals — the checked set and the dialed set are identical, so a DNS
 // change between check and dial cannot redirect a connection. Redirects are
 // never followed inside the proxy; a redirect answer returns to the client,
@@ -32,7 +32,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/publicweb"
+	"github.com/sumi-studio/sumi/apps/api/internal/netpolicy"
 )
 
 const (
@@ -158,7 +158,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) publicAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
 	host = strings.TrimSuffix(host, ".")
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if !publicweb.IsPublicAddress(ip) {
+		if !netpolicy.IsPublicAddress(ip) {
 			return nil, errNotPublic
 		}
 		return []netip.Addr{ip}, nil
@@ -174,7 +174,7 @@ func (p *Proxy) publicAddrs(ctx context.Context, host string) ([]netip.Addr, err
 		return nil, errDNS
 	}
 	for _, ip := range addrs {
-		if !publicweb.IsPublicAddress(ip) {
+		if !netpolicy.IsPublicAddress(ip) {
 			return nil, errNotPublic
 		}
 	}

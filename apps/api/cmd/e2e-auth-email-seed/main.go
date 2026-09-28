@@ -5,7 +5,6 @@
 // without the Firebase Auth emulator.
 //
 //	SUMI_E2E_AUTH_SEED_DATABASE_URL     postgres://... (already migrated)
-//	SUMI_E2E_AUTH_SEED_WRAPPING_KEY_ID  the server's SUMI_AGENT_WRAPPING_KEY_ID
 //	SUMI_E2E_AUTH_SEED_PROJECT_ID       Firebase project of the emulator
 //	SUMI_E2E_AUTH_SEED_FIREBASE_UID     UID to create
 //	SUMI_E2E_AUTH_SEED_EMAIL            verified email of that UID
@@ -37,12 +36,10 @@ func main() {
 func run(ctx context.Context) error {
 	env := func(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 	databaseURL := env("SUMI_E2E_AUTH_SEED_DATABASE_URL")
-	wrappingKeyID := env("SUMI_E2E_AUTH_SEED_WRAPPING_KEY_ID")
 	projectID := env("SUMI_E2E_AUTH_SEED_PROJECT_ID")
 	uid := env("SUMI_E2E_AUTH_SEED_FIREBASE_UID")
 	email := env("SUMI_E2E_AUTH_SEED_EMAIL")
-	if databaseURL == "" || wrappingKeyID == "" || projectID == "" || uid == "" || email == "" {
-		return errors.New("SUMI_E2E_AUTH_SEED_{DATABASE_URL,WRAPPING_KEY_ID,PROJECT_ID,FIREBASE_UID,EMAIL} are required")
+	if databaseURL == "" || projectID == "" || uid == "" || email == "" {
 	}
 	if env("FIREBASE_AUTH_EMULATOR_HOST") == "" {
 		return errors.New("FIREBASE_AUTH_EMULATOR_HOST is required; this fixture never touches a real Firebase project")
@@ -63,7 +60,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer pool.Close()
-	registration, err := koseki.NewWithWrappingKeyID(pool, wrappingKeyID).AutoRegisterWithDisplayName(ctx, "firebase", uid, "Email E2E")
+	registration, err := koseki.New(pool).AutoRegisterWithDisplayName(ctx, "firebase", uid, "Email E2E")
 	if err != nil {
 		return fmt.Errorf("register Human: %w", err)
 	}

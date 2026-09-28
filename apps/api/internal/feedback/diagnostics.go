@@ -188,7 +188,6 @@ func (s *Server) captureDiagnostics(r *http.Request, actor participant.Ref, pers
 		observation, err := s.Gateway.DiagnosticObservation(ctx, personalityAgentID)
 		if err == nil {
 			result.Status = "available"
-			result.Generation = observation.Generation
 			result.Ready = &observation.Ready
 			result.ReadinessReason = observation.ReadinessReason
 			result.RunInFlight = observation.RunInFlight

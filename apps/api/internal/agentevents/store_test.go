@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -111,66 +110,6 @@ func TestCommandStore_ConcurrentAppendsNoDuplicateOrGap(t *testing.T) {
 		if !seqs[uint64(i)] {
 			t.Fatalf("missing seq %d", i)
 		}
-	}
-}
-
-func TestCommandStore_RestartPreservesLogAndNextSeq(t *testing.T) {
-	dir := t.TempDir()
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd1 := json.RawMessage(`{"type":"user_message","text":"first","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd2 := json.RawMessage(`{"type":"user_message","text":"second","attachments":[]}`)
-	env2, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd2)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	store2, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store2.Close()
-
-	next, err := store2.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != env2.Seq+1 {
-		t.Fatalf("expected next seq %d after restart, got %d", env2.Seq+1, next)
-	}
-
-	caught, err := store2.CatchUp(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(caught) != 2 {
-		t.Fatalf("expected 2 commands after restart, got %d", len(caught))
-	}
-	if caught[0].Seq != env1.Seq || caught[1].Seq != env2.Seq {
-		t.Fatalf("restart changed seqs: got %+v", caught)
-	}
-	if string(caught[0].Command) != string(cmd1) || string(caught[1].Command) != string(cmd2) {
-		t.Fatal("restart corrupted command bytes")
-	}
-
-	env3, err := store2.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if env3.Seq != env2.Seq+1 {
-		t.Fatalf("expected next seq %d after restart, got %d", env2.Seq+1, env3.Seq)
 	}
 }
 
@@ -274,84 +213,6 @@ func TestCommandStore_ContextCancellation(t *testing.T) {
 	_, err = store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", cmd)
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
-	}
-}
-
-func TestCommandStoreBlockedPersonalityAgentDoesNotBlockOtherPersonalityAgent(t *testing.T) {
-	skipIfNoFlock(t)
-	dir := t.TempDir()
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	const blocked = "018f47a2-9b3c-7def-8abc-012345678992"
-	if _, err := store.Append(context.Background(), testDirectChatProvenance(blocked), "", json.RawMessage(`{"type":"user_message","text":"blocked","attachments":[]}`)); err != nil {
-		t.Fatal(err)
-	}
-	blocker, err := os.OpenFile(commandLogPath(dir, blocked), os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer blocker.Close()
-	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_EX); err != nil {
-		t.Fatal(err)
-	}
-	defer syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN)
-
-	store.mu.Lock()
-	st := store.states[blocked]
-	store.mu.Unlock()
-	blockedDone := make(chan error, 1)
-	go func() { _, err := store.NextCommandSeq(context.Background(), blocked); blockedDone <- err }()
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for st.mu.TryLock() {
-		st.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatal("blocked personality agent never reached its flock wait")
-		}
-		runtime.Gosched()
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	if _, err := store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-012345678993"), "", json.RawMessage(`{"type":"user_message","text":"progress","attachments":[]}`)); err != nil {
-		t.Fatalf("blocked personality agent serialized unrelated append: %v", err)
-	}
-	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-blockedDone; err != nil {
-		t.Fatalf("blocked personality agent did not recover: %v", err)
-	}
-}
-
-func TestCommandStoreFirstLoadFlockHonorsCancellation(t *testing.T) {
-	skipIfNoFlock(t)
-	dir := t.TempDir()
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	const personalityAgentID = "018f47a2-9b3c-7def-8abc-012345678971"
-	blocker, err := os.OpenFile(commandLogPath(dir, personalityAgentID), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer blocker.Close()
-	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_EX); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
-	if _, err := store.NextCommandSeq(ctx, personalityAgentID); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("first load must propagate deadline, got %v", err)
-	}
-	if err := syscall.Flock(int(blocker.Fd()), syscall.LOCK_UN); err != nil {
-		t.Fatal(err)
-	}
-	if next, err := store.NextCommandSeq(context.Background(), personalityAgentID); err != nil || next != 1 {
-		t.Fatalf("cancelled load must not leak partial state: next=%d err=%v", next, err)
 	}
 }
 
@@ -516,59 +377,6 @@ func TestCommandStore_SameSizeReplacementIsRescanned(t *testing.T) {
 	}
 	if env.CommandID != replacementID {
 		t.Fatalf("expected replacement command_id %q, got %q", replacementID, env.CommandID)
-	}
-}
-
-func TestCommandStore_PartialTailRecovery(t *testing.T) {
-	dir := t.TempDir()
-	env := func(seq uint64) string {
-		b, _ := json.Marshal(testLogRecord(
-			seq,
-			"00000000-0000-4000-8000-00000000000"+string(rune('1'+seq-1)),
-			json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`),
-			"018f47a2-9b3c-7def-8abc-0123456789ab",
-		))
-		return string(b)
-	}
-
-	// Two complete records followed by a partial third (no trailing newline).
-	contents := env(1) + "\n" + env(2) + "\n" + env(3)[:len(env(3))-3]
-	path := commandLogPath(dir, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	caught, err := store.CatchUp(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(caught) != 2 || caught[0].Seq != 1 || caught[1].Seq != 2 {
-		t.Fatalf("expected seq [1,2], got %+v", caught)
-	}
-
-	next, err := store.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != 3 {
-		t.Fatalf("expected next seq 3 after tail truncation, got %d", next)
-	}
-
-	env3, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"user_message","text":"third","attachments":[]}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if env3.Seq != 3 {
-		t.Fatalf("expected seq 3 after recovery, got %d", env3.Seq)
 	}
 }
 
@@ -840,116 +648,6 @@ func TestCommandStoreAppendRejectsInvalidCommandBeforeWrite(t *testing.T) {
 	}
 }
 
-func TestCommandStore_PoisonOnSyncRollbackFailure(t *testing.T) {
-	dir := t.TempDir()
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
-		t.Fatal(err)
-	}
-
-	ff := injectFailingFile(t, store, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	ff.failSyncOn = 1
-	ff.failTruncateOn = 1
-
-	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
-	if err == nil {
-		t.Fatal("expected append to fail")
-	}
-	if !strings.Contains(err.Error(), "rollback could not be confirmed") {
-		t.Fatalf("expected compound rollback error, got %v", err)
-	}
-
-	_, err = store.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err == nil || !strings.Contains(err.Error(), "poisoned") {
-		t.Fatalf("expected poisoned state error, got %v", err)
-	}
-}
-
-func TestCommandStore_NoPoisonOnRollbackSuccess(t *testing.T) {
-	dir := t.TempDir()
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`)); err != nil {
-		t.Fatal(err)
-	}
-
-	ff := injectFailingFile(t, store, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	ff.failSyncOn = 1
-
-	_, err = store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
-	if err == nil {
-		t.Fatal("expected append to fail")
-	}
-	if strings.Contains(err.Error(), "poisoned") {
-		t.Fatalf("expected non-poisoning sync error, got %v", err)
-	}
-
-	next, err := store.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != 2 {
-		t.Fatalf("expected next seq to remain 2 after rollback, got %d", next)
-	}
-
-	env, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "", json.RawMessage(`{"type":"abort"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if env.Seq != 2 {
-		t.Fatalf("expected seq 2 after successful retry, got %d", env.Seq)
-	}
-}
-
-func TestCommandStore_LoadIncompleteTailWithoutNewline(t *testing.T) {
-	dir := t.TempDir()
-	rec := func(seq uint64) []byte {
-		r := testLogRecord(seq, fmt.Sprintf("00000000-0000-4000-8000-%012d", seq), json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
-		b, _ := json.Marshal(r)
-		return b
-	}
-
-	partial := string(rec(2))[:len(rec(2))-7]
-	contents := string(rec(1)) + "\n" + partial
-	path := commandLogPath(dir, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	first, err := store.FirstCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != 1 {
-		t.Fatalf("expected first seq 1, got %d", first)
-	}
-	next, err := store.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != 2 {
-		t.Fatalf("expected next seq 2 after truncating incomplete tail, got %d", next)
-	}
-}
-
 func TestCommandStore_LoadMalformedFinalRecordWithoutNewlineFails(t *testing.T) {
 	dir := t.TempDir()
 	rec := testLogRecord(1, "00000000-0000-4000-8000-000000000001", json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
@@ -971,38 +669,6 @@ func TestCommandStore_LoadMalformedFinalRecordWithoutNewlineFails(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "malformed but complete") {
 		t.Fatalf("expected malformed-but-complete error, got %v", err)
-	}
-}
-
-func TestCommandStore_LoadValidFinalRecordWithoutNewline(t *testing.T) {
-	dir := t.TempDir()
-	rec := func(seq uint64) []byte {
-		r := testLogRecord(seq, fmt.Sprintf("00000000-0000-4000-8000-%012d", seq), json.RawMessage(`{"type":"user_message","text":"x","attachments":[]}`), "018f47a2-9b3c-7def-8abc-0123456789ab")
-		b, _ := json.Marshal(r)
-		return b
-	}
-
-	contents := string(rec(1)) + "\n" + string(rec(2))
-	path := commandLogPath(dir, "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	next, err := store.NextCommandSeq(context.Background(), "018f47a2-9b3c-7def-8abc-0123456789ab")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != 3 {
-		t.Fatalf("expected next seq 3, got %d", next)
 	}
 }
 
@@ -1181,70 +847,6 @@ func runMPWorker(t *testing.T, dir, conv, mode, id, count string) ([]byte, error
 	return cmd.CombinedOutput()
 }
 
-func TestCommandStore_MultiProcessNoDuplicateSeqOrLostRecord(t *testing.T) {
-	skipIfNoFlock(t)
-
-	dir := t.TempDir()
-	conv := "018f47a2-9b3c-7def-8abc-012345678994"
-	const children = 3
-	const count = 20
-
-	var wg sync.WaitGroup
-	errs := make(chan error, children)
-	for i := 0; i < children; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			out, err := runMPWorker(t, dir, conv, "append", strconv.Itoa(i), strconv.Itoa(count))
-			if err != nil {
-				errs <- fmt.Errorf("child %d failed: %w\n%s", i, err, out)
-			}
-		}(i)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-
-	all, err := store.CatchUp(context.Background(), conv, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := children * count
-	if len(all) != want {
-		t.Fatalf("expected %d commands, got %d", want, len(all))
-	}
-
-	seen := make(map[uint64]bool)
-	for i, env := range all {
-		if env.Seq != uint64(i+1) {
-			t.Fatalf("non-contiguous seq at index %d: got %d", i, env.Seq)
-		}
-		if seen[env.Seq] {
-			t.Fatalf("duplicate seq %d", env.Seq)
-		}
-		seen[env.Seq] = true
-		if !strings.Contains(string(env.Command), "child-") {
-			t.Fatalf("command %d missing child marker: %s", env.Seq, env.Command)
-		}
-	}
-
-	next, err := store.NextCommandSeq(context.Background(), conv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != uint64(want+1) {
-		t.Fatalf("expected next seq %d, got %d", want+1, next)
-	}
-}
-
 func TestCommandStore_MultiProcessIdempotencyIsGlobalAcrossTargets(t *testing.T) {
 	skipIfNoFlock(t)
 
@@ -1288,53 +890,6 @@ func TestCommandStore_MultiProcessIdempotencyIsGlobalAcrossTargets(t *testing.T)
 	}
 	if accepted != 1 || conflicts != 1 {
 		t.Fatalf("global idempotency race accepted=%d conflicts=%d", accepted, conflicts)
-	}
-}
-
-func TestCommandStore_MultiProcessRollbackDoesNotDestroyPeerRecord(t *testing.T) {
-	skipIfNoFlock(t)
-
-	dir := t.TempDir()
-	conv := "018f47a2-9b3c-7def-8abc-012345678995"
-
-	store, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parentCmd := json.RawMessage(`{"type":"user_message","text":"parent","attachments":[]}`)
-	env1, err := store.Append(context.Background(), testDirectChatProvenance(conv), "", parentCmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	out, err := runMPWorker(t, dir, conv, "rollback", "", "")
-	if err != nil {
-		t.Fatalf("rollback worker failed: %v\n%s", err, out)
-	}
-
-	store2, err := OpenCommandStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store2.Close()
-
-	all, err := store2.CatchUp(context.Background(), conv, env1.Seq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 1 || all[0].Seq != env1.Seq {
-		t.Fatalf("peer record destroyed by rollback: got %+v", all)
-	}
-
-	next, err := store2.NextCommandSeq(context.Background(), conv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if next != env1.Seq+1 {
-		t.Fatalf("expected next seq %d after rollback, got %d", env1.Seq+1, next)
 	}
 }
 

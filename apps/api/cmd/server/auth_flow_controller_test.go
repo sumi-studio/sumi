@@ -62,7 +62,7 @@ func TestProviderUnlinkIsBackendOwnedAndCountsOnlyProvedMethods(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	registered, err := store.AutoRegister(ctx, "firebase", "unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +143,7 @@ func TestProviderUnlinkReconcilesAmbiguousAdminSuccessAndSameNonceRetry(t *testi
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	registered, err := store.AutoRegister(ctx, "firebase", "ambiguous-unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestProviderUnlinkKeepsFenceUntilIndeterminatePostcheckReconciles(t *testin
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	registered, err := store.AutoRegister(ctx, "firebase", "postcheck-unlink-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestOrphanedProviderUnlinkIsSettledFromLiveStateInsteadOfFencingForever(t *
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "orphan-controller-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -338,7 +338,7 @@ func TestOrphanedProviderUnlinkReconcileDeleteFailureAndSubjectDrift(t *testing.
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "orphan-reconcile-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -428,7 +428,7 @@ func TestOrphanedProviderUnlinkOnLastMethodFailsWithoutServerDelete(t *testing.T
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "orphan-last-method-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -481,7 +481,7 @@ func TestProviderMethodsReadLiveAccountAndCountOnlyProvedEmail(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	const uid = "methods-controller-uid"
 	registered, err := store.AutoRegister(ctx, "firebase", uid)
 	if err != nil {
@@ -574,7 +574,7 @@ func TestProviderLinkRejectsPreOperationTokenAndAcceptsForcedRefresh(t *testing.
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	registered, err := store.AutoRegister(ctx, "firebase", "link-uid")
 	if err != nil {
 		t.Fatal(err)
@@ -634,7 +634,7 @@ func TestProviderOperationStatusMapsDurableSemanticOutcomes(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	owner, err := store.AutoRegister(ctx, "firebase", "status-controller-owner")
 	if err != nil {
 		t.Fatal(err)
@@ -768,7 +768,7 @@ func TestProviderRegistrationAndMethodsWithoutEmailSender(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	// The transfer choice gate is independent of the sender: wire the service
 	// so the sign-up below must still park at create-account confirmation.
 	store.Transfers = transfersession.New(pool, transfersession.Config{})

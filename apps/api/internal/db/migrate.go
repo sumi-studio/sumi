@@ -31,10 +31,8 @@ const migrationAdvisoryLockID = int64(0x534d4944) // "SMID"
 var upMigrationRe = regexp.MustCompile(`^(\d+)_[^/]+\.up\.sql$`)
 var noTransactionMigrationRe = regexp.MustCompile(`(?m)^-- \+no-transaction\s*$`)
 
-// ErrPreCutoverResetRequired marks the one intentional destructive migration
-// boundary. Version 0008 was replaced before dogfooding data became durable;
-// an old database must be reset instead of guessed at or partially adopted.
-var ErrPreCutoverResetRequired = errors.New("pre-cutover Workspace schema replacement requires a database reset")
+// ErrSchemaHistoryMismatch rejects a database from a different schema history.
+var ErrSchemaHistoryMismatch = errors.New("database schema history does not match the Core foundation")
 
 var ErrMigrationChecksumMismatch = errors.New("applied migration checksum does not match embedded history")
 
@@ -84,78 +82,14 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := conn.Exec(ctx, migrationBookkeepingSchema); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}
-	// Pre-checksum development databases have the table but not the column.
-	// Adding it is safe; the intentionally replaced version 0008 is rejected
-	// below when its checksum is absent instead of being silently adopted.
-	if _, err := conn.Exec(ctx,
-		"ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text"); err != nil {
-		return fmt.Errorf("ensure migration checksum column: %w", err)
-	}
-
 	pending, err := pendingMigrations(ctx, conn)
 	if err != nil {
-		return err
-	}
-	// Once the exact embedded prefix has been proven, make the invariant a DB
-	// constraint. A pre-checksum database with any applied row is rejected above
-	// rather than retroactively blessing unverifiable history.
-	if _, err := conn.Exec(ctx,
-		"ALTER TABLE schema_migrations ALTER COLUMN checksum SET NOT NULL"); err != nil {
-		return fmt.Errorf("require migration checksums: %w", err)
-	}
-	if err := rejectLegacyWorkspaceMigration(ctx, conn); err != nil {
 		return err
 	}
 	for _, m := range pending {
 		if err := applyMigration(ctx, conn, m); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// rejectLegacyWorkspaceMigration distinguishes every pre-cutover 0008 shape
-// from the current 0008_workspace_core. Migration versions are the durable
-// identity, so a database that recorded either the legacy Messaging schema or
-// an earlier draft of Workspace core would otherwise skip the replacement.
-// This is deliberately a reset guard, not a compatibility/backfill path.
-func rejectLegacyWorkspaceMigration(ctx context.Context, db migrationDB) error {
-	migrations, err := embeddedUpMigrations()
-	if err != nil {
-		return err
-	}
-	var expectedChecksum string
-	for _, migration := range migrations {
-		if migration.version == 8 {
-			expectedChecksum = migrationChecksum(migration.content)
-			break
-		}
-	}
-	if expectedChecksum == "" {
-		return errors.New("embedded Workspace migration 0008 is missing")
-	}
-	var versionApplied, currentFingerprint bool
-	var recordedChecksum *string
-	err = db.QueryRow(ctx, `
-		SELECT
-			EXISTS (SELECT 1 FROM schema_migrations WHERE version = 8),
-			(SELECT checksum FROM schema_migrations WHERE version = 8),
-			EXISTS (
-				SELECT 1
-				FROM information_schema.columns
-				WHERE table_schema = current_schema()
-				  AND table_name = 'workspaces'
-				  AND column_name = 'owner_workspace_member_id'
-			)
-			AND to_regclass(current_schema() || '.app_catalog') IS NOT NULL
-			AND to_regclass(current_schema() || '.app_workspace_role_capabilities') IS NOT NULL
-			AND to_regclass(current_schema() || '.workspace_role_app_capability_grants') IS NOT NULL
-	`).Scan(&versionApplied, &recordedChecksum, &currentFingerprint)
-	if err != nil {
-		return fmt.Errorf("inspect pre-cutover Workspace migration boundary: %w", err)
-	}
-	if versionApplied && (recordedChecksum == nil || *recordedChecksum != expectedChecksum || !currentFingerprint) {
-		return fmt.Errorf("%w: recorded migration 0008 does not match the current Workspace foundation; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired)
 	}
 	return nil
 }
@@ -181,17 +115,17 @@ func pendingMigrations(ctx context.Context, db migrationDB) ([]pendingMigration,
 			return nil, fmt.Errorf("scan applied version: %w", err)
 		}
 		if appliedCount >= len(embedded) {
-			return nil, fmt.Errorf("%w: applied migration %04d is not present in embedded history; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, version)
+			return nil, fmt.Errorf("%w: applied migration %04d is not present in embedded history; reset this database and migrate from empty", ErrSchemaHistoryMismatch, version)
 		}
 		expected := embedded[appliedCount]
 		if version != expected.version {
-			return nil, fmt.Errorf("%w: applied history is not the embedded prefix at position %d (found %04d, expected %04d); reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, appliedCount+1, version, expected.version)
+			return nil, fmt.Errorf("%w: applied history is not the embedded prefix at position %d (found %04d, expected %04d); reset this database and migrate from empty", ErrSchemaHistoryMismatch, appliedCount+1, version, expected.version)
 		}
 		if checksum == nil {
-			return nil, fmt.Errorf("%w: migration %04d has no verifiable checksum; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, version)
+			return nil, fmt.Errorf("%w: migration %04d has no verifiable checksum; reset this database and migrate from empty", ErrSchemaHistoryMismatch, version)
 		}
 		if *checksum != migrationChecksum(expected.content) {
-			return nil, fmt.Errorf("%w: %w: version %04d; reset this pre-cutover database and migrate from empty", ErrPreCutoverResetRequired, ErrMigrationChecksumMismatch, version)
+			return nil, fmt.Errorf("%w: %w: version %04d; reset this database and migrate from empty", ErrSchemaHistoryMismatch, ErrMigrationChecksumMismatch, version)
 		}
 		appliedCount++
 	}

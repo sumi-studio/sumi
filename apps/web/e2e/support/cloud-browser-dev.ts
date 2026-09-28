@@ -2,7 +2,7 @@
 // and keep it running until SIGINT. Prints the web URL and the session
 // cookie path (the cookie itself goes to a 0600 file, never stdout).
 import { writeFileSync } from "node:fs";
-import { buildWorkspaceBrowserStack, removeWorkspaceBrowserBuild } from "./real-agent-stack";
+import { buildWorkspaceBrowserStack, removeWorkspaceBrowserBuild } from "./workspace-stack";
 import { startCloudBrowserStack } from "./cloud-browser-stack";
 
 const databaseURL = process.env.CLOUD_BROWSER_E2E_DB_URL ?? "";

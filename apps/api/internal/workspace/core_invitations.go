@@ -214,3 +214,10 @@ func coreInvitationListCursorMAC(personaID string, payload []byte) []byte {
 	mac.Write(payload)
 	return mac.Sum(nil)
 }
+
+const (
+	workspaceInvitationListCursorVersion      = byte(1)
+	workspaceInvitationListCursorPayloadBytes = 1 + 8 + 16
+	workspaceInvitationListCursorBytes        = workspaceInvitationListCursorPayloadBytes + sha256.Size
+	workspaceInvitationListCursorEncodedBytes = 76
+)

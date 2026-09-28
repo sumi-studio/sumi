@@ -1,49 +1,16 @@
 package messaging
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
-
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 // callLocal invokes one local-control handler directly, the way the PAID-bound
 // Unix socket transport would after authorizing the lease.
-func callLocal(
-	t *testing.T,
-	ctx context.Context,
-	handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization),
-	path string,
-	body map[string]any,
-	authorization agentevents.LocalRuntimeAuthorization,
-) (int, map[string]any) {
-	t.Helper()
-	if store, ok := testStoreForParticipant(authorization.PersonalityAgentID); ok {
-		if scoped, err := store.fixtureScopeForRequest(ctx, PersonalityAgent(authorization.PersonalityAgentID), path, body); err == nil {
-			body["workspace_id"] = scoped.Scope.WorkspaceID
-			body["installation_id"] = scoped.Scope.InstallationID
-			body["authority_epoch"] = strconv.FormatInt(scoped.Scope.AuthorityEpoch, 10)
-		}
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal local request: %v", err)
-	}
-	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(raw)).WithContext(ctx)
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	handler(response, request, authorization)
-	var decoded map[string]any
-	_ = json.Unmarshal(response.Body.Bytes(), &decoded)
-	return response.Code, decoded
-}
 
 func TestToggleReactionFlipsAndAggregates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -310,46 +277,6 @@ func TestConcurrentReactionPublishesFollowCommittedSnapshots(t *testing.T) {
 	}
 }
 
-func TestLocalReactTogglesForTheAgent(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	server := NewServer(w.store.core, nil)
-	_, channel := w.workspaceWithChannel(t, ctx)
-	msg := w.send(t, ctx, channel.PlaceID, w.humanA, "generalの発言")
-
-	react := func(emoji, clientNonce string) (int, map[string]any) {
-		t.Helper()
-		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
-			"place_id": channel.PlaceID, "message_id": msg.MessageID, "emoji": emoji,
-			"client_nonce": clientNonce,
-		}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
-	}
-
-	status, body := react("🎉", "agent-reaction-add")
-	if status != http.StatusOK || body["reacted"] != true {
-		t.Fatalf("agent react: status %d body %v", status, body)
-	}
-	reactions := body["message"].(map[string]any)["reactions"].([]any)
-	participant := reactions[0].(map[string]any)["participants"].([]any)[0].(map[string]any)
-	if participant["kind"] != "personality_agent" || participant["personality_agent_id"] != w.agent.ID {
-		t.Fatalf("agent reaction participant = %v", participant)
-	}
-	status, body = react("🎉", "agent-reaction-add")
-	if status != http.StatusOK || body["reacted"] != true || len(body["message"].(map[string]any)["reactions"].([]any)) != 1 {
-		t.Fatalf("agent reaction replay changed state: status %d body %v", status, body)
-	}
-
-	// A fresh gesture removes it again.
-	status, body = react("🎉", "agent-reaction-remove")
-	if status != http.StatusOK || body["reacted"] != false {
-		t.Fatalf("agent un-react: status %d body %v", status, body)
-	}
-	if n := len(body["message"].(map[string]any)["reactions"].([]any)); n != 0 {
-		t.Fatalf("reactions after un-react = %d, want 0", n)
-	}
-}
-
 func TestToggleReactionIdempotentReplayAndConcurrentDuplicate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -460,42 +387,5 @@ func TestToggleReactionNonceConflictAcrossMessageRows(t *testing.T) {
 	}
 	if reactions != 1 || mutations != 1 {
 		t.Fatalf("cross-message durable state: reactions=%d mutations=%d, want 1/1", reactions, mutations)
-	}
-}
-
-func TestReactionNonceConflictMapsToRESTAndLocalControl409(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w, ts := newWSWorld(t, ctx)
-	_, ch := w.workspaceWithChannel(t, ctx)
-	first := w.send(t, ctx, ch.PlaceID, w.humanA, "first REST target")
-	second := w.send(t, ctx, ch.PlaceID, w.humanA, "second REST target")
-
-	restPath := func(messageID string) string {
-		return "/messaging/places/" + ch.PlaceID + "/messages/" + messageID + "/reactions"
-	}
-	request := map[string]any{"emoji": "👍", "client_nonce": "rest-conflict"}
-	if response, body := call(t, ts, http.MethodPost, restPath(first.MessageID), w.humanB.ID, request); response.StatusCode != http.StatusOK {
-		t.Fatalf("first REST reaction: status=%d body=%v", response.StatusCode, body)
-	}
-	response, body := call(t, ts, http.MethodPost, restPath(second.MessageID), w.humanB.ID, request)
-	if response.StatusCode != http.StatusConflict || body["error"] != "idempotency_conflict" {
-		t.Fatalf("REST nonce conflict: status=%d body=%v", response.StatusCode, body)
-	}
-
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	localRequest := func(messageID string) (int, map[string]any) {
-		return callLocal(t, ctx, server.localReact, LocalReactPath, map[string]any{
-			"place_id": ch.PlaceID, "message_id": messageID,
-			"emoji": "🎉", "client_nonce": "local-conflict",
-		}, authorization)
-	}
-	if status, localBody := localRequest(first.MessageID); status != http.StatusOK {
-		t.Fatalf("first local reaction: status=%d body=%v", status, localBody)
-	}
-	status, localBody := localRequest(second.MessageID)
-	if status != http.StatusConflict || localBody["error"] != "idempotency_conflict" {
-		t.Fatalf("local nonce conflict: status=%d body=%v", status, localBody)
 	}
 }

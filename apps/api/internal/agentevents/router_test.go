@@ -16,12 +16,12 @@ func TestNewProductionMux_NilStoreReturnsError(t *testing.T) {
 		t.Fatalf("open command store: %v", err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
+	gateway, err := OpenBrowserJournal(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatalf("open durable gateway: %v", err)
 	}
 
-	_, _, _, err = NewProductionMux(nil, gateway, nil, nil, nil, nil, nil, directchat.NewLifecycleFence())
+	_, _, err = NewProductionMux(nil, gateway, nil, nil, nil, directchat.NewLifecycleFence())
 	if err == nil {
 		t.Fatal("expected NewProductionMux to return an error for nil store")
 	}
@@ -36,17 +36,15 @@ func TestNewProductionMux_WiresBrowserOriginPolicyToCommandIngress(t *testing.T)
 		t.Fatalf("open command store: %v", err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(privateRuntimeDir(t), store)
+	gateway, err := OpenBrowserJournal(privateRuntimeDir(t), store)
 	if err != nil {
 		t.Fatalf("open durable gateway: %v", err)
 	}
 
-	mux, _, _, err := NewProductionMux(
+	mux, _, err := NewProductionMux(
 		store,
 		gateway,
-		nil,
 		&fakeSessionVerifier{},
-		nil,
 		[]string{testBrowserOrigin},
 		nil,
 		directchat.NewLifecycleFence(),

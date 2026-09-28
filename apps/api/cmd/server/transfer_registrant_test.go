@@ -113,7 +113,7 @@ func registrantRequest(t *testing.T, srv *httptest.Server, path, epoch, csrf, or
 
 func TestRegistrantProofAdapterBoundaries(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	svc := transfersession.New(pool, transfersession.Config{})
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -194,7 +194,7 @@ func TestSecretaryTransferEnvContract(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 
 	t.Setenv(transferPublicBaseURLEnv, "")
-	disabled := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	disabled := koseki.New(pool)
 	mount, err := secretaryTransferFromEnv(pool, disabled, []string{registrantTestOrigin})
 	if err != nil || mount != nil {
 		t.Fatalf("disabled mount: %+v %v", mount, err)
@@ -204,7 +204,7 @@ func TestSecretaryTransferEnvContract(t *testing.T) {
 	}
 
 	t.Setenv(transferPublicBaseURLEnv, "https://move.example.test")
-	enabled := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	enabled := koseki.New(pool)
 	mount, err = secretaryTransferFromEnv(pool, enabled, []string{registrantTestOrigin})
 	if err != nil || mount == nil || mount.service == nil || mount.server == nil {
 		t.Fatalf("enabled mount: %+v %v", mount, err)

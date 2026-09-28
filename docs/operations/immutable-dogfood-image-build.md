@@ -1,7 +1,7 @@
 # Immutable dogfood image build
 
 This runbook covers only the local build and evidence-validation slice for the
-four dogfood images: `api`, `agent`, `provisioner`, and `web`. It does
+five dogfood images: `api`, `core`, `job`, `provisioner`, and `web`. It does
 not push images, modify a registry, start or stop Docker workloads, or perform
 a cutover.
 
@@ -24,7 +24,7 @@ a cutover.
   client configuration.
 - Create the evidence directory with owner-only permissions. The manifest path
   must not already exist.
-- Ensure operational exclusivity for the four requested mutable references
+- Ensure operational exclusivity for the five requested mutable references
   during this build. The builder checks each reference before use, but no
   daemon-wide lock exists and an external actor can create a non-atomic race.
 
@@ -74,7 +74,7 @@ scripts/operations/build-dogfood-images \
   --manifest "${MANIFEST}"
 ```
 
-The command writes no evidence on a partial failure. After all four builds
+The command writes no evidence on a partial failure. After all five builds
 produce distinct canonical immutable image IDs and pass bounded label
 inspection, it atomically publishes one owner-only schema-v2 `COMPLETE`
 manifest.

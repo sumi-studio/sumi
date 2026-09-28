@@ -1,4 +1,4 @@
-# Local control-plane compose: Postgres + Go API + Vite web + the privileged
+# Core-only local stack: PostgreSQL, API, TypeScript secretary pool, Web, and job/PTY provisioner.
 # runtime provisioner. PersonalityAgent runtimes are separate PAID-derived
 # Compose projects created lazily by the provisioner.
 #
@@ -9,7 +9,7 @@
 # Web, API, and every provisioned runtime keep distinct network namespaces.
 # Web uses stable service DNS for its dev proxy; runtimes use the stable
 # internal control-plane alias. The API receives neither Docker access nor
-# agent-private volumes.
+# private job state.
 
 name: sumi-dev
 
@@ -71,7 +71,7 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Prepare API state and local-control socket directories with the exact
+  # Prepare API journal and attachment directories with the exact
   # ownership and modes the server expects.
   api-state-init:
     image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
@@ -82,10 +82,8 @@ services:
       - "-c"
       - |
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-command-log
-        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-runtime-state
+        install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-browser-events
         install -d -m 0700 -o 65532 -g 65532 /var/lib/sumi-messaging-attachments
-        install -d -m 0750 -o 65532 -g 20000 /run/sumi/local-control
-        install -d -m 0700 -o root -g root /run/sumi/runtime-secrets
         # The job egress proxy owns this directory; job containers only
         # traverse it to reach the unix socket (socket mode 0622 — connect
         # needs write on the socket file, not the directory).
@@ -93,18 +91,31 @@ services:
     cap_add: [CHOWN, FOWNER]
     volumes:
       - api-command-log:/var/lib/sumi-command-log
-      - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-browser-events:/var/lib/sumi-browser-events
       - api-messaging-attachments:/var/lib/sumi-messaging-attachments
-      - type: bind
-        source: /run/sumi/local-control
-        target: /run/sumi/local-control
-      - type: bind
-        source: /run/sumi/runtime-secrets
-        target: /run/sumi/runtime-secrets
       - type: bind
         source: /run/sumi/egress
         target: /run/sumi/egress
     restart: "no"
+
+  core-pool:
+    profiles: [local-core]
+    image: ghcr.io/sumi-studio/sumi-core:${SUMI_CORE_IMAGE_TAG:-latest}
+    pull_policy: always
+    network_mode: service:api
+    environment:
+      SUMI_DEV_POOL_LISTEN: 127.0.0.1:8086
+      SUMI_STATE_URL: http://127.0.0.1:8080
+      SUMI_CORE_RUNTIME_TOKEN: ${SUMI_CORE_RUNTIME_TOKEN:?SUMI_CORE_RUNTIME_TOKEN is required}
+      SUMI_CORE_WAKE_TOKEN: ${SUMI_CORE_WAKE_TOKEN:?SUMI_CORE_WAKE_TOKEN is required}
+      SUMI_MODEL_PROVIDER: ${SUMI_MODEL_PROVIDER:-mock}
+      SUMI_MODEL_BASE_URL: ${SUMI_MODEL_BASE_URL:-}
+      SUMI_MODEL_API_KEY: ${SUMI_MODEL_API_KEY:-}
+      SUMI_MODEL_MODEL: ${SUMI_MODEL_MODEL:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
 
   api:
     image: ghcr.io/sumi-studio/sumi-api:${SUMI_API_IMAGE_TAG:-latest}
@@ -116,7 +127,7 @@ services:
     environment:
       SUMI_DB_URL: ${SUMI_DB_URL:-postgres://sumi:sumi-dev@postgres:5432/sumi?sslmode=disable}
       SUMI_COMMAND_LOG_DIR: /var/lib/sumi-command-log
-      SUMI_AGENT_RUNTIME_STATE_DIR: /var/lib/sumi-runtime-state
+      SUMI_BROWSER_EVENT_DIR: /var/lib/sumi-browser-events
       # Messaging attachment bytes live in an API-owned named volume, never in
       # a PersonalityAgent artifact or Workspace volume. Compose named volumes
       # carry no size limit, so both Workspace and whole-store byte/object caps
@@ -136,7 +147,6 @@ services:
       # Explicit participants receiving submitted Sumi feedback. This grants
       # access to Feedback threads, not to the originating Workspaces.
       SUMI_FEEDBACK_RECIPIENTS: ${SUMI_FEEDBACK_RECIPIENTS:-}
-      SUMI_AGENT_TOKEN_SECRET: ${SUMI_AGENT_TOKEN_SECRET:-}
       SUMI_BROWSER_SESSION_SECRET: ${SUMI_BROWSER_SESSION_SECRET:?SUMI_BROWSER_SESSION_SECRET is required}
       SUMI_BROWSER_SESSION_AUDIENCE: ${SUMI_BROWSER_SESSION_AUDIENCE:-sumi:web}
       SUMI_BROWSER_WS_ALLOWED_ORIGINS: ${SUMI_BROWSER_WS_ALLOWED_ORIGINS:?SUMI_BROWSER_WS_ALLOWED_ORIGINS is required}
@@ -154,30 +164,13 @@ services:
       # exact published host address configured on the web service below.
       FIREBASE_AUTH_EMULATOR_HOST: firebase-auth:9099
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
-      SUMI_LOCAL_CONTROL_ENABLED: "1"
-      SUMI_LOCAL_CONTROL_ROOT: /run/sumi/local-control
-      SUMI_LOCAL_CONTROL_SOCKET_GID: "20000"
-      SUMI_LOCAL_CONTROL_TENANT_ID: ${SUMI_LOCAL_CONTROL_TENANT_ID:-sumi-dev}
-      SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION: ${SUMI_LOCAL_CONTROL_DELIVERY_AUTHORIZATION:-raw}
+      SUMI_CORE_STATE_TOKEN: ${SUMI_CORE_STATE_TOKEN:?SUMI_CORE_STATE_TOKEN is required}
+      SUMI_CORE_RUNTIME_TOKEN: ${SUMI_CORE_RUNTIME_TOKEN:?SUMI_CORE_RUNTIME_TOKEN is required}
+      SUMI_CORE_WAKE_TOKEN: ${SUMI_CORE_WAKE_TOKEN:?SUMI_CORE_WAKE_TOKEN is required}
+      SUMI_CORE_WAKE_URL: ${SUMI_CORE_WAKE_URL:-http://127.0.0.1:8086}
       SUMI_RUNTIME_PROVISIONER_SOCKET: /run/sumi/runtime-provisioner/control.sock
-      SUMI_AGENT_GATEWAY_URL: ws://sumi-agent-gateway:8080/agent/ws
-      SUMI_ALLOW_INSECURE_LOOPBACK_GATEWAY: "true"
-      SUMI_AGENT_WRAPPING_KEY_ID: ${SUMI_AGENT_WRAPPING_KEY_ID:-local-ephemeral/v1}
-      SUMI_APPROVAL_SECRET_DIGEST_KEY: ${SUMI_APPROVAL_SECRET_DIGEST_KEY:?SUMI_APPROVAL_SECRET_DIGEST_KEY is required}
       SUMI_CHATGPT_CREDENTIAL_KEY: ${SUMI_CHATGPT_CREDENTIAL_KEY:-}
       SUMI_MODEL_CONNECTION_KEY: ${SUMI_MODEL_CONNECTION_KEY:-}
-      SUMI_PROVIDER_API_KEY: ${SUMI_PROVIDER_API_KEY:-}
-      SUMI_MODEL_PRESET: ${SUMI_MODEL_PRESET:-kimi-k3}
-      SUMI_EXECUTION_REVIEWER_API_KEY: ${SUMI_EXECUTION_REVIEWER_API_KEY:?SUMI_EXECUTION_REVIEWER_API_KEY is required}
-      SUMI_EXECUTION_REVIEWER_MODEL_PRESET: ${SUMI_EXECUTION_REVIEWER_MODEL_PRESET:?SUMI_EXECUTION_REVIEWER_MODEL_PRESET is required}
-      SUMI_EXECUTION_REVIEWER_MODEL_ID: ${SUMI_EXECUTION_REVIEWER_MODEL_ID:-}
-      SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL: ${SUMI_EXECUTION_REVIEWER_MODEL_BASE_URL:-}
-      SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE: ${SUMI_EXECUTION_REVIEWER_MODEL_ACCOUNT_SCOPE:-}
-      SUMI_ESCALATION_REVIEWER_API_KEY: ${SUMI_ESCALATION_REVIEWER_API_KEY:?SUMI_ESCALATION_REVIEWER_API_KEY is required}
-      SUMI_ESCALATION_REVIEWER_MODEL_PRESET: ${SUMI_ESCALATION_REVIEWER_MODEL_PRESET:?SUMI_ESCALATION_REVIEWER_MODEL_PRESET is required}
-      SUMI_ESCALATION_REVIEWER_MODEL_ID: ${SUMI_ESCALATION_REVIEWER_MODEL_ID:-}
-      SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL: ${SUMI_ESCALATION_REVIEWER_MODEL_BASE_URL:-}
-      SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE: ${SUMI_ESCALATION_REVIEWER_MODEL_ACCOUNT_SCOPE:-}
       # The URL is browser-facing. Empty credentials deliberately leave call
       # routes unmounted while text messaging continues normally. The launcher
       # starts the livekit service below for exactly the same credential pair,
@@ -192,11 +185,8 @@ services:
       - "${SUMI_DEV_BIND_HOST:-127.0.0.1}:8080:8080"
     volumes:
       - api-command-log:/var/lib/sumi-command-log
-      - api-runtime-state:/var/lib/sumi-runtime-state
+      - api-browser-events:/var/lib/sumi-browser-events
       - api-messaging-attachments:/var/lib/sumi-messaging-attachments
-      - type: bind
-        source: /run/sumi/local-control
-        target: /run/sumi/local-control
       - provisioner-control:/run/sumi/runtime-provisioner
     depends_on:
       api-state-init:
@@ -213,7 +203,7 @@ services:
       default: {}
       control-plane:
         aliases:
-          - sumi-agent-gateway
+          - sumi-api
     healthcheck:
       test: ["CMD", "/busybox/wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 2s
@@ -295,26 +285,11 @@ services:
       - /run/sumi/runtime-provisioner/control.sock
       - -socket-gid
       - "20000"
-      - -supervisor
-      - /opt/sumi/deploy/agent/supervisor
       - -state-dir
       - /run/sumi/runtime-provisioner/state
     environment:
-      SUMI_CONTROL_PLANE_NETWORK: sumi-control-plane
-      # The launcher validates and file-mounts config.json here so the Docker
-      # CLI used by the supervisor can pull private agent images.
+      # Private registry credentials for the pinned job image.
       DOCKER_CONFIG: /run/sumi/docker-config
-      # Keep lazily provisioned agent containers on the same selected image
-      # tag as the local control plane. The default remains latest.
-      SUMI_AGENT_IMAGE_TAG: ${SUMI_AGENT_IMAGE_TAG:-latest}
-      SUMI_AGENT_IMAGE_PULL_POLICY: ${SUMI_AGENT_IMAGE_PULL_POLICY:-always}
-      # Passed only to the supervisor's non-secret activation descriptor.
-      # Empty keeps the agent default; local diagnostics may set a bounded
-      # tracing filter without rebuilding the API.
-      SUMI_LOG: ${SUMI_LOG:-}
-      # Explicitly local-development-only. The supervisor still fails closed
-      # unless the launcher confirms that this host has AppArmor disabled.
-      SUMI_DEV_ALLOW_APPARMOR_UNCONFINED: ${SUMI_DEV_ALLOW_APPARMOR_UNCONFINED:-false}
       # The interactive output pump tails the daemon's own json-file
       # journal. DockerRootDir is a host path, so the data root is
       # mounted read-only at a stable in-container point and the
@@ -324,6 +299,7 @@ services:
       # provisioner only names it to dockerd (bind source); it never opens
       # the socket itself. Empty disables job egress entirely — job
       # containers then launch with the byte-for-byte no-network contract.
+      SUMI_JOB_IMAGE_TAG: ${SUMI_JOB_IMAGE_TAG:-}
       SUMI_JOB_EGRESS_DIR: ${SUMI_JOB_EGRESS_DIR-/run/sumi/egress}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -344,12 +320,6 @@ services:
         bind:
           create_host_path: false
       - provisioner-control:/run/sumi/runtime-provisioner
-      - type: bind
-        source: /run/sumi/local-control
-        target: /run/sumi/local-control
-      - type: bind
-        source: /run/sumi/runtime-secrets
-        target: /run/sumi/runtime-secrets
     depends_on:
       api-state-init:
         condition: service_completed_successfully
@@ -438,7 +408,7 @@ volumes:
   firebase-auth-data: {}
   sumi-postgres: {}
   api-command-log: {}
-  api-runtime-state: {}
+  api-browser-events: {}
   api-messaging-attachments: {}
   provisioner-control: {}
 

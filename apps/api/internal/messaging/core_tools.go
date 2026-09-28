@@ -1007,3 +1007,6 @@ func (d *CoreAttentionDelivery) afterMessageEditedCommit(ctx context.Context, pe
 func (d *CoreAttentionDelivery) afterMessageDeletedCommit(ctx context.Context, personaID string, _, response map[string]any) {
 	d.afterMessageChangeCommit(ctx, personaID, response, EventMessageDeleted)
 }
+
+// MaxLocalAttachmentFetchBytes bounds a Core attachment fetch.
+const MaxLocalAttachmentFetchBytes int64 = 2 << 20

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 type interleavingPollQuerier struct {
@@ -686,117 +685,6 @@ func TestPollHTTPRejectsAttachmentCombinationAndPublishesPartialUpdate(t *testin
 	response, body = call(t, server, http.MethodPost, votePath, w.humanB.ID, map[string]any{})
 	if response.StatusCode != http.StatusBadRequest || body["error"] != "invalid_poll" {
 		t.Fatalf("missing option_ids = %d %v", response.StatusCode, body)
-	}
-}
-
-func TestLocalCreatePollReceiptStaysStableAcrossReplayEditAndTombstone(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	workspace, channel := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	request := map[string]any{
-		"place_id": channel.PlaceID, "content": "before", "question": "どちら？",
-		"options": []string{"A", "B"}, "client_nonce": "stable-poll-receipt",
-	}
-	status, fresh := callLocal(
-		t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization,
-	)
-	if status != http.StatusCreated || fresh["created"] != true || len(fresh) != 5 {
-		t.Fatalf("fresh local poll receipt = %d %v", status, fresh)
-	}
-	projection, ok := fresh["message"].(map[string]any)
-	poll, hasPoll := projection["poll"].(map[string]any)
-	if !ok || !hasPoll || projection["content"] != "before" || poll["question"] != "どちら？" {
-		t.Fatalf("fresh local poll projection = %v", fresh["message"])
-	}
-	messageID, _ := fresh["message_id"].(string)
-	seq, _ := fresh["seq"].(float64)
-	if messageID == "" || projection["message_id"] != messageID || seq != projection["seq"] ||
-		fresh["client_nonce"] != "stable-poll-receipt" {
-		t.Fatalf("fresh local poll identity = %v", fresh)
-	}
-	assertReplay := func(stage string) {
-		t.Helper()
-		status, replay := callLocal(
-			t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization,
-		)
-		message, hasMessage := replay["message"]
-		if status != http.StatusOK || len(replay) != 5 || replay["created"] != false ||
-			replay["client_nonce"] != "stable-poll-receipt" ||
-			replay["message_id"] != messageID || replay["seq"] != seq ||
-			!hasMessage || message != nil {
-			t.Fatalf("%s local poll replay = %d %v", stage, status, replay)
-		}
-	}
-	assertReplay("immediate")
-
-	agent := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent)
-	revision := int64(projection["revision"].(float64))
-	if _, err := agent.EditMessage(ctx, channel.PlaceID, messageID, "after", revision); err != nil {
-		t.Fatal(err)
-	}
-	assertReplay("after edit")
-	if _, err := agent.DeleteMessage(ctx, channel.PlaceID, messageID); err != nil {
-		t.Fatal(err)
-	}
-	assertReplay("after tombstone")
-}
-
-func TestLocalPollRelativeDeadlineReplayAndVoteUseExactScope(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	_, channel := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	request := map[string]any{
-		"place_id": channel.PlaceID, "question": "いつ？", "options": []string{"今日", "明日"},
-		"client_nonce": "relative-deadline-replay", "closes_in_minutes": 30,
-	}
-	status, first := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization)
-	if status != http.StatusCreated || first["created"] != true {
-		t.Fatalf("first local poll = %d %v", status, first)
-	}
-	firstMessage := first["message"].(map[string]any)
-	messageID := first["message_id"].(string)
-	seq := first["seq"]
-	if firstMessage["message_id"] != messageID || firstMessage["seq"] != seq {
-		t.Fatalf("fresh local poll identity = %v", first)
-	}
-	if _, err := w.store.pool.Exec(ctx, `
-		UPDATE message_polls SET closes_at = clock_timestamp() - interval '1 second'
-		WHERE message_id = $1`, messageID); err != nil {
-		t.Fatal(err)
-	}
-	status, replay := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, request, authorization)
-	if status != http.StatusOK || replay["created"] != false || replay["message"] != nil ||
-		replay["message_id"] != messageID || replay["seq"] != seq {
-		t.Fatalf("closed local replay = %d %v", status, replay)
-	}
-	changed := map[string]any{
-		"place_id": channel.PlaceID, "question": "いつ？", "options": []string{"今日", "明日"},
-		"client_nonce": "relative-deadline-replay", "closes_in_minutes": 31,
-	}
-	status, conflict := callLocal(t, ctx, server.localCreatePoll, LocalCreatePollPath, changed, authorization)
-	if status != http.StatusConflict || conflict["error"] != "idempotency_conflict" {
-		t.Fatalf("changed relative replay = %d %v", status, conflict)
-	}
-
-	// Re-open the poll only to exercise local voting without a wall-clock race.
-	if _, err := w.store.pool.Exec(ctx, `
-		UPDATE message_polls SET closes_at = clock_timestamp() + interval '1 hour'
-		WHERE message_id = $1`, messageID); err != nil {
-		t.Fatal(err)
-	}
-	options := firstMessage["poll"].(map[string]any)["options"].([]any)
-	optionID := options[0].(map[string]any)["option_id"].(string)
-	status, voted := callLocal(t, ctx, server.localVotePoll, LocalVotePollPath, map[string]any{
-		"place_id": channel.PlaceID, "message_id": messageID, "option_ids": []string{optionID},
-	}, authorization)
-	if status != http.StatusOK || voted["message"].(map[string]any)["poll"].(map[string]any)["revision"] != float64(1) {
-		t.Fatalf("local vote = %d %v", status, voted)
 	}
 }
 

@@ -17,11 +17,6 @@ import (
 const fakeDockerScript = `#!/bin/sh
 printf '%s\n' "$*" >> "$REC_LOG"
 case "$1 $2" in
-  "volume inspect")
-    name="$3"
-    project="${name%_workspace}"
-    printf '[{"Name":"%s","Labels":{"com.docker.compose.project":"%s","com.docker.compose.volume":"workspace"}}]' "$name" "$project"
-    ;;
   "image inspect")
     printf 'sha256:0000000000000000000000000000000000000000000000000000000000000001\n'
     ;;
@@ -46,8 +41,9 @@ func launchArgs(t *testing.T, extraEnv []string, o ProcessOperation) []string {
 		"PATH=" + dir + ":" + os.Getenv("PATH"),
 		"REC_LOG=" + recLog,
 		"SUMI_JOB_IMAGE_TAG=899a7cdf1defdf9ce09d76cccaea48bf5f58a20d",
-		"SUMI_AGENT_IMAGE_TAG=899a7cdf1defdf9ce09d76cccaea48bf5f58a20d",
 	}, extraEnv...)
+	o.WorkspaceBind = "/fixture/persona"
+	o.FilesVolumeUUID = "fixture-volume"
 	backend := &DockerBackend{baseEnvironment: env}
 	if err := backend.LaunchProcess(context.Background(), o); err != nil {
 		t.Fatalf("LaunchProcess: %v", err)
@@ -98,9 +94,9 @@ func egressTestOp(t *testing.T, interactive bool) ProcessOperation {
 func egressEnabledOp(t *testing.T) ProcessOperation {
 	o := egressTestOp(t, false)
 	o.Env = map[string]string{
-		"HTTP_PROXY": "http://requester-supplied.invalid:9",
+		"HTTP_PROXY":  "http://requester-supplied.invalid:9",
 		"https_proxy": "http://also-bad.invalid:9",
-		"KEEP_ME":    "yes",
+		"KEEP_ME":     "yes",
 	}
 	return o
 }
@@ -176,18 +172,6 @@ func TestLaunchProcessNoEgressUnchanged(t *testing.T) {
 	}
 }
 
-// Egress configured but a non-job image: no mount, no proxy env — the
-// agent image carries neither the bridge nor the mountpoint.
-func TestLaunchProcessEgressOnlyForJobImage(t *testing.T) {
-	o := egressEnabledOp(t)
-	o.Image = "agent"
-	args := launchArgs(t, []string{"SUMI_JOB_EGRESS_DIR=/run/sumi/egress"}, o)
-	joined := joinedArgs(args)
-	if strings.Contains(joined, "sumi/egress") || strings.Contains(joined, "HTTP_PROXY=http://127.0.0.1:3128") {
-		t.Fatalf("egress applied to non-job image:\n%s", joined)
-	}
-}
-
 // Interactive (terminal) ops get the same egress wiring through the
 // bash -c prelude, while the executable still becomes PID 1 via exec.
 func TestLaunchProcessEgressInteractive(t *testing.T) {
@@ -218,7 +202,7 @@ func TestJobEgressEnvNamesCaseInsensitive(t *testing.T) {
 }
 
 // The recording shim must not leak into other tests: prove docker was
-// actually shimmed by checking the recorded volume inspect answered.
+// actually shimmed by checking the recorded image inspect answered.
 func TestFakeDockerShimSanity(t *testing.T) {
 	dir := t.TempDir()
 	recLog := filepath.Join(dir, "calls.log")
@@ -226,13 +210,13 @@ func TestFakeDockerShimSanity(t *testing.T) {
 	if err := os.WriteFile(shim, []byte(fakeDockerScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(shim, "volume", "inspect", "sumi-abc_workspace")
+	cmd := exec.Command(shim, "image", "inspect", "fixture")
 	cmd.Env = []string{"REC_LOG=" + recLog}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "sumi-abc_workspace") {
+	if !strings.Contains(string(out), "sha256:") {
 		t.Fatalf("shim output: %s", out)
 	}
 }

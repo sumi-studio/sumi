@@ -1142,22 +1142,6 @@ type fenceBackend struct {
 	obs      runtimeprovision.ProcessObservation
 }
 
-func (b *fenceBackend) Prepare(_ context.Context, r runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error) {
-	return runtimeprovision.PreparedEpoch{PersonalityAgentID: r.PersonalityAgentID, Generation: 1, RPCBootNonce: "t", OpaquePreparedHandle: "h"}, nil
-}
-func (b *fenceBackend) Activate(context.Context, runtimeprovision.ActivateRequest) error { return nil }
-func (b *fenceBackend) Abort(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *fenceBackend) Inspect(context.Context, string) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *fenceBackend) Stop(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *fenceBackend) Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
 func (b *fenceBackend) LaunchProcess(context.Context, runtimeprovision.ProcessOperation) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

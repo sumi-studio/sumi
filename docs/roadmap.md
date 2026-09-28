@@ -6,7 +6,7 @@ existing implementation or historical architecture.
 ## 1. Complete the agent foundation work in Issue #362
 
 Deliver and verify the capabilities tracked in
-[the current acceptance ledger](agent/foundation-completion-2026-09-08.md).
+[the current acceptance ledger](core-architecture.md).
 The shared deployment of PRs #373/#374 is an intermediate milestone. Continue
 through the remaining memory, Attention, recovery, tool, permission and
 real-use acceptance work before declaring this goal complete.

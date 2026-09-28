@@ -1,13 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -63,8 +59,8 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	resolver := newKosekiIdentityBindingResolver(koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1"), "local", "firebase")
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	resolver := newKosekiIdentityBindingResolver(koseki.New(pool), "local", "firebase")
+	store := koseki.New(pool)
 
 	// First account: auto-registration mints a Human + Secretary.
 	first, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{
@@ -86,13 +82,6 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 		t.Fatalf("verified initial display name = %q, %v", got, err)
 	}
 	// Per-agent wrapping key is generated at registration.
-	firstKey, err := store.AgentWrappingKey(ctx, first.PersonalityAgentID)
-	if err != nil {
-		t.Fatalf("wrapping key for first agent: %v", err)
-	}
-	if firstKey.ID != "test-wrapping/v1" || len(firstKey.Bytes) != 64 {
-		t.Fatalf("wrapping key pair mismatch: id=%q bytes=%d", firstKey.ID, len(firstKey.Bytes))
-	}
 
 	// Known credential resolves to the same HumanId and agent (no re-registration).
 	firstAgain, err := resolver.ResolveIdentity(ctx, agentevents.FirebaseIdentity{UID: "firebase-uid-aaa", DisplayName: "Later Provider Name"})
@@ -113,13 +102,6 @@ func TestKosekiResolverAutoRegistersAndResolves(t *testing.T) {
 	}
 	if second.UserID == first.UserID || second.PersonalityAgentID == first.PersonalityAgentID {
 		t.Fatal("second account must get a distinct HumanId and PersonalityAgentID")
-	}
-	secondKey, err := store.AgentWrappingKey(ctx, second.PersonalityAgentID)
-	if err != nil {
-		t.Fatalf("wrapping key for second agent: %v", err)
-	}
-	if secondKey.ID != "test-wrapping/v1" || len(secondKey.Bytes) != 64 {
-		t.Fatalf("second wrapping key pair mismatch: id=%q bytes=%d", secondKey.ID, len(secondKey.Bytes))
 	}
 
 	// Each Human has exactly one Secretary that round-trips through the store.
@@ -143,7 +125,7 @@ func TestDirectChatAuthorizerComposesEmployerAndExactParticipantInstallation(t *
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	lifecycle := directchat.NewLifecycleFence()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	store := koseki.New(pool, lifecycle)
 	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, store, appStore)
 
@@ -244,7 +226,7 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	lifecycle := directchat.NewLifecycleFence()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	kosekiStore := koseki.New(pool, lifecycle)
 	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
 	registration, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-disable-race")
@@ -381,246 +363,12 @@ func TestDirectChatAuthorizerSerializesDisableAgainstOperation(t *testing.T) {
 	}
 }
 
-func TestDirectChatProcessFenceSurvivesBackendLossAfterAuthorizationCommit(t *testing.T) {
-	pool := kosekiResolverTestPool(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	lifecycle := directchat.NewLifecycleFence()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
-	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
-	const authorizationApplicationName = "sumi-direct-chat-auth-backend-loss"
-	authorizationConfig, err := pgxpool.ParseConfig(pool.Config().ConnString())
-	if err != nil {
-		t.Fatal(err)
-	}
-	authorizationConfig.MaxConns = 1
-	authorizationConfig.MinConns = 1
-	if authorizationConfig.ConnConfig.RuntimeParams == nil {
-		authorizationConfig.ConnConfig.RuntimeParams = map[string]string{}
-	}
-	authorizationConfig.ConnConfig.RuntimeParams["application_name"] = authorizationApplicationName
-	authorizationPool, err := pgxpool.NewWithConfig(ctx, authorizationConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer authorizationPool.Close()
-	if err := authorizationPool.Ping(ctx); err != nil {
-		t.Fatal(err)
-	}
-	authorizer := newDirectChatAuthorizer(authorizationPool, kosekiStore, appStore)
-	first, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-backend-loss-first")
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-backend-loss-second")
-	if err != nil {
-		t.Fatal(err)
-	}
-	actor := participant.Human(first.HumanID)
-	installation, err := appStore.ResolveEnabledInstallation(
-		ctx,
-		applicationapps.ParticipantOwner(actor),
-		actor,
-		directchat.AppID,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	commandStore, err := agentevents.OpenCommandStore(privateRuntimeDir(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = commandStore.Close() })
-	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commandStore)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtimeReceipt := "backend-loss-runtime-ready"
-	if err := gateway.PublishRuntimeState(first.AgentID, 1, &runtimeReceipt); err != nil {
-		t.Fatal(err)
-	}
-	sessions, err := agentevents.NewHMACUserSessionVerifier(
-		testSessionSecret,
-		agentevents.DefaultBrowserAudience(),
-		gateway,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := sessions.IssueSession(ctx, agentevents.UserSessionClaims{
-		TenantID:           "tenant-1",
-		UserID:             first.HumanID,
-		PersonalityAgentID: first.AgentID,
-	}, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	releaseEffect := make(chan struct{})
-	appender := &backendLossCommandAppender{
-		inner: gateway, started: make(chan struct{}), release: releaseEffect,
-	}
-	ingress, err := agentevents.NewUserCommandIngress(appender, sessions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ingress.AllowedOrigins = []string{testBrowserOrigin}
-	ingress.Authorizer = authorizer
-	ingress.LifecycleFence = lifecycle
-	server := httptest.NewServer(ingress)
-	defer server.Close()
-
-	type commandResult struct {
-		response *http.Response
-		err      error
-	}
-	commandDone := make(chan commandResult, 1)
-	go func() {
-		body := bytes.NewBufferString(
-			`{"type":"user_message","text":"survive backend loss","attachments":[]}`,
-		)
-		req, requestErr := http.NewRequestWithContext(
-			ctx,
-			http.MethodPost,
-			fmt.Sprintf(
-				"%s/direct-chat/commands?installation_id=%s&authority_epoch=1",
-				server.URL,
-				installation.InstallationID,
-			),
-			body,
-		)
-		if requestErr != nil {
-			commandDone <- commandResult{err: requestErr}
-			return
-		}
-		req.Header.Set("Origin", testBrowserOrigin)
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Idempotency-Key", "backend-loss-after-auth")
-		req.AddCookie(&http.Cookie{
-			Name: agentevents.BrowserSessionCookie, Value: session,
-		})
-		response, requestErr := http.DefaultClient.Do(req)
-		commandDone <- commandResult{response: response, err: requestErr}
-	}()
-	select {
-	case <-appender.started:
-		// The appender is entered only after the second composite authorization
-		// transaction committed. The durable filesystem append has completed,
-		// while returning its receipt and the HTTP acceptance are still fenced by
-		// the process-lifetime operation permit.
-	case <-ctx.Done():
-		t.Fatalf("authorized command effect did not start: %v", ctx.Err())
-	}
-
-	var backendPID int32
-	if err := pool.QueryRow(ctx, `
-		SELECT pid
-		FROM pg_stat_activity
-		WHERE datname = current_database()
-		  AND application_name = $1
-		  AND state = 'idle'
-		ORDER BY backend_start DESC
-		LIMIT 1`, authorizationApplicationName).Scan(&backendPID); err != nil {
-		t.Fatalf("locate committed authorization backend: %v", err)
-	}
-	var terminated bool
-	if err := pool.QueryRow(ctx, "SELECT pg_terminate_backend($1)", backendPID).Scan(&terminated); err != nil {
-		t.Fatalf("terminate authorization backend: %v", err)
-	}
-	if !terminated {
-		t.Fatalf("authorization backend %d was not terminated", backendPID)
-	}
-
-	disableDone := make(chan error, 1)
-	go func() {
-		_, disableErr := appStore.SetEnabledByID(
-			ctx,
-			installation.InstallationID,
-			actor,
-			false,
-		)
-		disableDone <- disableErr
-	}()
-	transferDone := make(chan error, 1)
-	go func() {
-		transferDone <- kosekiStore.TransferEmployment(
-			ctx,
-			first.AgentID,
-			koseki.EmployerHuman,
-			second.HumanID,
-		)
-	}()
-	for name, done := range map[string]<-chan error{
-		"disable":  disableDone,
-		"transfer": transferDone,
-	} {
-		select {
-		case mutationErr := <-done:
-			close(releaseEffect)
-			t.Fatalf("%s committed after PG lease loss but before effect completion: %v", name, mutationErr)
-		case <-time.After(75 * time.Millisecond):
-		}
-	}
-	close(releaseEffect)
-	result := <-commandDone
-	if result.err != nil {
-		t.Fatalf("authorized command became ambiguous after backend loss: %v", result.err)
-	}
-	defer result.response.Body.Close()
-	if result.response.StatusCode != http.StatusCreated {
-		t.Fatalf("authorized command status after backend loss = %d", result.response.StatusCode)
-	}
-	var receipt testCommandReceipt
-	if err := json.NewDecoder(result.response.Body).Decode(&receipt); err != nil {
-		t.Fatalf("decode command acceptance after backend loss: %v", err)
-	}
-	commands, err := gateway.CatchUp(ctx, agentevents.TokenClaims{
-		PersonalityAgentID: first.AgentID,
-	}, 1)
-	if err != nil {
-		t.Fatalf("read durable command after backend loss: %v", err)
-	}
-	if len(commands) != 1 || commands[0].CommandID != receipt.CommandID ||
-		commands[0].Seq != receipt.Seq {
-		t.Fatalf("accepted command does not match durable log: receipt=%+v commands=%+v", receipt, commands)
-	}
-	if err := <-disableDone; err != nil {
-		t.Fatalf("disable after effect completion: %v", err)
-	}
-	if err := <-transferDone; err != nil {
-		t.Fatalf("transfer after effect completion: %v", err)
-	}
-	var enabled bool
-	if err := pool.QueryRow(
-		ctx,
-		"SELECT enabled FROM app_installations WHERE installation_id = $1",
-		installation.InstallationID,
-	).Scan(&enabled); err != nil {
-		t.Fatal(err)
-	}
-	if enabled {
-		t.Fatal("direct-chat installation remained enabled")
-	}
-	var employerID string
-	if err := pool.QueryRow(
-		ctx,
-		"SELECT employer_id FROM employments WHERE agent_id = $1 AND ended_at IS NULL",
-		first.AgentID,
-	).Scan(&employerID); err != nil {
-		t.Fatal(err)
-	}
-	if employerID != second.HumanID {
-		t.Fatalf("current Employer = %q, want %q", employerID, second.HumanID)
-	}
-}
-
 func TestDirectChatAuthorizerUninstallReinstallDoesNotReviveStaleInstallation(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	lifecycle := directchat.NewLifecycleFence()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", lifecycle)
+	kosekiStore := koseki.New(pool, lifecycle)
 	appStore := applicationapps.New(pool, workspacecontrol.New(pool), lifecycle)
 	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
 	registration, err := kosekiStore.AutoRegister(ctx, "firebase", "uid-reinstall")

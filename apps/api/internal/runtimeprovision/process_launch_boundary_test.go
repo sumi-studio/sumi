@@ -71,7 +71,7 @@ func dockerE2EBackend(t *testing.T, extraEnv ...string) (*DockerBackend, string)
 		"DOCKER_HOST=unix:///var/run/docker.sock",
 		"SUMI_JOB_IMAGE_TAG=" + tag,
 	}, extraEnv...)
-	return &DockerBackend{baseEnvironment: env, runner: execCommandRunner{}}, tag
+	return &DockerBackend{baseEnvironment: env}, tag
 }
 
 // seedWorkspace creates the labelled persona volume the launcher
@@ -175,7 +175,7 @@ func TestDockerLaunchBoundaryCancelInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{backend: backend, processes: ps}
+	service := &Service{processes: ps}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go service.RunProcessObserver(ctx)
@@ -220,7 +220,7 @@ func TestDockerLaunchBoundaryUncertainStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{backend: backend, processes: ps}
+	service := &Service{processes: ps}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go service.RunProcessObserver(ctx)
@@ -267,7 +267,7 @@ func TestDockerLaunchBoundaryRestartDuringStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service1 := &Service{backend: backend, processes: ps1}
+	service1 := &Service{processes: ps1}
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go service1.RunProcessObserver(ctx)
@@ -280,7 +280,7 @@ func TestDockerLaunchBoundaryRestartDuringStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service2 := &Service{backend: backend, processes: ps2}
+	service2 := &Service{processes: ps2}
 
 	// The second store's first inspect sees a created-not-started
 	// container: indeterminate terminal verdict while `docker start`

@@ -17,7 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/publicweb"
+	"github.com/sumi-studio/sumi/apps/api/internal/netpolicy"
 )
 
 type Runner struct {
@@ -176,7 +176,7 @@ func (r *Runner) execute(parent context.Context, job agentstate.Job) (result map
 				return nil, errors.New("MCP destination could not be resolved")
 			}
 			for _, ip := range ips {
-				if !(r.Store.allowLoopback && ip.IsLoopback()) && !publicweb.IsPublicAddress(ip) {
+				if !(r.Store.allowLoopback && ip.IsLoopback()) && !netpolicy.IsPublicAddress(ip) {
 					return nil, errors.New("MCP destination is not public")
 				}
 			}

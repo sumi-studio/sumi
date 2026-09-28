@@ -64,7 +64,7 @@ func TestEmailDeliveryWorkerMapsSenderOutcomes(t *testing.T) {
 	pool := kosekiResolverTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	store.EmailChallengeKey = &koseki.EmailChallengeKey{
 		KeyID: "worker-smtp/v1", Key: []byte("0123456789abcdef0123456789abcdef"),
 	}

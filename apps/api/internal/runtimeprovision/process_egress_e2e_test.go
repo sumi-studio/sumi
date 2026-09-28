@@ -111,7 +111,7 @@ func egressService(t *testing.T, backend *DockerBackend) *Service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &Service{backend: backend, processes: ps}
+	service := &Service{processes: ps}
 	ctx, stop := context.WithCancel(context.Background())
 	t.Cleanup(stop)
 	go service.RunProcessObserver(ctx)

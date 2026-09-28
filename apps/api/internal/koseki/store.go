@@ -6,11 +6,8 @@ package koseki
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
-	"github.com/sumi-studio/sumi/apps/api/internal/spawn"
 	"github.com/sumi-studio/sumi/apps/api/internal/transfersession"
 )
 
@@ -59,7 +55,6 @@ type Store struct {
 	// and no account path ever consults transfer_sessions rows.
 	Transfers           *transfersession.Service
 	pool                *pgxpool.Pool
-	wrappingKeyID       string
 	directChatLifecycle *directchat.LifecycleFence
 	directChatApps      *applicationapps.Store
 }
@@ -77,19 +72,6 @@ func New(pool *pgxpool.Pool, directChatLifecycle ...*directchat.LifecycleFence) 
 
 // NewWithWrappingKeyID returns a Store that can provision new agents using the
 // configured current key identity. Read-only stores may use New.
-func NewWithWrappingKeyID(
-	pool *pgxpool.Pool,
-	wrappingKeyID string,
-	directChatLifecycle ...*directchat.LifecycleFence,
-) *Store {
-	lifecycle := firstLifecycleFence(directChatLifecycle)
-	return &Store{
-		pool:                pool,
-		wrappingKeyID:       wrappingKeyID,
-		directChatLifecycle: lifecycle,
-		directChatApps:      applicationapps.New(pool, nil, lifecycle),
-	}
-}
 
 func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
 	if len(fences) == 0 || fences[0] == nil {
@@ -403,10 +385,8 @@ func (s *Store) AgentWarmth(ctx context.Context, agentID string) (string, error)
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
 // and the per-agent wrapping key generated at hire time.
 type Registration struct {
-	HumanID       string
-	AgentID       string
-	WrappingKey   string
-	WrappingKeyID string
+	HumanID string
+	AgentID string
 }
 
 // AutoRegister performs first-login self-serve signup for an unbound credential:
@@ -423,16 +403,8 @@ func (s *Store) AutoRegister(ctx context.Context, provider, externalSubject stri
 // AutoRegisterWithDisplayName is AutoRegister with optional server-verified
 // provider profile metadata used only as the Human's initial label.
 func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, externalSubject, rawDisplayName string) (Registration, error) {
-	wrappingKeyID, err := validateWrappingKeyID(s.wrappingKeyID)
-	if err != nil {
-		return Registration{}, fmt.Errorf("configured wrapping key ID: %w", err)
-	}
 	humanID := newUUIDv7()
 	agentID := newUUIDv7()
-	wrappingKey, err := generateWrappingKey()
-	if err != nil {
-		return Registration{}, fmt.Errorf("generate wrapping key: %w", err)
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Registration{}, fmt.Errorf("begin auto-register: %w", err)
@@ -471,11 +443,6 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 		return Registration{}, fmt.Errorf("insert initial employment: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
-		"INSERT INTO agent_secrets (personality_agent_id, wrapping_key_id, wrapping_key) VALUES ($1, $2, $3)",
-		agentID, wrappingKeyID, wrappingKey); err != nil {
-		return Registration{}, fmt.Errorf("insert agent secrets: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
 		"INSERT INTO credentials (provider, external_subject, human_id) VALUES ($1, $2, $3)",
 		provider, externalSubject, humanID); err != nil {
 		if isUniqueViolation(err) {
@@ -499,58 +466,14 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 	}
 	return Registration{
 		HumanID: humanID, AgentID: agentID,
-		WrappingKey: wrappingKey, WrappingKeyID: wrappingKeyID,
 	}, nil
 }
 
 // AgentWrappingKey returns the per-agent wrapping key persisted at registration
 // time, or pgx.ErrNoRows when none exists.
-func (s *Store) AgentWrappingKey(ctx context.Context, agentID string) (spawn.WrappingKeyMaterial, error) {
-	var keyID, key string
-	err := s.pool.QueryRow(ctx,
-		"SELECT wrapping_key_id, wrapping_key FROM agent_secrets WHERE personality_agent_id = $1",
-		agentID).Scan(&keyID, &key)
-	if err != nil {
-		return spawn.WrappingKeyMaterial{}, err
-	}
-	keyID, err = validateWrappingKeyID(keyID)
-	if err != nil {
-		return spawn.WrappingKeyMaterial{}, fmt.Errorf("stored agent wrapping key ID: %w", err)
-	}
-	key, err = validateStoredWrappingKey(key)
-	if err != nil {
-		return spawn.WrappingKeyMaterial{}, err
-	}
-	return spawn.WrappingKeyMaterial{ID: keyID, Bytes: key}, nil
-}
 
 // generateWrappingKey produces the exact 64-hex representation consumed by
 // the runtime's 32-byte wrapping-key provider.
-func generateWrappingKey() (string, error) {
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(raw), nil
-}
-
-func validateStoredWrappingKey(value string) (string, error) {
-	decoded, err := hex.DecodeString(value)
-	if err != nil || len(value) != 64 || len(decoded) != 32 || value != strings.ToLower(value) {
-		return "", errors.New("stored agent wrapping key must be exactly 64 lowercase hexadecimal characters")
-	}
-	return value, nil
-}
-
-func validateWrappingKeyID(value string) (string, error) {
-	if value == "" || len(value) > 255 || strings.TrimSpace(value) != value ||
-		strings.IndexFunc(value, func(character rune) bool {
-			return character < 0x20 || character == 0x7f
-		}) >= 0 {
-		return "", errors.New("wrapping key ID must be 1-255 trimmed characters without control bytes")
-	}
-	return value, nil
-}
 
 // GrantResearchConsent registers an active 研究協力 consent for a Human. If an
 // active consent already exists this is a no-op; if a previously revoked consent

@@ -21,7 +21,7 @@ func bundleSetup(t *testing.T) (testWorld, *koseki.Store, Workspace) {
 	t.Helper()
 	w := newTestWorld(t)
 	w.store.EnrollmentAdmin = func(id string) bool { return id == w.humanA.ID }
-	registry := koseki.NewWithWrappingKeyID(w.pool, "test-wrapping/v1")
+	registry := koseki.New(w.pool)
 	registry.EnrollmentWorkspaceAuthority = w.store
 	space, err := w.store.CreateWorkspace(context.Background(), "Bundle workspace", w.humanA)
 	if err != nil {

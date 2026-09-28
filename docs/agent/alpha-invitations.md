@@ -13,11 +13,15 @@ issue enrollment invitations. Invalid or nonexistent IDs prevent startup rather
 than silently creating a different policy. Keep the list in deployment
 configuration, not in a shared browser build.
 
-Use the normal migration runner before starting the new API. This feature adds
-enrollment invitations and their Workspace relationships. The release contract permits one new migration version at a time: this feature
-uses the next version, 0043, for enrollment and Workspace reservation together.
-Extend FROZEN.sha256 using the migration-freeze script; never modify a sealed
-migration or insert a version before already released migrations.
+An empty installation first runs `sumi-production-bootstrap` to issue an
+email-bound invitation without creating a placeholder operator account. The
+command is available only while no Human exists; issuing another bootstrap
+invitation revokes the previous unused one. After the first person registers,
+configure that person's Human UUID as an enrollment administrator. See the
+command's `--help` for its database and output arguments.
+
+The initial Core schema includes enrollment and Workspace invitation state.
+Apply it to an empty database before issuing the first invitation.
 
 Existing users can still sign in. A new account requires a valid enrollment
 invitation, including when an unknown identity chooses the sign-in flow. The

@@ -340,7 +340,7 @@ async function main() {
     env: {
       ...process.env,
       SUMI_COMMAND_LOG_DIR: cmdLogDir,
-      SUMI_AGENT_RUNTIME_STATE_DIR: runtimeDir,
+      SUMI_BROWSER_EVENT_DIR: runtimeDir,
       SUMI_DB_URL: DB_URL,
       PORT: String(API_PORT),
       SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${API_PORT}`,
@@ -352,7 +352,6 @@ async function main() {
       SUMI_AUTH_FIREBASE_PROJECT_ID: "sumi-e2e-calls",
       SUMI_AUTH_TENANT_ID: "e2e-calls-tenant",
       SUMI_AUTH_ALLOW_INSECURE_COOKIES: "true",
-      SUMI_AGENT_WRAPPING_KEY_ID: "e2e-calls-wrapping",
       SUMI_CORE_STATE_TOKEN: CORE_TOKEN,
       SUMI_LIVEKIT_URL: LK_URL,
       SUMI_LIVEKIT_API_URL: LK_API,

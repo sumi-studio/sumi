@@ -44,7 +44,7 @@ var (
 // without hardcoding it in multiple packages.
 func DefaultBrowserAudience() string { return defaultBrowserAudience }
 
-// UserSessionClaims are deliberately separate from agent TokenClaims. A
+// UserSessionClaims are deliberately separate from agent JournalScope. A
 // browser can act only as its authenticated human principal. The signed target
 // never comes from a public route or browser-authored command.
 type UserSessionClaims struct {
@@ -803,4 +803,10 @@ func (v *HMACUserSessionVerifier) DiscardBrowserFlow(
 	retainUntil time.Time,
 ) (retiredSessions []string, err error) {
 	return v.revocations.CloseBrowserFlow(ctx, flowID, retainUntil, v.now())
+}
+
+const maxSignedTokenBytes = 8 * 1024
+
+func decodeBase64URL(s string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
 }

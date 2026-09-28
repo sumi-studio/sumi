@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
@@ -503,81 +501,6 @@ func TestPlaceCreationReplayRevalidatesCurrentAuthorityAndPrivateTenure(t *testi
 // The first handler response is intentionally discarded, as when the peer
 // loses the response after commit. A normal second local-control request must
 // recover the canonical place without a PA-only manual retry API.
-func TestLocalPlaceCreationRoutesRecoverACommittedLostResponse(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	workspace, source := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	server.Hub = NewHub(w.store.core)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
-	exactScope := w.store.mustScope(t, ctx, workspace.WorkspaceID, w.agent).Scope
-
-	retry := func(
-		name, path string,
-		handler func(http.ResponseWriter, *http.Request, agentevents.LocalRuntimeAuthorization),
-		request map[string]any,
-		identity func(map[string]any) string,
-	) {
-		t.Helper()
-		firstStatus, first := callLocal(t, ctx, handler, path, request, authorization)
-		if firstStatus != http.StatusCreated && firstStatus != http.StatusOK {
-			t.Fatalf("%s committed attempt: status %d body %v", name, firstStatus, first)
-		}
-		// Drop first/firstStatus here: the retry has no receipt supplied by the
-		// caller, only the same ordinary route request and nonce.
-		secondStatus, second := callLocal(t, ctx, handler, path, request, authorization)
-		if secondStatus != http.StatusOK || identity(first) == "" || identity(second) != identity(first) {
-			t.Fatalf("%s retry: first=%v second status=%d body=%v", name, first, secondStatus, second)
-		}
-		for _, response := range []map[string]any{first, second} {
-			if response["workspace_id"] != exactScope.WorkspaceID ||
-				response["installation_id"] != exactScope.InstallationID ||
-				response["authority_epoch"] != strconv.FormatInt(exactScope.AuthorityEpoch, 10) {
-				t.Fatalf("%s response scope = %v, want exact local scope", name, response)
-			}
-		}
-		if created, ok := second["created"]; ok && created != false {
-			t.Fatalf("%s retry created=%v, want false", name, created)
-		}
-	}
-
-	retry("create channel", LocalCreateChannelPath, server.localCreateChannel,
-		map[string]any{"name": "lost-create", "client_nonce": "lost-create-nonce"},
-		func(body map[string]any) string { return body["channel"].(map[string]any)["channel_id"].(string) })
-	retry("duplicate channel", LocalDuplicateChannelPath, server.localDuplicateChannel,
-		map[string]any{"place_id": source.PlaceID, "client_nonce": "lost-duplicate-nonce"},
-		func(body map[string]any) string { return body["channel"].(map[string]any)["channel_id"].(string) })
-	retry("one-to-one DM", LocalStartDMPath, server.localStartDM,
-		map[string]any{"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}}},
-		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
-	groupRequest := map[string]any{
-		"client_nonce": "lost-group-nonce",
-		"participants": []any{
-			map[string]any{"kind": "human", "human_id": w.humanA.ID},
-			map[string]any{"kind": "human", "human_id": w.humanB.ID},
-		},
-	}
-	retry("group DM", LocalStartDMPath, server.localStartDM, groupRequest,
-		func(body map[string]any) string { return body["dm"].(map[string]any)["dm_id"].(string) })
-	if err := w.store.removeWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
-		t.Fatalf("remove group participant after reconciliation: %v", err)
-	}
-	if err := w.store.addWorkspaceMember(ctx, workspace.WorkspaceID, w.humanB); err != nil {
-		t.Fatalf("rejoin group participant after reconciliation: %v", err)
-	}
-	status, stale := callLocal(t, ctx, server.localStartDM, LocalStartDMPath, groupRequest, authorization)
-	if status != http.StatusNotFound || stale["dm"] != nil || stale["created"] != nil {
-		t.Fatalf("stale group replay leaked a place projection: status %d body %v", status, stale)
-	}
-
-	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath,
-		map[string]any{"name": "changed-after-commit", "client_nonce": "lost-create-nonce"}, authorization)
-	if status != http.StatusConflict || body["error"] != "idempotency_conflict" {
-		t.Fatalf("changed request under committed nonce: status %d body %v", status, body)
-	}
-}
 
 func TestPlaceEditsOverHTTPRefuseANoOpAndAnnounceTheCopy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -697,140 +620,6 @@ func TestPlaceCreationHTTPRequiresClientNonceBeforeMutation(t *testing.T) {
 // in the same places. It gains no reach a person in that Workspace lacks: a
 // plain member is refused channel management whichever lane it arrives on, and
 // the sealed scope means there is no Workspace field to be talked into naming.
-func TestLocalPlaceActionsMatchTheHumanLane(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	workspace, channel := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	hub := NewHub(w.store.core)
-	server.Hub = hub
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-
-	// A member without the channel-management capability is refused, exactly as
-	// the Human REST route refuses one.
-	status, body := callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
-		"name": "設計", "client_nonce": "unprivileged-create-channel",
-	}, authorization)
-	if status != http.StatusForbidden {
-		t.Fatalf("unprivileged create: status %d body %v", status, body)
-	}
-
-	grantManageChannels(t, ctx, w, workspace.WorkspaceID, w.agent)
-
-	status, body = callLocal(t, ctx, server.localCreateChannel, LocalCreateChannelPath, map[string]any{
-		"name": "設計", "topic": "構造の話", "voice": true, "client_nonce": "local-create-channel",
-	}, authorization)
-	if status != http.StatusCreated {
-		t.Fatalf("create channel: status %d body %v", status, body)
-	}
-	created := body["channel"].(map[string]any)
-	if created["name"] != "設計" || created["topic"] != "構造の話" || created["voice"] != true {
-		t.Fatalf("created channel = %v", created)
-	}
-
-	status, body = callLocal(t, ctx, server.localUpdateChannel, LocalUpdateChannelPath, map[string]any{
-		"place_id": created["channel_id"], "topic": "構造と実装の話",
-	}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("update channel: status %d body %v", status, body)
-	}
-	updated := body["channel"].(map[string]any)
-	if updated["name"] != "設計" || updated["topic"] != "構造と実装の話" {
-		t.Fatalf("updated channel = %v", updated)
-	}
-
-	// Naming nothing is refused here too: the model must not be able to report
-	// an edit it did not make.
-	status, _ = callLocal(t, ctx, server.localUpdateChannel, LocalUpdateChannelPath, map[string]any{
-		"place_id": created["channel_id"],
-	}, authorization)
-	if status != http.StatusBadRequest {
-		t.Fatalf("empty local edit: status %d, want 400", status)
-	}
-
-	status, body = callLocal(t, ctx, server.localDuplicateChannel, LocalDuplicateChannelPath, map[string]any{
-		"place_id": channel.PlaceID, "client_nonce": "local-duplicate-channel",
-	}, authorization)
-	if status != http.StatusCreated {
-		t.Fatalf("duplicate channel: status %d body %v", status, body)
-	}
-	if body["channel"].(map[string]any)["name"] != "general のコピー" {
-		t.Fatalf("duplicated channel = %v", body)
-	}
-
-	// The actor can appear in an agent request, but it is not an "other": with
-	// one actual other this remains a 1:1 DM, and both the response and event
-	// describe each real member exactly once.
-	observer := hub.subscribe(w.store.mustScope(t, ctx, workspace.WorkspaceID, w.humanA))
-	defer hub.unsubscribe(observer)
-	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
-		"participants": []any{
-			map[string]any{"kind": "personality_agent", "personality_agent_id": w.agent.ID},
-			map[string]any{"kind": "human", "human_id": w.humanA.ID},
-		},
-	}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("start dm: status %d body %v", status, body)
-	}
-	dm := body["dm"].(map[string]any)
-	if dm["kind"] != "dm" || body["created"] != true {
-		t.Fatalf("start dm = %v", body)
-	}
-	assertDMParticipantsOnce(t, dm["participants"], w.agent, w.humanA)
-	select {
-	case frame := <-observer.send:
-		var eventFrame struct {
-			Event struct {
-				Type string `json:"type"`
-				DM   struct {
-					Participants any `json:"participants"`
-				} `json:"dm"`
-			} `json:"event"`
-		}
-		if err := json.Unmarshal(frame.payload, &eventFrame); err != nil {
-			t.Fatalf("decode place-created event: %v", err)
-		}
-		if eventFrame.Event.Type != EventPlaceCreated {
-			t.Fatalf("event type = %q, want %q", eventFrame.Event.Type, EventPlaceCreated)
-		}
-		assertDMParticipantsOnce(t, eventFrame.Event.DM.Participants, w.agent, w.humanA)
-	case <-ctx.Done():
-		t.Fatal("did not receive place_created for normalized DM")
-	}
-	status, again := callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
-		"participants": []any{map[string]any{"kind": "human", "human_id": w.humanA.ID}},
-	}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("start dm again: status %d body %v", status, again)
-	}
-	if again["dm"].(map[string]any)["dm_id"] != dm["dm_id"] || again["created"] != false {
-		t.Fatalf("second start dm = %v, want the same conversation and created=false", again)
-	}
-
-	// Several participants make a group conversation instead.
-	status, body = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
-		"client_nonce": "local-start-group-dm",
-		"participants": []any{
-			map[string]any{"kind": "human", "human_id": w.humanA.ID},
-			map[string]any{"kind": "human", "human_id": w.humanB.ID},
-		},
-	}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("start group dm: status %d body %v", status, body)
-	}
-	if body["dm"].(map[string]any)["kind"] != "group_dm" {
-		t.Fatalf("group dm = %v", body)
-	}
-
-	// Naming no one is refused rather than opening a conversation with nobody.
-	status, _ = callLocal(t, ctx, server.localStartDM, LocalStartDMPath, map[string]any{
-		"participants": []any{},
-	}, authorization)
-	if status != http.StatusBadRequest {
-		t.Fatalf("empty participants: status %d, want 400", status)
-	}
-}
 
 func assertDMParticipantsOnce(t *testing.T, raw any, actor, other ParticipantRef) {
 	t.Helper()
