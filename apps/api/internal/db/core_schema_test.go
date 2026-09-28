@@ -3,9 +3,11 @@ package db
 import (
 	"context"
 	"errors"
-	"github.com/google/uuid"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -36,6 +38,14 @@ func TestCoreFoundationFromEmptyDatabase(t *testing.T) {
 }
 
 func TestCoreFoundationWithDBAOwnedExtension(t *testing.T) {
+	// Only this fixture needs DBA privileges to create the extension and a
+	// separate schema owner. The migration itself still runs as that owner;
+	// other integration tests keep using the constrained test database role.
+	adminURL := strings.TrimSpace(os.Getenv("SUMI_TEST_ADMIN_DB_URL"))
+	if adminURL == "" {
+		t.Skip("SUMI_TEST_ADMIN_DB_URL not set; skipping DBA-owned extension fixture")
+	}
+	t.Setenv("SUMI_TEST_DB_URL", adminURL)
 	pool := testdb.CreateWithMaxConns(t, 1)
 	ctx := context.Background()
 	role := "core_schema_owner_" + strings.ReplaceAll(uuid.NewString(), "-", "")
