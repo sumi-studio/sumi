@@ -17,6 +17,11 @@
 // holder watches its lease session and reports the loss through
 // Options.OnLost; every write also re-checks the epoch inside its own
 // transaction, so a process that lost the lease can no longer acknowledge.
+// The database itself ends a lease session whose holder stopped checking
+// (idle_session_timeout) and a write transaction whose client stopped
+// (transaction_timeout), so a vanished process cannot keep the lease or the
+// owner row locked, even behind a proxy that keeps the server's connection
+// open.
 //
 // Initialization. A mirror directory exists in PostgreSQL only after an
 // explicit initialization: adopting a host's existing files (AttachAdopt) or
@@ -129,7 +134,25 @@ type Options struct {
 	// Defaults: 5 s each.
 	LeaseCheckInterval time.Duration
 	LeaseCheckTimeout  time.Duration
+	// LeaseIdleTimeout is the lease session's idle_session_timeout: the
+	// database ends the session, releasing the lease, once no check has
+	// arrived from its client for this long. It bounds how long a lease
+	// stays held by a process that stopped or can no longer reach the
+	// database, even when a proxy between them keeps the server's TCP
+	// connection alive. It must exceed LeaseCheckInterval +
+	// LeaseCheckTimeout, so a healthy owner is never ended. Default: 20 s.
+	LeaseIdleTimeout time.Duration
 }
+
+// writeTransactionTimeout is the transaction_timeout of every mirror write
+// transaction. A writer whose client stopped (behind a stalled proxy, for
+// example) cannot keep the owner row locked and so block the next owner's
+// acquisition for longer than this. Writes give up on the client side after
+// flushTimeout, so a live write never reaches it.
+const writeTransactionTimeout = 2 * flushTimeout
+
+// minServerVersion is PostgreSQL 17, the first with transaction_timeout.
+const minServerVersion = 170000
 
 type attachedDir struct {
 	logical string
@@ -185,6 +208,13 @@ func Acquire(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Mirror, er
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	idle := opts.LeaseIdleTimeout
+	if idle <= 0 {
+		idle = max(20*time.Second, 2*(interval+timeout))
+	}
+	if idle <= interval+timeout {
+		return nil, fmt.Errorf("journal mirror: LeaseIdleTimeout %s must exceed LeaseCheckInterval + LeaseCheckTimeout (%s)", idle, interval+timeout)
+	}
 
 	conn, err := pgx.ConnectConfig(ctx, pool.Config().ConnConfig.Copy())
 	if err != nil {
@@ -194,10 +224,24 @@ func Acquire(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Mirror, er
 		_ = conn.Close(context.Background())
 		return nil, err
 	}
-	// If this host vanishes without closing the connection, the server
-	// releases the lease once TCP keepalives fail (about 30 s) instead of
-	// the operating-system default of hours. Ignored on Unix sockets.
-	if _, err := conn.Exec(ctx, `SET tcp_keepalives_idle = 15; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3; SET application_name = 'sumi-journal-mirror-lease'`); err != nil {
+	var version int
+	if err := conn.QueryRow(ctx, `SELECT current_setting('server_version_num')::int`).Scan(&version); err != nil {
+		return fail(fmt.Errorf("journal mirror: read server version: %w", err))
+	}
+	if version < minServerVersion {
+		return fail(fmt.Errorf("journal mirror requires PostgreSQL 17 or later (server_version_num %d)", version))
+	}
+	// A lease must end when its holder is gone. TCP keepalives do not
+	// ensure that when a proxy terminates the server's TCP connection: the
+	// proxy answers them. idle_session_timeout does: the watcher sends a
+	// check every LeaseCheckInterval, and a session that receives none for
+	// the idle timeout is ended by the server itself, which releases the
+	// lease. The keepalives still shorten the direct-connection case.
+	settings := fmt.Sprintf(`SET idle_session_timeout = %d; SET application_name = 'sumi-journal-mirror-lease'`, idle.Milliseconds())
+	if _, err := conn.Exec(ctx, settings); err != nil {
+		return fail(fmt.Errorf("journal mirror: configure lease session: %w", err))
+	}
+	if _, err := conn.Exec(ctx, `SET tcp_keepalives_idle = 15; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3`); err != nil {
 		logf("journal mirror: lease connection keepalive settings not applied: %v", err)
 	}
 
@@ -213,7 +257,8 @@ func Acquire(ctx context.Context, pool *pgxpool.Pool, opts Options) (*Mirror, er
 		}
 		current := describeOwner(ctx, conn)
 		if time.Since(lastLog) >= 10*time.Second {
-			logf("journal mirror: waiting %s for the lease held by %s", time.Since(waitStarted).Round(time.Second), current)
+			logf("journal mirror: waiting %s for the lease held by %s; a holder that stopped or lost the database releases it within its idle timeout (%s by default)",
+				time.Since(waitStarted).Round(time.Second), current, 20*time.Second)
 			lastLog = time.Now()
 		}
 		select {

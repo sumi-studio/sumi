@@ -246,3 +246,137 @@ func TestAcknowledgedWritesSurviveTakeover(t *testing.T) {
 	}
 	t.Logf("%d acknowledged appends, all restored", len(acked))
 }
+
+// N-1: the old owner's lease session ends at a proxy that keeps the server's
+// connection open (the proxy answers TCP keepalives). The old owner notices
+// and stops; the database ends the session once its idle timeout passes
+// without a check, so a replacement acquires within that bound instead of
+// waiting forever.
+func TestLeaseBehindStalledProxyIsReleasedWithinIdleTimeout(t *testing.T) {
+	base := migratedPool(t)
+	proxy := proxyFor(t, base, 0)
+	pool := proxy.pool(t, base)
+	const idle = 2 * time.Second
+	lost, onLost := lostChannel()
+	old := acquire(t, pool, Options{OnLost: onLost, LeaseCheckInterval: 300 * time.Millisecond, LeaseCheckTimeout: 300 * time.Millisecond, LeaseIdleTimeout: idle})
+	dir := t.TempDir()
+	attachEmpty(t, old, base, "commands", dir)
+	appendSync(t, old, filepath.Join(dir, "log.jsonl"), "acknowledged\n")
+	proxy.stalled.Store(true)
+	stalled := time.Now()
+	select {
+	case <-lost:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old owner did not notice the stalled lease")
+	}
+	_ = old.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	next, err := Acquire(ctx, base, Options{Holder: "replacement", Logf: t.Logf})
+	if err != nil {
+		t.Fatalf("replacement did not acquire: %v", err)
+	}
+	defer next.Close()
+	elapsed := time.Since(stalled)
+	t.Logf("replacement acquired %v after the path stalled (idle timeout %v)", elapsed.Round(time.Millisecond), idle)
+	// The server ends the session at the idle timeout after the last check
+	// it received; its exit occasionally takes about 2 s more (3 of 50 bare
+	// probes on PostgreSQL 17.10), and the replacement polls every second.
+	if elapsed > idle+4*time.Second {
+		t.Fatalf("takeover took %v, bound is the idle timeout %v plus exit and poll", elapsed, idle)
+	}
+	if next.Epoch() <= old.Epoch() {
+		t.Fatalf("epochs old=%d new=%d", old.Epoch(), next.Epoch())
+	}
+	restored := t.TempDir()
+	if _, err := next.Attach(context.Background(), "commands", restored, AttachOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, filepath.Join(restored, "log.jsonl")); string(got) != "acknowledged\n" {
+		t.Fatalf("restored %q", got)
+	}
+}
+
+// N-1: the idle timeout never ends a healthy owner, even an idle one, and a
+// replacement keeps waiting for it.
+func TestHealthyOwnerOutlivesLeaseIdleTimeout(t *testing.T) {
+	pool := migratedPool(t)
+	const interval, timeout, idle = 200 * time.Millisecond, 200 * time.Millisecond, 700 * time.Millisecond
+	lost, onLost := lostChannel()
+	m := acquire(t, pool, Options{Holder: "healthy", OnLost: onLost, LeaseCheckInterval: interval, LeaseCheckTimeout: timeout, LeaseIdleTimeout: idle})
+	dir := t.TempDir()
+	attachEmpty(t, m, pool, "commands", dir)
+	path := filepath.Join(dir, "log.jsonl")
+	for i := 0; i < 5; i++ {
+		time.Sleep(idle) // no writes: only the watcher's checks keep the session
+		appendSync(t, m, path, fmt.Sprintf("line %d\n", i))
+	}
+	select {
+	case err := <-lost:
+		t.Fatalf("healthy owner lost the lease: %v", err)
+	default:
+	}
+	short, cancel := context.WithTimeout(context.Background(), 2*idle)
+	defer cancel()
+	if _, err := Acquire(short, pool, Options{Holder: "replacement"}); !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("acquire while a healthy owner holds the lease = %v, want ErrLeaseHeld", err)
+	}
+	if got := remoteBytes(t, pool, "commands", "log.jsonl"); string(got) != "line 0\nline 1\nline 2\nline 3\nline 4\n" {
+		t.Fatalf("mirror = %q", got)
+	}
+}
+
+func TestLeaseIdleTimeoutMustExceedTheCheckWindow(t *testing.T) {
+	pool := migratedPool(t)
+	_, err := Acquire(context.Background(), pool, Options{LeaseCheckInterval: time.Second, LeaseCheckTimeout: time.Second, LeaseIdleTimeout: 2 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "LeaseIdleTimeout") {
+		t.Fatalf("acquire with an idle timeout inside the check window = %v", err)
+	}
+}
+
+// N-1: a write transaction whose client stopped behind a stalled proxy still
+// holds the owner row share lock from api_journal_mirror_check_owner, which
+// the next owner's epoch update waits for. The transaction_timeout that every
+// write sets (limitTransactionSQL; writeTransactionTimeout in production)
+// ends it, so the takeover is bounded.
+func TestStalledWriteTransactionDoesNotBlockTakeover(t *testing.T) {
+	base := migratedPool(t)
+	ctx := context.Background()
+	old := acquire(t, base, Options{Holder: "old-host"})
+	proxy := proxyFor(t, base, 0)
+	stale := proxy.pool(t, base)
+	tx, err := stale.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { // before the pool closes, which waits for the connection
+		proxy.stalled.Store(false)
+		rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rctx)
+	})
+	const limit = 1500 * time.Millisecond
+	if _, err := tx.Exec(ctx, limitTransactionSQL, timeoutSetting(limit)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT api_journal_mirror_check_owner($1)`, old.Epoch()); err != nil {
+		t.Fatal(err)
+	}
+	proxy.stalled.Store(true)
+	started := time.Now()
+	_ = old.Close()
+
+	acquireCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	next, err := Acquire(acquireCtx, base, Options{Holder: "replacement", Logf: t.Logf})
+	if err != nil {
+		t.Fatalf("replacement did not acquire: %v", err)
+	}
+	defer next.Close()
+	elapsed := time.Since(started)
+	t.Logf("replacement acquired %v after the stale write stalled (transaction_timeout %v)", elapsed.Round(time.Millisecond), limit)
+	if elapsed > limit+3*time.Second {
+		t.Fatalf("takeover took %v", elapsed)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/journalmirror"
 )
@@ -14,7 +15,8 @@ import (
 // the mirror lease and restore the journals. Until the application is
 // ready, and again once the process stops after losing the lease, every
 // request gets a retryable 503 that names the phase instead of a refused or
-// hanging connection.
+// hanging connection. A GET or HEAD request first waits up to hold for the
+// application (see startupHold).
 type startupGate struct {
 	mu       sync.Mutex
 	handler  http.Handler
@@ -22,9 +24,24 @@ type startupGate struct {
 	progress *journalmirror.AttachProgress
 	stopped  error
 	stopHook func()
+	settled  chan struct{} // closed once the gate opens or stops
+	settle   sync.Once
+	hold     time.Duration
 }
 
-func newStartupGate() *startupGate { return &startupGate{phase: "starting"} }
+// startupHold is how long a GET or HEAD request that arrives while the API
+// starts (a cold start restoring the journals, usually) waits for it before
+// the gate answers 503. The request has not reached the application, so
+// passing it on once the application opens is its first delivery, not a
+// retry. Requests with other methods are not held: their body's read timeout
+// would run meanwhile, and they get the 503 at once as before. /health is not
+// held either; the container platform's readiness ping and monitors read the
+// phase from it.
+const startupHold = 10 * time.Second
+
+func newStartupGate() *startupGate {
+	return &startupGate{phase: "starting", settled: make(chan struct{}), hold: startupHold}
+}
 
 // setPhase names the current startup step. The name is public; details
 // belong in the log.
@@ -52,6 +69,7 @@ func (g *startupGate) open(handler http.Handler) {
 	g.mu.Lock()
 	g.handler = handler
 	g.mu.Unlock()
+	g.settle.Do(func() { close(g.settled) })
 }
 
 // stop closes the gate for good and runs the stop hook once.
@@ -67,6 +85,7 @@ func (g *startupGate) stop(reason error) {
 	g.stopped = reason
 	hook := g.stopHook
 	g.mu.Unlock()
+	g.settle.Do(func() { close(g.settled) })
 	if hook != nil {
 		hook()
 	}
@@ -92,6 +111,15 @@ type startupGateStatus struct {
 }
 
 func (g *startupGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if g.holds(r) {
+		timer := time.NewTimer(g.hold)
+		select {
+		case <-g.settled:
+		case <-timer.C:
+		case <-r.Context().Done():
+		}
+		timer.Stop()
+	}
 	g.mu.Lock()
 	handler, stopped := g.handler, g.stopped
 	status := startupGateStatus{Error: "api_starting", Phase: g.phase, Progress: g.progress}
@@ -108,4 +136,17 @@ func (g *startupGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Retry-After", "5")
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// holds reports whether r waits for the application; see startupHold.
+func (g *startupGate) holds(r *http.Request) bool {
+	if g.hold <= 0 || (r.Method != http.MethodGet && r.Method != http.MethodHead) || r.URL.Path == "/health" {
+		return false
+	}
+	select {
+	case <-g.settled:
+		return false
+	default:
+		return true
+	}
 }

@@ -89,38 +89,43 @@ func run(ctx context.Context) (runErr error) {
 	// Losing the journal mirror lease stops background work and browser
 	// connections at once; the process then exits through SIGTERM.
 	gate.onStop(func() { _ = app.Close() })
-	if app.messagingServer != nil {
-		// Readers resolve temporary status expiry themselves; this worker makes
-		// it visible on already-open screens. Start it only after run owns the
-		// application so Close can cancel it.
-		go app.messagingServer.RunStatusExpiry(
-			app.backgroundCtx,
-			messaging.DefaultStatusExpiryInterval,
-		)
-	}
+	started := app.startBackground(func() {
+		if app.messagingServer != nil {
+			// Readers resolve temporary status expiry themselves; this worker
+			// makes it visible on already-open screens.
+			go app.messagingServer.RunStatusExpiry(
+				app.backgroundCtx,
+				messaging.DefaultStatusExpiryInterval,
+			)
+		}
 
-	app.startAgentAttention()
-	app.startCoreWaker()
-	app.startCoreDirectChat()
-	app.startFeedbackAttention()
-	app.startJobExec()
-	app.startMCP()
-	app.startBrowserTabs()
-	app.startCloudBrowser()
-	app.startTermExec()
-	app.startEmailDelivery()
-	if app.transferSessions != nil {
-		// Owes activation after a committed account claim, retires staged
-		// copies of closed sessions, and promotes interrupted imports.
-		go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+		app.startAgentAttention()
+		app.startCoreWaker()
+		app.startCoreDirectChat()
+		app.startFeedbackAttention()
+		app.startJobExec()
+		app.startMCP()
+		app.startBrowserTabs()
+		app.startCloudBrowser()
+		app.startTermExec()
+		app.startEmailDelivery()
+		if app.transferSessions != nil {
+			// Owes activation after a committed account claim, retires staged
+			// copies of closed sessions, and promotes interrupted imports.
+			go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+		}
+		if app.returnSessions != nil {
+			// Expires unbound admission and lands ledger outcomes (seal,
+			// complete, abort) the request that owed the update lost.
+			go app.returnSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+		}
+	})
+	if started {
+		gate.open(app.publicMux)
+		log.Printf("sumi api ready")
+	} else {
+		log.Printf("sumi api stopped before it was ready; no background work was started")
 	}
-	if app.returnSessions != nil {
-		// Expires unbound admission and lands ledger outcomes (seal,
-		// complete, abort) the request that owed the update lost.
-		go app.returnSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
-	}
-	gate.open(app.publicMux)
-	log.Printf("sumi api ready")
 
 	var serveErr error
 	select {
@@ -212,8 +217,27 @@ type application struct {
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
-	closeOnce      sync.Once
-	closeErr       error
+	// backgroundMu orders startBackground and Close; backgroundClosed is set
+	// once Close has begun.
+	backgroundMu     sync.Mutex
+	backgroundClosed bool
+	closeOnce        sync.Once
+	closeErr         error
+}
+
+// startBackground runs start, which launches the background workers, unless
+// Close has begun. Close takes the same lock before it cancels and waits for
+// the workers, so each worker is either started before Close, which then
+// stops it, or never started: a journal mirror lease lost while the API
+// starts cannot leave a side-effect loop running on a closed application.
+func (a *application) startBackground(start func()) bool {
+	a.backgroundMu.Lock()
+	defer a.backgroundMu.Unlock()
+	if a.backgroundClosed {
+		return false
+	}
+	start()
+	return true
 }
 
 type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
@@ -231,6 +255,9 @@ func (a *application) Close() error {
 		return nil
 	}
 	a.closeOnce.Do(func() {
+		a.backgroundMu.Lock()
+		a.backgroundClosed = true
+		a.backgroundMu.Unlock()
 		if a.stopBackground != nil {
 			a.stopBackground()
 		}
@@ -1073,6 +1100,9 @@ func journalMirrorFromEnv(ctx context.Context, cmdDir, runtimeDir string, gate *
 		action := "restored"
 		if report.Initialized {
 			action = "initialized from local files"
+		}
+		if report.OverUnusedEmpty {
+			action = "initialized from local files over an empty initialization that had acknowledged nothing"
 		}
 		log.Printf("journal mirror %s %s: %d files, %d bytes, %d written locally, %d replaced, %s (lineage %s)",
 			dir.name, action, report.Files, report.Bytes, len(report.Restored), len(report.Replaced), report.Duration.Round(time.Millisecond), report.Lineage)

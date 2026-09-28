@@ -9,6 +9,8 @@
 // the migrations first and never changes an initialized mirror. It refuses a
 // database that already has accounts or agents, whose journals are on some
 // host and must be adopted from there (SUMI_API_JOURNAL_MIRROR=postgres-adopt).
+// If init-empty was run by mistake for such a database, that adoption still
+// succeeds as long as the empty mirror has acknowledged no write.
 //
 // verify is read-only. It prints one JSON report per directory and exits 1
 // if any differs. Use it to show that a host move carried every journal

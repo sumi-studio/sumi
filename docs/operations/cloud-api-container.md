@@ -55,7 +55,10 @@ The container therefore runs with `SUMI_API_JOURNAL_MIRROR=postgres`
 | The current host holds the journals | Start it once with `SUMI_API_JOURNAL_MIRROR=postgres-adopt`. It copies its journal files into PostgreSQL as the first copy (logged `initialized from local files`) and then behaves like `postgres`. An empty directory is never adopted. |
 | Container starts (empty disk) | PostgreSQL's copy is restored. |
 | Host restarts with its disk (crash, rollout) | Files equal to PostgreSQL's copy are kept. A file that differs (a write that was never acknowledged, or a rollback whose own commit failed) is **moved** to `<dir>/.journal-mirror-quarantine/<time>-epoch<N>/` and PostgreSQL's copy is written in its place. No manual step. |
-| The directory belongs to another mirror, or the database is older than what this host acknowledged (an older backup), or unmarked files differ from the mirror (e.g. an empty mirror was initialized before the host that holds the journals adopted them) | The start stops with `ErrWrongMirror` or `ErrMirrorBehind` and **changes nothing** in either copy. Attach the right database; nothing has to be repaired. |
+| `init-empty` was run by mistake for a database whose host holds the journals, and the empty mirror has acknowledged no write yet | Start that host with `postgres-adopt`: it adopts its files over the empty initialization (logged `over an empty initialization that had acknowledged nothing`) and keeps the mirror's lineage, so a container that already attached the empty mirror restores the adopted journals. The check that nothing was acknowledged is made in the adoption's transaction. In `postgres` mode the host is refused and told to do this. |
+| The directory belongs to another mirror, or the database is older than what this host acknowledged (an older backup) | The start stops with `ErrWrongMirror` or `ErrMirrorBehind` and **changes nothing** in either copy. Attach the database that holds this host's journals. |
+| Journal files of unknown origin: unmarked files differ from a mirror that is in use (adopted, or an empty initialization that has since acknowledged writes) | The start stops with `ErrWrongMirror` and **changes nothing** in either copy; both hold journal state. Check first that `SUMI_COMMAND_LOG_DIR` / `SUMI_BROWSER_EVENT_DIR` and `SUMI_DB_URL` are the ones this host has been using. If they are, two histories exist and neither may be dropped: keep both copies (the directory, and a backup of the database) and stop; merging them is not automated. Never delete mirror rows, reset the database or edit markers to get past it. |
+| A journal directory is empty in `postgres-adopt` mode (`ErrNothingToAdopt`) | Nothing is changed. A missing mount or a wrong directory variable looks exactly like this: fix the path. `init-empty` is only for installations without accounts. |
 
 Each directory carries a marker (`.journal-mirror`, the mirror's lineage)
 and, per file, the generation of its last acknowledged change
@@ -79,8 +82,22 @@ answers 503 `api_stopping`, stops its background work and browser
 connections, and exits; the platform starts it again. Every journal write
 also re-checks the owner epoch in its own transaction, so a process that
 lost the lease cannot acknowledge a journal write even before it notices.
-The database releases the lease of a host that vanished without closing
-its connection after TCP keepalives fail (about 30 s).
+
+A holder that stopped or can no longer reach the database cannot keep the
+lease, even when a proxy or pooler between them keeps the server's
+connection open (it answers TCP keepalives itself, so keepalives do not
+help there). The lease session sets `idle_session_timeout` (20 s, above the
+10 s check window): PostgreSQL ends a lease session that has received no
+check for that long, which releases the lock, and never a healthy one, which
+checks every 5 s. Every mirror write transaction sets `transaction_timeout`
+(30 s), so a write whose client stalled cannot keep the owner row locked
+either. A replacement therefore starts within about 20–25 s of the old
+holder's last check (measured: 2.6 s for a 2 s idle timeout, occasionally
+2 s more while the ended backend exits), with no operator step. Both
+settings are ordinary session settings (no privilege), and both require
+**PostgreSQL 17**; the API refuses to take the lease on an older server.
+They require a session-mode connection (see prerequisites): a pooler that
+multiplexes sessions would apply them to the wrong client.
 
 This protects the journals. It is **not** a fence for everything the
 process does: between the end of its lease session and its exit (normally
@@ -104,6 +121,10 @@ stops the old host **and disables its restart** first.
 The API listens before it builds the application and answers 503 with
 `Retry-After` and the phase (`database`, `journal_lease`,
 `journal_restore` with file and byte progress, `opening`) until it is ready.
+A GET or HEAD request (other than `/health`, which the container platform
+pings) first waits up to 10 s for the application and is then served
+normally, so a short cold start is a delay rather than an error. Requests
+with other methods get the 503 at once; nothing is retried on their behalf.
 Restoring streams one 64 KiB chunk at a time (memory does not grow with the
 journals) and is bounded by `SUMI_API_JOURNAL_MIRROR_RESTORE_TIMEOUT`
 (default 30m); files restored before an interruption are kept, so the next
@@ -156,14 +177,20 @@ before relying on the CPU figure.
 
 - **Workers Paid** on the Sumi account; Containers are not available on the
   Free plan.
-- **A hosted PostgreSQL 17** reachable over TLS from the internet, accepting
-  direct *session-mode* connections. The API holds session-level advisory
+- **A hosted PostgreSQL 17 or later** reachable over TLS from the internet,
+  accepting direct *session-mode* connections that pass `SET` through
+  (`idle_session_timeout`, `transaction_timeout`; see the lease above). The API holds session-level advisory
   locks (migrations, terminal runner lock) and long-lived lock connections,
   so a transaction-mode pooler (PgBouncer transaction mode, Hyperdrive) is
   not suitable, and Hyperdrive is not needed for a container. Candidates
   include PlanetScale Postgres, Neon, Supabase, Crunchy Bridge or RDS; choose
   a region near the users (Japan). A PostgreSQL inside a Container is not an
   option: its disk does not persist.
+- **No loss of committed transactions on failover.** The container has no
+  local copy of what it acknowledged, so a failover to an asynchronous
+  replica that lacks the last commits would lose acknowledged journal writes
+  without any refusal. Choose a plan with synchronous replication (or
+  equivalent zero-data-loss failover), and confirm it before the move.
 - **A Google credential for Firebase Admin** usable outside the WSL host
   (service-account key JSON passed as `SUMI_GOOGLE_CREDENTIALS_JSON`), with the
   roles the current API credential has.
@@ -232,8 +259,10 @@ refuses the later build's history instead of guessing (see below).
 If step 6 refuses (`ErrNotInitialized`, `ErrWrongMirror`,
 `ErrMirrorBehind`), nothing was changed: check that the container uses the
 database from step 4. Do not run `init-empty` on a database that has
-accounts — that is what would make an empty journal authoritative; the
-command refuses it for that reason.
+accounts — the command refuses it. If it was run by mistake before the host
+that holds the journals adopted them, starting that host with
+`postgres-adopt` corrects it while the empty mirror has acknowledged nothing
+(see the table above).
 
 A fresh installation without users skips steps 1–5 and runs
 `SUMI_DB_URL=<db> sumi-journal-mirror init-empty` once before the first
@@ -256,8 +285,8 @@ The file service database, file objects and LiveKit move separately.
   the same assertions against the disk and PostgreSQL attachment stores.
   The journal mirror's failure and restore contracts are in
   `internal/journalmirror/{mirror,lease,perf}_test.go`,
-  `internal/agentevents/journal_mirror_test.go` and
-  `cmd/server/journal_mirror_startup_test.go`.
+  `internal/agentevents/{journal_mirror,idempotency_scope}_test.go` and
+  `cmd/server/{journal_mirror_startup,background_start}_test.go`.
 - `cmd/server/cloud_replacement_proof_test.go` (`SUMI_CLOUD_PROOF=1`) runs a
   Direct Chat exchange against a running API, replaces its host with an
   operator command, and requires identical history, the original receipt for

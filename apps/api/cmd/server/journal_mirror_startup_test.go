@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,5 +206,54 @@ func TestLostJournalMirrorLeaseStopsTheAPI(t *testing.T) {
 	}
 	if !mirror.Fenced() {
 		t.Fatal("mirror still reports ownership")
+	}
+}
+
+// N-5: during a cold start a GET waits briefly for the application and is
+// then served once, instead of a 503; it gets the 503 if the start takes
+// longer than the hold. A POST and /health are answered at once.
+func TestStartupGateHoldsReadsUntilReady(t *testing.T) {
+	gate := newStartupGate()
+	gate.hold = 2 * time.Second
+	gate.setPhase("journal_restore")
+	served := 0
+	app := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { served++; w.WriteHeader(http.StatusNoContent) })
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/api/v1/commands", strings.NewReader(`{}`)),
+		httptest.NewRequest(http.MethodGet, "/health", nil),
+	} {
+		started := time.Now()
+		rec := httptest.NewRecorder()
+		gate.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable || time.Since(started) > 500*time.Millisecond {
+			t.Fatalf("%s %s during start = %d after %v, want an immediate 503", req.Method, req.URL.Path, rec.Code, time.Since(started))
+		}
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		gate.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil))
+		done <- rec.Code
+	}()
+	time.Sleep(300 * time.Millisecond)
+	gate.open(app)
+	select {
+	case code := <-done:
+		if code != http.StatusNoContent || served != 1 {
+			t.Fatalf("held GET = %d, served %d times", code, served)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("held GET was not released when the gate opened")
+	}
+
+	slow := newStartupGate()
+	slow.hold = 200 * time.Millisecond
+	started := time.Now()
+	rec := httptest.NewRecorder()
+	slow.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/conversations", nil))
+	if rec.Code != http.StatusServiceUnavailable || time.Since(started) < 200*time.Millisecond || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("GET beyond the hold = %d after %v", rec.Code, time.Since(started))
 	}
 }

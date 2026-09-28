@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -211,14 +213,29 @@ func TestCommandStoreIdempotencySerializesCrossTargetRaceWithinOneStore(t *testi
 	}
 }
 
-func TestCommandStoreIdempotencyGuardHonorsContextCancellation(t *testing.T) {
-	store, err := OpenCommandStore(t.TempDir())
+// holdIdempotencyLock takes a lock file of the store's directory as another
+// process would, through a descriptor of its own.
+func holdIdempotencyLock(t *testing.T, dir, name string, mode int) func() {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), mode); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = f.Close() }
+}
+
+func TestCommandStoreIdempotencyLockHonorsContextCancellation(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 
-	store.idempotencyGuard <- struct{}{}
+	release := holdIdempotencyLock(t, dir, idempotencyLockName("waiting-key"), syscall.LOCK_EX)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	_, appendErr := store.Append(
@@ -227,53 +244,44 @@ func TestCommandStoreIdempotencyGuardHonorsContextCancellation(t *testing.T) {
 		"waiting-key",
 		json.RawMessage(`{"type":"abort"}`),
 	)
-	<-store.idempotencyGuard
+	release()
 	if !errors.Is(appendErr, context.DeadlineExceeded) {
-		t.Fatalf("guard wait ignored context cancellation: %v", appendErr)
+		t.Fatalf("idempotency lock wait ignored context cancellation: %v", appendErr)
 	}
 }
 
-func TestCommandStoreCloseWaitsForIdempotencyGuardBeforeClosingFlock(t *testing.T) {
+// A process of a build before the lock stripes holds .idempotency.lock
+// exclusively for every keyed admission; keyed writers of this build wait for
+// it, so the two cannot admit the same key twice during a rolling restart.
+func TestCommandStoreKeyedAppendWaitsForLegacyExclusiveLock(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommandStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	release := holdIdempotencyLock(t, dir, legacyIdempotencyLock, syscall.LOCK_EX)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_, err = store.Append(ctx, testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "legacy-key", json.RawMessage(`{"type":"abort"}`))
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("keyed append while a legacy writer holds the index = %v", err)
+	}
+	release()
+	if _, err := store.Append(context.Background(), testDirectChatProvenance("018f47a2-9b3c-7def-8abc-0123456789ab"), "legacy-key", json.RawMessage(`{"type":"abort"}`)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCommandStoreKeyedAppendAfterCloseFails(t *testing.T) {
 	store, err := OpenCommandStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	store.idempotencyGuard <- struct{}{}
-	closeResult := make(chan error, 1)
-	go func() {
-		closeResult <- store.Close()
-	}()
-
-	deadline := time.Now().Add(time.Second)
-	for {
-		store.mu.Lock()
-		closed := store.closed
-		store.mu.Unlock()
-		if closed {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("Close did not enter closed state")
-		}
-		time.Sleep(time.Millisecond)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
 	}
-	select {
-	case err := <-closeResult:
-		t.Fatalf("Close returned before the idempotency guard was released: %v", err)
-	default:
-	}
-
-	<-store.idempotencyGuard
-	select {
-	case err := <-closeResult:
-		if err != nil {
-			t.Fatalf("Close failed: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Close did not finish after the idempotency guard was released")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if _, err := store.Append(

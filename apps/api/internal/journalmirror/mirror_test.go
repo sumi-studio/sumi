@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -279,6 +281,12 @@ func TestEmptyTargetBeforePopulatedSourceDestroysNothing(t *testing.T) {
 		_, err := src.Attach(ctx, "commands", source, AttachOptions{Mode: mode})
 		if !errors.Is(err, ErrWrongMirror) {
 			t.Fatalf("mode %d: populated source against the empty-initialized mirror = %v, want ErrWrongMirror", mode, err)
+		}
+		// N-2: the empty mirror acknowledged a write, so adopting over it
+		// is refused, and the advice neither discards a copy nor adopts.
+		if mode == AttachAdopt && !strings.Contains(err.Error(), "has since acknowledged writes") ||
+			strings.Contains(err.Error(), "move the directory aside") {
+			t.Fatalf("mode %d: advice = %v", mode, err)
 		}
 		src.Close()
 		if got := snapshot(t, source); len(got) != len(before) {
@@ -683,5 +691,109 @@ func TestVerifyReportsDifferencesWithoutChangingAnything(t *testing.T) {
 	}
 	if _, err := Verify(ctx, pool, "browser-events", dir); !errors.Is(err, ErrNotInitialized) {
 		t.Fatalf("verify of an uninitialized mirror = %v", err)
+	}
+}
+
+// N-2: an empty initialization made by mistake for an installation whose host
+// holds the journals is corrected by adopting, as long as the empty mirror
+// never acknowledged a write. The adoption keeps the mirror's lineage, so a
+// host that had already attached the empty mirror restores the adopted
+// journals. The advice on the way never suggests overriding the account
+// check or abandoning either copy.
+func TestMistakenEmptyInitializationIsCorrectedByAdopt(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	_, emptyLineage, err := InitializeEmpty(ctx, pool, "commands", "wrong mount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	container := acquire(t, pool, Options{Holder: "container"})
+	containerDir := t.TempDir()
+	if _, err := container.Attach(ctx, "commands", containerDir, AttachOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	container.Close()
+
+	host := t.TempDir()
+	hostFiles := map[string][]byte{
+		"commands-QQ.jsonl": []byte("{\"seq\":1,\"key\":\"idem-1\"}\n{\"seq\":2,\"key\":\"idem-2\"}\n"),
+		"events-QQ.jsonl":   bytes.Repeat([]byte("event\n"), 20000),
+	}
+	writeFiles(t, host, hostFiles)
+	before, rows := snapshot(t, host), mirrorRows(t, pool)
+
+	// Without adopt mode the host is refused, told how to correct it, and
+	// nothing changes.
+	m := acquire(t, pool, Options{Holder: "host"})
+	_, err = m.Attach(ctx, "commands", host, AttachOptions{Mode: AttachRestore})
+	if !errors.Is(err, ErrWrongMirror) || !strings.Contains(err.Error(), "postgres-adopt") {
+		t.Fatalf("restore-mode attach over a mistaken empty mirror = %v", err)
+	}
+	for _, bad := range []string{"allow-existing-accounts", "move the directory aside"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Fatalf("advice mentions %q: %v", bad, err)
+		}
+	}
+	m.Close()
+	if mirrorRows(t, pool) != rows || !maps.Equal(snapshot(t, host), before) {
+		t.Fatal("refusal changed something")
+	}
+
+	m = acquire(t, pool, Options{Holder: "host"})
+	report, err := m.Attach(ctx, "commands", host, AttachOptions{Mode: AttachAdopt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Initialized || !report.OverUnusedEmpty || report.Lineage != emptyLineage {
+		t.Fatalf("report = %+v, want an adoption over the empty mirror keeping lineage %s", report, emptyLineage)
+	}
+	for name, content := range hostFiles {
+		if got := mustRead(t, filepath.Join(host, name)); !bytes.Equal(got, content) {
+			t.Fatalf("adopt changed the host's %s", name)
+		}
+	}
+	var how string
+	if err := pool.QueryRow(ctx, `SELECT initialized_how FROM api_journal_mirror_dirs WHERE dir = 'commands'`).Scan(&how); err != nil || how != "adopted" {
+		t.Fatalf("initialized_how = %q (%v)", how, err)
+	}
+	appendSync(t, m, filepath.Join(host, "commands-QQ.jsonl"), "{\"seq\":3,\"key\":\"idem-3\"}\n")
+	m.Close()
+
+	// The adopted mirror is now in use: another unmarked directory is never
+	// adopted over it.
+	other := t.TempDir()
+	writeFiles(t, other, map[string][]byte{"commands-QQ.jsonl": []byte("{\"seq\":1,\"key\":\"other\"}\n")})
+	rows = mirrorRows(t, pool)
+	intruder := acquire(t, pool, Options{Holder: "intruder"})
+	if _, err := intruder.Attach(ctx, "commands", other, AttachOptions{Mode: AttachAdopt}); !errors.Is(err, ErrWrongMirror) {
+		t.Fatalf("second adopt = %v, want ErrWrongMirror", err)
+	}
+	intruder.Close()
+	if mirrorRows(t, pool) != rows {
+		t.Fatal("refused adopt changed the mirror")
+	}
+
+	// The host that attached the empty mirror restores the adopted journals.
+	container = acquire(t, pool, Options{Holder: "container"})
+	if _, err := container.Attach(ctx, "commands", containerDir, AttachOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	want := string(hostFiles["commands-QQ.jsonl"]) + "{\"seq\":3,\"key\":\"idem-3\"}\n"
+	if got := string(mustRead(t, filepath.Join(containerDir, "commands-QQ.jsonl"))); got != want {
+		t.Fatalf("restored commands = %q", got)
+	}
+	if got := mustRead(t, filepath.Join(containerDir, "events-QQ.jsonl")); !bytes.Equal(got, hostFiles["events-QQ.jsonl"]) {
+		t.Fatal("restored events differ")
+	}
+}
+
+// N-2: an empty directory is never adopted, and the refusal points at the
+// mount, not at initializing an empty mirror over existing accounts.
+func TestNothingToAdoptAdvisesCheckingTheMount(t *testing.T) {
+	pool := migratedPool(t)
+	m := acquire(t, pool, Options{})
+	_, err := m.Attach(context.Background(), "commands", t.TempDir(), AttachOptions{Mode: AttachAdopt})
+	if !errors.Is(err, ErrNothingToAdopt) || strings.Contains(err.Error(), "init-empty") || !strings.Contains(err.Error(), "SUMI_COMMAND_LOG_DIR") {
+		t.Fatalf("adopt of an empty directory = %v", err)
 	}
 }

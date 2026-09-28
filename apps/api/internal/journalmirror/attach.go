@@ -44,7 +44,8 @@ const (
 	// AttachAdopt initializes an uninitialized mirror from the directory's
 	// existing journal files (a host that already holds the journals). With
 	// an initialized mirror it behaves like AttachRestore, so it may stay
-	// configured across restarts.
+	// configured across restarts, except that it may replace an empty
+	// initialization that never acknowledged a write.
 	AttachAdopt
 )
 
@@ -69,10 +70,13 @@ type AttachReport struct {
 	Dir         string
 	Lineage     string
 	Initialized bool // this attach adopted the directory as the mirror's first copy
-	Files       int  // mirrored files after attach
-	Bytes       int64
-	Restored    []string // absent locally; written from PostgreSQL
-	Replaced    []string // differed locally; PostgreSQL's copy written
+	// OverUnusedEmpty reports that the adoption replaced an empty
+	// initialization that had never acknowledged a write.
+	OverUnusedEmpty bool
+	Files           int // mirrored files after attach
+	Bytes           int64
+	Restored        []string // absent locally; written from PostgreSQL
+	Replaced        []string // differed locally; PostgreSQL's copy written
 	// Quarantined lists local files, with their sizes, that were moved aside
 	// before PostgreSQL's copy replaced them or because PostgreSQL has no
 	// such file. Their bytes are kept under QuarantineDir.
@@ -121,7 +125,10 @@ type localState struct {
 //   - A file's recorded generation is newer than PostgreSQL's: the database
 //     is older than what this host acknowledged. ErrMirrorBehind.
 //   - Files exist but the directory has no marker and they differ from the
-//     mirror: files of unknown origin. ErrWrongMirror.
+//     mirror: files of unknown origin. ErrWrongMirror. The one exception is
+//     AttachAdopt over an empty initialization that never acknowledged a
+//     write (a mistaken init-empty); it adopts the files and keeps the
+//     mirror's lineage.
 //
 // These refusals change nothing. Otherwise every local file that differs
 // from PostgreSQL's copy (an unacknowledged tail, a whole-file replacement
@@ -160,21 +167,33 @@ func (m *Mirror) Attach(ctx context.Context, logical, dir string, opts AttachOpt
 	if err != nil {
 		return report, err
 	}
-	var lineage string
-	err = m.pool.QueryRow(ctx, `SELECT lineage::text FROM api_journal_mirror_dirs WHERE dir = $1`, logical).Scan(&lineage)
+	var lineage, how string
+	err = m.pool.QueryRow(ctx, `SELECT lineage::text, initialized_how FROM api_journal_mirror_dirs WHERE dir = $1`, logical).Scan(&lineage, &how)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if opts.Mode != AttachAdopt {
 			return report, fmt.Errorf("%w: %q. Start the host that holds these journals once with SUMI_API_JOURNAL_MIRROR=postgres-adopt, or restore the database that contains its mirror. For a new installation without journals, run `sumi-journal-mirror init-empty`",
 				ErrNotInitialized, logical)
 		}
-		if err := m.adopt(ctx, logical, abs, local, &report); err != nil {
+		if err := m.adopt(ctx, logical, abs, local, "", &report); err != nil {
 			return report, err
 		}
 	case err != nil:
 		return report, fmt.Errorf("read journal mirror %q: %w", logical, err)
 	default:
-		if err := m.reconcile(ctx, logical, abs, lineage, local, opts.Progress, &report); err != nil {
+		// An empty initialization that never acknowledged a write holds no
+		// journal state; the host that holds the journals may adopt over it.
+		// adopt re-checks "never acknowledged" in its transaction.
+		if opts.Mode == AttachAdopt && how == "empty" && local.lineage == "" && len(local.acked) == 0 && len(local.files) > 0 {
+			err := m.adopt(ctx, logical, abs, local, lineage, &report)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, errMirrorUsed) {
+				return report, err
+			}
+		}
+		if err := m.reconcile(ctx, logical, abs, lineage, how, local, opts, &report); err != nil {
 			return report, err
 		}
 	}
@@ -185,8 +204,33 @@ func (m *Mirror) Attach(ctx context.Context, logical, dir string, opts AttachOpt
 	return report, nil
 }
 
-// adopt initializes the mirror from the directory's journal files.
-func (m *Mirror) adopt(ctx context.Context, logical, abs string, local localState, report *AttachReport) error {
+// unknownFilesAdvice is the way forward when a directory without a marker
+// holds files the mirror does not. It never offers to replace either copy.
+func unknownFilesAdvice(how string, mode AttachMode) string {
+	switch {
+	case how == "empty" && mode == AttachAdopt:
+		return "The mirror was initialized empty and has since acknowledged writes, so these files cannot be adopted over it: both hold journal state. Keep both copies and see the runbook (\"Journal files of unknown origin\")"
+	case how == "empty":
+		return "If these are this installation's journals and the empty initialization was a mistake, start this host once with SUMI_API_JOURNAL_MIRROR=postgres-adopt: it adopts them while the empty mirror has acknowledged nothing, and refuses otherwise"
+	default:
+		return "If this host's journals are the ones to keep, attach the database that contains their mirror. If this directory is not a journal directory of this installation, point SUMI_COMMAND_LOG_DIR / SUMI_BROWSER_EVENT_DIR at the right one. See the runbook (\"Journal files of unknown origin\")"
+	}
+}
+
+// errMirrorUsed reports that an empty initialization has acknowledged a
+// write, so it holds journal state and cannot be adopted over.
+var errMirrorUsed = errors.New("empty journal mirror has acknowledged writes")
+
+// adoptTransactionTimeout bounds the one adoption transaction; see
+// writeTransactionTimeout.
+const adoptTransactionTimeout = time.Hour
+
+// adopt initializes the mirror from the directory's journal files. With
+// emptyLineage set, it replaces that empty initialization, keeping its
+// lineage, provided the mirror still has no file: nothing was ever
+// acknowledged through it, so no acknowledged journal is overwritten. A host
+// that attached the empty mirror then restores the adopted files.
+func (m *Mirror) adopt(ctx context.Context, logical, abs string, local localState, emptyLineage string, report *AttachReport) error {
 	if foreign := local.lineage; foreign != "" {
 		return fmt.Errorf("%w: %s is a replica of journal mirror lineage %s, which this database does not contain; attach the database that holds it instead of adopting",
 			ErrWrongMirror, abs, foreign)
@@ -196,10 +240,13 @@ func (m *Mirror) adopt(ctx context.Context, logical, abs string, local localStat
 			ErrWrongMirror, abs, rec.lineage, name)
 	}
 	if len(local.files) == 0 {
-		return fmt.Errorf("%w: %s. An empty directory is never adopted, because a misconfigured new host would otherwise make an empty journal authoritative. If this is the host that holds the journals and this directory is really empty, run `sumi-journal-mirror init-empty --allow-existing-accounts` (it leaves initialized directories unchanged) and start again",
+		return fmt.Errorf("%w: %s. Nothing was changed. An empty directory is never adopted: a missing mount or a wrong SUMI_COMMAND_LOG_DIR / SUMI_BROWSER_EVENT_DIR looks exactly like this. Check that the path is the one this host's API has been writing to (see the runbook: \"A journal directory is empty\")",
 			ErrNothingToAdopt, abs)
 	}
-	lineage := uuid.NewString()
+	lineage := emptyLineage
+	if lineage == "" {
+		lineage = uuid.NewString()
+	}
 	var total int64
 	for _, size := range local.files {
 		total += size
@@ -209,13 +256,33 @@ func (m *Mirror) adopt(ctx context.Context, logical, abs string, local localStat
 		return err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, `SELECT set_config('idle_in_transaction_session_timeout', $1, true), set_config('transaction_timeout', $2, true)`,
+		timeoutSetting(writeTransactionTimeout), timeoutSetting(adoptTransactionTimeout)); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `SELECT api_journal_mirror_check_owner($1)`, m.epoch); err != nil {
 		return m.flushError(err)
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO api_journal_mirror_dirs (dir, lineage, initialized_how, initialized_by, initialized_files, initialized_bytes)
-		VALUES ($1, $2, 'adopted', $3, $4, $5)`, logical, lineage, m.holder, len(local.files), total); err != nil {
-		return fmt.Errorf("initialize journal mirror %q: %w", logical, err)
+	if emptyLineage == "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO api_journal_mirror_dirs (dir, lineage, initialized_how, initialized_by, initialized_files, initialized_bytes)
+			VALUES ($1, $2, 'adopted', $3, $4, $5)`, logical, lineage, m.holder, len(local.files), total); err != nil {
+			return fmt.Errorf("initialize journal mirror %q: %w", logical, err)
+		}
+	} else {
+		tag, err := tx.Exec(ctx, `
+			UPDATE api_journal_mirror_dirs
+			SET initialized_how = 'adopted', initialized_at = now(), initialized_by = $3, initialized_files = $4, initialized_bytes = $5
+			WHERE dir = $1 AND lineage = $2 AND initialized_how = 'empty'
+			  AND NOT EXISTS (SELECT 1 FROM api_journal_mirror_files WHERE dir = $1)`,
+			logical, lineage, m.holder+" over an unused empty initialization", len(local.files), total)
+		if err != nil {
+			return fmt.Errorf("adopt over empty journal mirror %q: %w", logical, err)
+		}
+		if tag.RowsAffected() != 1 {
+			return errMirrorUsed
+		}
+		report.OverUnusedEmpty = true
 	}
 	for _, name := range sortedKeys(local.files) {
 		if _, err := tx.Exec(ctx, `INSERT INTO api_journal_mirror_files (dir, name, size, gen) VALUES ($1, $2, 0, 1)`, logical, name); err != nil {
@@ -247,7 +314,8 @@ func (m *Mirror) adopt(ctx context.Context, logical, abs string, local localStat
 	return nil
 }
 
-func (m *Mirror) reconcile(ctx context.Context, logical, abs, lineage string, local localState, progress func(AttachProgress), report *AttachReport) error {
+func (m *Mirror) reconcile(ctx context.Context, logical, abs, lineage, how string, local localState, opts AttachOptions, report *AttachReport) error {
+	progress := opts.Progress
 	report.Lineage = lineage
 	remote, err := readRemoteMeta(ctx, m.pool, logical)
 	if err != nil {
@@ -289,8 +357,8 @@ func (m *Mirror) reconcile(ctx context.Context, logical, abs, lineage string, lo
 			}
 		}
 		if len(unknown) > 0 {
-			return fmt.Errorf("%w: %s holds journal files of unknown origin (%s) that differ from mirror %q and has no mirror marker; nothing was changed. If this host's journals are the ones to keep, restore the database that contains them; otherwise move the directory aside",
-				ErrWrongMirror, abs, strings.Join(unknown, ", "), logical)
+			return fmt.Errorf("%w: %s holds journal files of unknown origin (%s) that differ from mirror %q and has no mirror marker; nothing was changed and both copies are intact. %s",
+				ErrWrongMirror, abs, strings.Join(unknown, ", "), logical, unknownFilesAdvice(how, opts.Mode))
 		}
 	}
 

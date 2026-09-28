@@ -96,6 +96,14 @@ func (m *Mirror) WrapAtomicWrite(write func(string, []byte, os.FileMode) error) 
 
 const fencedSQLState = "SJ001"
 
+// limitTransactionSQL sets the transaction_timeout of the current
+// transaction, including a pipeline's implicit one. The server ends the
+// session when it expires, whatever the client is doing, which releases the
+// owner row lock that api_journal_mirror_check_owner holds until commit.
+const limitTransactionSQL = `SELECT set_config('transaction_timeout', $1, true)`
+
+func timeoutSetting(d time.Duration) string { return fmt.Sprintf("%dms", d.Milliseconds()) }
+
 // flush commits ops to one mirrored file in a single pipelined round trip:
 // the owner check, the file's operations and its generation bump run as one
 // implicit transaction, and only the written bytes travel.
@@ -106,6 +114,7 @@ func (m *Mirror) flush(ctx context.Context, dir attachedDir, name string, ops []
 	ctx, cancel := context.WithTimeout(ctx, flushTimeout)
 	defer cancel()
 	batch := &pgx.Batch{}
+	batch.Queue(limitTransactionSQL, timeoutSetting(writeTransactionTimeout))
 	batch.Queue(`SELECT api_journal_mirror_check_owner($1)`, m.epoch)
 	batch.Queue(`INSERT INTO api_journal_mirror_files (dir, name, size) VALUES ($1, $2, 0) ON CONFLICT (dir, name) DO NOTHING`, dir.logical, name)
 	for _, o := range ops {
@@ -162,6 +171,9 @@ func (m *Mirror) resync(ctx context.Context, dir attachedDir, name, path string,
 		return 0, m.flushError(err)
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, limitTransactionSQL, timeoutSetting(writeTransactionTimeout)); err != nil {
+		return 0, m.flushError(err)
+	}
 	if _, err := tx.Exec(ctx, `SELECT api_journal_mirror_check_owner($1)`, m.epoch); err != nil {
 		return 0, m.flushError(err)
 	}
