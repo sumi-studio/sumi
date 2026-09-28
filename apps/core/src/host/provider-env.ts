@@ -13,7 +13,6 @@
  *              Any other preset fails the request.
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
- *   chatgpt  → not implemented by this core: the request fails.
  *   unset    → no selection exists (dev personas without a human, or a
  *              human who never chose): the operator env default below.
  *
@@ -405,10 +404,6 @@ export class SelectedModelProvider implements ModelProvider {
         throw unusable(
           "the selected model connection is 接続しない (none); choose a connection to let the secretary answer",
           "no_model_connection",
-        );
-      case "chatgpt":
-        throw unusable(
-          "the selected ChatGPT connection is not supported by this core yet; choose an API connection",
         );
       case "api":
         break;

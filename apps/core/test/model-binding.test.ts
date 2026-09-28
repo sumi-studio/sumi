@@ -266,7 +266,7 @@ test("a selection the core cannot honor fails the request without using another 
   await withModelServer(async (baseUrl, seen) => {
     const cases: [string, ModelBinding][] = [
       ["接続しない", { selection: "none" }],
-      ["chatgpt", { selection: "chatgpt", reason: "not served" }],
+      ["unknown selection", { selection: "invalid" } as unknown as ModelBinding],
       ["unknown wire", api(baseUrl, { preset: "not-a-wire" })],
       [
         "no credential",

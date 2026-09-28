@@ -68,7 +68,7 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
 // preset, or endpoint: when the selection cannot be honored the binding
 // says so and the core must fail rather than fall back.
 type ModelBinding struct {
-	// unset | none | api | chatgpt | needs_rebinding
+	// unset | none | api | needs_rebinding
 	Selection string `json:"selection"`
 	// Intent echoes the carried model_intent when the persona arrived by
 	// transfer: non-secret preference the destination must satisfy.
@@ -163,13 +163,6 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 	switch sel.Kind {
 	case "none":
 		writeJSON(w, http.StatusOK, ModelBinding{Selection: "none"})
-	case "chatgpt":
-		// The ChatGPT token is not served to the TS core in this slice —
-		// the binding reports the selection honestly and the core fails.
-		writeJSON(w, http.StatusOK, ModelBinding{
-			Selection: "chatgpt",
-			Reason:    "chatgpt connections are not yet served by the TypeScript core",
-		})
 	case "api":
 		meta, err := s.conns.Describe(r.Context(), human, sel.ConnectionID)
 		if err != nil {
