@@ -842,6 +842,22 @@ func (s *processStore) observe(ctx context.Context, original *processRecord) {
 	// No record or store mutex is held during Docker I/O.
 	if launch {
 		if err := s.backend.LaunchProcess(ctx, next.Operation); err != nil {
+			// A refusal before container create is a definite failure
+			// with its real cause; inspecting for a container that was
+			// never created would only turn it into "indeterminate".
+			var notStarted *ProcessNotStartedError
+			if errors.As(err, &notStarted) {
+				terminalProcess(&next, ProcessFailed, "process was not started: "+notStarted.Error())
+				next.Operation.NotStarted = true
+				next.ContainerRemoved = true // none was ever created
+				_ = s.commitProcess(original, &next)
+				// An early output read may already have started a
+				// supervisor; end it (it records no loss boundary).
+				if io_ := s.interactiveIOFor(next.Operation.OperationID); io_ != nil {
+					s.stopInteractive(io_)
+				}
+				return
+			}
 			next.Operation.Error = "process launch could not be confirmed"
 		}
 		if next.Operation.Interactive {
