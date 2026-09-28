@@ -43,6 +43,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// A Cloud provisioner exists to launch job-image processes (terminals
+	// and jobs). An unusable image pin must fail the deployment here —
+	// a healthy provisioner that refuses every launch looks like a
+	// terminal bug to the person using it.
+	if os.Getenv("SUMI_JOB_IMAGE_TAG") != "" || os.Getenv("SUMI_FILES_MOUNTPOINT") != "" {
+		checkContext, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		image, err := backend.ResolveProcessImage(checkContext)
+		checkCancel()
+		if err != nil {
+			return fmt.Errorf("process launches unavailable: %w", err)
+		}
+		log.Printf("runtime-provisioner: job image %s", image)
+	} else {
+		log.Printf("runtime-provisioner: SUMI_JOB_IMAGE_TAG unset; process launches will be refused")
+	}
 	service, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{
 		StateDirectory: stateDirectory,
 		Files: runtimeprovision.FilesEnvironment{

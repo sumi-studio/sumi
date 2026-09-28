@@ -18,7 +18,54 @@ import (
 
 const processOutputLimit = 1 << 20
 
-var processImageTag = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var (
+	processImageTag = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	processImageID  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+)
+
+const processImageRepository = "ghcr.io/sumi-studio/sumi-job"
+
+// processImagePin reads SUMI_JOB_IMAGE_TAG. Two immutable pins are
+// accepted: a full 40-hex source revision, resolved as the job image tag,
+// or a local image ID (sha256:<64 hex>) used directly. Anything else —
+// unset, a short revision, a movable tag like "latest" — is refused.
+func processImagePin(environment []string) (reference, wantID string, err error) {
+	pin := ""
+	for _, v := range environment {
+		if value, ok := strings.CutPrefix(v, "SUMI_JOB_IMAGE_TAG="); ok {
+			pin = value
+		}
+	}
+	switch {
+	case processImageTag.MatchString(pin):
+		return processImageRepository + ":" + pin, "", nil
+	case processImageID.MatchString(pin):
+		return pin, pin, nil
+	case pin == "":
+		return "", "", errors.New("job image is not configured: SUMI_JOB_IMAGE_TAG is unset")
+	default:
+		return "", "", errors.New("job image pin is invalid: SUMI_JOB_IMAGE_TAG must be a full 40-hex revision or a sha256 image ID")
+	}
+}
+
+// ResolveProcessImage resolves the pinned job image to its local image ID.
+// The provisioner never pulls: an image missing here refuses every launch,
+// so startup calls this to fail the deployment instead of each terminal.
+func (b *DockerBackend) ResolveProcessImage(ctx context.Context) (string, error) {
+	reference, wantID, err := processImagePin(b.baseEnvironment)
+	if err != nil {
+		return "", err
+	}
+	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", reference)
+	if err != nil {
+		return "", fmt.Errorf("pinned job image %s is not available locally: %w", reference, err)
+	}
+	image := strings.TrimSpace(string(raw))
+	if !processImageID.MatchString(image) || (wantID != "" && image != wantID) {
+		return "", fmt.Errorf("pinned job image %s resolved to an unexpected ID", reference)
+	}
+	return image, nil
+}
 
 // Process Docker calls execute only in the root provisioner. Callers provide
 // inert argv; all container authority and image selection remain server-owned.
@@ -41,31 +88,19 @@ func processContainer(o ProcessOperation) string { return "sumi-process-" + o.Op
 //
 // LaunchProcess runs the pinned job image on the verified canonical files scope.
 func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) error {
-	repo, tagEnv := "ghcr.io/sumi-studio/sumi-job", "SUMI_JOB_IMAGE_TAG"
-	tag := ""
-	for _, v := range b.baseEnvironment {
-		if strings.HasPrefix(v, tagEnv+"=") {
-			tag = strings.TrimPrefix(v, tagEnv+"=")
-		}
+	// Every refusal before `docker create` is a definite never-started
+	// outcome: no container carries this operation's name or label.
+	if o.WorkspaceBind == "" || o.FilesVolumeUUID == "" {
+		return processNotStarted(ErrProcessWorkspace)
 	}
-	if !processImageTag.MatchString(tag) {
-		return errors.New("process image requires a pinned full revision")
+	image, err := b.ResolveProcessImage(ctx)
+	if err != nil {
+		return processNotStarted(err)
 	}
 	labels := []string{"--label", "sumi.operation_id=" + o.OperationID, "--label", "sumi.personality_agent_id=" + o.PersonalityAgentID}
-	if o.WorkspaceBind == "" || o.FilesVolumeUUID == "" {
-		return ErrProcessWorkspace
-	}
 	labels = append(labels, "--label", "sumi.files_volume_uuid="+o.FilesVolumeUUID)
 	mount := "type=bind,src=" + o.WorkspaceBind + ",dst=/workspace"
 
-	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", repo+":"+tag)
-	if err != nil {
-		return err
-	}
-	image := strings.TrimSpace(string(raw))
-	if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(image) {
-		return errors.New("invalid pinned process image")
-	}
 	// Public egress is opt-in per deployment: SUMI_JOB_EGRESS_DIR names the
 	// host directory holding the egress proxy's unix socket. Job-image
 	// containers get that directory bind-mounted (read-only rootfs, so the

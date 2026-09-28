@@ -1192,6 +1192,13 @@ func (g *gateScope) EnsureScope(context.Context, string) error {
 // journal/fence ordering is.
 func newJoinedTerminalStack(t *testing.T, personaID string) (*agentstate.Store, *pgxpool.Pool, *fenceBackend, *runtimeprovision.Client, context.CancelFunc) {
 	t.Helper()
+	backend := &fenceBackend{}
+	s, pool, client, cancel := newJoinedTerminalStackWith(t, personaID, backend)
+	return s, pool, backend, client, cancel
+}
+
+func newJoinedTerminalStackWith(t *testing.T, personaID string, backend runtimeprovision.ProcessBackend) (*agentstate.Store, *pgxpool.Pool, *runtimeprovision.Client, context.CancelFunc) {
+	t.Helper()
 	pool := testdb.Create(t)
 	if err := db.Migrate(context.Background(), pool); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -1216,7 +1223,6 @@ func newJoinedTerminalStack(t *testing.T, personaID string) (*agentstate.Store, 
 		t.Fatal(err)
 	}
 
-	backend := &fenceBackend{}
 	svc, err := runtimeprovision.NewService(backend, runtimeprovision.ServiceConfig{
 		StateDirectory: t.TempDir() + "/prov",
 		Files: runtimeprovision.FilesEnvironment{
@@ -1246,7 +1252,7 @@ func newJoinedTerminalStack(t *testing.T, personaID string) (*agentstate.Store, 
 		cancel()
 		t.Fatalf("provisioner client: %v", err)
 	}
-	return s, pool, backend, client, cancel
+	return s, pool, client, cancel
 }
 
 // RWC-01 schedule, joined: claim commits, runSession is parked before
@@ -1378,4 +1384,125 @@ func TestDriverStartReleasesTombstoneOnActivePersona(t *testing.T) {
 	waitFor(t, 10*time.Second, "session active", func() bool {
 		return sessionStatus(t, s, pa, sess.SessionID) == "active"
 	})
+}
+
+type readyScope struct{}
+
+func (readyScope) EnsureScope(context.Context, string) error { return nil }
+
+// Hosted defect 2026-09-28: the provisioner's job image pin was unusable,
+// so every terminal launch was refused before `docker create`, yet the
+// session ended 'lost' with "process container unavailable". Through the
+// real store, wire transport and the real Docker backend's pin check,
+// the session must end 'ended' with the actual cause, launch once, and
+// stay quiesced — nothing ran, so nothing is repeated or left to stop.
+func TestDriverNeverStartedLaunchEndsWithCause(t *testing.T) {
+	ctx := context.Background()
+	pa := pid(t)
+	backend, err := runtimeprovision.NewDockerBackend(runtimeprovision.DockerBackendConfig{
+		BaseEnvironment: []string{"PATH=/nonexistent", "SUMI_JOB_IMAGE_TAG=latest"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, pool, client, stopObs := newJoinedTerminalStackWith(t, pa, backend)
+	defer stopObs()
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "shell", "human", "test")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	var logs sync.Map
+	d := New(s, client, readyScope{}, testConfig(&logs, "d:"))
+	dctx, dcancel := context.WithCancel(context.Background())
+	ddone := make(chan struct{})
+	go func() { d.Run(dctx); close(ddone) }()
+	defer func() { dcancel(); <-ddone }()
+
+	waitFor(t, 20*time.Second, "session ended", func() bool {
+		return sessionStatus(t, s, pa, sess.SessionID) == "ended"
+	})
+	var reason string
+	if err := pool.QueryRow(ctx, `SELECT end_reason FROM core_terminal_sessions WHERE session_id = $1`, sess.SessionID).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(reason, "process was not started: job image pin is invalid") {
+		t.Fatalf("end_reason = %q", reason)
+	}
+	op, err := client.ProcessStatus(ctx, runtimeprovision.ProcessLookupRequest{
+		PersonalityAgentID: pa, OperationID: runtimeprovision.ProcessOperationID(pa, "term:"+sess.SessionID),
+	})
+	if err != nil || op.State != runtimeprovision.ProcessFailed || !op.NotStarted || !op.Quiesced {
+		t.Fatalf("op = %+v, %v", op, err)
+	}
+}
+
+// A driver restart (API redeploy) adopts an open session. The new pump
+// must resume at the scrollback's output_bytes: re-draining from 0
+// produced a longer chunk at an already-stored base, which the dedupe
+// dropped whole — output around the restart silently never reached the
+// person or the secretary.
+func TestDriverRestartKeepsOutputAroundAdoption(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	pa := pid(t)
+	if _, _, err := s.EnsurePersona(ctx, pa, nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	sess, err := s.CreateTerminalSession(ctx, pa, "sh", "human", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	stream := "$ one\r\n"
+	var reads []int64
+	fake := &fakeProc{
+		ops: map[string]*runtimeprovision.ProcessOperation{},
+		readFunc: func(offset int64) runtimeprovision.ProcessOutput {
+			mu.Lock()
+			defer mu.Unlock()
+			reads = append(reads, offset)
+			if offset >= int64(len(stream)) {
+				return runtimeprovision.ProcessOutput{Offset: offset, NextOffset: offset}
+			}
+			return runtimeprovision.ProcessOutput{Offset: offset, NextOffset: int64(len(stream)), Content: stream[offset:]}
+		},
+	}
+	var logs sync.Map
+	screen := func() string {
+		read, err := s.ReadTerminalOutput(ctx, pa, sess.SessionID, 0, 0, 64)
+		if err != nil {
+			return ""
+		}
+		var b strings.Builder
+		for _, c := range read.Chunks {
+			b.Write(c.Data)
+		}
+		return b.String()
+	}
+	run := func() func() {
+		d := New(s, fake, nil, testConfig(&logs, "d:"))
+		dctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { d.Run(dctx); close(done) }()
+		return func() { cancel(); <-done }
+	}
+	stop := run()
+	waitFor(t, 10*time.Second, "first output stored", func() bool { return screen() == "$ one\r\n" })
+	stop()
+
+	mu.Lock()
+	stream += "$ two\r\n" // emitted while no driver runs
+	reads = nil
+	mu.Unlock()
+	stop = run()
+	defer stop()
+	waitFor(t, 10*time.Second, "output from the restart window stored", func() bool { return screen() == "$ one\r\n$ two\r\n" })
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reads) == 0 || reads[0] != int64(len("$ one\r\n")) {
+		t.Fatalf("adopted pump re-drained from %v, want resume at output_bytes", reads)
+	}
 }

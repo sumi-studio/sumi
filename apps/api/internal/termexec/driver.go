@@ -520,9 +520,13 @@ func (d *Driver) runSession(ctx context.Context, session agentstate.TerminalSess
 		d.reportTerminal(ctx, session, op, claimID)
 		return
 	}
+	// The scrollback already holds every byte below output_bytes; a
+	// pump adopted after a driver restart resumes there instead of
+	// re-draining the stream from 0.
 	pump := &sessionPump{
 		d: d, ctx: ctx, sessionID: sessionID, personaID: personaID,
 		claimID: claimID, epoch: epoch, opID: opID, ending: session.Status == "ending",
+		cursor:      session.OutputBytes,
 		emittedGaps: map[string]struct{}{},
 	}
 	d.mu.Lock()
@@ -954,7 +958,11 @@ func (d *Driver) reportTerminal(ctx context.Context, session agentstate.Terminal
 		reason = "closed"
 	case runtimeprovision.ProcessFailed:
 		reason = "failed"
-		if op.Error != "" && (containsFold(op.Error, "timeout") || containsFold(op.Error, "deadline")) {
+		if op.NotStarted && op.Error != "" {
+			// The shell never started; say why instead of a bare
+			// "failed" the person and secretary cannot act on.
+			reason = op.Error
+		} else if op.Error != "" && (containsFold(op.Error, "timeout") || containsFold(op.Error, "deadline")) {
 			reason = "timeout"
 		}
 	case runtimeprovision.ProcessIndeterminate:
