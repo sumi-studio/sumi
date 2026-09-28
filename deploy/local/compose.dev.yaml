@@ -169,7 +169,6 @@ services:
       SUMI_CORE_WAKE_TOKEN: ${SUMI_CORE_WAKE_TOKEN:?SUMI_CORE_WAKE_TOKEN is required}
       SUMI_CORE_WAKE_URL: ${SUMI_CORE_WAKE_URL:-http://127.0.0.1:8086}
       SUMI_RUNTIME_PROVISIONER_SOCKET: /run/sumi/runtime-provisioner/control.sock
-      SUMI_CHATGPT_CREDENTIAL_KEY: ${SUMI_CHATGPT_CREDENTIAL_KEY:-}
       SUMI_MODEL_CONNECTION_KEY: ${SUMI_MODEL_CONNECTION_KEY:-}
       # The URL is browser-facing. Empty credentials deliberately leave call
       # routes unmounted while text messaging continues normally. The launcher

@@ -41,7 +41,7 @@ function setup() {
 }
 it("retains the saved secret on editing only the name, requires a new key for another endpoint", async () => {
   const { client } = setup();
-  render(<APIConnectionSettings chatgptConnected client={client} />);
+  render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "編集" }));
   expect(screen.getByLabelText("APIキー")).toHaveValue("");
   fireEvent.change(screen.getByLabelText("名前"), {
@@ -63,9 +63,7 @@ it("retains the saved secret on editing only the name, requires a new key for an
 });
 it("does not select a newly saved connection silently and clears the entered key on closing", async () => {
   const { client } = setup();
-  const view = render(
-    <APIConnectionSettings chatgptConnected={false} client={client} />,
-  );
+  const view = render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "APIを追加" }));
   fireEvent.change(screen.getByLabelText("APIキー"), {
     target: { value: "fixture-secret" },
@@ -81,7 +79,7 @@ it("keeps edit values after failed save without reporting success", async () => 
   vi.mocked(client.save).mockRejectedValue(
     new Error("provider diagnostic must not be displayed"),
   );
-  render(<APIConnectionSettings chatgptConnected client={client} />);
+  render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "編集" }));
   fireEvent.change(screen.getByLabelText("名前"), {
     target: { value: "My revised name" },
@@ -99,7 +97,7 @@ it("hides transport and timeout diagnostics", async () => {
     .mockRejectedValueOnce(
       new DOMException("signal timed out at provider.internal", "TimeoutError"),
     );
-  render(<APIConnectionSettings chatgptConnected client={client} />);
+  render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "編集" }));
   for (let i = 0; i < 2; i++) {
     fireEvent.click(screen.getByRole("button", { name: "保存する" }));
@@ -120,7 +118,7 @@ it("shows validation guidance, keeps the entry, then saves after correction", as
       'extra header "Authorization" is reserved by the request itself',
     ),
   );
-  render(<APIConnectionSettings chatgptConnected client={client} />);
+  render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "編集" }));
   fireEvent.change(screen.getByLabelText("APIキー"), {
     target: { value: "fixture-key" },

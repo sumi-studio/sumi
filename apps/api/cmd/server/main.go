@@ -23,7 +23,6 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
 	applicationapps "github.com/sumi-studio/sumi/apps/api/internal/apps"
 	"github.com/sumi-studio/sumi/apps/api/internal/browsertabs"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/cloudbrowser"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
@@ -197,7 +196,6 @@ func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
 }
 
 type application struct {
-	chatGPTLogin               *chatgpt.LoginService
 	emailDelivery              *emailDeliveryWorker
 	publicMux                  *http.ServeMux
 	store                      *agentevents.CommandStore
@@ -244,9 +242,6 @@ func (a *application) Close() error {
 			a.stopBackground()
 		}
 		a.attentionWorkers.Wait()
-		if a.chatGPTLogin != nil {
-			a.chatGPTLogin.Close()
-		}
 		if a.browser != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			a.closeErr = errors.Join(a.closeErr, a.browser.ShutdownBrowserConnections(ctx))
@@ -317,21 +312,12 @@ func newApplicationFromEnv() (*application, error) {
 		}
 	}
 
-	chatGPTConnections, err := chatGPTStoreFromEnv(databasePool)
-	if err != nil {
-		closeOnError()
-		return nil, err
-	}
-	var chatGPTLogin *chatgpt.LoginService
-	if chatGPTConnections != nil {
-		chatGPTLogin = chatgpt.NewLoginService(chatGPTConnections, chatgpt.NewOAuthClient(), chatGPTBrowserIdentity(sv, browserOrigins), nil)
-	}
 	modelConnections, err := modelConnectionStoreFromEnv(databasePool)
 	if err != nil {
 		closeOnError()
 		return nil, err
 	}
-	modelConnectionService := &modelconnections.Service{Store: modelConnections, Authenticate: chatGPTBrowserIdentity(sv, browserOrigins)}
+	modelConnectionService := &modelconnections.Service{Store: modelConnections, Authenticate: browserIdentity(sv, browserOrigins)}
 
 	var directChatAuthorizer agentevents.DirectChatAuthorizer
 	if database != nil {
@@ -506,9 +492,6 @@ func newApplicationFromEnv() (*application, error) {
 		}
 		authServer.Connections = closers
 	}
-	if chatGPTLogin != nil {
-		chatGPTLogin.RegisterRoutes(mux)
-	}
 	modelConnectionService.RegisterRoutes(mux)
 	// Persona-scoped core-state service for the shared TypeScript secretary
 	// core. Opt-in: mounted only when a service token is configured and the
@@ -549,7 +532,7 @@ func newApplicationFromEnv() (*application, error) {
 		// model-connection change callback.
 		usageService := &usageview.Service{
 			Store:        coreServer.Store(),
-			Authenticate: chatGPTBrowserIdentity(sv, browserOrigins),
+			Authenticate: browserIdentity(sv, browserOrigins),
 		}
 		usageService.RegisterRoutes(mux)
 		prevChanged := modelConnectionService.Changed
@@ -638,17 +621,17 @@ func newApplicationFromEnv() (*application, error) {
 			log.Print("core file tools ready (file.* effects scoped to the claiming persona; job file capability armed)")
 		}
 	}
-	browserTabs, err := wireBrowserTabs(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	browserTabs, err := wireBrowserTabs(databasePool, coreServer, mux, browserIdentity(sv, browserOrigins))
 	if err != nil {
 		closeOnError()
 		return nil, err
 	}
-	cloudBrowser, err := wireCloudBrowser(databasePool, browserTabs, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	cloudBrowser, err := wireCloudBrowser(databasePool, browserTabs, mux, browserIdentity(sv, browserOrigins))
 	if err != nil {
 		closeOnError()
 		return nil, err
 	}
-	mcpRunner, err := wireMCP(databasePool, coreServer, mux, chatGPTBrowserIdentity(sv, browserOrigins))
+	mcpRunner, err := wireMCP(databasePool, coreServer, mux, browserIdentity(sv, browserOrigins))
 	if err != nil {
 		closeOnError()
 		return nil, err
@@ -819,7 +802,6 @@ func newApplicationFromEnv() (*application, error) {
 	return &application{
 		cleanupFeedbackAttachments: cleanupFeedbackAttachments,
 		deliverFeedbackAttention:   deliverFeedbackAttention,
-		chatGPTLogin:               chatGPTLogin,
 		emailDelivery:              emailDeliveryWorkerFor(authServer),
 		deliverAttention:           deliverAttention,
 		coreWaker:                  coreWaker,

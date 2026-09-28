@@ -26,10 +26,8 @@ const OUTPUT_BOUND_MAX = 1_000_000;
 const inputClass =
   "mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm";
 export function APIConnectionSettings({
-  chatgptConnected,
   client = defaultClient,
 }: {
-  chatgptConnected: boolean;
   client?: APIConnectionsClient;
 }) {
   const [state, setState] = useState<ConnectionsState | null>(null);
@@ -125,15 +123,6 @@ export function APIConnectionSettings({
       )}
       {state && (
         <div className="mt-4 space-y-2">
-          {chatgptConnected && (
-            <ConnectionRow
-              name="ChatGPT"
-              detail="接続済みのあなたのアカウント"
-              selected={state.selection?.kind === "chatgpt"}
-              busy={busy || !state.available}
-              onSelect={() => choose({ kind: "chatgpt" })}
-            />
-          )}
           {state.connections.map((c) => (
             <div key={c.id} className="rounded-lg border border-border p-3">
               <ConnectionRow

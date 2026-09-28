@@ -7,9 +7,9 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
-func TestChatGPTBrowserIdentityRevalidatesSessionAtAsyncCommit(t *testing.T) {
+func TestBrowserIdentityRevalidatesSessionAtAsyncCommit(t *testing.T) {
 	sessions := &profileSessionAuthorizer{claims: agentevents.UserSessionClaims{UserID: "human"}, authorize: true}
-	authenticate := chatGPTBrowserIdentity(sessions, []string{testBrowserOrigin})
+	authenticate := browserIdentity(sessions, []string{testBrowserOrigin})
 	identity, err := authenticate(profileRequest(`{}`))
 	if err != nil || identity.HumanID != "human" {
 		t.Fatal("valid authenticated mutation rejected")

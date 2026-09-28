@@ -69,11 +69,8 @@ type CommandAppender interface {
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
 type UserCommandIngress struct {
-	Appender  CommandAppender
-	Sessions  UserSessionAuthorizer
-	Readiness interface {
-		IsPersonalityAgentReady(context.Context, string) (bool, error)
-	}
+	Appender       CommandAppender
+	Sessions       UserSessionAuthorizer
 	MaxBytes       int64
 	AllowedOrigins []string
 	// Authorizer gates direct chat on Current Employer and the exact enabled
@@ -97,11 +94,6 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 		return nil, errCommandAppenderRequired
 	}
 	ingress := &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}
-	if readiness, ok := appender.(interface {
-		IsPersonalityAgentReady(context.Context, string) (bool, error)
-	}); ok {
-		ingress.Readiness = readiness
-	}
 	return ingress, nil
 }
 

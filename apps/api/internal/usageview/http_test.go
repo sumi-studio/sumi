@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -41,11 +41,11 @@ func newFixture(t *testing.T) *fixture {
 	f := &fixture{pool: pool, asHuman: new(string)}
 	svc := &Service{
 		Store: agentstate.NewStore(pool),
-		Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
+		Authenticate: func(*http.Request) (browseridentity.Identity, error) {
 			if *f.asHuman == "" {
-				return chatgpt.LoginIdentity{}, http.ErrNoCookie
+				return browseridentity.Identity{}, http.ErrNoCookie
 			}
-			return chatgpt.LoginIdentity{
+			return browseridentity.Identity{
 				HumanID:   *f.asHuman,
 				SessionID: "s-1",
 				Authorize: func(ctx context.Context, fn func(context.Context) error) error {

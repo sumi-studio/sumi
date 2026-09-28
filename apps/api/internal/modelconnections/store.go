@@ -384,7 +384,7 @@ func (s *Store) Selected(ctx context.Context, human string) (Selection, bool, er
 	return v, err == nil, err
 }
 func (s *Store) Select(ctx context.Context, human string, v Selection) error {
-	if v.Kind != "none" && v.Kind != "chatgpt" && v.Kind != "api" {
+	if v.Kind != "none" && v.Kind != "api" {
 		return ErrInvalid
 	}
 	if (v.Kind == "api") != (v.ConnectionID != "") {
@@ -406,8 +406,6 @@ func (s *Store) Select(ctx context.Context, human string, v Selection) error {
 	var found bool
 	if v.Kind == "api" {
 		err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM model_api_connections WHERE human_id=$1 AND connection_id=$2)", human, v.ConnectionID).Scan(&found)
-	} else if v.Kind == "chatgpt" {
-		err = tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM chatgpt_connections WHERE human_id=$1 AND NOT reconnect_required)", human).Scan(&found)
 	} else {
 		found = true
 	}

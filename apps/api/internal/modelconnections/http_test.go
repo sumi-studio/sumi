@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +12,8 @@ import (
 )
 
 func TestUnavailableAndUnauthenticatedStatus(t *testing.T) {
-	service := &Service{Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
-		return chatgpt.LoginIdentity{HumanID: "human"}, nil
+	service := &Service{Authenticate: func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{HumanID: "human"}, nil
 	}}
 	mux := http.NewServeMux()
 	service.RegisterRoutes(mux)
@@ -22,8 +22,8 @@ func TestUnavailableAndUnauthenticatedStatus(t *testing.T) {
 	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatal(w.Code)
 	}
-	service.Authenticate = func(*http.Request) (chatgpt.LoginIdentity, error) {
-		return chatgpt.LoginIdentity{}, errors.New("no session")
+	service.Authenticate = func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{}, errors.New("no session")
 	}
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, httptest.NewRequest("GET", "/api/model-connections", nil))
@@ -36,8 +36,8 @@ func TestHTTPWriteOnlyAndSessionRevocation(t *testing.T) {
 	store := fixture(t)
 	human := owner
 	revoked := false
-	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
-		return chatgpt.LoginIdentity{HumanID: human, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+	service := &Service{Store: store, Authenticate: func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{HumanID: human, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
 			if revoked {
 				return errors.New("revoked")
 			}
@@ -77,8 +77,8 @@ func TestHTTPWriteOnlyAndSessionRevocation(t *testing.T) {
 
 func TestHTTPExtraHeadersWriteOnly(t *testing.T) {
 	store := fixture(t)
-	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
-		return chatgpt.LoginIdentity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+	service := &Service{Store: store, Authenticate: func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
 			return effect(ctx)
 		}}, nil
 	}}
@@ -121,8 +121,8 @@ func TestHTTPExtraHeadersWriteOnly(t *testing.T) {
 
 func TestHTTPMaxOutputTokensAndErrorDetail(t *testing.T) {
 	store := fixture(t)
-	service := &Service{Store: store, Authenticate: func(*http.Request) (chatgpt.LoginIdentity, error) {
-		return chatgpt.LoginIdentity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
+	service := &Service{Store: store, Authenticate: func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error {
 			return effect(ctx)
 		}}, nil
 	}}
@@ -155,5 +155,22 @@ func TestHTTPMaxOutputTokensAndErrorDetail(t *testing.T) {
 	w = request("POST", "/api/model-connections/api", `{"name":"gw2","preset":"anthropic","baseUrl":"https://api.example/v1","model":"m","apiKey":"k","extraHeaders":{"Authorization":"Bearer evil-value"}}`)
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "Authorization") || strings.Contains(w.Body.String(), "evil-value") {
 		t.Fatalf("detail missing or value leaked: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestChatGPTSelectionIsUnavailable(t *testing.T) {
+	store := fixture(t)
+	service := &Service{Store: store, Authenticate: func(*http.Request) (browseridentity.Identity, error) {
+		return browseridentity.Identity{HumanID: owner, Authorize: func(ctx context.Context, effect func(context.Context) error) error { return effect(ctx) }}, nil
+	}}
+	mux := http.NewServeMux()
+	service.RegisterRoutes(mux)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPut, "/api/model-connections/selection", strings.NewReader(`{"kind":"chatgpt"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported selection status=%d body=%s", w.Code, w.Body.String())
+	}
+	if _, selected, err := store.Selected(context.Background(), owner); err != nil || selected {
+		t.Fatalf("unsupported selection persisted: selected=%v err=%v", selected, err)
 	}
 }

@@ -70,8 +70,6 @@ type BrowserServer struct {
 	WriteTimeout   time.Duration
 	PongWait       time.Duration
 	PingInterval   time.Duration
-	// SpawnTimeout bounds lazy runtime provisioning without making the browser
-	// request or socket the owner of the resulting runtime lifetime.
 	// AuthorizationPollInterval bounds how long an otherwise-idle socket can
 	// retain stale Current-Employer authorization.
 	AuthorizationPollInterval time.Duration
@@ -85,10 +83,6 @@ type BrowserServer struct {
 	beforeWrite    func()
 	commandIngress *UserCommandIngress
 }
-
-// SetSpawner installs one lazy-runtime controller for both direct-chat
-// transports. HTTP command admission waits for the newly spawned runtime's
-// authenticated Ready publication before allocating a durable sequence.
 
 // SetAuthorizer installs one composite authority boundary for both browser
 // transports. It is primarily useful for explicit application assembly and
@@ -600,7 +594,6 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseLifecycle()
-	runtimeUnavailable := false
 
 	var conn *websocket.Conn
 	finalLeaseEntered := false
@@ -672,20 +665,6 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	releaseLifecycle()
 	defer s.removeConnection(conn)
 	defer conn.Close()
-	if runtimeUnavailable {
-		deadline := s.sessionDeadline(claims, s.writeTimeout())
-		if deadline.After(time.Now()) {
-			_ = conn.WriteControl(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(
-					DirectChatRuntimeUnavailableCloseCode,
-					DirectChatRuntimeUnavailableCloseReason,
-				),
-				deadline,
-			)
-		}
-		return
-	}
 	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {
 		deadline := s.sessionDeadline(claims, s.writeTimeout())
 		if deadline.After(time.Now()) {

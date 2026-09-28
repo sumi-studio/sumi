@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 )
 
 type Service struct {
 	Store        *Store
-	Authenticate func(*http.Request) (chatgpt.LoginIdentity, error)
+	Authenticate func(*http.Request) (browseridentity.Identity, error)
 	Changed      func(string)
 }
 
@@ -52,10 +52,10 @@ func failure(w http.ResponseWriter, err error) {
 	}
 	respond(w, status, map[string]any{"error": payload})
 }
-func (s *Service) identity(w http.ResponseWriter, r *http.Request) (chatgpt.LoginIdentity, bool) {
+func (s *Service) identity(w http.ResponseWriter, r *http.Request) (browseridentity.Identity, bool) {
 	if s.Authenticate == nil {
 		respond(w, 401, map[string]string{"error": "Sign in to Sumi"})
-		return chatgpt.LoginIdentity{}, false
+		return browseridentity.Identity{}, false
 	}
 	id, err := s.Authenticate(r)
 	if err != nil {

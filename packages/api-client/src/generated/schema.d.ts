@@ -66,7 +66,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Select this Human’s API, ChatGPT or explicit none; none never falls back */
+        /** Select this Human’s API or explicit none; none never falls back */
         put: operations["selectModelConnection"];
         post?: never;
         delete?: never;
@@ -641,7 +641,7 @@ export interface components {
         };
         ModelConnectionSelection: {
             /** @enum {string} */
-            kind: "none" | "chatgpt";
+            kind: "none";
         } | {
             /** @constant */
             kind: "api";

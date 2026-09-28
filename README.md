@@ -68,7 +68,7 @@ To connect a real model, set `SUMI_MODEL_PROVIDER=openai` and the `SUMI_MODEL_*`
 
 `make dev` starts the full Web app with real secretaries on your machine: the Go API, PostgreSQL in Docker, the accepted TypeScript secretary core (`apps/core`) via a local dev pool — the same core the Local host and Sumi Cloud use — and Vite.
 
-Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. The default core runtime needs no model credential (deterministic `mock` provider);
+Requirements: Node.js 22.18 or newer, pnpm 11, Go, Docker, `curl`, `openssl` and `flock`; a Firebase project with Google or GitHub sign-in and matching Admin credentials. The default core runtime needs no model credential (deterministic `mock` provider).
 
 ```sh
 make setup
@@ -134,7 +134,7 @@ The workflows in `.github/workflows/` are configured to run on every pull reques
 
 ## Design principles
 
-- **People and secretaries use the same apps.** A secretary works through the same applications, operations and authorization checks as people, not through a separate agent-only copy of the product ([ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md), [ADR 0011 (proposed)](docs/adr/0011-messaging-surface-and-agent-participation.md), [ADR 0013](docs/core-architecture.md)).
+- **People and secretaries use the same apps.** A secretary works through the same applications, operations and authorization checks as people, not through a separate agent-only copy of the product ([ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md), [ADR 0011 (proposed)](docs/adr/0011-messaging-surface-and-agent-participation.md), [Core architecture](docs/core-architecture.md)).
 - **A secretary is one continuing individual.** People and secretaries are registered in the same identity registry. Starting or stopping the process that runs a secretary is resource management; it is not the secretary sleeping or ending ([ADR 0009](docs/adr/0009-human-koseki-and-multi-user-auth.md), [CONTEXT.md](CONTEXT.md)).
 - **Canonical state lives behind the API.** The processes that run a secretary keep no canonical state, so they can be stopped, restarted or replaced, and the next process recovers from what was saved.
 - **A person's model choice is authoritative.** The new secretary core does not substitute an operator model for the connection a person selected.

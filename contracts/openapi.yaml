@@ -128,7 +128,7 @@ paths:
   /api/model-connections/selection:
     put:
       operationId: selectModelConnection
-      summary: Select this Human’s API, ChatGPT or explicit none; none never falls back
+      summary: Select this Human’s API or explicit none; none never falls back
       security:
       - sumiSession: []
       responses:
@@ -1459,7 +1459,6 @@ components:
             type: string
             enum:
             - none
-            - chatgpt
       - type: object
         additionalProperties: false
         required:

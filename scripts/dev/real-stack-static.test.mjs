@@ -8,6 +8,7 @@ import {
   rm,
   stat,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -433,4 +434,34 @@ test("current Direct Chat receipts and events persist alongside attachments", as
   const launcher = await source("scripts/dev/real-stack");
   assert.match(launcher, /COMMAND_LOG_DIR="\$\{PERSISTENT_STATE_ROOT\}\/command-log"/);
   assert.match(launcher, /GATEWAY_STATE_DIR="\$\{PERSISTENT_STATE_ROOT\}\/browser-events"/);
+});
+
+test("persistent journal setup can repeat without changing existing ownership or data", async () => {
+  const launcher = await source("scripts/dev/real-stack");
+  const root = await mkdtemp(join(tmpdir(), "sumi-journal-repeat-"));
+  try {
+    const setupStart = launcher.indexOf('provision_persistent_state_root "${COMMAND_LOG_DIR}"');
+    const setupEnd = launcher.indexOf('readonly API_BINARY=', setupStart);
+    assert.ok(setupStart > 0 && setupEnd > setupStart);
+    const setup = launcher.slice(setupStart, setupEnd);
+    const preamble = [
+      launcherFunction(launcher, "validate_persistent_state_root_ancestors"),
+      launcherFunction(launcher, "provision_persistent_state_root"),
+      'COMMAND_LOG_DIR="$FIXTURE_ROOT/commands"',
+      'GATEWAY_STATE_DIR="$FIXTURE_ROOT/events"',
+    ].join("\n");
+    for (const run of ["first", "second"]) {
+      const result = await runBash(`${preamble}\nLOG_DIR="$FIXTURE_ROOT/${run}-logs"\nBIN_DIR="$FIXTURE_ROOT/${run}-bin"\n${setup}`, { FIXTURE_ROOT: root });
+      assert.equal(result.code, 0, result.stderr);
+      if (run === "first") await writeFile(join(root, "commands", "existing"), "receipt");
+    }
+    assert.equal(await readFile(join(root, "commands", "existing"), "utf8"), "receipt");
+    assert.equal((await stat(join(root, "commands"))).mode & 0o777, 0o700);
+    await chmod(join(root, "commands"), 0o755);
+    const unsafe = await runBash(`${preamble}\n${setup}`, { FIXTURE_ROOT: root });
+    assert.notEqual(unsafe.code, 0);
+    assert.equal((await stat(join(root, "commands"))).mode & 0o777, 0o755);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

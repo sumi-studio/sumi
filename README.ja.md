@@ -132,7 +132,7 @@ make migrate   # API のスキーマ migration を適用（SUMI_DB_URL が必要
 
 ## 設計の原則
 
-- **人と秘書は同じアプリを使います。** 秘書は、人と同じアプリケーション、操作、認可チェックを通して働きます。agent 専用に別に作ったプロダクトの複製は使いません（[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md)、[ADR 0011（提案段階）](docs/adr/0011-messaging-surface-and-agent-participation.md)、[ADR 0013](docs/core-architecture.md)）。
+- **人と秘書は同じアプリを使います。** 秘書は、人と同じアプリケーション、操作、認可チェックを通して働きます。agent 専用に別に作ったプロダクトの複製は使いません（[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md)、[ADR 0011（提案段階）](docs/adr/0011-messaging-surface-and-agent-participation.md)、[Core architecture](docs/core-architecture.md)）。
 - **秘書は続いていく一個人です。** 人と秘書は同じ identity 台帳（戸籍）に登録されます。秘書を動かすプロセスの起動や停止はリソース管理であり、秘書が眠ったり終わったりすることではありません（[ADR 0009](docs/adr/0009-human-koseki-and-multi-user-auth.md)、[CONTEXT.md](CONTEXT.md)）。
 - **正本の状態は API の向こう側にあります。** 秘書を動かすプロセスは正本の状態を持たないため、停止、再起動、置き換えができ、次のプロセスは保存された状態から回復します。
 - **本人が選んだモデルが優先されます。** 新しい秘書コアは、本人が選んだ接続の代わりに運営側のモデルを使いません。

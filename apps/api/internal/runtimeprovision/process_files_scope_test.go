@@ -98,7 +98,6 @@ printf '%s\n' "$(cd "$dir" && pwd -P)"
 	environment := []string{
 		"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"SUMI_JOB_IMAGE_TAG=" + jobTag,
-		"SUMI_JOB_IMAGE_TAG=" + jobTag,
 	}
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONFIG"} {
 		if v := os.Getenv(key); v != "" {

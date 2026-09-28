@@ -3,7 +3,6 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 
-COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
 
 CREATE DOMAIN public.uuidv7 AS text
 	CONSTRAINT uuidv7_check CHECK ((VALUE ~ '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'::text));
@@ -532,17 +531,6 @@ CREATE TABLE public.call_utterances (
     CONSTRAINT call_utterances_text_check CHECK (((length(text) >= 1) AND (length(text) <= 4000)))
 );
 
-CREATE TABLE public.chatgpt_connections (
-    human_id public.uuidv7 NOT NULL,
-    connection_id uuid NOT NULL,
-    account_id text NOT NULL,
-    credential_ciphertext bytea NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    model text NOT NULL,
-    effort text NOT NULL,
-    reconnect_required boolean DEFAULT false NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
-);
 
 CREATE TABLE public.cloud_browser_jev_credentials (
     human_id public.uuidv7 NOT NULL,
@@ -1297,7 +1285,7 @@ CREATE TABLE public.model_connection_selections (
     kind text NOT NULL,
     connection_id uuid,
     CONSTRAINT model_connection_selections_check CHECK (((kind = 'api'::text) = (connection_id IS NOT NULL))),
-    CONSTRAINT model_connection_selections_kind_check CHECK ((kind = ANY (ARRAY['api'::text, 'chatgpt'::text, 'none'::text])))
+    CONSTRAINT model_connection_selections_kind_check CHECK ((kind = ANY (ARRAY['api'::text, 'none'::text])))
 );
 
 CREATE TABLE public.notification_setting_places (
@@ -1775,8 +1763,6 @@ ALTER TABLE ONLY public.call_utterances
 ALTER TABLE ONLY public.call_utterances
     ADD CONSTRAINT call_utterances_session_id_seq_key UNIQUE (session_id, seq);
 
-ALTER TABLE ONLY public.chatgpt_connections
-    ADD CONSTRAINT chatgpt_connections_pkey PRIMARY KEY (human_id);
 
 ALTER TABLE ONLY public.cloud_browser_jev_credentials
     ADD CONSTRAINT cloud_browser_jev_credentials_pkey PRIMARY KEY (human_id);
@@ -2327,8 +2313,6 @@ ALTER TABLE ONLY public.call_sessions
 ALTER TABLE ONLY public.call_utterances
     ADD CONSTRAINT call_utterances_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.call_sessions(session_id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.chatgpt_connections
-    ADD CONSTRAINT chatgpt_connections_human_id_fkey FOREIGN KEY (human_id) REFERENCES public.humans(human_id);
 
 ALTER TABLE ONLY public.cloud_browser_jev_credentials
     ADD CONSTRAINT cloud_browser_jev_credentials_human_id_fkey FOREIGN KEY (human_id) REFERENCES public.humans(human_id);

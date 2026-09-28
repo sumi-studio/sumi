@@ -624,9 +624,9 @@ readonly MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS="${SUMI_MESSAGING_ATTACHMENT_T
 readonly MESSAGING_PUSH_SUBJECT="${SUMI_MESSAGING_PUSH_SUBJECT:-mailto:dev@sumi.local}"
 readonly LOG_DIR="${RUNTIME_ROOT}/logs"
 readonly BIN_DIR="${RUNTIME_ROOT}/bin"
+provision_persistent_state_root "${COMMAND_LOG_DIR}" >/dev/null
+provision_persistent_state_root "${GATEWAY_STATE_DIR}" >/dev/null
 mkdir -m 0700 \
-  "${COMMAND_LOG_DIR}" \
-  "${GATEWAY_STATE_DIR}" \
   "${LOG_DIR}" \
   "${BIN_DIR}"
 readonly API_BINARY="${BIN_DIR}/sumi-api"

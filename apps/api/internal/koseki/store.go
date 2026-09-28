@@ -70,9 +70,6 @@ func New(pool *pgxpool.Pool, directChatLifecycle ...*directchat.LifecycleFence) 
 	}
 }
 
-// NewWithWrappingKeyID returns a Store that can provision new agents using the
-// configured current key identity. Read-only stores may use New.
-
 func firstLifecycleFence(fences []*directchat.LifecycleFence) *directchat.LifecycleFence {
 	if len(fences) == 0 || fences[0] == nil {
 		return directchat.NewLifecycleFence()
@@ -369,21 +366,9 @@ func (s *Store) ListAgents(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// AgentWarmth returns the warmth setting (cold/warm) of an agent, or
-// pgx.ErrNoRows when the agent is not registered.
-func (s *Store) AgentWarmth(ctx context.Context, agentID string) (string, error) {
-	var warmth string
-	err := s.pool.QueryRow(ctx,
-		"SELECT warmth FROM agents WHERE personality_agent_id = $1", agentID).Scan(&warmth)
-	if err != nil {
-		return "", err
-	}
-	return warmth, nil
-}
-
 // Registration is the result of auto-registering a previously unbound credential
 // (ADR 0009 §3): a fresh HumanId, the default Secretary's PersonalityAgentId,
-// and the per-agent wrapping key generated at hire time.
+// for the new account.
 type Registration struct {
 	HumanID string
 	AgentID string
@@ -468,12 +453,6 @@ func (s *Store) AutoRegisterWithDisplayName(ctx context.Context, provider, exter
 		HumanID: humanID, AgentID: agentID,
 	}, nil
 }
-
-// AgentWrappingKey returns the per-agent wrapping key persisted at registration
-// time, or pgx.ErrNoRows when none exists.
-
-// generateWrappingKey produces the exact 64-hex representation consumed by
-// the runtime's 32-byte wrapping-key provider.
 
 // GrantResearchConsent registers an active 研究協力 consent for a Human. If an
 // active consent already exists this is a no-op; if a previously revoked consent

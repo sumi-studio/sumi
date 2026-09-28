@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 )
 
 // Service mounts the person's routes (browser session + CSRF, like the other
@@ -23,7 +23,7 @@ import (
 // bearer, never reachable through the public web edge).
 type Service struct {
 	Store        *Store
-	Authenticate func(*http.Request) (chatgpt.LoginIdentity, error)
+	Authenticate func(*http.Request) (browseridentity.Identity, error)
 	// RuntimeToken authenticates the browser Worker; WakeURL is its origin.
 	RuntimeToken string
 	WakeURL      string
