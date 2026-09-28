@@ -32,17 +32,94 @@ The container therefore runs with `SUMI_API_JOURNAL_MIRROR=postgres`
 (set by `deploy/api-container/entrypoint.sh`):
 
 - Every journal `fsync` also commits the written bytes to PostgreSQL before it
-  returns. A write the API acknowledged is in PostgreSQL.
-- On start, the API writes PostgreSQL's copy into the empty directories, then
+  returns. A write the API acknowledged is in PostgreSQL. If the commit fails
+  or its outcome is unknown (the connection broke after `COMMIT`), the write
+  is reported as failed and the journal rolls it back locally as it does for
+  a disk error; the next write first makes PostgreSQL's copy equal to the
+  local file again (only the uncertain tail is sent). A database outage
+  therefore fails the writes made during it and nothing else: Direct Chat
+  is not disabled, and it works again when the database answers.
+- On start, the API writes PostgreSQL's copy into the directories, then
   opens the journals as before. The existing journal code (flock, positional
   writes, rollback by truncation) is unchanged.
-- Each starting API process takes a new owner epoch. A process whose epoch
-  was superseded cannot commit journal writes (`ErrFenced`) and shuts itself
-  down. Fencing prevents two hosts from diverging; it does not arbitrate
-  availability, so the old host must be disabled at a move.
-- If a host restarts with its disk intact, bytes after the mirrored copy
-  (written but never acknowledged) are trimmed; any other difference stops
-  startup with `ErrConflict` and changes nothing.
+- The mirror must have been **initialized explicitly** (see below). The
+  container's mode `postgres` is restore-only: a database without an
+  initialized mirror stops the start with `ErrNotInitialized`; it is never
+  taken as empty journals.
+
+### Initialization, restart and refusals
+
+| Situation | What happens |
+| --- | --- |
+| New installation, no journals anywhere | Run `sumi-journal-mirror init-empty` once against the database. It refuses a database that already has accounts or agents. |
+| The current host holds the journals | Start it once with `SUMI_API_JOURNAL_MIRROR=postgres-adopt`. It copies its journal files into PostgreSQL as the first copy (logged `initialized from local files`) and then behaves like `postgres`. An empty directory is never adopted. |
+| Container starts (empty disk) | PostgreSQL's copy is restored. |
+| Host restarts with its disk (crash, rollout) | Files equal to PostgreSQL's copy are kept. A file that differs (a write that was never acknowledged, or a rollback whose own commit failed) is **moved** to `<dir>/.journal-mirror-quarantine/<time>-epoch<N>/` and PostgreSQL's copy is written in its place. No manual step. |
+| The directory belongs to another mirror, or the database is older than what this host acknowledged (an older backup), or unmarked files differ from the mirror (e.g. an empty mirror was initialized before the host that holds the journals adopted them) | The start stops with `ErrWrongMirror` or `ErrMirrorBehind` and **changes nothing** in either copy. Attach the right database; nothing has to be repaired. |
+
+Each directory carries a marker (`.journal-mirror`, the mirror's lineage)
+and, per file, the generation of its last acknowledged change
+(`.<file>.acked`); these distinguish an ordinary unacknowledged write from a
+wrong database. Quarantined files are kept until an operator removes them;
+they are never read by the API.
+
+### One owner at a time (lease)
+
+A starting API takes the mirror lease: a PostgreSQL session advisory lock on
+a dedicated connection. While another process holds it, the start **waits**
+(logging the holder; `SUMI_API_JOURNAL_MIRROR_ACQUIRE_TIMEOUT`, default no
+limit) and answers 503 `api_starting` / `journal_lease`. It never takes the
+journals from a running owner.
+
+The owner watches its lease session. When the session ends (database
+restart or failover, a broken connection, `pg_terminate_backend`), the loss
+is noticed at once; a connection that silently stops answering is noticed
+within 10 s (a 5 s check interval plus a 5 s read-only check). The API then
+answers 503 `api_stopping`, stops its background work and browser
+connections, and exits; the platform starts it again. Every journal write
+also re-checks the owner epoch in its own transaction, so a process that
+lost the lease cannot acknowledge a journal write even before it notices.
+The database releases the lease of a host that vanished without closing
+its connection after TCP keepalives fail (about 30 s).
+
+This protects the journals. It is **not** a fence for everything the
+process does: between the end of its lease session and its exit (normally
+milliseconds, at most the 10 s window above) an old process may still finish
+an in-flight request or background step. Most background loops claim their
+work in PostgreSQL and cannot act twice; the exceptions, which can repeat
+an effect when two API processes overlap, are:
+
+- job execution (`SUMI_JOBEXEC_*`): the runner id defaults to the same value
+  on every host, so a second host can relaunch a running job;
+- email delivery: a claim lease of 60 s with sends of up to 30 s can send
+  one email twice;
+- Core wakes and cloud-browser wakes: duplicate wakes only (harmless).
+
+An API started without the mirror (the current WSL host without
+`SUMI_API_JOURNAL_MIRROR`) takes no lease at all. A move therefore always
+stops the old host **and disables its restart** first.
+
+### Start-up time and network budget
+
+The API listens before it builds the application and answers 503 with
+`Retry-After` and the phase (`database`, `journal_lease`,
+`journal_restore` with file and byte progress, `opening`) until it is ready.
+Restoring streams one 64 KiB chunk at a time (memory does not grow with the
+journals) and is bounded by `SUMI_API_JOURNAL_MIRROR_RESTORE_TIMEOUT`
+(default 30m); files restored before an interruption are kept, so the next
+start continues.
+
+Each acknowledged journal write costs one round trip to PostgreSQL and
+sends about the written bytes plus ~500 bytes: a Direct Chat command is one
+round trip, a projected browser-event batch two (dedup index, then events).
+Measured on one machine with 20 ms injected per flight: 1.1 round trips and
+984 bytes per 500-byte append; a restore at 12.5 MiB/s through a 5 ms,
+16 MiB/s link. These are local measurements, not Cloudflare measurements:
+place the database in the container's region so the round trip stays in the
+low tens of milliseconds, and measure it before the move. Production
+journals were about 30 KB in total on 2026-09-28; they only grow, and
+retention is a separate product decision (history is never compacted by
+this mirror).
 
 Attachment bytes use the same `messaging.AttachmentBlobs` contract as the
 disk store (staging, no-replace publish, sweep, reconciliation). The
@@ -126,23 +203,49 @@ the container-local ones (`SUMI_API_JOURNAL_MIRROR`, `SUMI_COMMAND_LOG_DIR`,
 
 No data is regenerated or imported; the same rows and journal bytes move.
 The new migrations (`0003_api_journal_mirror`, `0004_messaging_attachment_blobs`)
-only add tables; existing rows are not rewritten. Version 0002 is left to
-`0002_chatgpt_subscription` on the subscription branch; the migrator allows
-the gap and applies these after it.
+only add tables; existing rows are not rewritten. Version 0002 is
+`0002_chatgpt_subscription` from the subscription branch; the production
+build must contain 0001–0004 in order. Never apply a build that lacks 0002
+(0001, 0003, 0004 only) to a database that will be kept: the migrator
+refuses the later build's history instead of guessing (see below).
 
-1. On the current WSL API, set `SUMI_API_JOURNAL_MIRROR=postgres` and
-   restart it. The first start adopts the existing journal files into
-   PostgreSQL (logged as `seeded from local files`); later writes are mirrored.
-2. Maintenance window: stop the WSL API (and disable its restart policy),
-   `pg_dump` the Sumi database, restore it into the hosted PostgreSQL.
-   Alternatively point the WSL API at the hosted database first; then the
-   container's start fences the WSL API instead of relying on the stop alone.
-3. Compare: `SUMI_DB_URL=<hosted> sumi-journal-mirror verify --commands <wsl
-   command-log copy> --browser-events <wsl browser-events copy>` must print
-   `"equal":true` for both.
-4. Deploy/start the container Worker against the hosted database; switch the
-   Web/Core/browser Workers' bindings from the VPC Service to the service
-   binding.
+1. Take a backup of the current database and copy both journal directories
+   aside (read-only copies for `verify`).
+2. On the current WSL API, set `SUMI_API_JOURNAL_MIRROR=postgres-adopt` and
+   restart it. The first start copies its journal files into PostgreSQL
+   (logged `initialized from local files`, with file and byte counts). From
+   then on every acknowledged write is mirrored. Leave it in this mode.
+3. Maintenance window: stop the WSL API **and disable its restart**
+   (systemd unit / supervisor), so nothing can write the old journals again.
+4. `pg_dump` the Sumi database and restore it into the hosted PostgreSQL.
+   (Alternatively the WSL API was already pointed at the hosted database in
+   step 2; then no dump is needed and the lease keeps a second process out.)
+5. Compare the stopped host's directories with the hosted database:
+   `SUMI_DB_URL=<hosted> sumi-journal-mirror verify --commands <command-log>
+   --browser-events <browser-events>` must print `"equal":true` for both.
+6. Deploy/start the container Worker against the hosted database
+   (`SUMI_API_JOURNAL_MIRROR=postgres`, restore-only). Its log shows the
+   restore with the same file and byte counts; its 503 answers name the phase
+   until it is ready. Then switch the Web/Core/browser Workers' bindings from
+   the VPC Service to the service binding.
+
+If step 6 refuses (`ErrNotInitialized`, `ErrWrongMirror`,
+`ErrMirrorBehind`), nothing was changed: check that the container uses the
+database from step 4. Do not run `init-empty` on a database that has
+accounts — that is what would make an empty journal authoritative; the
+command refuses it for that reason.
+
+A fresh installation without users skips steps 1–5 and runs
+`SUMI_DB_URL=<db> sumi-journal-mirror init-empty` once before the first
+container start.
+
+### Schema history mismatch
+
+If the API stops with `schema history mismatch`, the database was migrated
+by a different build (a later one, another branch's order, or an edited
+migration). Nothing was changed. Stop, and run the build whose migration
+history matches the database, or release the missing migration in order.
+Never drop or recreate a database that holds user data to get past it.
 
 The file service database, file objects and LiveKit move separately.
 
@@ -151,6 +254,10 @@ The file service database, file objects and LiveKit move separately.
 - `go test ./internal/journalmirror/ ./internal/agentevents/ ./internal/messaging/ ./internal/db/ ./cmd/server/`
   with `SUMI_TEST_DB_URL`. `TestAttachmentBlobBackendsShareTheContract` runs
   the same assertions against the disk and PostgreSQL attachment stores.
+  The journal mirror's failure and restore contracts are in
+  `internal/journalmirror/{mirror,lease,perf}_test.go`,
+  `internal/agentevents/journal_mirror_test.go` and
+  `cmd/server/journal_mirror_startup_test.go`.
 - `cmd/server/cloud_replacement_proof_test.go` (`SUMI_CLOUD_PROOF=1`) runs a
   Direct Chat exchange against a running API, replaces its host with an
   operator command, and requires identical history, the original receipt for

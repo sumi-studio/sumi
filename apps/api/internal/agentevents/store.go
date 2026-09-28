@@ -323,11 +323,21 @@ func (s *CommandStore) poisonLocked(st *personalityAgentState, reason error) {
 
 // rollbackLocked attempts to truncate the log back to offset and fsync. If the
 // rollback cannot be durably confirmed, it poisons the personality-agent state.
+//
+// A Sync that failed only to replicate (the local truncation is durable) is
+// confirmed locally: the file, fileSize, nextSeq and the idempotency index
+// all describe the log without the failed record, and the mirror repairs its
+// copy before the next append is acknowledged. Poisoning there would disable
+// Direct Chat for the personality until restart after a transient database
+// outage.
 func (s *CommandStore) rollbackLocked(st *personalityAgentState, offset int64, origErr error) error {
 	var truncErr, syncErr error
 	if st.file != nil {
 		truncErr = st.file.Truncate(offset)
 		syncErr = st.file.Sync()
+	}
+	if truncErr == nil && syncErr != nil && replicationOnly(syncErr) {
+		return nil
 	}
 	if truncErr != nil || syncErr != nil {
 		reason := fmt.Errorf("append failure %v; rollback could not be confirmed (truncate=%v, sync=%v)", origErr, truncErr, syncErr)

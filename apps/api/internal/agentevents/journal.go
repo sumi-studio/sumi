@@ -1822,6 +1822,9 @@ func rollbackDurableFile(f durableFileHandle, offset int64, origErr error) error
 		truncErr = f.Truncate(offset)
 		syncErr = f.Sync()
 	}
+	if truncErr == nil && syncErr != nil && replicationOnly(syncErr) {
+		return nil
+	}
 	if truncErr != nil || syncErr != nil {
 		return fmt.Errorf("append failure %v; rollback could not be confirmed (truncate=%v, sync=%v)", origErr, truncErr, syncErr)
 	}

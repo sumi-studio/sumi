@@ -94,6 +94,11 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// schemaMismatchAdvice ends every history-mismatch error. Nothing was
+// changed; the database may hold user data, so the way forward is the
+// matching build, never a reset.
+const schemaMismatchAdvice = "nothing was changed. The database was migrated by a different build: stop this process and run the build whose migration history matches the database, or have the missing migration released in order. Do not drop or recreate a database that holds user data"
+
 func pendingMigrations(ctx context.Context, db migrationDB) ([]pendingMigration, error) {
 	embedded, err := embeddedUpMigrations()
 	if err != nil {
@@ -115,17 +120,17 @@ func pendingMigrations(ctx context.Context, db migrationDB) ([]pendingMigration,
 			return nil, fmt.Errorf("scan applied version: %w", err)
 		}
 		if appliedCount >= len(embedded) {
-			return nil, fmt.Errorf("%w: applied migration %04d is not present in embedded history; reset this database and migrate from empty", ErrSchemaHistoryMismatch, version)
+			return nil, fmt.Errorf("%w: applied migration %04d is not present in this build's history; %s", ErrSchemaHistoryMismatch, version, schemaMismatchAdvice)
 		}
 		expected := embedded[appliedCount]
 		if version != expected.version {
-			return nil, fmt.Errorf("%w: applied history is not the embedded prefix at position %d (found %04d, expected %04d); reset this database and migrate from empty", ErrSchemaHistoryMismatch, appliedCount+1, version, expected.version)
+			return nil, fmt.Errorf("%w: applied history is not this build's prefix at position %d (found %04d, expected %04d); %s", ErrSchemaHistoryMismatch, appliedCount+1, version, expected.version, schemaMismatchAdvice)
 		}
 		if checksum == nil {
-			return nil, fmt.Errorf("%w: migration %04d has no verifiable checksum; reset this database and migrate from empty", ErrSchemaHistoryMismatch, version)
+			return nil, fmt.Errorf("%w: migration %04d has no verifiable checksum; %s", ErrSchemaHistoryMismatch, version, schemaMismatchAdvice)
 		}
 		if *checksum != migrationChecksum(expected.content) {
-			return nil, fmt.Errorf("%w: %w: version %04d; reset this database and migrate from empty", ErrSchemaHistoryMismatch, ErrMigrationChecksumMismatch, version)
+			return nil, fmt.Errorf("%w: %w: version %04d; %s", ErrSchemaHistoryMismatch, ErrMigrationChecksumMismatch, version, schemaMismatchAdvice)
 		}
 		appliedCount++
 	}
