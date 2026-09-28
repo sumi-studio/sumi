@@ -496,3 +496,109 @@ test("binding dying mid-call reshelves and shelves the wake", async () => {
     `reshelve's short pacing does not re-arm the alarm: ${armedIn}ms`,
   );
 });
+
+/** The DO-storage routing key (workerd.ts PERSONA_KEY). */
+const PERSONA_KEY_FOR_TEST = "sumi/persona_id";
+
+/** Counts storage writes and can fail the next get/put once. */
+function countingCtx() {
+  const ctx = fakeCtx();
+  const counts = { put: 0, get: 0 };
+  const fail = { get: false, put: false };
+  const { get, put } = ctx.storage;
+  ctx.storage.get = async (k: string) => {
+    counts.get++;
+    if (fail.get) {
+      fail.get = false;
+      throw new Error("storage get failed");
+    }
+    return get(k);
+  };
+  ctx.storage.put = async (k: string, v: unknown) => {
+    if (fail.put) {
+      fail.put = false;
+      throw new Error("storage put failed");
+    }
+    counts.put++;
+    return put(k, v);
+  };
+  return { ctx, counts, fail };
+}
+
+test("a reconstructed instance reuses the stored persona id without rewriting it", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const { ctx, counts } = countingCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+  assert.equal(counts.put, 1, "activation stores the persona id once");
+
+  // Alarm on a fresh instance: the id it read drives the drain, and the
+  // heartbeat re-arms as before.
+  state.addInput(PERSONA, "in-alarm", "after eviction");
+  const t0 = Date.now();
+  await new TestObject(ctx as never, env as never, state).alarm();
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-alarm")!.status,
+    "done",
+  );
+  const armedIn = ctx.alarmAt()! - t0;
+  assert.ok(armedIn >= 60_000 && armedIn < 61_000, `heartbeat: ${armedIn}`);
+
+  // Wake on another fresh instance.
+  state.addInput(PERSONA, "in-fetch", "wake after eviction");
+  const r = await new TestObject(ctx as never, env as never, state).fetch(
+    wakeReq(),
+  );
+  assert.equal(r.status, 200);
+  await settle(ctx);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-fetch")!.status,
+    "done",
+  );
+  assert.equal(counts.put, 1, "no rewrite after reconstruction");
+});
+
+test("a failed persona-id read or write never answers a wake without a stored binding", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const { ctx, counts, fail } = countingCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state);
+
+  // The initial binding write fails: the wake is refused, nothing runs.
+  fail.put = true;
+  const r1 = await obj.fetch(wakeReq());
+  assert.equal(r1.status, 500);
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), undefined);
+  assert.equal(ctx.alarmAt(), null);
+
+  // The same instance retries the write on the next wake before serving.
+  const r2 = await obj.fetch(wakeReq());
+  assert.equal(r2.status, 200);
+  await settle(ctx);
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA);
+  assert.equal(counts.put, 1);
+
+  // A reconstructed instance whose storage read fails is refused too, then
+  // binds from the stored id on the next wake without writing it again.
+  const fresh = new TestObject(ctx as never, env as never, state);
+  fail.get = true;
+  const r3 = await fresh.fetch(wakeReq());
+  assert.equal(r3.status, 500);
+  state.addInput(PERSONA, "in-after-read-failure", "hello");
+  const r4 = await fresh.fetch(wakeReq());
+  assert.equal(r4.status, 200);
+  await settle(ctx);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-after-read-failure")!.status,
+    "done",
+  );
+  assert.equal(counts.put, 1);
+
+  // The durable binding carries the alarm across a further reconstruction.
+  const t0 = Date.now();
+  await new TestObject(ctx as never, env as never, state).alarm();
+  assert.ok(ctx.alarmAt()! - t0 >= 60_000, "alarm re-armed from storage");
+});
