@@ -142,12 +142,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 				fmt.Fprintf(stderr, "Paste the %s from Sumi Cloud: ", what)
 			}
 		}
-		line, err := bufio.NewReader(stdin).ReadString('\n')
-		if err != nil && line == "" {
+		line, _ := bufio.NewReader(stdin).ReadString('\n')
+		if line = strings.TrimSpace(line); line == "" {
 			fmt.Fprintf(stderr, "sumi-local-move: no %s on stdin\n", what)
 			return "", exitUsage
 		}
-		return strings.TrimSpace(line), 0
+		return line, 0
 	}
 
 	switch cmd {

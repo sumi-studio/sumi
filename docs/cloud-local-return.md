@@ -65,8 +65,10 @@ no source checkout or Go compiler is needed. This is not a native Mac receiver.
    | any other secretary | occupied | refused before any request reaches Cloud |
 
    It then tells Cloud which placement and slot it is (the destination
-   binding) — one return URL serves one Local placement; a second install
-   pasting it is refused — and only then does Cloud seal the secretary.
+   binding) — one return URL serves one Local placement. A second install
+   is refused while the move is pending; after completion it reports that
+   the secretary moved elsewhere and exits 1 without importing or changing
+   its configuration. Only the bound destination can proceed to seal.
    From that commit Cloud stops answering for it.
 3. The command downloads the sealed bundle, stages the import, activates
    it locally, and reports the activation proof. Cloud completes the
@@ -140,7 +142,9 @@ stops and explains.
 
 | What happened | What converges it |
 | --- | --- |
-| Return URL pasted into a second Local | the second `return` is refused before Cloud seals; the first keeps the session |
+| Return URL pasted into a second Local while the move is pending | the destination binding is refused; the first install keeps the session |
+| Return URL pasted into a second Local after completion | `return` and `return-resume` report completion elsewhere and exit 1; nothing is imported or reconfigured. `return-status` succeeds as a query and explains that the secretary is not here |
+| Unfinished Cloud work prevents sealing | the secretary stays active on Cloud. The attempted file freeze is avoided or released; `return` exits 3 with the reason. Finish the work and run `return-resume`, or use `return-cancel`. A failed file-service release is retried by reconciliation |
 | Local occupied by a different live secretary | refused before any request reaches Cloud; nothing binds. An inert surrendered shell of another secretary is authored history — preserved, not disqualifying |
 | Cancel or the deadline lands while the bind's seal is in flight | the session goes `cancelling`, never terminal; the row lock serializes the seal — if it committed, the retire proof resolves to `aborted`; if it never did, the session closes `cancelled` (nothing ever moved) |
 | A tool approval is still pending when the return runs | `preflight.pending_approvals` shows it; the imported persona is unbound on a fresh Local so activation refuses until a human decides it — the command says to decide it on Cloud then `return-resume`, or `return-cancel` and return again once decided |

@@ -282,6 +282,69 @@ func (s *Service) sealTarget(ctx context.Context, q querier, personaID, transfer
 	return nil
 }
 
+// CheckSealable reports the persona's unfinished external work that a
+// seal refuses on — running operations, non-terminal jobs, unsettled job
+// file operations — as the same ErrUnresolvedOperations the seal returns.
+// It takes no locks and mutates nothing: a caller asks it BEFORE raising
+// anything the seal needs (the return's file fence, the terminal gate) so
+// a move that cannot seal yet touches nothing the still-active secretary
+// is using. The seal re-checks under its own locks; this is the early
+// answer, never the authority.
+func (s *Service) CheckSealable(ctx context.Context, q querier, personaID string) error {
+	return unresolvedWork(ctx, q, personaID)
+}
+
+// unresolvedWork is the seal's refusal set, shared by sealInTx (under the
+// persona lock) and CheckSealable (advisory, before any fence).
+func unresolvedWork(ctx context.Context, q querier, personaID string) error {
+	running, err := strings_(ctx, q, `
+		SELECT operation_id || ' (' || tool || ')' FROM core_operations
+		WHERE persona_id = $1 AND status = 'running' ORDER BY operation_id COLLATE "C"`, personaID)
+	if err != nil {
+		return err
+	}
+	if len(running) > 0 {
+		return fmt.Errorf("%w: %s; reconcile them before sealing",
+			ErrUnresolvedOperations, strings.Join(running, ", "))
+	}
+	// A non-terminal job is an unresolved external effect of the same kind:
+	// its runner claim belongs to this placement, so moving now would leave
+	// work running detached — finishing detached on a sealed source whose
+	// notification lands in a dead inbox — while the destination knows
+	// nothing of it. Finish or cancel the jobs, then seal. The persona row
+	// lock the seal holds serializes this check against submitJobTx's
+	// share-lock.
+	inflight, err := strings_(ctx, q, `
+		SELECT job_id || ' (' || status || ')' FROM core_jobs
+		WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested')
+		ORDER BY job_id COLLATE "C"`, personaID)
+	if err != nil {
+		return err
+	}
+	if len(inflight) > 0 {
+		return fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
+			ErrUnresolvedOperations, strings.Join(inflight, ", "))
+	}
+	// A job file operation admitted but not yet settled is an unresolved
+	// file effect of the same kind: its upstream outcome is not known, so
+	// sealing could strand a write the destination knows nothing about —
+	// and for file-inclusive moves, could cut the workspace under a write
+	// still landing. The keyed resend reconciles it; seal only once the
+	// ledger is quiet.
+	fileOps, err := strings_(ctx, q, `
+		SELECT op_id || ' (' || status || ')' FROM core_job_file_ops
+		WHERE persona_id = $1 AND status IN ('admitted','unknown')
+		ORDER BY op_id COLLATE "C"`, personaID)
+	if err != nil {
+		return err
+	}
+	if len(fileOps) > 0 {
+		return fmt.Errorf("%w: file operations %s still unresolved; reconcile them before sealing",
+			ErrUnresolvedOperations, strings.Join(fileOps, ", "))
+	}
+	return nil
+}
+
 // sealInTx is the seal's body: every lock and mutation of Seal, on the
 // given transaction, with commit left to the caller.
 func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID, destinationID string) (Receipt, error) {
@@ -335,49 +398,8 @@ func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID
 		return Receipt{}, fmt.Errorf("seal writer lease: %w", err)
 	}
 
-	running, err := strings_(ctx, tx, `
-		SELECT operation_id || ' (' || tool || ')' FROM core_operations
-		WHERE persona_id = $1 AND status = 'running' ORDER BY operation_id COLLATE "C"`, personaID)
-	if err != nil {
+	if err := unresolvedWork(ctx, tx, personaID); err != nil {
 		return Receipt{}, err
-	}
-	if len(running) > 0 {
-		return Receipt{}, fmt.Errorf("%w: %s; reconcile them before sealing",
-			ErrUnresolvedOperations, strings.Join(running, ", "))
-	}
-	// A non-terminal job is an unresolved external effect of the same kind:
-	// its runner claim belongs to this placement, so moving now would leave
-	// work running detached — finishing detached on a sealed source whose
-	// notification lands in a dead inbox — while the destination knows
-	// nothing of it. Finish or cancel the jobs, then seal. The persona row
-	// lock held here serializes this check against submitJobTx's share-lock.
-	inflight, err := strings_(ctx, tx, `
-		SELECT job_id || ' (' || status || ')' FROM core_jobs
-		WHERE persona_id = $1 AND status IN ('queued','running','cancel_requested')
-		ORDER BY job_id COLLATE "C"`, personaID)
-	if err != nil {
-		return Receipt{}, err
-	}
-	if len(inflight) > 0 {
-		return Receipt{}, fmt.Errorf("%w: jobs %s; wait for them to finish or cancel them before sealing",
-			ErrUnresolvedOperations, strings.Join(inflight, ", "))
-	}
-	// A job file operation admitted but not yet settled is an unresolved
-	// file effect of the same kind: its upstream outcome is not known, so
-	// sealing could strand a write the destination knows nothing about —
-	// and for file-inclusive moves, could cut the workspace under a write
-	// still landing. The keyed resend reconciles it; seal only once the
-	// ledger is quiet.
-	fileOps, err := strings_(ctx, tx, `
-		SELECT op_id || ' (' || status || ')' FROM core_job_file_ops
-		WHERE persona_id = $1 AND status IN ('admitted','unknown')
-		ORDER BY op_id COLLATE "C"`, personaID)
-	if err != nil {
-		return Receipt{}, err
-	}
-	if len(fileOps) > 0 {
-		return Receipt{}, fmt.Errorf("%w: file operations %s still unresolved; reconcile them before sealing",
-			ErrUnresolvedOperations, strings.Join(fileOps, ", "))
 	}
 	// A live call session is a runner claim of the same detachable kind as
 	// a job: its media actor keeps minting tickets and speaking on this

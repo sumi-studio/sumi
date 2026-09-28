@@ -409,6 +409,13 @@ func (s *Server) writeErr(w http.ResponseWriter, err error, v *View) {
 	if errors.Is(err, ErrTerminalQuiescePending) {
 		body["code"] = "terminal_quiesce_pending"
 	}
+	if errors.Is(err, portable.ErrUnresolvedOperations) {
+		// The secretary still has unfinished external work on Cloud; it
+		// stays active there with its workspace until the work settles,
+		// then the same destination binds again (or the return is
+		// cancelled). A retry, not a failure of the move.
+		body["code"] = "unfinished_work"
+	}
 	if errors.Is(err, ErrFilePolicyUndecided) {
 		// A machine-readable marker: the web client renders the undecided
 		// file-policy state from this instead of matching message text.

@@ -127,9 +127,18 @@ type returnState struct {
 	FilesQuarantined int64 `json:"files_quarantined,omitempty"`
 	// Outcome records the terminal step the driver reached so status after
 	// a finished run still explains what happened.
-	Outcome   string    `json:"outcome,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Outcome string `json:"outcome,omitempty"`
+	// CompletedAt is the placement Cloud recorded as the destination when
+	// the return completed somewhere other than this install
+	// (outcomeElsewhere).
+	CompletedAt string    `json:"completed_at_placement_id,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
+
+// outcomeElsewhere is the settled outcome of a return URL whose session
+// completed for a different placement: the secretary is active there,
+// nothing arrived here, and nothing here changed.
+const outcomeElsewhere = "completed_elsewhere"
 
 // returner carries the return command's dependencies: the same transport
 // and local stores the mover uses, plus the return record's home and the
@@ -324,8 +333,7 @@ func (m *mover) ReturnResume(ctx context.Context, pool *pgxpool.Pool, config str
 		return exitDone
 	}
 	if st.Outcome != "" {
-		m.say("The recorded return already finished (%s).", st.Outcome)
-		return exitDone
+		return r.explainOutcome(ctx, st)
 	}
 	return r.drive(ctx, st)
 }
@@ -439,8 +447,11 @@ func (r *returner) step(ctx context.Context, st *returnState) (code int, again b
 		return 0, true, r.retireTombstone(ctx, st, v)
 
 	case returnsession.StatusCompleted:
-		// The source already knows; make sure our side is finished too.
-		return r.finishActive(ctx, st)
+		// Completed, yet this install's ledger holds no activated import
+		// for it (that case was handled above): the activation that
+		// completed it happened at another placement. The secretary is
+		// not here, and nothing here may claim it is.
+		return r.finishElsewhere(ctx, st, v)
 
 	default:
 		return r.finishTerminal(ctx, st, v)
@@ -552,12 +563,30 @@ func (r *returner) bind(ctx context.Context, st *returnState, v returnsession.Vi
 	// declaration that does not match, so an old or mismatched mover can
 	// never bind a file-inclusive return and drop the files.
 	d.FileMode = v.FileMode
-	_, code, msg, err := r.rcall(ctx, http.MethodPost, st.SessionURL+"/destination",
+	raw, code, err := r.m.callSession(ctx, http.MethodPost, st.SessionURL+"/destination",
 		st.Grant, jsonBody(d), "application/json")
 	if err != nil {
 		return err
 	}
 	if code != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		msg := strings.TrimSpace(e.Error)
+		switch e.Code {
+		case "unfinished_work", "terminal_sessions_open", "terminal_quiesce_pending":
+			// The seal did not happen: the secretary is still active on
+			// Cloud with its workspace, and the binding stays ours. Nothing
+			// here is wrong — the move waits for that work.
+			r.m.say("Sumi Cloud cannot hand the secretary over yet: %s", msg)
+			r.m.say("It stays active on Sumi Cloud, and its work can finish there")
+			r.m.say("(its files stay writable). When that work is done, run")
+			r.m.say("`sumi-local-move return-resume`, or `sumi-local-move return-cancel`")
+			r.m.say("to give this return up.")
+			return errPending
+		}
 		return fmt.Errorf("Cloud refused the destination (HTTP %d): %s", code, msg)
 	}
 	st.Bound = true
@@ -924,6 +953,59 @@ func (r *returner) finishActive(ctx context.Context, st *returnState) (int, bool
 	return exitDone, false, nil
 }
 
+// finishElsewhere settles a return that completed at another placement.
+// Nothing is imported, retargeted or restarted here — the absence of any
+// local change is the correct result — and the command does not succeed:
+// the secretary it was asked to bring to this install is not here.
+func (r *returner) finishElsewhere(ctx context.Context, st *returnState, v returnsession.View) (int, bool, error) {
+	st.Outcome = outcomeElsewhere
+	if v.Destination != nil {
+		st.CompletedAt = v.Destination.PlacementID
+	}
+	if err := r.save(st); err != nil {
+		return 0, false, err
+	}
+	return r.explainOutcome(ctx, st), false, nil
+}
+
+// explainOutcome says what a recorded outcome means and returns the exit
+// status for a command that drove or resumed the return into it: done when
+// the return settled as it should (the secretary active here, or — after a
+// cancel — still or again on Cloud), an error when this install cannot take
+// part in it (the return completed elsewhere).
+func (r *returner) explainOutcome(ctx context.Context, st *returnState) int {
+	switch st.Outcome {
+	case "active":
+		r.m.say("The recorded return already finished: the secretary is active on this install.")
+		return exitDone
+	case outcomeElsewhere:
+		if own := mustPlacement(ctx, r.m.src); st.CompletedAt != "" && st.CompletedAt == own {
+			r.m.say("Sumi Cloud records this return as completed at this install's placement")
+			r.m.say("(%s), but this install's database holds no activated copy of the", own)
+			r.m.say("secretary. Check that SUMI_DB_URL points at this install's database.")
+			r.m.say("Nothing here was changed.")
+			return exitError
+		}
+		where := "another Sumi Local install"
+		if st.CompletedAt != "" {
+			where += " (placement " + st.CompletedAt + ")"
+		}
+		r.m.say("This return already finished on %s.", where)
+		r.m.say("The secretary is active there, not here: nothing was imported into")
+		r.m.say("this install and its configuration was not changed.")
+		return exitError
+	case returnsession.StatusAborted:
+		r.m.say("The recorded return was cancelled; the secretary is active on Sumi Cloud.")
+		r.m.say("Nothing is active here.")
+		return exitDone
+	case returnsession.StatusCancelled, returnsession.StatusExpired:
+		r.m.say("The recorded return ended before the transfer started; nothing moved.")
+		return exitDone
+	}
+	r.m.say("The recorded return already finished (%s).", st.Outcome)
+	return exitDone
+}
+
 // retarget points the install's config at the imported secretary. It runs
 // only after the activation committed on both sides, only rewrites the one
 // line, and refuses to touch a config whose current value is not the slot
@@ -1116,6 +1198,15 @@ func (m *mover) ReturnStatus(ctx context.Context, pool *pgxpool.Pool, config str
 	m.say("Return session %s", st.SessionID)
 	if st.Outcome != "" {
 		m.say("Outcome recorded here: %s", st.Outcome)
+		if st.Outcome == outcomeElsewhere {
+			// A status query succeeds; the return it describes did not
+			// bring the secretary here, and the line says so.
+			where := "another Sumi Local install"
+			if st.CompletedAt != "" {
+				where = "placement " + st.CompletedAt
+			}
+			m.say("The return completed at %s; the secretary is not on this install.", where)
+		}
 	}
 	imp, impErr := r.m.src.Status(ctx, "import", st.SessionID)
 	switch {
@@ -1183,6 +1274,9 @@ func (m *mover) ReturnCancel(ctx context.Context, pool *pgxpool.Pool, config str
 	}
 	if st.Outcome == "active" {
 		return m.fail(errors.New("the secretary is active on this install — there is no return left to cancel"))
+	}
+	if st.Outcome == outcomeElsewhere {
+		return m.fail(errors.New("this return already completed on another install — the secretary is active there, and nothing here needs cancelling"))
 	}
 	imp, impErr := r.m.src.Status(ctx, "import", st.SessionID)
 	if impErr == nil && imp.Status == "activated" {
