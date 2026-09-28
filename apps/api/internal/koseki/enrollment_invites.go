@@ -6,12 +6,21 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
 var ErrEnrollmentInvite = errors.New("a valid enrollment invitation is required")
+
+// These remain invitation refusals, but distinguish a usable invitation whose
+// email proof needs attention from a missing, expired or revoked invitation.
+var (
+	ErrEnrollmentEmailUnverified = fmt.Errorf("%w: email is not verified", ErrEnrollmentInvite)
+	ErrEnrollmentEmailMismatch   = fmt.Errorf("%w: email does not match", ErrEnrollmentInvite)
+)
 
 type EnrollmentInvite struct {
 	ID         string     `json:"id"`
@@ -130,6 +139,30 @@ func (s *Store) InspectEnrollmentInvite(ctx context.Context, token string) (Enro
 	}
 	return v, err
 }
+
+// PendingEnrollmentEmail names the address a still-unproved provider flow's
+// invitation is bound to, so a caller can fetch provider email evidence only
+// when an invitation will actually demand it. It is advisory: the proof is
+// still judged inside ResolveAuthProof under the invitation row lock, and an
+// unknown flow, wrong nonce or unbound invitation all read as "".
+func (s *Store) PendingEnrollmentEmail(ctx context.Context, flowID, nonce string) (string, error) {
+	nonceHash, err := validateNonce(nonce)
+	if err != nil {
+		return "", nil
+	}
+	if _, err := uuid.Parse(flowID); err != nil {
+		return "", nil
+	}
+	var email string
+	err = s.pool.QueryRow(ctx, `SELECT COALESCE(i.email,'') FROM auth_flows f
+		JOIN enrollment_invites i ON i.invite_id=f.enrollment_invite_id
+		WHERE f.flow_id=$1 AND f.nonce_hash=$2 AND f.status='pending' AND f.channel=$3`,
+		flowID, nonceHash, ChannelProvider).Scan(&email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return email, err
+}
 func (s *Store) checkEnrollmentInviteProof(ctx context.Context, tx pgx.Tx, flow AuthFlow, identity VerifiedIdentity) error {
 	if flow.EnrollmentInviteID == "" {
 		return ErrEnrollmentInvite
@@ -155,8 +188,13 @@ func (s *Store) checkEnrollmentInviteProof(ctx context.Context, tx pgx.Tx, flow 
 	if !live {
 		return ErrEnrollmentInvite
 	}
-	if email != "" && (!identity.EmailVerified || identity.NormalizedEmail != email) {
-		return ErrEnrollmentInvite
+	if email != "" {
+		if identity.NormalizedEmail != email {
+			return ErrEnrollmentEmailMismatch
+		}
+		if !identity.EmailVerified {
+			return ErrEnrollmentEmailUnverified
+		}
 	}
 	return nil
 }

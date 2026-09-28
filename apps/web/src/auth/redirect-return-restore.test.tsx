@@ -90,6 +90,7 @@ vi.mock("./firebase", () => ({
 vi.mock("firebase/auth", () => ({
   GithubAuthProvider: class GithubAuthProvider {
     providerId = "github.com";
+    addScope() {}
   },
   GoogleAuthProvider: class GoogleAuthProvider {
     providerId = "google.com";

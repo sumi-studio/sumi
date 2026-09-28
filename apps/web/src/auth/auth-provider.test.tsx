@@ -79,7 +79,7 @@ const authMocks = vi.hoisted(() => ({
   takePendingRedirectSignIn: vi.fn<() => PendingRedirectAuthFlow | null>(
     () => null,
   ),
-  resolveRedirectSignInUser: vi.fn(),
+  resolveRedirectSignIn: vi.fn(),
   bindDirectChatAuthority: vi.fn(),
   clearDirectChatAuthority: vi.fn(() => true),
 }));
@@ -132,7 +132,7 @@ vi.mock("./redirect-sign-in", async (importOriginal) => ({
   beginRedirectSignIn: authMocks.beginRedirectSignIn,
   hasPendingRedirectSignIn: authMocks.hasPendingRedirectSignIn,
   takePendingRedirectSignIn: authMocks.takePendingRedirectSignIn,
-  resolveRedirectSignInUser: authMocks.resolveRedirectSignInUser,
+  resolveRedirectSignIn: authMocks.resolveRedirectSignIn,
 }));
 
 vi.mock("../agent/auth-authority", () => ({
@@ -337,7 +337,7 @@ function pendingRedirectReceipt() {
 function simulateRedirectReturn(user: { uid: string }) {
   authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
   authMocks.takePendingRedirectSignIn.mockReturnValue(pendingRedirectReceipt());
-  authMocks.resolveRedirectSignInUser.mockResolvedValue(user);
+  authMocks.resolveRedirectSignIn.mockResolvedValue({ user });
 }
 
 describe("canonical Human profile", () => {
@@ -1061,7 +1061,7 @@ describe("logout authority transition", () => {
     );
     // getRedirectResult rejects with the collision before any credential is
     // produced, so no Firebase sign-out is owed.
-    authMocks.resolveRedirectSignInUser.mockRejectedValue(collision);
+    authMocks.resolveRedirectSignIn.mockRejectedValue(collision);
     authMocks.isSameEmailCredentialCollision.mockImplementation(
       (error) => error === collision,
     );
@@ -1310,7 +1310,7 @@ describe("logout authority transition", () => {
       ...pendingRedirectReceipt(),
       intent: "sign_up",
     });
-    authMocks.resolveRedirectSignInUser.mockResolvedValue(firebaseUser);
+    authMocks.resolveRedirectSignIn.mockResolvedValue({ user: firebaseUser });
     authMocks.getIdToken.mockResolvedValue("id-token-existing");
     authMocks.resolveAuthFlow
       .mockResolvedValueOnce({
@@ -1481,8 +1481,8 @@ describe("logout authority transition", () => {
   });
 
   it("does not establish a stale Firebase success after logout takes the generation", async () => {
-    let resolveReturn!: (value: { uid: string }) => void;
-    const returnRead = new Promise<{ uid: string }>((resolve) => {
+    let resolveReturn!: (value: { user: { uid: string } }) => void;
+    const returnRead = new Promise<{ user: { uid: string } }>((resolve) => {
       resolveReturn = resolve;
     });
     authMocks.getSumiSession.mockResolvedValue({
@@ -1495,7 +1495,7 @@ describe("logout authority transition", () => {
     authMocks.takePendingRedirectSignIn.mockReturnValue(
       pendingRedirectReceipt(),
     );
-    authMocks.resolveRedirectSignInUser.mockReturnValue(returnRead);
+    authMocks.resolveRedirectSignIn.mockReturnValue(returnRead);
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
     authMocks.signOut.mockResolvedValue(undefined);
     render(
@@ -1504,7 +1504,7 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalled();
+      expect(authMocks.resolveRedirectSignIn).toHaveBeenCalled();
     });
     authMocks.clearDirectChatAuthority.mockClear();
 
@@ -1517,7 +1517,7 @@ describe("logout authority transition", () => {
     // The committed logout cleared the cookie: the deferred session read must
     // see the cleared state, not resurrect the signed-out account.
     authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
-    resolveReturn({ uid: "firebase-b" });
+    resolveReturn({ user: { uid: "firebase-b" } });
     // The abandoned Firebase credential is cleaned up: once by logout itself
     // and once when the late redirect return notices the stale generation.
     await waitFor(() => {
@@ -1609,7 +1609,7 @@ describe("logout authority transition", () => {
     authMocks.takePendingRedirectSignIn.mockReturnValue(
       pendingRedirectReceipt(),
     );
-    authMocks.resolveRedirectSignInUser.mockReturnValue(returnRead);
+    authMocks.resolveRedirectSignIn.mockReturnValue(returnRead);
     authMocks.logoutSumiSession.mockResolvedValue(undefined);
     render(
       <AuthProvider>
@@ -1617,7 +1617,7 @@ describe("logout authority transition", () => {
       </AuthProvider>,
     );
     await waitFor(() => {
-      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalled();
+      expect(authMocks.resolveRedirectSignIn).toHaveBeenCalled();
     });
     authMocks.clearDirectChatAuthority.mockClear();
 
@@ -1656,7 +1656,7 @@ describe("redirect return resilience", () => {
       ...pendingRedirectReceipt(),
       expiresAt: "2020-08-01T01:00:00Z",
     });
-    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+    authMocks.resolveRedirectSignIn.mockRejectedValue(
       new RedirectSignInAbandonedError(),
     );
 
@@ -1686,8 +1686,8 @@ describe("redirect return resilience", () => {
       ...pendingRedirectReceipt(),
       expiresAt: "2020-08-01T01:00:00Z",
     });
-    authMocks.resolveRedirectSignInUser.mockResolvedValue({
-      uid: "firebase-b",
+    authMocks.resolveRedirectSignIn.mockResolvedValue({
+      user: { uid: "firebase-b" },
     });
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.verifyCommittedSumiSession.mockResolvedValue({
@@ -1737,7 +1737,7 @@ describe("redirect return resilience", () => {
         "unauthenticated",
       );
     });
-    expect(authMocks.resolveRedirectSignInUser).not.toHaveBeenCalled();
+    expect(authMocks.resolveRedirectSignIn).not.toHaveBeenCalled();
   });
 
   it("completes an unclaimed return after a back/forward-cache restore", async () => {
@@ -1770,7 +1770,7 @@ describe("redirect return resilience", () => {
     authMocks.takePendingRedirectSignIn.mockReturnValue(
       pendingRedirectReceipt(),
     );
-    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+    authMocks.resolveRedirectSignIn.mockRejectedValue(
       new RedirectSignInAbandonedError(),
     );
     await act(async () => {
@@ -1887,7 +1887,7 @@ describe("redirect return resilience", () => {
     authMocks.takePendingRedirectSignIn.mockReturnValue(
       pendingRedirectReceipt(),
     );
-    authMocks.resolveRedirectSignInUser.mockRejectedValue(
+    authMocks.resolveRedirectSignIn.mockRejectedValue(
       new RedirectSignInAbandonedError(),
     );
     await act(async () => {
@@ -1916,7 +1916,7 @@ describe("redirect return resilience", () => {
 
     await waitFor(() => {
       expect(authMocks.takePendingRedirectSignIn).toHaveBeenCalledTimes(2);
-      expect(authMocks.resolveRedirectSignInUser).toHaveBeenCalledTimes(2);
+      expect(authMocks.resolveRedirectSignIn).toHaveBeenCalledTimes(2);
       expect(screen.getByTestId("redirect-error")).toHaveTextContent(
         "RedirectSignInAbandonedError",
       );
@@ -1984,8 +1984,8 @@ describe("redirect return resilience", () => {
     authMocks.takePendingRedirectSignIn.mockReturnValue(
       pendingRedirectReceipt(),
     );
-    authMocks.resolveRedirectSignInUser.mockResolvedValue({
-      uid: "firebase-b",
+    authMocks.resolveRedirectSignIn.mockResolvedValue({
+      user: { uid: "firebase-b" },
     });
     authMocks.getIdToken.mockResolvedValue("id-token-b");
     authMocks.resolveAuthFlow.mockRejectedValue(
@@ -2011,6 +2011,48 @@ describe("redirect return resilience", () => {
     // The server's refusal committed nothing, so the Firebase credential is
     // retained: it is shared across tabs and a sibling's in-progress flow may
     // still depend on it. A deliberate cancel or logout still signs out.
+    expect(authMocks.signOut).not.toHaveBeenCalled();
+  });
+
+  it("sends a GitHub return's token with its proof and keeps GitHub as the recovery", async () => {
+    authMocks.getSumiSession.mockResolvedValue({ authenticated: false });
+    authMocks.getFirebaseAuth.mockReturnValue({});
+    authMocks.hasPendingRedirectSignIn.mockReturnValue(true);
+    authMocks.takePendingRedirectSignIn.mockReturnValue({
+      ...pendingRedirectReceipt(),
+      provider: "github.com",
+      intent: "sign_up",
+    });
+    authMocks.resolveRedirectSignIn.mockResolvedValue({
+      user: { uid: "firebase-gh" },
+      providerAccessToken: "gho_token",
+    });
+    authMocks.getIdToken.mockResolvedValue("id-token-gh");
+    authMocks.resolveAuthFlow.mockRejectedValue(
+      new AuthAPIError("invitation_email_unverified", 403),
+    );
+
+    render(
+      <AuthProvider>
+        <AuthStateProbe />
+      </AuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("redirect-error-message")).toHaveTextContent(
+        "もう一度同じ方法で続けてください",
+      );
+    });
+    expect(authMocks.resolveAuthFlow).toHaveBeenCalledWith({
+      flowId: "flow-id",
+      nonce: "n".repeat(43),
+      idToken: "id-token-gh",
+      providerAccessToken: "gho_token",
+    });
+    const shown = screen.getByTestId("redirect-error-message").textContent;
+    expect(shown).not.toContain("Google");
+    // A refused proof committed nothing; the invitation and the Firebase
+    // credential both stay for the retry.
     expect(authMocks.signOut).not.toHaveBeenCalled();
   });
 });

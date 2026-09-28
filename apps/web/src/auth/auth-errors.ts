@@ -59,6 +59,17 @@ export function getAuthErrorMessage(error: unknown): string {
 }
 
 const emailErrorMessages: Record<string, string> = {
+  invitation_required:
+    "登録には有効な招待リンクが必要です。届いた招待リンクを開き直してください。期限切れ・使用済みの場合は、新しい招待を受け取ってください。",
+  // The invitation stays usable after each of these refusals.
+  invitation_email_unverified:
+    "招待先のメールアドレスが、ログインしたアカウントでまだ確認済みになっていません。GitHubの場合は Settings → Emails で招待先アドレスの確認を済ませてから、もう一度同じ方法で続けてください。招待はそのまま使えます。",
+  invitation_email_mismatch:
+    "ログインしたアカウントに、招待先のメールアドレスが見つかりませんでした。招待を受け取ったアドレスを持つアカウントで続けてください。GitHubの場合は、招待先アドレスをGitHubに追加して確認すれば、そのまま使えます。",
+  invitation_email_proof_required:
+    "GitHubから招待先メールアドレスの確認結果を受け取れませんでした。もう一度GitHubで続け、メールアドレスの読み取りを許可してください。招待はそのまま使えます。",
+  invitation_email_proof_unavailable:
+    "GitHubにメールアドレスを確認できませんでした。招待はそのまま使えます。少し時間をおいて、もう一度GitHubで続けてください。",
   code_locked:
     "入力回数の上限に達しました。メール内のリンクを開くか、コードを再送信してください。",
   email_superseded:

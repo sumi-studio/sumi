@@ -28,7 +28,10 @@ type kosekiAuthFlowController struct {
 	tenantID  string
 	providers firebaseProviderLifecycle
 	email     *emailCodeController
-	clock     func() time.Time
+	// githubEmails proves the invited address when Firebase's GitHub identity
+	// does not already establish its verified ownership.
+	githubEmails githubEmailProver
+	clock        func() time.Time
 }
 
 type firebaseProviderAccount struct {
@@ -45,7 +48,10 @@ type firebaseProviderLifecycle interface {
 }
 
 func newKosekiAuthFlowController(store *koseki.Store, tenantID string, providers firebaseProviderLifecycle) *kosekiAuthFlowController {
-	return &kosekiAuthFlowController{store: store, tenantID: tenantID, providers: providers, clock: time.Now}
+	return &kosekiAuthFlowController{
+		store: store, tenantID: tenantID, providers: providers,
+		githubEmails: newGitHubAPIEmailProver(), clock: time.Now,
+	}
 }
 
 func (c *kosekiAuthFlowController) Start(ctx context.Context, request agentevents.StartBrowserAuthFlowRequest) (agentevents.BrowserAuthFlowResult, error) {
@@ -80,11 +86,86 @@ func (c *kosekiAuthFlowController) Resolve(ctx context.Context, request agenteve
 	if err != nil {
 		return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserAuthFlowProof
 	}
+	proof, err := c.proveInvitationEmail(ctx, request, &verified)
+	if err != nil {
+		return agentevents.BrowserAuthFlowResult{}, err
+	}
 	flow, err := c.store.ResolveAuthProof(ctx, request.FlowID, request.Nonce, verified)
 	if err != nil {
+		if errors.Is(err, koseki.ErrEnrollmentEmailUnverified) || errors.Is(err, koseki.ErrEnrollmentEmailMismatch) {
+			// Without an answer from GitHub, neither refusal is known to be
+			// true: say what the person can do to obtain one instead.
+			switch proof {
+			case invitationEmailProofMissing:
+				return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserEnrollmentEmailProofRequired
+			case invitationEmailProofUnreachable:
+				return agentevents.BrowserAuthFlowResult{}, agentevents.ErrBrowserEnrollmentEmailProofUnavailable
+			}
+		}
 		return agentevents.BrowserAuthFlowResult{}, mapFlowError(err)
 	}
 	return c.flowResult(flow), nil
+}
+
+type invitationEmailProof int
+
+const (
+	// invitationEmailProofNotNeeded: no pending email-bound invitation, or
+	// Firebase already verified the invited address.
+	invitationEmailProofNotNeeded invitationEmailProof = iota
+	// invitationEmailProofAnswered: GitHub answered for the proven account.
+	invitationEmailProofAnswered
+	// invitationEmailProofMissing: no usable GitHub token was presented.
+	invitationEmailProofMissing
+	// invitationEmailProofUnreachable: GitHub could not be asked right now.
+	invitationEmailProofUnreachable
+)
+
+// proveInvitationEmail upgrades a GitHub identity with GitHub's own answer
+// about the invited address. The token must belong to the GitHub account the
+// verified Firebase ID token names; only then does its email list count, and
+// only the invited address is taken from it. The invitation check itself
+// still runs in ResolveAuthProof under the invitation row lock.
+func (c *kosekiAuthFlowController) proveInvitationEmail(ctx context.Context, request agentevents.ResolveBrowserAuthFlowRequest, identity *koseki.VerifiedIdentity) (invitationEmailProof, error) {
+	if identity.SignInProvider != "github.com" || identity.ProviderSubject == "" {
+		return invitationEmailProofNotNeeded, nil
+	}
+	invited, err := c.store.PendingEnrollmentEmail(ctx, request.FlowID, request.Nonce)
+	if err != nil {
+		return invitationEmailProofNotNeeded, mapFlowError(err)
+	}
+	if invited == "" || (identity.EmailVerified && identity.NormalizedEmail == invited) {
+		return invitationEmailProofNotNeeded, nil
+	}
+	if request.ProviderAccessToken == "" {
+		return invitationEmailProofMissing, nil
+	}
+	if c.githubEmails == nil {
+		return invitationEmailProofUnreachable, nil
+	}
+	evidence, err := c.githubEmails.EmailEvidence(ctx, request.ProviderAccessToken, identity.ProviderSubject, invited)
+	switch {
+	case errors.Is(err, errGitHubSubjectMismatch):
+		return invitationEmailProofNotNeeded, agentevents.ErrBrowserAuthFlowProof
+	case errors.Is(err, errGitHubProofRejected):
+		return invitationEmailProofMissing, nil
+	case err != nil:
+		return invitationEmailProofUnreachable, nil
+	}
+	switch evidence {
+	case githubEmailVerified:
+		identity.NormalizedEmail, identity.EmailVerified = invited, true
+	case githubEmailUnverified:
+		identity.NormalizedEmail, identity.EmailVerified = invited, false
+	default:
+		// This GitHub account does not hold the invited address, whatever
+		// profile email Firebase copied.
+		identity.EmailVerified = false
+		if identity.NormalizedEmail == invited {
+			identity.NormalizedEmail = ""
+		}
+	}
+	return invitationEmailProofAnswered, nil
 }
 
 func (c *kosekiAuthFlowController) Confirm(ctx context.Context, request agentevents.ConfirmBrowserAuthFlowRequest) (agentevents.BrowserAuthFlowResult, error) {
@@ -706,6 +787,10 @@ func mapFlowError(err error) error {
 		return agentevents.ErrBrowserEmailContinuedElsewhere
 	case errors.Is(err, koseki.ErrEmailChallengeUnavailable):
 		return agentevents.ErrBrowserEmailUnavailable
+	case errors.Is(err, koseki.ErrEnrollmentEmailUnverified):
+		return agentevents.ErrBrowserEnrollmentEmailUnverified
+	case errors.Is(err, koseki.ErrEnrollmentEmailMismatch):
+		return agentevents.ErrBrowserEnrollmentEmailMismatch
 	case errors.Is(err, koseki.ErrEnrollmentInvite):
 		return agentevents.ErrBrowserEnrollmentInvite
 	case errors.Is(err, koseki.ErrAuthFlowExpired):

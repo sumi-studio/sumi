@@ -6,7 +6,7 @@ import {
   beginRedirectSignIn,
   hasPendingRedirectSignIn,
   RedirectSignInAbandonedError,
-  resolveRedirectSignInUser,
+  resolveRedirectSignIn,
   takePendingRedirectSignIn,
 } from "./redirect-sign-in";
 import { AuthAPIError } from "./session-client";
@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   getRedirectResult: vi.fn(),
   signInWithRedirect: vi.fn(),
   setCustomParameters: vi.fn(),
+  addScope: vi.fn(),
+  credentialFromResult: vi.fn(),
   startAuthFlow: vi.fn(),
   createAuthFlowNonce: vi.fn(() => "n".repeat(43)),
 }));
@@ -23,6 +25,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("firebase/auth", () => ({
   GithubAuthProvider: class GithubAuthProvider {
     providerId = "github.com";
+    addScope = mocks.addScope;
+    static credentialFromResult = mocks.credentialFromResult;
   },
   GoogleAuthProvider: class GoogleAuthProvider {
     providerId = "google.com";
@@ -110,6 +114,8 @@ describe("beginRedirectSignIn", () => {
     };
     expect(provider.providerId).toBe("github.com");
     expect(mocks.setCustomParameters).not.toHaveBeenCalled();
+    // An email-bound invitation needs GitHub's own verified-address list.
+    expect(mocks.addScope).toHaveBeenCalledWith("user:email");
   });
 
   it("replaces a stale receipt before leaving again", async () => {
@@ -185,19 +191,52 @@ describe("redirect return receipt", () => {
   });
 });
 
-describe("resolveRedirectSignInUser", () => {
+describe("resolveRedirectSignIn", () => {
   it("returns the user from the Firebase redirect result", async () => {
     const user = { uid: "firebase-a" };
-    mocks.getRedirectResult.mockResolvedValue({ user });
+    mocks.getRedirectResult.mockResolvedValue({
+      user,
+      providerId: "google.com",
+    });
+    mocks.credentialFromResult.mockReturnValue({ accessToken: "ya29.google" });
 
-    await expect(resolveRedirectSignInUser()).resolves.toBe(user);
+    await expect(resolveRedirectSignIn()).resolves.toEqual({ user });
     expect(mocks.getRedirectResult).toHaveBeenCalledWith({});
+    // A Google token is never read as GitHub evidence.
+    expect(mocks.credentialFromResult).not.toHaveBeenCalled();
+  });
+
+  it("keeps a GitHub return's access token for the invitation email proof", async () => {
+    const user = { uid: "firebase-gh" };
+    const result = { user, providerId: "github.com" };
+    mocks.getRedirectResult.mockResolvedValue(result);
+    mocks.credentialFromResult.mockReturnValue({ accessToken: "gho_token" });
+
+    await expect(resolveRedirectSignIn()).resolves.toEqual({
+      user,
+      providerAccessToken: "gho_token",
+    });
+    expect(mocks.credentialFromResult).toHaveBeenCalledWith(result);
+    // The token is memory-only: nothing about it reaches browser storage.
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain("gho_token");
+    expect(JSON.stringify({ ...localStorage })).not.toContain("gho_token");
+  });
+
+  it("returns only the user when a GitHub return carries no token", async () => {
+    const user = { uid: "firebase-gh" };
+    mocks.getRedirectResult.mockResolvedValue({
+      user,
+      providerId: "github.com",
+    });
+    mocks.credentialFromResult.mockReturnValue(null);
+
+    await expect(resolveRedirectSignIn()).resolves.toEqual({ user });
   });
 
   it("fails as abandoned when the return carries no credential", async () => {
     mocks.getRedirectResult.mockResolvedValue(null);
 
-    await expect(resolveRedirectSignInUser()).rejects.toBeInstanceOf(
+    await expect(resolveRedirectSignIn()).rejects.toBeInstanceOf(
       RedirectSignInAbandonedError,
     );
   });

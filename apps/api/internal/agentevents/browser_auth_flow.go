@@ -41,10 +41,31 @@ type ResolveBrowserAuthFlowRequest struct {
 	FlowID  string `json:"flow_id"`
 	Nonce   string `json:"nonce"`
 	IDToken string `json:"id_token"`
+	// ProviderAccessToken is the GitHub OAuth access token from the same
+	// redirect result. It is only evidence of which addresses GitHub verified
+	// for the account the ID token names; it never authenticates anyone and
+	// is neither stored nor logged.
+	ProviderAccessToken string `json:"provider_access_token,omitempty"`
 	// SwitchFromUserID is the person's explicit choice to replace the
 	// currently active Human; it must equal that Human, not merely some
 	// cookie the request happened to carry.
 	SwitchFromUserID string `json:"switch_from_user_id,omitempty"`
+}
+
+// maxProviderAccessTokenBytes bounds the GitHub token; GitHub documents its
+// tokens as opaque strings far below this.
+const maxProviderAccessTokenBytes = 512
+
+func validProviderAccessToken(token string) bool {
+	if len(token) > maxProviderAccessTokenBytes {
+		return false
+	}
+	for _, r := range token {
+		if !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 type ConfirmBrowserAuthFlowRequest struct {
@@ -122,15 +143,17 @@ type ProviderMethodsResult struct {
 }
 
 var (
-	ErrBrowserEnrollmentInvite        = errors.New("enrollment invitation required")
-	ErrBrowserAuthFlowInvalid         = errors.New("invalid authentication flow")
-	ErrBrowserAuthFlowExpired         = errors.New("authentication flow expired")
-	ErrBrowserAuthFlowConsumed        = errors.New("authentication flow consumed")
-	ErrBrowserAuthFlowProof           = errors.New("authentication proof mismatch")
-	ErrBrowserAuthRecentReauth        = errors.New("recent reauthentication required")
-	ErrBrowserAuthLastMethod          = errors.New("last login method")
-	ErrBrowserAuthProviderPending     = errors.New("provider operation pending")
-	ErrBrowserAuthProviderUnavailable = errors.New("provider operation unavailable")
+	ErrBrowserEnrollmentInvite          = errors.New("enrollment invitation required")
+	ErrBrowserEnrollmentEmailUnverified = errors.New("invitation email is not verified")
+	ErrBrowserEnrollmentEmailMismatch   = errors.New("invitation email does not match")
+	ErrBrowserAuthFlowInvalid           = errors.New("invalid authentication flow")
+	ErrBrowserAuthFlowExpired           = errors.New("authentication flow expired")
+	ErrBrowserAuthFlowConsumed          = errors.New("authentication flow consumed")
+	ErrBrowserAuthFlowProof             = errors.New("authentication proof mismatch")
+	ErrBrowserAuthRecentReauth          = errors.New("recent reauthentication required")
+	ErrBrowserAuthLastMethod            = errors.New("last login method")
+	ErrBrowserAuthProviderPending       = errors.New("provider operation pending")
+	ErrBrowserAuthProviderUnavailable   = errors.New("provider operation unavailable")
 	// ErrBrowserTransferPending is a registration that chose to bring its
 	// Local secretary while that secretary has not arrived yet: run the move
 	// command or cancel the session, then finish.
@@ -139,12 +162,20 @@ var (
 	// can no longer be claimed (cancelled, expired or raced); the person
 	// starts the move choice again.
 	ErrBrowserTransferUnavailable = errors.New("secretary move can no longer be claimed")
+	// ErrBrowserEnrollmentEmailProofRequired: the provider's answer about the
+	// invited address was not presented or not usable; signing in with the
+	// same provider again obtains it.
+	ErrBrowserEnrollmentEmailProofRequired = errors.New("invitation email proof required")
+	// ErrBrowserEnrollmentEmailProofUnavailable: the provider could not be
+	// asked; nothing was decided and a later attempt may succeed.
+	ErrBrowserEnrollmentEmailProofUnavailable = errors.New("invitation email proof unavailable")
 )
 
-// BrowserAuthFlowController owns persisted intent/proof transitions. It never
-// receives a provider OAuth credential; linkWithCredential remains a bounded
-// Firebase browser-SDK operation and completion is proven by a refreshed ID
-// token.
+// BrowserAuthFlowController owns persisted intent/proof transitions. The only
+// provider OAuth credential it sees is a resolve's GitHub access token, read
+// once as email evidence for an invitation; linkWithCredential remains a
+// bounded Firebase browser-SDK operation and completion is proven by a
+// refreshed ID token.
 type BrowserAuthFlowController interface {
 	Start(ctx context.Context, request StartBrowserAuthFlowRequest) (BrowserAuthFlowResult, error)
 	Resolve(ctx context.Context, request ResolveBrowserAuthFlowRequest, identity FirebaseIdentity) (BrowserAuthFlowResult, error)
@@ -203,7 +234,8 @@ func (s *BrowserAuthServer) serveResolveAuthFlow(w http.ResponseWriter, r *http.
 	if !decodeAuthJSON(w, r, &request) {
 		return
 	}
-	if request.IDToken == "" || len(request.IDToken) > maxFirebaseIDTokenBytes {
+	if request.IDToken == "" || len(request.IDToken) > maxFirebaseIDTokenBytes ||
+		!validProviderAccessToken(request.ProviderAccessToken) {
 		writeBrowserAuthError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -490,6 +522,14 @@ func writeFlowError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "session_active"
 	case errors.Is(err, ErrBrowserEnrollmentInvite):
 		status, code = http.StatusForbidden, "invitation_required"
+	case errors.Is(err, ErrBrowserEnrollmentEmailUnverified):
+		status, code = http.StatusForbidden, "invitation_email_unverified"
+	case errors.Is(err, ErrBrowserEnrollmentEmailMismatch):
+		status, code = http.StatusForbidden, "invitation_email_mismatch"
+	case errors.Is(err, ErrBrowserEnrollmentEmailProofRequired):
+		status, code = http.StatusForbidden, "invitation_email_proof_required"
+	case errors.Is(err, ErrBrowserEnrollmentEmailProofUnavailable):
+		status, code = http.StatusServiceUnavailable, "invitation_email_proof_unavailable"
 	case errors.Is(err, ErrBrowserAuthFlowExpired):
 		status, code = http.StatusGone, "flow_expired"
 	case errors.Is(err, ErrBrowserAuthFlowConsumed):

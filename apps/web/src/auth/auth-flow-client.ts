@@ -106,11 +106,17 @@ export async function resolveAuthFlow({
   flowId,
   nonce,
   idToken,
+  providerAccessToken,
   switchFromUserId,
 }: {
   flowId: string;
   nonce: string;
   idToken: string;
+  /**
+   * GitHub's access token from the same redirect return: the evidence an
+   * email-bound invitation needs. Sent once with the proof, never stored.
+   */
+  providerAccessToken?: string;
   /** The person's explicit choice to replace this jar's active Human. */
   switchFromUserId?: string;
 }): Promise<Exclude<AuthFlowResult, { outcome: "proof_required" }>> {
@@ -124,6 +130,9 @@ export async function resolveAuthFlow({
         flow_id: flowId,
         nonce,
         id_token: idToken,
+        ...(providerAccessToken
+          ? { provider_access_token: providerAccessToken }
+          : {}),
         ...(switchFromUserId ? { switch_from_user_id: switchFromUserId } : {}),
       }),
     );
