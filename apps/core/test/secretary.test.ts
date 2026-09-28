@@ -2059,3 +2059,161 @@ test("an oversized plan's tool calls never reach the operation ledger", async ()
   );
   assert.equal(state.plans.size, 0);
 });
+
+/** Scripted rounds whose round-0 answer carries provider continuation. */
+class ContinuingProvider implements ModelProvider {
+  readonly name = "continuing";
+  requests: ModelRequest[] = [];
+  private readonly finalText: string;
+  constructor(finalText: string) {
+    this.finalText = finalText;
+  }
+  async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+    this.requests.push(req);
+    if (req.round === 0) {
+      yield {
+        type: "tool_call",
+        call: {
+          id: "call-0",
+          name: "journal.note",
+          route: "normal",
+          arguments: { text: "n0" },
+        },
+      };
+      yield {
+        type: "done",
+        usage: { round: 0 },
+        continuation: {
+          scope: "chatgpt:test",
+          output: [
+            {
+              type: "reasoning",
+              id: "rs_1",
+              summary: [],
+              encrypted_content: "ENC-ROUND-0",
+            },
+            { type: "function_call", call_id: "call-0" },
+          ],
+        },
+      };
+      return;
+    }
+    yield { type: "text", delta: this.finalText };
+    yield { type: "done", usage: { round: req.round } };
+  }
+}
+
+test("provider continuation is recorded with its round and replayed after a restart", async () => {
+  const expected = {
+    scope: "chatgpt:test",
+    output: [
+      {
+        type: "reasoning",
+        id: "rs_1",
+        summary: [],
+        encrypted_content: "ENC-ROUND-0",
+      },
+      { type: "function_call", call_id: "call-0" },
+    ],
+  };
+  // Live: round 1 receives round 0's continuation on its assistant message.
+  {
+    const state = new FakeState();
+    state.addPersona(PERSONA);
+    state.addInput(PERSONA, "in-c1", "note it");
+    const p = new ContinuingProvider("done-live");
+    const s = new Secretary(cfg(state, "h", { provider: p }));
+    await s.start();
+    assert.equal(await s.step(), "turn");
+    const round1 = p.requests.find((r) => r.round === 1);
+    const assistant = round1?.messages.find(
+      (m) => m.role === "assistant" && m.toolCalls?.length,
+    );
+    assert.deepEqual(assistant?.continuation, expected);
+  }
+  // Restart: the attempt dies after round 0's effect; the next attempt
+  // replays round 0 from the durable plan — with the same continuation
+  // bytes — and consults the model only for round 1.
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-c2", "note it");
+  let claims = 0;
+  const crashy: StateClient = Object.create(state, {
+    claimOperation: {
+      value: async (
+        p: string,
+        g: number,
+        op: Parameters<StateClient["claimOperation"]>[2],
+      ) => {
+        const r = await state.claimOperation(p, g, op);
+        if (++claims === 1) throw new Error("simulated hard exit");
+        return r;
+      },
+    },
+  });
+  const first = new ContinuingProvider("unused");
+  const s1 = new Secretary(cfg(crashy, "h", { provider: first }));
+  await s1.start();
+  await assert.rejects(s1.step(), /hard exit/);
+  const [plan] = [...state.plans.values()];
+  assert.deepEqual(
+    plan?.plan[0]?.continuation,
+    expected,
+    "recorded with round 0",
+  );
+
+  const second = new ContinuingProvider("done-after-restart");
+  const s2 = new Secretary(cfg(state, "h", { provider: second }));
+  await s2.start();
+  assert.equal(await s2.step(), "turn");
+  assert.deepEqual(
+    second.requests.map((r) => r.round),
+    [1],
+  );
+  const assistant = second.requests[0]?.messages.find(
+    (m) => m.role === "assistant" && m.toolCalls?.length,
+  );
+  assert.deepEqual(assistant?.continuation, expected, "replayed from the plan");
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(
+    (outbox.at(-1)!.payload as { output: { text: string } }).output.text,
+    "done-after-restart",
+  );
+});
+
+test("continuation that cannot be stored is dropped, never failing the decision", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-c3", "note it");
+  const p = new (class extends ContinuingProvider {
+    override async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
+      for await (const ev of super.stream(req)) {
+        if (ev.type === "done" && ev.continuation) {
+          yield {
+            ...ev,
+            continuation: {
+              scope: "chatgpt:test",
+              output: [
+                {
+                  type: "reasoning",
+                  summary: [],
+                  encrypted_content: "bad\u0000",
+                },
+              ],
+            },
+          };
+        } else yield ev;
+      }
+    }
+  })("done-without");
+  const s = new Secretary(cfg(state, "h", { provider: p }));
+  await s.start();
+  assert.equal(await s.step(), "turn");
+  const [plan] = [...state.plans.values()];
+  assert.equal(plan?.plan[0]?.continuation, undefined);
+  const outbox = await state.outbox(PERSONA, 0);
+  assert.equal(
+    (outbox.at(-1)!.payload as { output: { text: string } }).output.text,
+    "done-without",
+  );
+});

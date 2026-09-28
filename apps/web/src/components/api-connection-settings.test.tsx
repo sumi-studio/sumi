@@ -307,6 +307,70 @@ it("edits a ChatGPT connection's model and effort without any API key field", as
   );
   expect(client.save).not.toHaveBeenCalled();
 });
+it("leaves a pending sign-in open when the panel goes away, and continues it when reopened", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin).mockResolvedValue({
+    ...pendingLogin,
+    intervalMs: 60_000,
+  });
+  const first = render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
+    "ABCD-1234",
+  );
+  expect(
+    screen.getByText(/セキュリティ設定でデバイスコードによるログインを有効に/),
+  ).toBeInTheDocument();
+  // A reload, a discarded tab or a closed sheet: the panel unmounts.
+  first.unmount();
+  expect(client.cancelChatGPTLogin).not.toHaveBeenCalled();
+  // Opening it again in the same browser session asks the server, which
+  // returns the same pending login; the same code is shown.
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
+    "ABCD-1234",
+  );
+  expect(client.beginChatGPTLogin).toHaveBeenCalledTimes(2);
+  expect(client.cancelChatGPTLogin).not.toHaveBeenCalled();
+});
+it("keeps a stored reasoning effort and offers the model's own efforts", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    connections: [{ ...chatGPTConnection, reasoningEffort: "max" }],
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.saveChatGPTSettings).mockResolvedValue(chatGPTConnection);
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "編集" }));
+  const select = screen.getByLabelText("推論の強さ") as HTMLSelectElement;
+  expect(select.value).toBe("max");
+  const values = () => Array.from(select.options, (o) => o.value);
+  expect(values()).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  // gpt-5.5 offers up to xhigh; the stored value stays selectable rather
+  // than silently becoming another one.
+  fireEvent.change(screen.getByLabelText("モデル"), {
+    target: { value: "gpt-5.5" },
+  });
+  expect(values()).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  expect(select.value).toBe("max");
+  fireEvent.change(screen.getByLabelText("モデル"), {
+    target: { value: "gpt-6-astra" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "保存する" }));
+  await waitFor(() =>
+    expect(client.saveChatGPTSettings).toHaveBeenCalledWith(
+      "sub",
+      { name: "ChatGPT", model: "gpt-6-astra", reasoningEffort: "max" },
+      expect.any(AbortSignal),
+    ),
+  );
+});
 it("does not offer ChatGPT sign-in when the server does not support it", async () => {
   const { client, state } = setup();
   vi.mocked(client.list).mockResolvedValue({

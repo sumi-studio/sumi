@@ -278,12 +278,36 @@ func TestChatGPTLoginExpiryCancelAndUnavailable(t *testing.T) {
 		t.Fatal("expired", v, err)
 	}
 	v, _ = s.BeginChatGPTLogin(ctx, owner, "s", "")
-	w, _ := s.BeginChatGPTLogin(ctx, owner, "s", "")
+	// The same browser session starting again (a reload, a reopened
+	// sheet) resumes the pending login and its code.
+	same, err := s.BeginChatGPTLogin(ctx, owner, "s", "")
+	if err != nil || same.LoginID != v.LoginID || same.Status != "pending" || same.UserCode != v.UserCode {
+		t.Fatal("resume in the same session", same, err)
+	}
+	// Another session of the same person starts a new login; the earlier
+	// one is superseded.
+	w, _ := s.BeginChatGPTLogin(ctx, owner, "s2", "")
+	if w.LoginID == v.LoginID {
+		t.Fatal("another session resumed a login it does not own")
+	}
 	if old, err := s.PollChatGPTLogin(ctx, owner, "s", v.LoginID); err != nil || old.Status != "cancelled" {
 		t.Fatal("superseded login", old, err)
 	}
-	if c, err := s.CancelChatGPTLogin(ctx, owner, "s", w.LoginID); err != nil || c.Status != "cancelled" {
+	// Near its expiry a pending login is not resumed.
+	clk.Add(deviceLoginLifetime - 30*time.Second)
+	if fresh, err := s.BeginChatGPTLogin(ctx, owner, "s2", ""); err != nil || fresh.LoginID == w.LoginID {
+		t.Fatal("near-expiry resume", fresh, err)
+	} else {
+		w = fresh
+	}
+	// An explicit cancel ends it; the session's next start is a new login.
+	if c, err := s.CancelChatGPTLogin(ctx, owner, "s2", w.LoginID); err != nil || c.Status != "cancelled" {
 		t.Fatal("cancel", c, err)
+	}
+	if again, err := s.BeginChatGPTLogin(ctx, owner, "s2", ""); err != nil || again.LoginID == w.LoginID {
+		t.Fatal("start after cancel", again, err)
+	} else if _, err := s.CancelChatGPTLogin(ctx, owner, "s2", again.LoginID); err != nil {
+		t.Fatal(err)
 	}
 	issuer.usercodeStatus = 404
 	if _, err := s.BeginChatGPTLogin(ctx, owner, "s", ""); !errors.Is(err, ErrDeviceLoginUnavailable) {
@@ -379,12 +403,20 @@ func TestChatGPTRevocationIsPerPersonAndNeedsReconnect(t *testing.T) {
 	if a, err := s.ResolveChatGPT(ctx, other, theirs.ID, ""); err != nil || a.AccountID != "acct-other" {
 		t.Fatal("other person affected", err)
 	}
-	// Reconnecting the same connection repairs it with a new version.
+	// Reconnecting the same connection repairs it with a new version. The
+	// person had meanwhile chosen another connection; a reconnect does not
+	// change that choice.
 	issuer.refreshStatus, issuer.refreshBody = 0, ""
 	before, _ := s.Describe(ctx, owner, mine.ID)
+	if err := s.Select(ctx, owner, Selection{Kind: "none"}); err != nil {
+		t.Fatal(err)
+	}
 	again := connect(t, s, issuer, clk, owner, mine.ID)
 	if again.ID != mine.ID {
 		t.Fatal("reconnect created a new connection")
+	}
+	if sel, ok, err := s.Selected(ctx, owner); err != nil || !ok || sel.Kind != "none" {
+		t.Fatal("reconnect changed the selection", sel, err)
 	}
 	after, err := s.ResolveChatGPT(ctx, owner, mine.ID, "")
 	if err != nil || after.Version == before.Version || after.Connection.ReconnectRequired {

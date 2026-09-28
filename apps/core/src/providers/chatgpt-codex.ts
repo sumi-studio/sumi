@@ -11,6 +11,13 @@
 
 import { ModelError } from "../provider.ts";
 
+/**
+ * The only endpoint a ChatGPT access token is ever sent to. The state
+ * service stores this value for every subscription connection; the Core
+ * checks it again at the token boundary rather than trusting the binding.
+ */
+export const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
 /** Access material for one call; refreshed by the state service. */
 export interface ChatGPTAccess {
   accessToken: string;
@@ -160,4 +167,99 @@ export function usageLimitError(
     `ChatGPT subscription usage limit reached${resets ? `; resets at ${resets}` : ""}`,
     { retryable: false, cause: "model_usage_limit" },
   );
+}
+
+/**
+ * A diagnostic code from an upstream error body, reduced to something safe
+ * to record. The body is untrusted and may carry anything, so no text is
+ * copied from it except `error.code` / `error.type` values shaped like an
+ * error identifier: 1–5 lowercase letter-only words joined by "_", each
+ * at most 20 letters. Tokens, keys and ids (mixed case, digits, base64 or
+ * hex) cannot pass. Anything else present is reported as "unrecognized";
+ * a body with neither field yields undefined.
+ */
+export function safeDiagnosticCode(body: string): string | undefined {
+  let err: unknown;
+  try {
+    err = (JSON.parse(body) as { error?: unknown }).error;
+  } catch {
+    return undefined;
+  }
+  if (typeof err === "string") err = { code: err };
+  if (!err || typeof err !== "object") return undefined;
+  const e = err as { code?: unknown; type?: unknown };
+  let seen = false;
+  for (const v of [e.code, e.type]) {
+    if (v === undefined || v === null) continue;
+    seen = true;
+    if (typeof v === "string" && /^[a-z]{1,20}(?:_[a-z]{1,20}){0,4}$/.test(v)) {
+      return v;
+    }
+  }
+  return seen ? "unrecognized" : undefined;
+}
+
+/**
+ * Bound on one round's continuation (all its encrypted reasoning bytes).
+ * The durable plan request is limited to 4 MiB; continuation is optional,
+ * so a larger one is not kept rather than crowding out the decision.
+ */
+export const MAX_CONTINUATION_BYTES = 1 << 20;
+
+/**
+ * Scope of a ChatGPT continuation: a digest of the account and model it
+ * was produced for. A round's encrypted reasoning is resent only to the
+ * same account and model.
+ */
+export async function continuationScope(
+  accountId: string,
+  model: string,
+): Promise<string> {
+  return `chatgpt:${(await tokenDigest(`${accountId}\n${model}`)).slice(0, 32)}`;
+}
+
+const ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * One output entry kept for continuation, or null. A reasoning item keeps
+ * only its opaque encrypted content (and item id); readable summary or
+ * reasoning text, if any was sent, is dropped. A message or function call
+ * keeps only its type and ids — its content is in the journal already.
+ */
+export function continuationEntry(
+  item: unknown,
+): Record<string, unknown> | null {
+  if (!item || typeof item !== "object") return null;
+  const it = item as {
+    type?: unknown;
+    id?: unknown;
+    call_id?: unknown;
+    encrypted_content?: unknown;
+  };
+  const id =
+    typeof it.id === "string" && ITEM_ID.test(it.id) ? { id: it.id } : {};
+  switch (it.type) {
+    case "reasoning":
+      if (
+        typeof it.encrypted_content !== "string" ||
+        it.encrypted_content === "" ||
+        it.encrypted_content.length > MAX_CONTINUATION_BYTES
+      ) {
+        return null;
+      }
+      return {
+        type: "reasoning",
+        ...id,
+        summary: [],
+        encrypted_content: it.encrypted_content,
+      };
+    case "message":
+      return { type: "message", ...id };
+    case "function_call":
+      return typeof it.call_id === "string" && it.call_id !== ""
+        ? { type: "function_call", ...id, call_id: it.call_id }
+        : null;
+    default:
+      return null;
+  }
 }

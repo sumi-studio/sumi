@@ -56,7 +56,11 @@ import {
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
-import { type ChatGPTAccess, tokenDigest } from "../providers/chatgpt-codex.ts";
+import {
+  CHATGPT_BASE_URL,
+  type ChatGPTAccess,
+  tokenDigest,
+} from "../providers/chatgpt-codex.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
@@ -172,6 +176,13 @@ export class SelectedModelProvider implements ModelProvider {
     fallback: ModelProvider;
     timeoutMs: number;
     log?: (msg: string, fields?: Record<string, unknown>) => void;
+    /**
+     * Which endpoint a ChatGPT access token may be sent to. Only tests and
+     * the synthetic proof harness set this (to reach a local fake
+     * backend); hosts never do, so production accepts exactly
+     * CHATGPT_BASE_URL.
+     */
+    chatgptEndpoint?: (baseUrl: string) => boolean;
   };
 
   constructor(opts: SelectedModelProvider["opts"]) {
@@ -287,7 +298,7 @@ export class SelectedModelProvider implements ModelProvider {
         usage = ev.usage;
         // The recorded plan's usage names the connection that produced the
         // decision, so "which model answered" is durable evidence.
-        yield { type: "done", usage: { ...ev.usage, model_binding: identity } };
+        yield { ...ev, usage: { ...ev.usage, model_binding: identity } };
       }
     } catch (e) {
       streamError = e;
@@ -502,6 +513,15 @@ export class SelectedModelProvider implements ModelProvider {
       if (!binding.credential_available || !binding.api_key || !c.account_id) {
         throw chatGPTUnavailable(c.name, binding);
       }
+      // The access token goes to the Codex backend and nowhere else, even
+      // if a binding ever named another endpoint.
+      const allowed =
+        this.opts.chatgptEndpoint ?? ((u: string) => u === CHATGPT_BASE_URL);
+      if (!allowed(c.base_url)) {
+        throw unusable(
+          `the ChatGPT connection ${c.name} names an endpoint other than the ChatGPT Codex backend; its sign-in is not sent there`,
+        );
+      }
       const provider = new OpenAIResponsesProvider({
         baseUrl: c.base_url,
         apiKey: binding.api_key,
@@ -557,9 +577,15 @@ function chatGPTUnavailable(name: string, binding: ModelBinding): ModelError {
       "model_reconnect_required",
     );
   }
+  if (binding.credential_state === "disabled") {
+    // A connection is selected; this server does not offer its kind.
+    return unusable(
+      `the selected connection ${name} is a ChatGPT subscription connection, which is not enabled on this server`,
+      "model_connection_disabled",
+    );
+  }
   return unusable(
     `the selected connection ${name} has no usable ChatGPT sign-in (${binding.reason ?? "unavailable"})`,
-    binding.credential_state === "disabled" ? "no_model_connection" : undefined,
   );
 }
 

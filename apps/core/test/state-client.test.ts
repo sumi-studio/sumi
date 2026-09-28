@@ -28,6 +28,13 @@ function stallingServer(): Promise<{ server: Server; url: string }> {
       res.write('{"partial"');
       return; // body never finishes
     }
+    if (url.includes("slow-")) {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ persona: { persona_id: "p" } }));
+      }, SLOW);
+      return;
+    }
     if (url.includes("fast-error")) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "state unavailable" }));
@@ -56,6 +63,32 @@ function stallingServer(): Promise<{ server: Server; url: string }> {
 }
 
 const TIMEOUT = 250; // test-scale deadline; production default is 10s
+const SLOW = 500; // a "slow-" path answers after this long
+
+test("model-credential calls wait out a slow issuer refresh; other calls keep the short deadline", async () => {
+  // The binding and credential-refresh calls may include an issuer refresh
+  // the service completes on its own bounded context; they get their own,
+  // longer (still bounded) deadline so that refresh can finish in-turn.
+  const { server, url } = await stallingServer();
+  try {
+    const client = new HttpStateClient(url, "tok", undefined, TIMEOUT, 5_000);
+    await client.modelBinding("slow-p");
+    await client.refreshModelCredential("slow-p", "c", "d");
+    await assert.rejects(client.personaState("slow-p"), (e: unknown) => {
+      assert.ok(e instanceof StateError);
+      assert.equal(e.status, 503);
+      assert.match(e.message, /timed out after 250ms/);
+      return true;
+    });
+    const bounded = new HttpStateClient(url, "tok", undefined, 5_000, TIMEOUT);
+    await assert.rejects(
+      bounded.modelBinding("stall-h"),
+      /timed out after 250ms/,
+    );
+  } finally {
+    server.close();
+  }
+});
 
 test("a state call that never answers fails at the deadline; the next call succeeds", async () => {
   const { server, url } = await stallingServer();

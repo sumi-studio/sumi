@@ -278,6 +278,12 @@ type Decision struct {
 	Text  string         `json:"text"`
 	Calls []PlanCall     `json:"calls"`
 	Usage map[string]any `json:"usage"`
+	// Continuation is opaque provider data recorded with the round (the
+	// encrypted reasoning a Responses provider returns) so a resumed or
+	// retried attempt resends it unchanged. It is a JSON object the Core
+	// alone interprets; the service stores and returns it and never
+	// renders it.
+	Continuation json.RawMessage `json:"continuation,omitempty"`
 }
 
 // TurnPlan is the durable record of one input's decisions. One row per
@@ -1068,6 +1074,15 @@ func (s *Store) SavePlan(ctx context.Context, personaID, turnID string, generati
 	}
 	if decision.Usage == nil {
 		decision.Usage = map[string]any{}
+	}
+	if len(decision.Continuation) > 0 {
+		var cont map[string]any
+		if err := json.Unmarshal(decision.Continuation, &cont); err != nil {
+			return TurnPlan{}, false, fmt.Errorf("%w: continuation must be a JSON object", ErrBadRequest)
+		}
+		if cont == nil {
+			decision.Continuation = nil
+		}
 	}
 	for i := range decision.Calls {
 		if decision.Calls[i].Tool == "" {

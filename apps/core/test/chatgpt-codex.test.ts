@@ -11,7 +11,12 @@ import {
   type ModelProvider,
   type ModelRequest,
 } from "../src/provider.ts";
-import { uuidV5 } from "../src/providers/chatgpt-codex.ts";
+import {
+  continuationScope,
+  safeDiagnosticCode,
+  uuidV5,
+} from "../src/providers/chatgpt-codex.ts";
+import { OpenAIResponsesProvider } from "../src/providers/openai-responses.ts";
 import type { ModelBinding } from "../src/types.ts";
 
 /**
@@ -227,6 +232,8 @@ async function setup(personas: string[] = [PA]) {
         },
       },
       timeoutMs: 5_000,
+      // The fake backend listens on loopback.
+      chatgptEndpoint: (u) => u.startsWith("http://127.0.0.1:"),
     });
   const req = (
     persona: string,
@@ -299,7 +306,13 @@ test("lite wire shape: headers, ordered prefix items, no bound, namespaced tool 
     assert.equal(body.stream, true);
     assert.equal(body.tool_choice, "auto");
     assert.equal(body.parallel_tool_calls, false);
-    assert.deepEqual(body.reasoning, { effort: "medium" });
+    // The Codex client's reasoning parameters for a lite model, and the
+    // encrypted reasoning returned so it can continue into the next round.
+    assert.deepEqual(body.reasoning, {
+      effort: "medium",
+      context: "all_turns",
+    });
+    assert.deepEqual(body.include, ["reasoning.encrypted_content"]);
     assert.equal(body.prompt_cache_key, PA);
     for (const absent of ["instructions", "tools", "max_output_tokens"]) {
       assert.equal(absent in body, false, `${absent} must not be sent`);
@@ -452,7 +465,11 @@ test("a second 401, a revoked grant, or a changed selection end the call without
       (e: unknown) => {
         assert.ok(e instanceof ModelError);
         assert.equal(e.retryable, false);
-        assert.equal(e.cause, "model_reconnect_required");
+        // The refresh succeeded; ChatGPT still refused the fresh token.
+        // That is not "your sign-in expired" — a reconnect would repeat
+        // the same refresh — so it is classified on its own.
+        assert.equal(e.cause, "model_auth_rejected");
+        assert.equal(e.unavailable, true);
         return true;
       },
     );
@@ -538,7 +555,8 @@ test("reconnect-required and disabled bindings fail before any request", async (
     );
     await assert.rejects(probe(), (e: unknown) => {
       assert.ok(e instanceof ModelError);
-      assert.equal(e.cause, "no_model_connection");
+      // A connection IS selected; this server does not offer its kind.
+      assert.equal(e.cause, "model_connection_disabled");
       return true;
     });
     assert.equal(seen.length, 0);
@@ -619,5 +637,373 @@ test("a caller abort mid-stream stops the call without a refresh or a retry", as
     await assert.rejects(run);
     assert.equal(seen.length, 1);
     assert.equal(state.modelCredentialRefreshCalls.length, 0);
+  });
+});
+
+// --- Opaque reasoning continuation across tool rounds (review F6) -------
+
+const READABLE = "private readable reasoning must never be kept";
+const ENC_1 = `gAAAA${"x".repeat(2048)}-opaque-1`;
+
+/** A round that reasons (encrypted item), then calls one tool. */
+const reasoningToolRound: Reply = (_seen, res) => {
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end(
+    sse([
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "reasoning",
+          id: "rs_1",
+          summary: [{ type: "summary_text", text: READABLE }],
+          content: [{ type: "reasoning_text", text: READABLE }],
+          encrypted_content: ENC_1,
+        },
+      },
+      {
+        type: "response.output_item.added",
+        output_index: 1,
+        item: {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_abc",
+          name: "remember",
+          namespace: "functions",
+          arguments: "",
+        },
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_abc",
+          name: "remember",
+          namespace: "functions",
+          arguments: JSON.stringify({
+            route: "normal",
+            input: { note: "milk" },
+          }),
+        },
+      },
+      {
+        type: "response.completed",
+        response: {
+          status: "completed",
+          output: [],
+          usage: { input_tokens: 10, output_tokens: 3 },
+        },
+      },
+    ]),
+  );
+};
+
+const badRequest: Reply = (_s, res) => {
+  res.writeHead(400, { "content-type": "application/json" });
+  res.end('{"error":{"code":"invalid_encrypted_content","message":"x"}}');
+};
+
+function doneOf(events: ModelEvent[]) {
+  const d = events.at(-1);
+  assert.ok(d && d.type === "done");
+  return d;
+}
+
+function nextRound(first: ModelEvent[]): ChatMessage[] {
+  const call = first.find((e) => e.type === "tool_call");
+  assert.ok(call && call.type === "tool_call");
+  const done = doneOf(first);
+  return [
+    ...MESSAGES,
+    {
+      role: "assistant",
+      content: "",
+      toolCalls: [call.call],
+      ...(done.continuation ? { continuation: done.continuation } : {}),
+    },
+    { role: "tool", toolCallId: call.call.id, content: '{"ok":true}' },
+  ];
+}
+
+test("encrypted reasoning continues into the next tool round byte-for-byte; readable text is never kept", async () => {
+  await withBackend([reasoningToolRound, textOnly], async (baseUrl, seen) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    const first = await collect(provider(PA), req(PA, MESSAGES));
+    const cont = doneOf(first).continuation;
+    assert.ok(cont, "the round returns its continuation");
+    assert.equal(cont.scope, await continuationScope("acct-1", "gpt-6-astra"));
+    assert.deepEqual(cont.output, [
+      { type: "reasoning", id: "rs_1", summary: [], encrypted_content: ENC_1 },
+      { type: "function_call", id: "fc_1", call_id: "call_abc" },
+    ]);
+    assert.equal(JSON.stringify(cont).includes(READABLE), false);
+
+    // The durable plan stores the continuation as JSON; replay reads it
+    // back from that form.
+    const stored = JSON.parse(JSON.stringify(cont));
+    const messages = nextRound(first).map((m) =>
+      m.continuation ? { ...m, continuation: stored } : m,
+    );
+    await collect(provider(PA), { ...req(PA, messages), round: 1 });
+    assert.equal(seen.length, 2);
+    const input = nth(seen, 1).body.input as Record<string, unknown>[];
+    const at = input.findIndex((i) => i.type === "reasoning");
+    assert.ok(at > 0, "reasoning item resent");
+    assert.deepEqual(input[at], {
+      type: "reasoning",
+      id: "rs_1",
+      summary: [],
+      encrypted_content: ENC_1,
+    });
+    // Same bytes as the backend sent, followed by the call it preceded.
+    assert.equal(input[at]?.encrypted_content, ENC_1);
+    const { arguments: args, ...fc } = nth(input, at + 1);
+    assert.deepEqual(fc, {
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call_abc",
+      name: "remember",
+      namespace: "functions",
+    });
+    assert.deepEqual(JSON.parse(String(args)), {
+      route: "normal",
+      input: { note: "milk" },
+    });
+    assert.equal(input[at + 2]?.type, "function_call_output");
+    assert.equal(JSON.stringify(nth(seen, 1).body).includes(READABLE), false);
+    assert.deepEqual(nth(seen, 1).body.include, [
+      "reasoning.encrypted_content",
+    ]);
+  });
+});
+
+test("continuation is resent only to the account and model that produced it", async () => {
+  await withBackend([reasoningToolRound, textOnly], async (baseUrl, seen) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    const first = await collect(provider(PA), req(PA, MESSAGES));
+    // The person switched to another model between rounds.
+    state.setModelBinding(
+      PA,
+      chatgpt(baseUrl, "tok-1", { model: "gpt-6-nova" }),
+    );
+    await collect(provider(PA), { ...req(PA, nextRound(first)), round: 1 });
+    const input = nth(seen, 1).body.input as Record<string, unknown>[];
+    assert.equal(
+      input.some((i) => i.type === "reasoning"),
+      false,
+    );
+    assert.equal(
+      input.some((i) => "id" in i && i.type === "function_call"),
+      false,
+    );
+  });
+});
+
+test("a backend that refuses recorded continuation gets one resend without it", async () => {
+  await withBackend(
+    [reasoningToolRound, badRequest, textOnly],
+    async (baseUrl, seen) => {
+      const { state, provider, req } = await setup();
+      state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+      const first = await collect(provider(PA), req(PA, MESSAGES));
+      const events = await collect(provider(PA), {
+        ...req(PA, nextRound(first)),
+        round: 1,
+      });
+      assert.equal(doneOf(events).type, "done");
+      assert.equal(seen.length, 3, "one resend, no more");
+      const refused = nth(seen, 1).body.input as Record<string, unknown>[];
+      const resent = nth(seen, 2).body.input as Record<string, unknown>[];
+      assert.ok(refused.some((i) => i.type === "reasoning"));
+      assert.equal(
+        resent.some((i) => i.type === "reasoning"),
+        false,
+      );
+      // Everything else is the same request: only the reasoning items and
+      // the function-call item ids they came with are gone.
+      const strip = (b: Record<string, unknown>) =>
+        JSON.stringify({
+          ...b,
+          input: (b.input as Record<string, unknown>[])
+            .filter((i) => i.type !== "reasoning")
+            .map((i) => {
+              if (i.type !== "function_call") return i;
+              const { id: _id, ...rest } = i;
+              return rest;
+            }),
+        });
+      assert.equal(strip(nth(seen, 1).body), strip(nth(seen, 2).body));
+    },
+  );
+  // Without recorded continuation a 400 is an ordinary failure: no resend.
+  await withBackend([badRequest], async (baseUrl, seen) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    await assert.rejects(collect(provider(PA), req(PA, MESSAGES)));
+    assert.equal(seen.length, 1);
+  });
+});
+
+test("the API-key Responses wire is unchanged by continuation", async () => {
+  const bodies: string[] = [];
+  const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+    bodies.push(String(init?.body));
+    return new Response(
+      sse([
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "reasoning", id: "rs_9", encrypted_content: "enc" },
+        },
+        {
+          type: "response.completed",
+          response: { status: "completed", output: [], usage: {} },
+        },
+      ]),
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+  const p = new OpenAIResponsesProvider(
+    { baseUrl: "https://api.example.invalid/v1", apiKey: "k", model: "m" },
+    fetchImpl,
+  );
+  const call = {
+    id: "call_1",
+    name: "remember",
+    route: "normal" as const,
+    arguments: { note: "milk" },
+  };
+  const base: ChatMessage[] = [
+    ...MESSAGES,
+    { role: "assistant", content: "", toolCalls: [call] },
+    { role: "tool", toolCallId: "call_1", content: "{}" },
+  ];
+  const withCont = base.map((m) =>
+    m.role === "assistant"
+      ? {
+          ...m,
+          continuation: {
+            scope: "anything",
+            output: [
+              { type: "reasoning", summary: [], encrypted_content: "e" },
+            ],
+          },
+        }
+      : m,
+  );
+  const r = (messages: ChatMessage[]): ModelRequest => ({
+    personaId: PA,
+    turnId: "t",
+    round: 1,
+    messages,
+    tools: [TOOL],
+  });
+  const a = await collect(p, r(base));
+  await collect(p, r(withCont));
+  assert.equal(bodies[0], bodies[1], "identical standard request bytes");
+  const body = JSON.parse(nth(bodies, 0)) as Record<string, unknown>;
+  assert.equal("include" in body, false);
+  assert.equal("reasoning" in body, false);
+  assert.equal(doneOf(a).continuation, undefined);
+});
+
+test("a repeated 401 records only a safely shaped error code", async () => {
+  assert.equal(
+    safeDiagnosticCode('{"error":{"code":"token_expired"}}'),
+    "token_expired",
+  );
+  assert.equal(
+    safeDiagnosticCode('{"error":{"type":"invalid_request_error"}}'),
+    "invalid_request_error",
+  );
+  assert.equal(
+    safeDiagnosticCode('{"error":"unsupported_client"}'),
+    "unsupported_client",
+  );
+  for (const hostile of [
+    '{"error":{"code":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc"}}',
+    '{"error":{"code":"sk-proj-AbC123"}}',
+    '{"error":{"code":"rt_3f9a0c"}}',
+    '{"error":{"code":"Bearer abc"}}',
+    `{"error":{"code":"${"a".repeat(21)}"}}`,
+    '{"error":{"code":{"nested":"x"}}}',
+  ]) {
+    assert.equal(safeDiagnosticCode(hostile), "unrecognized", hostile);
+  }
+  assert.equal(safeDiagnosticCode("not json"), undefined);
+  assert.equal(safeDiagnosticCode('{"detail":"x"}'), undefined);
+
+  const leaky: Reply = (_s, res) => {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(
+      '{"error":{"code":"eyJsecret.eyJsecret.sig","message":"tok-new is bad"}}',
+    );
+  };
+  await withBackend([leaky], async (baseUrl) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-old"));
+    state.modelCredentialRefresh = () => chatgpt(baseUrl, "tok-new");
+    await assert.rejects(
+      collect(provider(PA), req(PA, MESSAGES)),
+      (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.cause, "model_auth_rejected");
+        assert.match(e.message, /HTTP 401, code unrecognized/);
+        assert.equal(e.message.includes("secret"), false);
+        assert.equal(e.message.includes("tok-new"), false);
+        return true;
+      },
+    );
+  });
+  await withBackend([unauthorized], async (baseUrl) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-old"));
+    state.modelCredentialRefresh = () => chatgpt(baseUrl, "tok-new");
+    await assert.rejects(
+      collect(provider(PA), req(PA, MESSAGES)),
+      /code token_expired/,
+    );
+  });
+});
+
+test("a ChatGPT token is never sent to an endpoint other than the Codex backend", async () => {
+  await withBackend([textOnly], async (baseUrl, seen) => {
+    const state = new FakeState();
+    state.addPersona(PA);
+    const gen = (await state.acquireWriter(PA, "w", 60_000)).generation;
+    // No test seam: the production endpoint rule applies.
+    const p = new SelectedModelProvider({
+      state,
+      persona: PA,
+      fallback: {
+        name: "fallback",
+        stream(): AsyncIterable<ModelEvent> {
+          throw new Error("fallback must never run");
+        },
+      },
+      timeoutMs: 5_000,
+    });
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    await assert.rejects(
+      collect(p, {
+        personaId: PA,
+        turnId: "t",
+        generation: gen,
+        round: 0,
+        messages: MESSAGES,
+        tools: [],
+      }),
+      (e: unknown) => {
+        assert.ok(e instanceof ModelError);
+        assert.equal(e.unavailable, true);
+        assert.equal(e.retryable, false);
+        return true;
+      },
+    );
+    assert.equal(seen.length, 0, "no request reached the other endpoint");
   });
 });

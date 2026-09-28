@@ -174,6 +174,16 @@ const MODEL_FAILURE_COPY: Record<
       "ChatGPTへのログインが期限切れか取り消されたため、応答できませんでした。",
     next: "「AIの接続」でChatGPTに再接続すると、次のメッセージに応答できるようになります。",
   },
+  model_auth_rejected: {
+    cause:
+      "ChatGPTが、更新したばかりのログインでもこの接続からの利用を受け付けなかったため、応答できませんでした。理由はChatGPT側からは示されていません。",
+    next: "時間をおいてもう一度お試しいただくか、「AIの接続」で別の接続を選んでください。",
+  },
+  model_connection_disabled: {
+    cause:
+      "選択中のChatGPT接続は、このサーバーでは現在使えないため、応答できませんでした。",
+    next: "「AIの接続」で別の接続を選ぶと、次のメッセージに応答できるようになります。",
+  },
   model_usage_limit: {
     cause: "ChatGPTのプランの利用上限に達したため、応答できませんでした。",
     next: "上限がリセットされるまで待つか、「AIの接続」で別の接続を選んでください。",
@@ -181,8 +191,9 @@ const MODEL_FAILURE_COPY: Record<
 };
 
 /**
- * The classified failures the user can fix themselves: no usable model
- * connection, an expired ChatGPT sign-in, or a reached plan limit. States
+ * The classified failures the user can act on: no usable model
+ * connection, an expired or refused ChatGPT sign-in, a connection kind
+ * this server has turned off, or a reached plan limit. States
  * the cause in Japanese and opens the existing connection settings — the
  * committed turn stays visible above, so the copy says nothing about
  * resending and nothing about work already applied.

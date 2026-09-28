@@ -678,12 +678,13 @@ func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Generation int64          `json:"generation"`
-		TurnID     string         `json:"turn_id"`
-		Round      *int64         `json:"round"`
-		Text       string         `json:"text"`
-		Calls      *[]PlanCall    `json:"calls"`
-		Usage      map[string]any `json:"usage"`
+		Generation   int64           `json:"generation"`
+		TurnID       string          `json:"turn_id"`
+		Round        *int64          `json:"round"`
+		Text         string          `json:"text"`
+		Calls        *[]PlanCall     `json:"calls"`
+		Usage        map[string]any  `json:"usage"`
+		Continuation json.RawMessage `json:"continuation"`
 	}
 	if !decode(w, r, &req, s.maxBody) {
 		return
@@ -696,9 +697,10 @@ func (s *Server) savePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plan, created, err := s.store.SavePlan(r.Context(), personaID, req.TurnID, req.Generation, *req.Round, Decision{
-		Text:  req.Text,
-		Calls: *req.Calls,
-		Usage: req.Usage,
+		Text:         req.Text,
+		Calls:        *req.Calls,
+		Usage:        req.Usage,
+		Continuation: req.Continuation,
 	})
 	if err != nil {
 		storeError(w, err)

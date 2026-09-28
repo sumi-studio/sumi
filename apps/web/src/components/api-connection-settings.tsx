@@ -108,12 +108,14 @@ export function APIConnectionSettings({
   const editingChatGPT = state?.connections.find(
     (c) => c.id === editing && c.preset === CHATGPT_PRESET,
   );
-  function signedIn() {
+  function signedIn(reconnected: boolean) {
     setSignIn(null);
     void run(async (signal) => {
       if (!signal.aborted)
         setNotice(
-          "ChatGPTを接続し、この接続を使うように切り替えました。新しい接続は作業が止まってから起動します。",
+          reconnected
+            ? "ChatGPTに再接続しました。使う接続の選択は変わっていません。"
+            : "ChatGPTを接続し、この接続を使うように切り替えました。新しい接続は作業が止まってから起動します。",
         );
     });
   }
@@ -249,7 +251,7 @@ export function APIConnectionSettings({
         <ChatGPTLoginPanel
           client={client}
           connectionId={signIn.connectionId}
-          onDone={signedIn}
+          onDone={() => signedIn(!!signIn.connectionId)}
           onClose={() => setSignIn(null)}
         />
       )}

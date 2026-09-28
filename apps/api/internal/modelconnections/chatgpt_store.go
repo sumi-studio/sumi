@@ -116,6 +116,11 @@ func TokenDigest(token string) string {
 // use, so a streamed call does not start with a token about to lapse.
 const refreshMargin = 5 * time.Minute
 
+// resolveTimeout bounds one resolve (row lock wait, issuer refresh and the
+// write of its result). It is longer than the OAuth client's HTTP timeout so
+// an issuer answer that arrives is always stored.
+const resolveTimeout = 30 * time.Second
+
 // ResolveChatGPT returns a usable access token for the person's
 // subscription connection, refreshing it when it is near expiry or when
 // the caller reports it was rejected (rejectedDigest = TokenDigest of the
@@ -133,7 +138,12 @@ func (s *Store) ResolveChatGPT(ctx context.Context, human, id, rejectedDigest st
 		return ChatGPTAccess{}, ErrNotFound
 	}
 	id = parsed.String()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// The issuer rotates the refresh token as soon as it answers; the new
+	// one must be stored even when the caller has already gone (a Core
+	// timeout, a cancelled Worker request, a dropped connection), or the
+	// next refresh presents a spent token and the connection is lost. The
+	// operation therefore runs on its own bounded context, not the caller's.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
 	defer cancel()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -257,9 +267,10 @@ func (s *Store) SetChatGPTSettings(ctx context.Context, human, id string, v Chat
 }
 
 // connectChatGPT stores a freshly authorized grant inside the login's
-// transaction and selects it. A reconnect (target set, same person, still
-// a subscription connection) replaces that connection's grant and gives it
-// a new version; otherwise a new connection is created.
+// transaction. A reconnect (target set, same person, still a subscription
+// connection) replaces that connection's grant and gives it a new version,
+// leaving the person's selection unchanged; otherwise a new connection is
+// created and selected.
 func (s *Store) connectChatGPT(ctx context.Context, tx pgx.Tx, human, target string, t OAuthTokens) (Connection, error) {
 	if !validAccount(t.AccountID) || t.AccessToken == "" || t.RefreshToken == "" || t.ExpiresAt.IsZero() {
 		return Connection{}, errLoginFailed
@@ -292,7 +303,12 @@ func (s *Store) connectChatGPT(ctx context.Context, tx pgx.Tx, human, target str
 	if err != nil {
 		return Connection{}, err
 	}
-	// Signing in is the person's explicit choice of this connection.
+	if existing {
+		// Reconnecting repairs this connection's sign-in; which connection
+		// the person uses is a separate choice and stays as it was.
+		return c, nil
+	}
+	// Signing in to add a connection is the person's explicit choice of it.
 	_, err = tx.Exec(ctx, `INSERT INTO model_connection_selections(human_id,kind,connection_id) VALUES($1,'api',$2)
  ON CONFLICT(human_id) DO UPDATE SET kind=EXCLUDED.kind,connection_id=EXCLUDED.connection_id`, human, c.ID)
 	if err != nil {

@@ -4,13 +4,18 @@ import {
   type ModelEvent,
   type ModelProvider,
   type ModelRequest,
+  type ProviderContinuation,
   type ToolCall,
 } from "../provider.ts";
 import {
   type ChatGPTDialect,
+  continuationEntry,
+  continuationScope,
   FUNCTION_NAMESPACE,
   LITE_HEADER,
   litePrefix,
+  MAX_CONTINUATION_BYTES,
+  safeDiagnosticCode,
   usageLimitError,
   usesResponsesLite,
 } from "./chatgpt-codex.ts";
@@ -114,8 +119,24 @@ export class OpenAIResponsesProvider implements ModelProvider {
     let events: AsyncGenerator<{ event: string; data: string }> | null = null;
     try {
       const chatgpt = this.cfg.chatgpt;
-      const body = chatgpt
-        ? await chatGPTBody(this.cfg.model, chatgpt, request, tools, toWire)
+      // Continuation (encrypted reasoning) is exchanged only on the
+      // ChatGPT dialect, scoped to this account and model.
+      const scope = chatgpt
+        ? await continuationScope(chatgpt.accountId, this.cfg.model)
+        : undefined;
+      const built = chatgpt
+        ? await chatGPTBody(
+            this.cfg.model,
+            chatgpt,
+            request,
+            tools,
+            toWire,
+            scope,
+          )
+        : undefined;
+      let replaying = built?.replaying ?? false;
+      let body = built
+        ? built.body
         : JSON.stringify({
             model: this.cfg.model,
             stream: true,
@@ -127,7 +148,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
             ...(this.cfg.maxOutputTokens
               ? { max_output_tokens: this.cfg.maxOutputTokens }
               : {}),
-            ...toInput(request.messages, toWire),
+            ...standardInput(request.messages, toWire),
             ...(tools.length
               ? {
                   // `strict: false` is explicit: when it is omitted,
@@ -146,8 +167,9 @@ export class OpenAIResponsesProvider implements ModelProvider {
           });
       let apiKey = this.cfg.apiKey;
       let accountId = chatgpt?.accountId;
+      let refreshed = false;
       let res: Response;
-      for (let attempt = 0; ; attempt++) {
+      for (;;) {
         try {
           res = await this.fetchImpl(
             `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
@@ -190,24 +212,43 @@ export class OpenAIResponsesProvider implements ModelProvider {
         // A subscription access token rejected before any output: refresh
         // once through the state service (which serializes rotation) and
         // resend the identical body. A second 401 is not retried.
-        if (res.status === 401 && chatgpt && attempt === 0) {
+        if (res.status === 401 && chatgpt && !refreshed) {
           await res.body?.cancel().catch(() => {});
           const next = await chatgpt.refresh(apiKey);
           apiKey = next.accessToken;
           accountId = next.accountId;
+          refreshed = true;
+          continue;
+        }
+        // A request carrying recorded continuation that the backend
+        // refuses (400) is resent once without it. The continuation is an
+        // optimization, never a precondition: a stored round whose
+        // encrypted reasoning can no longer be used must not wedge the
+        // turn on every retry.
+        if (res.status === 400 && chatgpt && replaying) {
+          await res.body?.cancel().catch(() => {});
+          body = (
+            await chatGPTBody(this.cfg.model, chatgpt, request, tools, toWire)
+          ).body;
+          replaying = false;
           continue;
         }
         break;
       }
       if (res.status === 401 && chatgpt) {
-        await res.body?.cancel().catch(() => {});
+        // The refresh succeeded — a reconnect would only repeat it — and
+        // the backend still refuses the fresh token. Why is ChatGPT's to
+        // say; the body's error code is kept only when it is shaped like
+        // an error identifier, never the body itself.
+        const text = (await res.text().catch(() => "")).slice(0, 4096);
+        const code = safeDiagnosticCode(text);
         throw new ModelError(
-          "ChatGPT rejected the refreshed sign-in for this connection; reconnect ChatGPT",
+          `ChatGPT rejected this connection's sign-in again right after it was refreshed (HTTP 401${code ? `, code ${code}` : ""})`,
           // No output was produced and nothing was billed: the model was
           // not consulted.
           {
             retryable: false,
-            cause: "model_reconnect_required",
+            cause: "model_auth_rejected",
             unavailable: true,
           },
         );
@@ -234,6 +275,11 @@ export class OpenAIResponsesProvider implements ModelProvider {
       const items = new Map<string, number>();
       let usage: Record<string, unknown> = {};
       let finished = false;
+      // The round's output order with its encrypted reasoning, kept for
+      // continuation (ChatGPT dialect only).
+      const kept: Record<string, unknown>[] = [];
+      let reasoningBytes = 0;
+      let reasoningItems = 0;
       events = sseEvents(res.body);
 
       for await (const { data } of events) {
@@ -309,6 +355,16 @@ export class OpenAIResponsesProvider implements ModelProvider {
           }
           case "response.output_item.done": {
             const item = json.item;
+            if (chatgpt) {
+              const entry = continuationEntry(item);
+              if (entry) {
+                kept.push(entry);
+                if (entry.type === "reasoning") {
+                  reasoningItems += 1;
+                  reasoningBytes += String(entry.encrypted_content).length;
+                }
+              }
+            }
             if (item?.type === "function_call") {
               const idx = json.output_index ?? calls.size;
               const cur = calls.get(idx) ?? { callId: "", name: "", args: "" };
@@ -439,7 +495,11 @@ export class OpenAIResponsesProvider implements ModelProvider {
         };
         yield { type: "tool_call", call };
       }
-      yield { type: "done", usage };
+      const continuation: ProviderContinuation | undefined =
+        scope && reasoningItems > 0 && reasoningBytes <= MAX_CONTINUATION_BYTES
+          ? { scope, output: kept }
+          : undefined;
+      yield { type: "done", usage, ...(continuation ? { continuation } : {}) };
     } finally {
       deadline.done();
       await events?.return(undefined).catch(() => {});
@@ -457,10 +517,15 @@ function toInput(
   messages: ChatMessage[],
   toWire: Map<string, string>,
   dialect: "standard" | "chatgpt" | "chatgpt-lite" = "standard",
+  /** Continuation scope to replay; unset = replay none. */
+  replayScope?: string,
 ): {
   instructions?: string;
   input: Record<string, unknown>[];
+  /** Whether any recorded continuation was placed in `input`. */
+  replaying: boolean;
 } {
+  let replaying = false;
   const system: string[] = [];
   const input: Record<string, unknown>[] = [];
   for (const m of messages) {
@@ -476,7 +541,10 @@ function toInput(
         });
         break;
       case "assistant": {
-        if (m.content) {
+        let textDone = !m.content;
+        const pushText = () => {
+          if (textDone) return;
+          textDone = true;
           // The easy input-message form: role "assistant" is documented as
           // "presumed to have been generated by the model in previous
           // interactions" and needs no item id — unlike the output-message
@@ -491,12 +559,16 @@ function toInput(
                 ? m.content
                 : [{ type: "output_text", text: m.content }],
           });
-        }
-        for (const c of m.toolCalls ?? []) {
-          // call_id links the result back; the item `id` is optional on a
-          // function_call input item and is not persisted in the journal.
+        };
+        const pending = new Map((m.toolCalls ?? []).map((c) => [c.id, c]));
+        const pushCall = (c: ToolCall, id?: string) => {
+          pending.delete(c.id);
+          // call_id links the result back. The item `id` is optional on a
+          // function_call input item; it is sent only when the round's
+          // continuation recorded it.
           input.push({
             type: "function_call",
+            ...(id ? { id } : {}),
             call_id: c.id,
             // The recorded name is canonical; replay must still produce a
             // valid wire name when the tool is no longer advertised in
@@ -509,7 +581,30 @@ function toInput(
             arguments: encodeCallArguments(c),
             ...(dialect === "standard" ? { status: "completed" } : {}),
           });
+        };
+        // A round's recorded continuation replays in the round's own
+        // output order: its encrypted reasoning items byte-for-byte, the
+        // text and calls at the positions the provider emitted them.
+        const cont =
+          dialect !== "standard" &&
+          replayScope !== undefined &&
+          m.continuation?.scope === replayScope
+            ? m.continuation.output
+            : [];
+        for (const o of cont) {
+          const entry = continuationEntry(o);
+          if (entry?.type === "reasoning") {
+            input.push(entry);
+            replaying = true;
+          } else if (entry?.type === "message") {
+            pushText();
+          } else if (entry?.type === "function_call") {
+            const c = pending.get(String(entry.call_id));
+            if (c) pushCall(c, entry.id as string | undefined);
+          }
         }
+        pushText();
+        for (const c of pending.values()) pushCall(c);
         break;
       }
       case "tool":
@@ -524,7 +619,17 @@ function toInput(
   return {
     ...(system.length ? { instructions: system.join("\n\n") } : {}),
     input,
+    replaying,
   };
+}
+
+/** The standard wire's instructions + input (no continuation exists there). */
+function standardInput(
+  messages: ChatMessage[],
+  toWire: Map<string, string>,
+): { instructions?: string; input: Record<string, unknown>[] } {
+  const { replaying: _, ...rest } = toInput(messages, toWire);
+  return rest;
 }
 
 function numOr(v: unknown): number | undefined {
@@ -556,15 +661,24 @@ async function chatGPTBody(
   request: ModelRequest,
   tools: WireTool[],
   toWire: Map<string, string>,
-): Promise<string> {
+  replayScope?: string,
+): Promise<{ body: string; replaying: boolean }> {
   const lite = usesResponsesLite(model);
-  const { instructions, input } = toInput(
+  const { instructions, input, replaying } = toInput(
     request.messages,
     toWire,
     lite ? "chatgpt-lite" : "chatgpt",
+    replayScope,
   );
   const functions = tools.map((t) => functionTool(t));
-  return JSON.stringify({
+  // The Codex client's reasoning parameters: the requested effort, and on
+  // lite models `context: "all_turns"` so reasoning items in the input are
+  // used rather than only the current turn's.
+  const reasoning = {
+    ...(dialect.reasoningEffort ? { effort: dialect.reasoningEffort } : {}),
+    ...(lite ? { context: "all_turns" } : {}),
+  };
+  const body = JSON.stringify({
     model,
     ...(lite ? {} : instructions ? { instructions } : {}),
     input: lite
@@ -576,12 +690,14 @@ async function chatGPTBody(
     ...(!lite && functions.length ? { tools: functions } : {}),
     tool_choice: "auto",
     parallel_tool_calls: !lite,
-    ...(dialect.reasoningEffort
-      ? { reasoning: { effort: dialect.reasoningEffort } }
-      : {}),
+    ...(Object.keys(reasoning).length ? { reasoning } : {}),
     store: false,
     stream: true,
-    include: [],
+    // With store:false the provider keeps nothing, so reasoning can only
+    // continue into the next round when its encrypted form is returned
+    // and resent (see ProviderContinuation).
+    include: ["reasoning.encrypted_content"],
     prompt_cache_key: request.personaId,
   });
+  return { body, replaying };
 }

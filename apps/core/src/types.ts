@@ -214,6 +214,11 @@ export interface ApprovalDecision {
  * Bounded failure classifications a surface may render (see error_kind).
  * "model_reconnect_required": the selected ChatGPT subscription sign-in
  * expired or was revoked — the person must reconnect ChatGPT.
+ * "model_auth_rejected": ChatGPT rejected a just-refreshed sign-in for
+ * the selected connection. The refresh itself succeeded, so the cause is
+ * on ChatGPT's side and not known to Sumi; reconnecting is not implied.
+ * "model_connection_disabled": the selected connection's kind (a ChatGPT
+ * subscription) is turned off on this server — a connection IS selected.
  * "model_usage_limit": the subscription's usage limit is reached (or the
  * plan does not include this use) — waiting or a different connection
  * is the fix, not a resend.
@@ -222,6 +227,8 @@ export type FailureKind =
   | "no_model_connection"
   | "oversize_plan"
   | "model_reconnect_required"
+  | "model_auth_rejected"
+  | "model_connection_disabled"
   | "model_usage_limit";
 
 export interface ModelBinding {
@@ -284,6 +291,11 @@ export interface Decision {
   text: string;
   calls: PlanCall[];
   usage: Json;
+  /**
+   * Opaque provider continuation of this round (ProviderContinuation in
+   * provider.ts), replayed with the round on the next consultation.
+   */
+  continuation?: { scope: string; output: Json[] };
 }
 
 /**

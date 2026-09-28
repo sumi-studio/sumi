@@ -300,7 +300,12 @@ test("a no-model-connection failure carries its classified cause", () => {
 });
 
 test("ChatGPT sign-in and plan-limit failures keep their bounded cause", () => {
-  for (const code of ["model_reconnect_required", "model_usage_limit"]) {
+  for (const code of [
+    "model_reconnect_required",
+    "model_auth_rejected",
+    "model_connection_disabled",
+    "model_usage_limit",
+  ]) {
     let session = createAgentSession();
     session = apply(session, {
       audience: "direct_chat",

@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   ClaimedMemoryChunk,
   CommitRequest,
+  Decision,
   Event,
   FundingRef,
   Job,
@@ -178,6 +179,7 @@ export interface StateClient {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     },
   ): Promise<{ plan: TurnPlan; created: boolean }>;
   commitTurn(
@@ -425,6 +427,17 @@ type FetchLike = (
 export const STATE_CALL_TIMEOUT_MS = 10_000;
 
 /**
+ * Deadline for the two model-credential calls (binding and
+ * credential-refresh). Either may refresh a subscription grant at the
+ * issuer, which the service bounds at 30s (its issuer HTTP timeout is
+ * 20s) and completes even if this call is abandoned. Waiting slightly
+ * longer than that bound lets an ordinary slow refresh finish inside the
+ * turn instead of failing it and retrying against a row that is still
+ * locked; the call stays bounded.
+ */
+export const MODEL_CREDENTIAL_CALL_TIMEOUT_MS = 35_000;
+
+/**
  * The deadline's rejection shape. call() passes only its own timeout
  * signal, so an abort here is always the deadline expiring — reported as a
  * transient 503 rather than leaking an undifferentiated AbortError, which
@@ -453,6 +466,7 @@ export class HttpStateClient implements StateClient {
   private readonly token: string;
   private readonly fetchImpl: FetchLike;
   private readonly timeoutMs: number;
+  private readonly credentialTimeoutMs: number;
 
   constructor(
     baseUrl: string,
@@ -462,17 +476,20 @@ export class HttpStateClient implements StateClient {
     fetchImpl: FetchLike = (input, init) =>
       fetch(input, init) as ReturnType<FetchLike>,
     timeoutMs = STATE_CALL_TIMEOUT_MS,
+    credentialTimeoutMs = MODEL_CREDENTIAL_CALL_TIMEOUT_MS,
   ) {
     this.baseUrl = baseUrl;
     this.token = token;
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
+    this.credentialTimeoutMs = credentialTimeoutMs;
   }
 
   private async call<T>(
     method: string,
     path: string,
     body?: unknown,
+    timeoutMs = this.timeoutMs,
   ): Promise<T> {
     // One signal bounds the whole request: a service that accepts but never
     // answers, or answers headers and stalls mid-body, fails here instead
@@ -484,7 +501,7 @@ export class HttpStateClient implements StateClient {
     // clearTimeout on every exit releases the deadline once the body has
     // settled; a still-pending call keeps its bound.
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), this.timeoutMs);
+    const timer = setTimeout(() => deadline.abort(), timeoutMs);
     try {
       let res: StateResponse;
       try {
@@ -498,13 +515,13 @@ export class HttpStateClient implements StateClient {
           signal: deadline.signal,
         });
       } catch (e) {
-        throw callDeadlineError(e, method, path, this.timeoutMs) ?? e;
+        throw callDeadlineError(e, method, path, timeoutMs) ?? e;
       }
       if (res.ok) {
         try {
           return (await res.json()) as T;
         } catch (e) {
-          const timeout = callDeadlineError(e, method, path, this.timeoutMs);
+          const timeout = callDeadlineError(e, method, path, timeoutMs);
           if (timeout) throw timeout;
           // A 200 with an unreadable body is an infrastructure blip — a
           // truncated proxy/middlebox response or a service bug — not a
@@ -688,6 +705,7 @@ export class HttpStateClient implements StateClient {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     },
   ) {
     return this.call<{ plan: TurnPlan; created: boolean }>(
@@ -700,6 +718,7 @@ export class HttpStateClient implements StateClient {
         text: req.text,
         calls: req.calls,
         usage: req.usage,
+        ...(req.continuation ? { continuation: req.continuation } : {}),
       },
     );
   }
@@ -780,6 +799,8 @@ export class HttpStateClient implements StateClient {
     return this.call<ModelBinding>(
       "GET",
       `/internal/core/personas/${persona}/model`,
+      undefined,
+      this.credentialTimeoutMs,
     );
   }
   refreshModelCredential(
@@ -794,6 +815,7 @@ export class HttpStateClient implements StateClient {
         connection_id: connectionId,
         rejected_token_sha256: rejectedTokenSha256,
       },
+      this.credentialTimeoutMs,
     );
   }
   async completeOperation(
