@@ -52,6 +52,25 @@
         // Explicitly off: wake always requires SUMI_CORE_WAKE_TOKEN here.
         "SUMI_CORE_WAKE_OPEN": ""
       }
+    },
+    // Isolated proof: SUMI_STATE reaches the api-container Worker through a
+    // service binding. SUMI_STATE_URL only shapes request URLs; the binding
+    // decides where they go.
+    "proof": {
+      "name": "sumi-core-proof",
+      "workers_dev": true,
+      "preview_urls": false,
+      "compatibility_flags": [],
+      "observability": { "enabled": true },
+      "durable_objects": {
+        "bindings": [{ "name": "SECRETARY", "class_name": "SecretaryObject" }]
+      },
+      "services": [{ "binding": "SUMI_STATE", "service": "sumi-api-proof" }],
+      "vars": {
+        "SUMI_STATE_URL": "http://sumi-api",
+        "SUMI_MODEL_PROVIDER": "none",
+        "SUMI_CORE_WAKE_OPEN": ""
+      }
     }
   }
 }

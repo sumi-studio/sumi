@@ -35,8 +35,11 @@ import (
 // and reconstructs the per-personality-agent next seq and idempotency maps, so
 // restart preserves the log and allocation continuity.
 type CommandStore struct {
-	mu              sync.Mutex
-	dir             string
+	mu  sync.Mutex
+	dir string
+	// mirror, when set, makes each command log fsync durable beyond this
+	// host's disk (see FileMirror).
+	mirror          FileMirror
 	states          map[string]*personalityAgentState
 	idempotencyLock *os.File
 	// idempotencyGuard serializes keyed appends that share this store's one
@@ -183,6 +186,20 @@ var ErrSeqExhausted = errors.New("command sequence number exhausted")
 
 // OpenCommandStore opens or creates the command log under dir.
 func OpenCommandStore(dir string) (*CommandStore, error) {
+	return openCommandStore(dir, nil)
+}
+
+// OpenMirroredCommandStore is OpenCommandStore with every command log write
+// committed through mirror before its Sync succeeds. The mirror must already
+// have reconciled dir.
+func OpenMirroredCommandStore(dir string, mirror FileMirror) (*CommandStore, error) {
+	if mirror == nil {
+		return nil, errors.New("command store mirror is required")
+	}
+	return openCommandStore(dir, mirror)
+}
+
+func openCommandStore(dir string, mirror FileMirror) (*CommandStore, error) {
 	if dir == "" {
 		return nil, errors.New("command log directory is required")
 	}
@@ -207,6 +224,7 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 
 	s := &CommandStore{
 		dir:              abs,
+		mirror:           mirror,
 		states:           make(map[string]*personalityAgentState),
 		idempotencyGuard: make(chan struct{}, 1),
 	}
@@ -897,9 +915,19 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *personalityAgent
 		return fmt.Errorf("stat command log for %q: %w", personalityAgentID, err)
 	}
 
-	file, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	const logFlags = os.O_CREATE | os.O_RDWR | os.O_APPEND | syscall.O_NOFOLLOW
+	var file fileHandle
+	file, err = os.OpenFile(st.path, logFlags, 0o600)
 	if err != nil {
 		return fmt.Errorf("open command log for %q: %w", personalityAgentID, err)
+	}
+	if s.mirror != nil {
+		mirrored, mirrorErr := s.mirror.Wrap(st.path, logFlags, file)
+		if mirrorErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("mirror command log for %q: %w", personalityAgentID, mirrorErr)
+		}
+		file = mirrored
 	}
 	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		_ = file.Close()

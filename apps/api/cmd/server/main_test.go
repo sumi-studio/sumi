@@ -19,6 +19,7 @@ import (
 
 	firebaseauth "firebase.google.com/go/v4/auth"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -608,7 +609,7 @@ func TestConfigureMessagingAttachmentsRequiresWholeStoreCaps(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	store := messaging.New(nil, nil, nil)
-	if err := configureMessagingAttachmentsFromEnv(store); err != nil {
+	if err := configureMessagingAttachmentsFromEnv(store, nil); err != nil {
 		t.Fatalf("all absent must leave attachments disabled: %v", err)
 	}
 	if store.AttachmentsEnabled() {
@@ -617,7 +618,7 @@ func TestConfigureMessagingAttachmentsRequiresWholeStoreCaps(t *testing.T) {
 	for name, value := range all {
 		t.Setenv(name, value)
 	}
-	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil)); err != nil {
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), nil); err != nil {
 		t.Fatalf("complete attachment cap configuration: %v", err)
 	}
 	for missing := range all {
@@ -625,8 +626,54 @@ func TestConfigureMessagingAttachmentsRequiresWholeStoreCaps(t *testing.T) {
 			t.Setenv(name, value)
 		}
 		t.Setenv(missing, "")
-		if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil)); err == nil {
+		if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), nil); err == nil {
 			t.Fatalf("configuration missing %s was accepted", missing)
 		}
+	}
+}
+
+// A host without a durable disk keeps attachment bytes in PostgreSQL. The
+// store replaces the root; the caps stay mandatory.
+func TestConfigureMessagingAttachmentsPostgresStore(t *testing.T) {
+	caps := map[string]string{
+		messagingAttachmentWorkspaceBytesEnv:   "20971520",
+		messagingAttachmentWorkspaceObjectsEnv: "10",
+		messagingAttachmentTotalBytesEnv:       "41943040",
+		messagingAttachmentTotalObjectsEnv:     "20",
+	}
+	for name, value := range caps {
+		t.Setenv(name, value)
+	}
+	t.Setenv(messagingAttachmentRootEnv, "")
+	t.Setenv(messagingAttachmentStoreEnv, "postgres")
+	// pgxpool connects lazily; configuration never dials.
+	pool, err := pgxpool.New(context.Background(), "postgres://unused@127.0.0.1:1/unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := messaging.New(nil, nil, nil)
+	if err := configureMessagingAttachmentsFromEnv(store, pool); err != nil {
+		t.Fatalf("postgres attachment store: %v", err)
+	}
+	if !store.AttachmentsEnabled() {
+		t.Fatal("postgres attachment store left attachments disabled")
+	}
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), nil); err == nil {
+		t.Fatal("postgres attachment store without a database was accepted")
+	}
+	t.Setenv(messagingAttachmentWorkspaceObjectsEnv, "")
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), pool); err == nil {
+		t.Fatal("postgres attachment store without every cap was accepted")
+	}
+	t.Setenv(messagingAttachmentWorkspaceObjectsEnv, "10")
+	t.Setenv(messagingAttachmentRootEnv, t.TempDir())
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), pool); err == nil {
+		t.Fatal("postgres store together with a root was accepted")
+	}
+	t.Setenv(messagingAttachmentRootEnv, "")
+	t.Setenv(messagingAttachmentStoreEnv, "s3")
+	if err := configureMessagingAttachmentsFromEnv(messaging.New(nil, nil, nil), pool); err == nil {
+		t.Fatal("unknown attachment store was accepted")
 	}
 }

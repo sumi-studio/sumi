@@ -238,6 +238,34 @@ type durableFileHandle interface {
 	Fd() uintptr
 }
 
+// OpenMirroredBrowserJournal is OpenBrowserJournal with every event log,
+// dedup index and session-revocation write committed through mirror before
+// it is reported durable. The mirror must already have reconciled dir.
+func OpenMirroredBrowserJournal(dir string, commands *CommandStore, mirror FileMirror) (*BrowserJournal, error) {
+	if mirror == nil {
+		return nil, errors.New("browser journal mirror is required")
+	}
+	g, err := OpenBrowserJournal(dir, commands)
+	if err != nil {
+		return nil, err
+	}
+	open := g.newFile
+	g.newFile = func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
+		file, err := open(name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		mirrored, err := mirror.Wrap(name, flag, file)
+		if err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+		return mirrored, nil
+	}
+	g.writeAtomic = mirror.WrapAtomicWrite(g.writeAtomic)
+	return g, nil
+}
+
 func OpenBrowserJournal(dir string, commands *CommandStore) (*BrowserJournal, error) {
 	if dir == "" {
 		return nil, errors.New("browser journal directory is required")

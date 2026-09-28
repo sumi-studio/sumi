@@ -30,6 +30,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/jobexec"
+	"github.com/sumi-studio/sumi/apps/api/internal/journalmirror"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/mcpconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -270,29 +271,56 @@ func newApplicationFromEnv() (*application, error) {
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
 	}
-	store, err := agentevents.OpenCommandStore(cmdDir)
-	if err != nil {
-		return nil, fmt.Errorf("open command store: %w", err)
-	}
 	runtimeDir := os.Getenv("SUMI_BROWSER_EVENT_DIR")
 	if runtimeDir == "" {
-		_ = store.Close()
 		return nil, errors.New("SUMI_BROWSER_EVENT_DIR not set")
 	}
-	runtime, err := agentevents.OpenBrowserJournal(runtimeDir, store)
+	// With the journal mirror the database opens first: it holds the
+	// acknowledged journal bytes that must be restored into the (possibly
+	// fresh) directories before the journals read them.
+	database, mirror, err := journalMirrorFromEnv(context.Background(), cmdDir, runtimeDir)
 	if err != nil {
+		return nil, err
+	}
+	var store *agentevents.CommandStore
+	if mirror != nil {
+		store, err = agentevents.OpenMirroredCommandStore(cmdDir, mirror)
+	} else {
+		store, err = agentevents.OpenCommandStore(cmdDir)
+	}
+	if err != nil {
+		if database != nil {
+			database.Close()
+		}
+		return nil, fmt.Errorf("open command store: %w", err)
+	}
+	closeEarly := func() {
 		_ = store.Close()
+		if database != nil {
+			database.Close()
+		}
+	}
+	var runtime *agentevents.BrowserJournal
+	if mirror != nil {
+		runtime, err = agentevents.OpenMirroredBrowserJournal(runtimeDir, store, mirror)
+	} else {
+		runtime, err = agentevents.OpenBrowserJournal(runtimeDir, store)
+	}
+	if err != nil {
+		closeEarly()
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
 	sv, browserOrigins, err := browserSessionConfigFromEnv(runtime)
 	if err != nil {
-		_ = store.Close()
+		closeEarly()
 		return nil, fmt.Errorf("browser session configuration: %w", err)
 	}
-	database, err := databaseFromEnv(context.Background())
-	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("control-plane database: %w", err)
+	if database == nil {
+		database, err = databaseFromEnv(context.Background())
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("control-plane database: %w", err)
+		}
 	}
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
@@ -416,7 +444,7 @@ func newApplicationFromEnv() (*application, error) {
 		if authEnabled {
 			authServer.PushDevices = messagingStore
 		}
-		if err := configureMessagingAttachmentsFromEnv(messagingStore); err != nil {
+		if err := configureMessagingAttachmentsFromEnv(messagingStore, database.Pool); err != nil {
 			closeOnError()
 			return nil, fmt.Errorf("messaging attachments: %w", err)
 		}
@@ -828,6 +856,7 @@ func newApplicationFromEnv() (*application, error) {
 // answer 503) when all are absent, and startup fails for a partial policy so
 // the API never runs with an unbounded Workspace or whole blob store.
 const (
+	messagingAttachmentStoreEnv            = "SUMI_MESSAGING_ATTACHMENT_STORE"
 	messagingAttachmentRootEnv             = "SUMI_MESSAGING_ATTACHMENT_ROOT"
 	messagingAttachmentWorkspaceBytesEnv   = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES"
 	messagingAttachmentWorkspaceObjectsEnv = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS"
@@ -835,8 +864,25 @@ const (
 	messagingAttachmentTotalObjectsEnv     = "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS"
 )
 
-func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
+// SUMI_MESSAGING_ATTACHMENT_STORE=postgres keeps the bytes in the database
+// instead of under a root directory, for hosts without a durable disk. It
+// takes the place of the root; the caps are required either way.
+func configureMessagingAttachmentsFromEnv(store *messaging.Store, pool *pgxpool.Pool) error {
+	backend := strings.TrimSpace(os.Getenv(messagingAttachmentStoreEnv))
 	root := strings.TrimSpace(os.Getenv(messagingAttachmentRootEnv))
+	switch backend {
+	case "", "disk":
+	case "postgres":
+		if root != "" {
+			return fmt.Errorf("%s=postgres and %s are mutually exclusive", messagingAttachmentStoreEnv, messagingAttachmentRootEnv)
+		}
+	default:
+		return fmt.Errorf("%s must be unset, \"disk\" or \"postgres\"", messagingAttachmentStoreEnv)
+	}
+	if backend == "postgres" {
+		// The root stands for "a store is configured" in the checks below.
+		root = "postgres"
+	}
 	values := map[string]string{
 		messagingAttachmentWorkspaceBytesEnv:   strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceBytesEnv)),
 		messagingAttachmentWorkspaceObjectsEnv: strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceObjectsEnv)),
@@ -862,9 +908,20 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 		}
 		parsed[name] = value
 	}
-	blobs, err := messaging.NewDiskAttachments(root)
-	if err != nil {
-		return err
+	var blobs messaging.AttachmentBlobs
+	location := root
+	if backend == "postgres" {
+		pgBlobs, err := messaging.NewPostgresAttachments(pool)
+		if err != nil {
+			return err
+		}
+		blobs, location = pgBlobs, "PostgreSQL"
+	} else {
+		disk, err := messaging.NewDiskAttachments(root)
+		if err != nil {
+			return err
+		}
+		blobs, location = disk, disk.RootPath()
 	}
 	policy := messaging.AttachmentPolicy{
 		WorkspaceQuotaBytes:   parsed[messagingAttachmentWorkspaceBytesEnv],
@@ -876,7 +933,7 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 		return err
 	}
 	log.Printf("messaging attachments ready at %s (workspace %d bytes/%d objects; total %d bytes/%d objects)",
-		blobs.RootPath(), policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
+		location, policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
 		policy.TotalQuotaBytes, policy.TotalQuotaObjects)
 	return nil
 }
@@ -908,6 +965,63 @@ func liveKitConfigFromEnv() (messaging.LiveKitConfig, bool, error) {
 		}
 	}
 	return config, true, nil
+}
+
+const journalMirrorEnv = "SUMI_API_JOURNAL_MIRROR"
+
+// journalMirrorFromEnv enables the PostgreSQL journal mirror when
+// SUMI_API_JOURNAL_MIRROR=postgres. The API then treats its command log and
+// browser event directories as a cache that PostgreSQL restores on start, so
+// it can run on a host whose disk is discarded on replacement. Only one API
+// process may run with the mirror; a newer one fences the older, which then
+// shuts down.
+func journalMirrorFromEnv(ctx context.Context, cmdDir, runtimeDir string) (*db.Pool, *journalmirror.Mirror, error) {
+	mode := strings.TrimSpace(os.Getenv(journalMirrorEnv))
+	switch mode {
+	case "":
+		return nil, nil, nil
+	case "postgres":
+	default:
+		return nil, nil, fmt.Errorf("%s must be unset or \"postgres\"", journalMirrorEnv)
+	}
+	database, err := databaseFromEnv(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("control-plane database: %w", err)
+	}
+	if database == nil {
+		return nil, nil, fmt.Errorf("%s=postgres requires SUMI_DB_URL", journalMirrorEnv)
+	}
+	hostname, _ := os.Hostname()
+	holder := fmt.Sprintf("%s pid %d", hostname, os.Getpid())
+	if instance := strings.TrimSpace(os.Getenv("SUMI_API_INSTANCE")); instance != "" {
+		holder = instance + " (" + holder + ")"
+	}
+	acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	mirror, err := journalmirror.Acquire(acquireCtx, database.Pool, holder, func(err error) {
+		// Another API process owns the journals now. This one can no longer
+		// acknowledge a write, so it stops instead of serving stale state.
+		log.Printf("journal mirror: %v; shutting down", err)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	})
+	if err != nil {
+		database.Close()
+		return nil, nil, err
+	}
+	for _, dir := range []struct{ name, path string }{{"commands", cmdDir}, {"browser-events", runtimeDir}} {
+		report, err := mirror.Attach(acquireCtx, dir.name, dir.path)
+		if err != nil {
+			database.Close()
+			return nil, nil, fmt.Errorf("journal mirror %s: %w", dir.name, err)
+		}
+		action := "restored"
+		if report.Seeded {
+			action = "seeded from local files"
+		}
+		log.Printf("journal mirror %s %s: %d files, %d bytes, %d written locally, %d trimmed, %s (epoch %d)",
+			dir.name, action, report.Files, report.Bytes, len(report.Restored), len(report.Trimmed), report.Duration.Round(time.Millisecond), mirror.Epoch())
+	}
+	return database, mirror, nil
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when
