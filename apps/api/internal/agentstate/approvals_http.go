@@ -2,6 +2,7 @@ package agentstate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -76,7 +77,12 @@ type ModelBinding struct {
 	Connection          *ModelConnectionBinding `json:"connection,omitempty"`
 	APIKey              string                  `json:"api_key,omitempty"`
 	CredentialAvailable bool                    `json:"credential_available"`
-	Reason              string                  `json:"reason,omitempty"`
+	// CredentialState classifies an unavailable subscription credential
+	// for the surfaces that render it: "reconnect_required" (the person
+	// must sign in to ChatGPT again) or "disabled" (this server does not
+	// offer subscription connections). Empty otherwise.
+	CredentialState string `json:"credential_state,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 type ModelConnectionBinding struct {
@@ -93,6 +99,12 @@ type ModelConnectionBinding struct {
 	// only with the credential material (armed store) — never in
 	// metadata-only responses and never persisted into core state.
 	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
+	// AccountID is the ChatGPT account a subscription access token belongs
+	// to (sent as ChatGPT-Account-ID). Only with credential material.
+	AccountID string `json:"account_id,omitempty"`
+	// ReasoningEffort is the connection's requested effort (subscription
+	// connections); empty = adapter default.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // modelBinding resolves the persona's human's explicit model selection.
@@ -104,6 +116,37 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.writeModelBinding(w, r, personaID, "", "")
+}
+
+// refreshModelCredential is the core's report that the provider rejected
+// the access token it was given (HTTP 401 before any output). It answers
+// with the persona's current binding, exactly as GET .../model would, but
+// for a subscription connection it first refreshes the grant unless the
+// rejected token (named by its SHA-256, never sent back) was already
+// replaced by a concurrent call. The rejection applies only to the
+// connection the core names: a selection that changed meanwhile is simply
+// returned as the new binding.
+func (s *Server) refreshModelCredential(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ConnectionID string `json:"connection_id"`
+		Rejected     string `json:"rejected_token_sha256"`
+	}
+	if !decode(w, r, &req, s.maxBody) {
+		return
+	}
+	if req.ConnectionID == "" || len(req.Rejected) != 64 {
+		writeError(w, http.StatusBadRequest, "connection_id and rejected_token_sha256 are required")
+		return
+	}
+	s.writeModelBinding(w, r, personaID, req.ConnectionID, req.Rejected)
+}
+
+func (s *Server) writeModelBinding(w http.ResponseWriter, r *http.Request, personaID, rejectedConnection, rejectedDigest string) {
 	persona, err := s.store.persona(r.Context(), personaID)
 	if err != nil {
 		storeError(w, err)
@@ -186,7 +229,16 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 				Model:           meta.Connection.Model,
 				Version:         meta.Version,
 				MaxOutputTokens: meta.Connection.MaxOutputTokens,
+				ReasoningEffort: meta.Connection.ReasoningEffort,
 			},
+		}
+		if meta.Connection.Preset == modelconnections.ChatGPTPreset {
+			rejected := ""
+			if rejectedConnection == meta.Connection.ID {
+				rejected = rejectedDigest
+			}
+			s.writeChatGPTBinding(w, r, human, binding, rejected)
+			return
 		}
 		if s.conns.CredentialsAvailable() {
 			access, err := s.conns.Resolve(r.Context(), human, sel.ConnectionID)
@@ -204,4 +256,36 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, ModelBinding{Selection: sel.Kind, Reason: "unknown selection kind"})
 	}
+}
+
+// writeChatGPTBinding resolves a subscription connection's access token,
+// refreshing under the connection's row lock when needed. A grant that can
+// no longer be refreshed is a definite, user-fixable unavailability
+// (reconnect), never a fallback; a transient refresh failure is a 503 the
+// core retries like a provider outage.
+func (s *Server) writeChatGPTBinding(w http.ResponseWriter, r *http.Request, human string, binding ModelBinding, rejectedDigest string) {
+	access, err := s.conns.ResolveChatGPT(r.Context(), human, binding.Connection.ID, rejectedDigest)
+	switch {
+	case err == nil:
+		binding.APIKey = access.AccessToken
+		binding.Connection.AccountID = access.AccountID
+		binding.Connection.Version = access.Version
+		binding.CredentialAvailable = true
+	case errors.Is(err, modelconnections.ErrReconnectRequired):
+		binding.CredentialState = "reconnect_required"
+		binding.Reason = "the ChatGPT sign-in for this connection has expired or was revoked; reconnect ChatGPT in AI connection settings"
+	case errors.Is(err, modelconnections.ErrChatGPTDisabled):
+		binding.CredentialState = "disabled"
+		binding.Reason = "ChatGPT subscription connections are not enabled on this server"
+	case errors.Is(err, modelconnections.ErrNotFound):
+		binding.Connection = nil
+		binding.Reason = "selected API connection no longer exists"
+	case errors.Is(err, modelconnections.ErrRefreshFailed):
+		writeError(w, http.StatusServiceUnavailable, "ChatGPT credential refresh failed; retry")
+		return
+	default:
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, binding)
 }

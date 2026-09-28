@@ -158,6 +158,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/core/personas/{persona}/approvals/{approval}", s.getApproval)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/approvals/{approval}/decision", s.decideApproval)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/model", s.modelBinding)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/model/credential-refresh", s.refreshModelCredential)
 	// Binding a carried persona to a destination human is an account-level
 	// act, not a persona-scoped one — admin-authenticated like persona
 	// creation and approval decisions. Works on staged (unbound import)

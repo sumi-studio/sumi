@@ -36,6 +36,10 @@ function setup() {
     save: vi.fn().mockResolvedValue(state.connections[0]),
     remove: vi.fn().mockResolvedValue(undefined),
     select: vi.fn().mockResolvedValue(undefined),
+    beginChatGPTLogin: vi.fn(),
+    chatGPTLogin: vi.fn(),
+    cancelChatGPTLogin: vi.fn().mockResolvedValue(undefined),
+    saveChatGPTSettings: vi.fn(),
   };
   return { client, state };
 }
@@ -152,4 +156,166 @@ it("shows validation guidance, keeps the entry, then saves after correction", as
     "own",
     expect.any(AbortSignal),
   );
+});
+
+const chatGPTConnection = {
+  id: "sub",
+  name: "ChatGPT",
+  preset: "chatgpt-codex",
+  baseUrl: "https://chatgpt.com/backend-api/codex",
+  model: "gpt-6-astra",
+  reasoningEffort: "medium",
+};
+const pendingLogin = {
+  loginId: "login-1",
+  status: "pending" as const,
+  verificationUrl: "https://auth.openai.com/codex/device",
+  userCode: "ABCD-1234",
+  expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+  intervalMs: 0,
+};
+it("connects ChatGPT with a device code the person enters on ChatGPT's page", async () => {
+  const { client, state } = setup();
+  const completed = {
+    ...state,
+    connections: [...state.connections, chatGPTConnection],
+    selection: { kind: "api" as const, connectionId: "sub" },
+    chatgpt: { available: true },
+  };
+  vi.mocked(client.list)
+    .mockResolvedValueOnce({ ...state, chatgpt: { available: true } })
+    .mockResolvedValue(completed);
+  vi.mocked(client.beginChatGPTLogin).mockResolvedValue(pendingLogin);
+  vi.mocked(client.chatGPTLogin)
+    .mockResolvedValueOnce(pendingLogin)
+    .mockResolvedValueOnce({
+      ...pendingLogin,
+      status: "completed",
+      verificationUrl: undefined,
+      userCode: undefined,
+      connection: chatGPTConnection,
+    });
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
+    "ABCD-1234",
+  );
+  expect(
+    screen.getByRole("link", { name: "ChatGPTのログインページを開く" }),
+  ).toHaveAttribute("href", "https://auth.openai.com/codex/device");
+  expect(client.beginChatGPTLogin).toHaveBeenCalledWith(
+    undefined,
+    expect.any(AbortSignal),
+  );
+  expect(
+    await screen.findByText(
+      /ChatGPTを接続し、この接続を使うように切り替えました/,
+      undefined,
+      { timeout: 4000 },
+    ),
+  ).toBeInTheDocument();
+  expect(client.chatGPTLogin).toHaveBeenCalledTimes(2);
+  expect(screen.queryByLabelText("ログインコード")).not.toBeInTheDocument();
+  expect(
+    screen.getByText("ChatGPTのサブスクリプション · gpt-6-astra"),
+  ).toBeInTheDocument();
+  expect(client.cancelChatGPTLogin).not.toHaveBeenCalled();
+});
+it("offers reconnecting an expired sign-in and cancels a login left open", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    connections: [{ ...chatGPTConnection, reconnectRequired: true }],
+    selection: { kind: "api", connectionId: "sub" },
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin).mockResolvedValue({
+    ...pendingLogin,
+    intervalMs: 60_000,
+  });
+  render(<APIConnectionSettings client={client} />);
+  expect(
+    await screen.findByText(/ChatGPTへのログインが期限切れか取り消されました/),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "ChatGPTに再接続" }));
+  await screen.findByLabelText("ログインコード");
+  expect(client.beginChatGPTLogin).toHaveBeenCalledWith(
+    "sub",
+    expect.any(AbortSignal),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+  await waitFor(() =>
+    expect(client.cancelChatGPTLogin).toHaveBeenCalledWith(
+      "login-1",
+      expect.any(AbortSignal),
+    ),
+  );
+  expect(screen.queryByLabelText("ログインコード")).not.toBeInTheDocument();
+});
+it("shows an expired code and a refused start without a stale code", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin)
+    .mockResolvedValueOnce({
+      ...pendingLogin,
+      status: "expired",
+      verificationUrl: undefined,
+      userCode: undefined,
+    })
+    .mockRejectedValueOnce(
+      new APIConnectionError(502, undefined, "デバイスコードを開始できません"),
+    );
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  expect(
+    await screen.findByText(/コードの有効期限が切れました/),
+  ).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "もう一度はじめる" }));
+  expect(
+    await screen.findByText("デバイスコードを開始できません"),
+  ).toBeInTheDocument();
+  expect(screen.queryByLabelText("ログインコード")).not.toBeInTheDocument();
+  expect(client.chatGPTLogin).not.toHaveBeenCalled();
+});
+it("edits a ChatGPT connection's model and effort without any API key field", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    connections: [chatGPTConnection],
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.saveChatGPTSettings).mockResolvedValue(chatGPTConnection);
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "編集" }));
+  expect(screen.queryByLabelText("APIキー")).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("モデル"), {
+    target: { value: "gpt-5.5" },
+  });
+  fireEvent.change(screen.getByLabelText("推論の強さ"), {
+    target: { value: "high" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "保存する" }));
+  await waitFor(() =>
+    expect(client.saveChatGPTSettings).toHaveBeenCalledWith(
+      "sub",
+      { name: "ChatGPT", model: "gpt-5.5", reasoningEffort: "high" },
+      expect.any(AbortSignal),
+    ),
+  );
+  expect(client.save).not.toHaveBeenCalled();
+});
+it("does not offer ChatGPT sign-in when the server does not support it", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: false, unavailableReason: "no" },
+  });
+  render(<APIConnectionSettings client={client} />);
+  await screen.findByRole("button", { name: "APIを追加" });
+  expect(
+    screen.queryByRole("button", { name: "ChatGPTで接続" }),
+  ).not.toBeInTheDocument();
 });

@@ -210,6 +210,20 @@ export interface ApprovalDecision {
  * credential store is armed — the decrypted key. Never a substituted
  * model/provider.
  */
+/**
+ * Bounded failure classifications a surface may render (see error_kind).
+ * "model_reconnect_required": the selected ChatGPT subscription sign-in
+ * expired or was revoked — the person must reconnect ChatGPT.
+ * "model_usage_limit": the subscription's usage limit is reached (or the
+ * plan does not include this use) — waiting or a different connection
+ * is the fix, not a resend.
+ */
+export type FailureKind =
+  | "no_model_connection"
+  | "oversize_plan"
+  | "model_reconnect_required"
+  | "model_usage_limit";
+
 export interface ModelBinding {
   // "needs_rebinding": the persona arrived by transfer carrying a model
   // selection intent; no model may run until the destination's bound
@@ -237,9 +251,27 @@ export interface ModelBinding {
      * default.
      */
     max_output_tokens?: number;
+    /**
+     * ChatGPT subscription connections: the account the access token
+     * belongs to (sent as ChatGPT-Account-ID). Present only with
+     * credential material.
+     */
+    account_id?: string;
+    /** Requested reasoning effort (subscription connections). */
+    reasoning_effort?: string;
   };
+  /**
+   * The connection's credential for this call: an API key, or for a
+   * ChatGPT subscription connection its current OAuth access token.
+   */
   api_key?: string;
   credential_available?: boolean;
+  /**
+   * Why a subscription credential is unavailable: "reconnect_required"
+   * (the person must sign in to ChatGPT again) or "disabled" (the server
+   * does not offer subscription connections).
+   */
+  credential_state?: "reconnect_required" | "disabled";
   reason?: string;
 }
 
@@ -429,7 +461,7 @@ export interface CommitRequest {
    * size limit and could not be recorded). Anything without a certain cause
    * stays absent rather than guessing at a provider-error taxonomy.
    */
-  error_kind?: "no_model_connection" | "oversize_plan";
+  error_kind?: FailureKind;
   /**
    * Provider-supplied retry pacing (Retry-After) for a retryable
    * failure: the requeue's not_before is at least now+retry_after_ms

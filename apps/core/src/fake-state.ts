@@ -2489,6 +2489,41 @@ export class FakeState implements StateClient {
   }
 
   /**
+   * Test fixture: how a reported credential rejection is answered. The
+   * default re-serves the persona's binding unchanged (no refresh).
+   */
+  modelCredentialRefresh?: (
+    persona: string,
+    connectionId: string,
+    rejectedTokenSha256: string,
+  ) => ModelBinding | Promise<ModelBinding>;
+  modelCredentialRefreshCalls: {
+    persona: string;
+    connectionId: string;
+    rejectedTokenSha256: string;
+  }[] = [];
+
+  async refreshModelCredential(
+    persona: string,
+    connectionId: string,
+    rejectedTokenSha256: string,
+  ): Promise<ModelBinding> {
+    this.modelCredentialRefreshCalls.push({
+      persona,
+      connectionId,
+      rejectedTokenSha256,
+    });
+    if (this.modelCredentialRefresh) {
+      return this.modelCredentialRefresh(
+        persona,
+        connectionId,
+        rejectedTokenSha256,
+      );
+    }
+    return this.modelBinding(persona);
+  }
+
+  /**
    * conversation_history: opens this persona's stored journal records —
    * recorded history, not implicit recollection. Mirrors the Go backend:
    * literal case-sensitive substring search over each record's stored text

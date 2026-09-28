@@ -131,3 +131,63 @@ it("uses session-bound BYOK routes, explicit none and write-only credential subm
   }
   expect(JSON.parse(String(mutations[1]?.[1]?.body))).toEqual({ kind: "none" });
 });
+
+it("drives the ChatGPT sign-in endpoints and shows only fixed failure text", async () => {
+  const calls: { path: string; method: string; body?: string }[] = [];
+  const replies: Response[] = [
+    Response.json({
+      loginId: "l/1",
+      status: "pending",
+      verificationUrl: "https://auth.openai.com/codex/device",
+      userCode: "ABCD-1234",
+      expiresAt: "2026-09-28T10:15:00Z",
+      intervalMs: 5000,
+    }),
+    Response.json(
+      {
+        error: {
+          code: "device_login_unavailable",
+          message: "upstream said something private",
+        },
+      },
+      { status: 502 },
+    ),
+    Response.json({ error: { message: "x" } }, { status: 409 }),
+  ];
+  const client = createAPIConnectionsClient(async (input, init) => {
+    const path = String(input);
+    if (path === "/auth/csrf")
+      return Response.json({ csrf_token: "a".repeat(43) });
+    calls.push({
+      path,
+      method: init?.method ?? "GET",
+      body: init?.body as string | undefined,
+    });
+    return replies.shift() ?? new Response(null, { status: 204 });
+  });
+  const signal = new AbortController().signal;
+  const login = await client.beginChatGPTLogin("conn-1", signal);
+  expect(login.userCode).toBe("ABCD-1234");
+  expect(calls[0]).toEqual({
+    path: "/api/model-connections/chatgpt/login",
+    method: "POST",
+    body: JSON.stringify({ connectionId: "conn-1" }),
+  });
+  const refused = await client
+    .chatGPTLogin(login.loginId, signal)
+    .catch((e: unknown) => e);
+  expect(calls[1]?.path).toBe("/api/model-connections/chatgpt/login/l%2F1");
+  expect(refused).toBeInstanceOf(APIConnectionError);
+  expect((refused as Error).message).toContain("デバイスコード");
+  expect((refused as Error).message).not.toContain("private");
+  const disabled = await client
+    .beginChatGPTLogin(undefined, signal)
+    .catch((e: unknown) => e);
+  expect((disabled as APIConnectionError).status).toBe(409);
+  expect((disabled as Error).message).toContain("利用できません");
+  await client.cancelChatGPTLogin("l/1", signal);
+  expect(calls[3]).toMatchObject({
+    path: "/api/model-connections/chatgpt/login/l%2F1",
+    method: "DELETE",
+  });
+});

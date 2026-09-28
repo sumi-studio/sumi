@@ -31,6 +31,7 @@ import type {
   Decision,
   Event,
   EventInput,
+  FailureKind,
   Input,
   Json,
   MemoryBlock,
@@ -1391,7 +1392,7 @@ export class Secretary {
     turn: Turn,
     events: { kind: string; payload: Record<string, unknown> }[],
     error: string,
-    errorKind?: "no_model_connection" | "oversize_plan",
+    errorKind?: FailureKind,
   ): Promise<void> {
     await this.commitTurnFinal(turn, {
       outcome: "fail",

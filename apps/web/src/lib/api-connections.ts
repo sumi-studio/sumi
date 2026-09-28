@@ -8,6 +8,22 @@ const connectionSchema = z.object({
   baseUrl: z.string(),
   model: z.string(),
   maxOutputTokens: z.number().int().positive().optional(),
+  reasoningEffort: z.string().optional(),
+  reconnectRequired: z.boolean().optional(),
+});
+const chatGPTSchema = z.object({
+  available: z.boolean(),
+  unavailableReason: z.string().optional(),
+});
+const loginSchema = z.object({
+  loginId: z.string(),
+  status: z.enum(["pending", "completed", "failed", "expired", "cancelled"]),
+  verificationUrl: z.string().optional(),
+  userCode: z.string().optional(),
+  expiresAt: z.string(),
+  intervalMs: z.number().int().nonnegative(),
+  error: z.string().optional(),
+  connection: connectionSchema.optional(),
 });
 const stateSchema = z.object({
   available: z.boolean(),
@@ -20,6 +36,7 @@ const stateSchema = z.object({
     ])
     .nullable(),
   activation: z.literal("next_start"),
+  chatgpt: chatGPTSchema.optional(),
 });
 
 function decode<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -41,8 +58,8 @@ const VALIDATION_DETAIL_MAX = 300;
  */
 export class APIConnectionError extends Error {
   readonly status: number;
-  constructor(status: number, validationDetail?: unknown) {
-    super(failureMessage(status, validationDetail));
+  constructor(status: number, validationDetail?: unknown, message?: string) {
+    super(message ?? failureMessage(status, validationDetail));
     this.name = "APIConnectionError";
     this.status = status;
   }
@@ -60,6 +77,21 @@ function failureMessage(status: number, detail: unknown): string {
   return `接続を変更できませんでした。入力内容を確認してください。${reason ? ` ${reason}` : ""}`;
 }
 
+/** Preset of a connection backed by the person's ChatGPT subscription. */
+export const CHATGPT_PRESET = "chatgpt-codex";
+
+// ChatGPT sign-in failures carry a bounded code; the text shown for each is
+// fixed here, never the server's body.
+function chatGPTFailureMessage(status: number, code: unknown): string {
+  if (status === 409)
+    return "このサーバーではChatGPTのサブスクリプション接続を利用できません。";
+  if (status === 404)
+    return "ログインが見つかりません。もう一度はじめてください。";
+  if (code === "device_login_unavailable")
+    return "ChatGPTのデバイスコードによるログインを開始できませんでした。ChatGPTのセキュリティ設定でCodexのデバイスコード認証が有効か確認して、もう一度お試しください。";
+  return "ChatGPTのログインを開始できませんでした。しばらくしてからもう一度お試しください。";
+}
+
 export interface APIConnection {
   id: string;
   name: string;
@@ -73,6 +105,32 @@ export interface APIConnection {
    * the protocol default.
    */
   maxOutputTokens?: number;
+  /** ChatGPT subscription connections: requested reasoning effort. */
+  reasoningEffort?: string;
+  /**
+   * ChatGPT subscription connections: the sign-in expired or was revoked;
+   * the connection cannot answer until the person signs in again.
+   */
+  reconnectRequired?: boolean;
+}
+/** One ChatGPT device-code sign-in, as the browser polls it. */
+export interface ChatGPTLogin {
+  loginId: string;
+  status: "pending" | "completed" | "failed" | "expired" | "cancelled";
+  /** Page where the person enters userCode (only while pending). */
+  verificationUrl?: string;
+  userCode?: string;
+  expiresAt: string;
+  /** Minimum wait before the next status read. */
+  intervalMs: number;
+  /** login_failed | device_login_unavailable | save_failed */
+  error?: string;
+  connection?: APIConnection;
+}
+export interface ChatGPTSettingsInput {
+  name?: string;
+  model: string;
+  reasoningEffort: string;
 }
 export type ConnectionSelection =
   | { kind: "none" }
@@ -83,6 +141,8 @@ export interface ConnectionsState {
   connections: APIConnection[];
   selection: ConnectionSelection | null;
   activation: "next_start";
+  /** Whether this server offers ChatGPT subscription sign-in. */
+  chatgpt?: { available: boolean; unavailableReason?: string };
 }
 export type ConnectionInput = Omit<APIConnection, "id"> & {
   apiKey?: string;
@@ -102,6 +162,23 @@ export interface APIConnectionsClient {
   ): Promise<APIConnection>;
   remove(id: string, signal: AbortSignal): Promise<void>;
   select(selection: ConnectionSelection, signal: AbortSignal): Promise<void>;
+  /**
+   * Start a ChatGPT sign-in. With connectionId, a completed sign-in
+   * reconnects that connection (same id, name and model) instead of adding
+   * one.
+   */
+  beginChatGPTLogin(
+    connectionId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<ChatGPTLogin>;
+  /** Read (and advance) a sign-in; completion stores and selects it. */
+  chatGPTLogin(loginId: string, signal: AbortSignal): Promise<ChatGPTLogin>;
+  cancelChatGPTLogin(loginId: string, signal: AbortSignal): Promise<void>;
+  saveChatGPTSettings(
+    id: string,
+    input: ChatGPTSettingsInput,
+    signal: AbortSignal,
+  ): Promise<APIConnection>;
 }
 export function createAPIConnectionsClient(
   fetcher: typeof fetch = globalThis.fetch.bind(globalThis),
@@ -111,6 +188,7 @@ export function createAPIConnectionsClient(
     signal: AbortSignal,
     method = "GET",
     body?: unknown,
+    chatgpt = false,
   ) {
     const csrf =
       method === "GET" ? undefined : await fetchCSRFToken({ fetcher, signal });
@@ -126,6 +204,17 @@ export function createAPIConnectionsClient(
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
+    if (!response.ok && chatgpt && response.status !== 400) {
+      const code = await response
+        .json()
+        .then((body) => body?.error?.code)
+        .catch(() => undefined);
+      throw new APIConnectionError(
+        response.status,
+        undefined,
+        chatGPTFailureMessage(response.status, code),
+      );
+    }
     if (!response.ok) {
       // Only an input-invalid 400 carries {error:{detail}} the user can act
       // on; no other failure body is read.
@@ -158,5 +247,47 @@ export function createAPIConnectionsClient(
     select: async (body, signal) => {
       await request("/selection", signal, "PUT", body);
     },
+    beginChatGPTLogin: async (connectionId, signal) =>
+      decode(
+        loginSchema,
+        await request(
+          "/chatgpt/login",
+          signal,
+          "POST",
+          connectionId ? { connectionId } : {},
+          true,
+        ),
+      ),
+    chatGPTLogin: async (loginId, signal) =>
+      decode(
+        loginSchema,
+        await request(
+          `/chatgpt/login/${encodeURIComponent(loginId)}`,
+          signal,
+          "GET",
+          undefined,
+          true,
+        ),
+      ),
+    cancelChatGPTLogin: async (loginId, signal) => {
+      await request(
+        `/chatgpt/login/${encodeURIComponent(loginId)}`,
+        signal,
+        "DELETE",
+        undefined,
+        true,
+      );
+    },
+    saveChatGPTSettings: async (id, body, signal) =>
+      decode(
+        connectionSchema,
+        await request(
+          `/chatgpt/${encodeURIComponent(id)}`,
+          signal,
+          "PUT",
+          body,
+          true,
+        ),
+      ),
   };
 }

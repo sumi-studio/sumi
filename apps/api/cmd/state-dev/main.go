@@ -80,6 +80,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("model connection store: %v", err)
 		}
+		if strings.TrimSpace(os.Getenv("SUMI_CHATGPT_SUBSCRIPTION")) == "enabled" {
+			if err := conns.EnableChatGPT(modelconnections.NewOAuthClient()); err != nil {
+				log.Fatalf("chatgpt subscription: %v", err)
+			}
+		}
 		coreState.SetModelConnections(conns)
 	} else {
 		conns = modelconnections.MetadataOnly(pool.Pool)

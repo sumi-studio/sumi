@@ -10,7 +10,13 @@
  *   api      → exactly that connection's base_url / model / api_key /
  *              extra_headers, on the wire its preset declares (chat
  *              completions, OpenAI Responses, or Anthropic Messages).
- *              Any other preset fails the request.
+ *              Any other preset fails the request. The chatgpt-codex
+ *              preset is the person's ChatGPT subscription: the state
+ *              service hands over a short-lived access token for it, the
+ *              call goes to the Codex backend's Responses endpoint, and a
+ *              401 asks the state service to refresh once (a revoked grant
+ *              is a visible "reconnect ChatGPT" failure, never another
+ *              model).
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
  *   unset    → no selection exists (dev personas without a human, or a
@@ -45,10 +51,12 @@
 import {
   ModelError,
   type ModelEvent,
+  type ModelFailureCause,
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
+import { type ChatGPTAccess, tokenDigest } from "../providers/chatgpt-codex.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
@@ -80,6 +88,13 @@ export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
 export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
   "openai-responses",
 ]);
+
+/**
+ * ChatGPT subscription connections: the Responses wire on the Codex
+ * backend, authenticated by the person's own "Sign in with ChatGPT" grant
+ * (an OAuth access token the state service refreshes), not an API key.
+ */
+export const CHATGPT_PRESETS: ReadonlySet<string> = new Set(["chatgpt-codex"]);
 
 /** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
 export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
@@ -172,6 +187,54 @@ export class SelectedModelProvider implements ModelProvider {
    */
   async probe(): Promise<void> {
     await this.resolve();
+  }
+
+  /**
+   * The provider's one refresh after a 401: report the rejected token (by
+   * digest) and take the replacement from the state service, which owns
+   * the grant and serializes rotation. The call must stay on the same
+   * connection and version it was admitted under — a selection changed
+   * meanwhile retries the turn rather than finishing on another grant.
+   */
+  private async refreshChatGPT(
+    c: NonNullable<ModelBinding["connection"]>,
+    rejectedToken: string,
+  ): Promise<ChatGPTAccess> {
+    const { state, persona } = this.opts;
+    let next: ModelBinding;
+    try {
+      next = await state.refreshModelCredential(
+        persona,
+        c.id,
+        await tokenDigest(rejectedToken),
+      );
+    } catch (e) {
+      const definite =
+        e instanceof StateError &&
+        e.status >= 400 &&
+        e.status < 500 &&
+        e.status !== 429;
+      throw new ModelError(
+        `ChatGPT credential refresh failed: ${e instanceof Error ? e.message : String(e)}`,
+        { retryable: !definite, unavailable: true },
+      );
+    }
+    const nc = next.connection;
+    if (
+      next.selection !== "api" ||
+      !nc ||
+      nc.id !== c.id ||
+      nc.version !== c.version
+    ) {
+      throw new ModelError(
+        "the selected model connection changed during the call",
+        { retryable: true, unavailable: true },
+      );
+    }
+    if (!next.credential_available || !next.api_key || !nc.account_id) {
+      throw chatGPTUnavailable(nc.name, next);
+    }
+    return { accessToken: next.api_key, accountId: nc.account_id };
   }
 
   /**
@@ -421,11 +484,37 @@ export class SelectedModelProvider implements ModelProvider {
     if (
       !CHAT_COMPLETIONS_PRESETS.has(c.preset) &&
       !RESPONSES_PRESETS.has(c.preset) &&
-      !ANTHROPIC_PRESETS.has(c.preset)
+      !ANTHROPIC_PRESETS.has(c.preset) &&
+      !CHATGPT_PRESETS.has(c.preset)
     ) {
       throw unusable(
         `the selected connection ${c.name} uses preset ${c.preset}, whose protocol this core does not implement`,
       );
+    }
+    const identity: BindingIdentity = {
+      selection: "api",
+      connection_id: c.id,
+      preset: c.preset,
+      model: c.model,
+      version: c.version,
+    };
+    if (CHATGPT_PRESETS.has(c.preset)) {
+      if (!binding.credential_available || !binding.api_key || !c.account_id) {
+        throw chatGPTUnavailable(c.name, binding);
+      }
+      const provider = new OpenAIResponsesProvider({
+        baseUrl: c.base_url,
+        apiKey: binding.api_key,
+        model: c.model,
+        timeoutMs: this.opts.timeoutMs,
+        chatgpt: {
+          accountId: c.account_id,
+          reasoningEffort: c.reasoning_effort || undefined,
+          refresh: (rejected) => this.refreshChatGPT(c, rejected),
+        },
+      });
+      this.opts.log?.("model bound to selected connection", identity);
+      return { provider, identity };
     }
     if (!binding.credential_available || !binding.api_key) {
       throw unusable(
@@ -456,19 +545,25 @@ export class SelectedModelProvider implements ModelProvider {
       : ANTHROPIC_PRESETS.has(c.preset)
         ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
         : new OpenAIProvider(shared);
-    const identity: BindingIdentity = {
-      selection: "api",
-      connection_id: c.id,
-      preset: c.preset,
-      model: c.model,
-      version: c.version,
-    };
     this.opts.log?.("model bound to selected connection", identity);
     return { provider, identity };
   }
 }
 
-function unusable(message: string, cause?: "no_model_connection"): ModelError {
+function chatGPTUnavailable(name: string, binding: ModelBinding): ModelError {
+  if (binding.credential_state === "reconnect_required") {
+    return unusable(
+      `the ChatGPT sign-in for connection ${name} expired or was revoked; reconnect ChatGPT in AI connection settings`,
+      "model_reconnect_required",
+    );
+  }
+  return unusable(
+    `the selected connection ${name} has no usable ChatGPT sign-in (${binding.reason ?? "unavailable"})`,
+    binding.credential_state === "disabled" ? "no_model_connection" : undefined,
+  );
+}
+
+function unusable(message: string, cause?: ModelFailureCause): ModelError {
   return new ModelError(message, {
     retryable: false,
     unavailable: true,

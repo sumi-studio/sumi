@@ -235,6 +235,18 @@ export interface StateClient {
    * binding or report it unavailable; never substitute another provider.
    */
   modelBinding(persona: string): Promise<ModelBinding>;
+  /**
+   * Report that the provider rejected the credential the binding carried
+   * (HTTP 401 before any output) and receive the persona's current
+   * binding. For a subscription connection the state service refreshes
+   * the grant unless the rejected token (named by its SHA-256 hex, never
+   * sent back) was already replaced by a concurrent call.
+   */
+  refreshModelCredential(
+    persona: string,
+    connectionId: string,
+    rejectedTokenSha256: string,
+  ): Promise<ModelBinding>;
   completeOperation(
     persona: string,
     operationId: string,
@@ -768,6 +780,20 @@ export class HttpStateClient implements StateClient {
     return this.call<ModelBinding>(
       "GET",
       `/internal/core/personas/${persona}/model`,
+    );
+  }
+  refreshModelCredential(
+    persona: string,
+    connectionId: string,
+    rejectedTokenSha256: string,
+  ) {
+    return this.call<ModelBinding>(
+      "POST",
+      `/internal/core/personas/${persona}/model/credential-refresh`,
+      {
+        connection_id: connectionId,
+        rejected_token_sha256: rejectedTokenSha256,
+      },
     );
   }
   async completeOperation(

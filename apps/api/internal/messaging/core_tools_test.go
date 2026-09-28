@@ -1536,7 +1536,7 @@ func TestCoreToolsTerminalFailureNoticeIsolation(t *testing.T) {
 // conversation; unknown causes get truthful generic wording.
 func TestFailureNoticeCauseStaysPublic(t *testing.T) {
 	const canary = "CANARY-PRIVATE-TOKEN-123456"
-	for _, kind := range []string{"", "no_model_connection", "oversize_plan", "unlisted_kind"} {
+	for _, kind := range []string{"", "no_model_connection", "oversize_plan", "model_reconnect_required", "model_usage_limit", "unlisted_kind"} {
 		f := agentstate.TerminalFailure{
 			Error:     "provider rejected request containing " + canary,
 			ErrorKind: kind,

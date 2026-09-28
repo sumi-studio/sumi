@@ -35,8 +35,10 @@ person ─ browser ─ sumi-alpha Worker ─ VPC Service sumi-alpha-api ─ tunn
   memory preparation and schedules without any wake.
 - A secretary without a selected model connection gets a visible
   `turn_failed` ("no model connection is selected …"). No operator model
-  answers for it. ChatGPT selections are not implemented by this core and fail
-  the same way.
+  answers for it. ChatGPT subscription connections are off unless the API
+  sets `SUMI_CHATGPT_SUBSCRIPTION=enabled`, which the hosted alpha does not.
+  See [ChatGPT subscription connections](../agent/chatgpt-subscription.md)
+  for the policy status.
 
 ## Credentials
 

@@ -121,12 +121,18 @@ export interface ModelProvider {
  * settings. It is set only where the cause is certain; everything else
  * stays unclassified rather than guessing at a provider taxonomy.
  */
+/** The model-side subset of the bounded failure classifications. */
+export type ModelFailureCause =
+  | "no_model_connection"
+  | "model_reconnect_required"
+  | "model_usage_limit";
+
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
   readonly refusal?: "context_length";
   readonly unavailable?: boolean;
-  readonly cause?: "no_model_connection";
+  readonly cause?: ModelFailureCause;
   constructor(
     message: string,
     opts: {
@@ -134,7 +140,7 @@ export class ModelError extends Error {
       retryAfterMs?: number;
       refusal?: "context_length";
       unavailable?: boolean;
-      cause?: "no_model_connection";
+      cause?: ModelFailureCause;
     },
   ) {
     super(message);

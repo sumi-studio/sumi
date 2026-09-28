@@ -7,6 +7,14 @@ import {
   type ToolCall,
 } from "../provider.ts";
 import {
+  type ChatGPTDialect,
+  FUNCTION_NAMESPACE,
+  LITE_HEADER,
+  litePrefix,
+  usageLimitError,
+  usesResponsesLite,
+} from "./chatgpt-codex.ts";
+import {
   assertExtraHeaders,
   encodeCallArguments,
   httpError,
@@ -53,6 +61,12 @@ export interface ResponsesConfig {
    * `headers` so the live identity always wins over a static value.
    */
   sessionHeader?: string;
+  /**
+   * ChatGPT subscription connection (Codex backend). `apiKey` is then the
+   * OAuth access token; requests carry ChatGPT-Account-ID, send no output
+   * bound, and a 401 before any output triggers one credential refresh.
+   */
+  chatgpt?: ChatGPTDialect;
 }
 
 /**
@@ -64,7 +78,7 @@ export interface ResponsesConfig {
  * record of it.
  */
 export class OpenAIResponsesProvider implements ModelProvider {
-  readonly name = "openai-responses";
+  readonly name: string;
   private readonly cfg: ResponsesConfig;
   private readonly fetchImpl: typeof fetch;
 
@@ -74,10 +88,13 @@ export class OpenAIResponsesProvider implements ModelProvider {
   ) {
     this.cfg = cfg;
     this.fetchImpl = fetchImpl;
+    this.name = cfg.chatgpt ? "chatgpt-codex" : "openai-responses";
   }
 
   /** The output bound the next request will actually send, if any. */
   outputBound(): number | undefined {
+    // The Codex backend takes no output bound; none is sent.
+    if (this.cfg.chatgpt) return undefined;
     const extra = this.cfg.extra;
     const overridden =
       extra !== undefined ? numOr(extra.max_output_tokens) : undefined;
@@ -96,68 +113,114 @@ export class OpenAIResponsesProvider implements ModelProvider {
     );
     let events: AsyncGenerator<{ event: string; data: string }> | null = null;
     try {
+      const chatgpt = this.cfg.chatgpt;
+      const body = chatgpt
+        ? await chatGPTBody(this.cfg.model, chatgpt, request, tools, toWire)
+        : JSON.stringify({
+            model: this.cfg.model,
+            stream: true,
+            store: false,
+            // Stable per-persona identity for provider prefix-cache
+            // routing — the same identity the legacy agent supplied as
+            // `session_id` (session IDs are the documented common value).
+            prompt_cache_key: request.personaId,
+            ...(this.cfg.maxOutputTokens
+              ? { max_output_tokens: this.cfg.maxOutputTokens }
+              : {}),
+            ...toInput(request.messages, toWire),
+            ...(tools.length
+              ? {
+                  // `strict: false` is explicit: when it is omitted,
+                  // Responses normalizes each schema into strict mode
+                  // where it can, which marks every property required.
+                  // Sumi's tools use optional fields as alternatives
+                  // (conversation_history's seq/chunk_seq/from_seq, a
+                  // search-only query), so the normalized schema admits
+                  // no valid read at all. The canonical schema, as
+                  // written, is the contract on every provider;
+                  // receivers validate the call.
+                  tools: tools.map((t) => functionTool(t)),
+                }
+              : {}),
+            ...this.cfg.extra,
+          });
+      let apiKey = this.cfg.apiKey;
+      let accountId = chatgpt?.accountId;
       let res: Response;
-      try {
-        res = await this.fetchImpl(
-          `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
+      for (let attempt = 0; ; attempt++) {
+        try {
+          res = await this.fetchImpl(
+            `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
+            {
+              method: "POST",
+              headers: requestHeaders(
+                {
+                  Authorization: `Bearer ${apiKey}`,
+                  "Content-Type": "application/json",
+                  "User-Agent": SUMI_USER_AGENT,
+                  ...(chatgpt
+                    ? {
+                        Accept: "text/event-stream",
+                        "ChatGPT-Account-ID": accountId ?? "",
+                        // Identifies the calling client honestly; Sumi does
+                        // not present itself as a Codex first-party client.
+                        originator: "sumi",
+                        session_id: request.personaId,
+                        ...(usesResponsesLite(this.cfg.model)
+                          ? { [LITE_HEADER]: "true" }
+                          : {}),
+                      }
+                    : {}),
+                },
+                this.cfg.headers,
+                this.cfg.sessionHeader
+                  ? { header: this.cfg.sessionHeader, value: request.personaId }
+                  : undefined,
+              ),
+              signal: deadline.signal,
+              // Never follow a redirect: this request carries credentials
+              // and fetch forwards x-api-key/extra headers cross-origin.
+              redirect: "manual",
+              body,
+            },
+          );
+        } catch (e) {
+          throw networkError(e, request.signal);
+        }
+        // A subscription access token rejected before any output: refresh
+        // once through the state service (which serializes rotation) and
+        // resend the identical body. A second 401 is not retried.
+        if (res.status === 401 && chatgpt && attempt === 0) {
+          await res.body?.cancel().catch(() => {});
+          const next = await chatgpt.refresh(apiKey);
+          apiKey = next.accessToken;
+          accountId = next.accountId;
+          continue;
+        }
+        break;
+      }
+      if (res.status === 401 && chatgpt) {
+        await res.body?.cancel().catch(() => {});
+        throw new ModelError(
+          "ChatGPT rejected the refreshed sign-in for this connection; reconnect ChatGPT",
+          // No output was produced and nothing was billed: the model was
+          // not consulted.
           {
-            method: "POST",
-            headers: requestHeaders(
-              {
-                Authorization: `Bearer ${this.cfg.apiKey}`,
-                "Content-Type": "application/json",
-                "User-Agent": SUMI_USER_AGENT,
-              },
-              this.cfg.headers,
-              this.cfg.sessionHeader
-                ? { header: this.cfg.sessionHeader, value: request.personaId }
-                : undefined,
-            ),
-            signal: deadline.signal,
-            // Never follow a redirect: this request carries credentials
-            // and fetch forwards x-api-key/extra headers cross-origin.
-            redirect: "manual",
-            body: JSON.stringify({
-              model: this.cfg.model,
-              stream: true,
-              store: false,
-              // Stable per-persona identity for provider prefix-cache
-              // routing — the same identity the legacy agent supplied as
-              // `session_id` (session IDs are the documented common value).
-              prompt_cache_key: request.personaId,
-              ...(this.cfg.maxOutputTokens
-                ? { max_output_tokens: this.cfg.maxOutputTokens }
-                : {}),
-              ...toInput(request.messages, toWire),
-              ...(tools.length
-                ? {
-                    // `strict: false` is explicit: when it is omitted,
-                    // Responses normalizes each schema into strict mode
-                    // where it can, which marks every property required.
-                    // Sumi's tools use optional fields as alternatives
-                    // (conversation_history's seq/chunk_seq/from_seq, a
-                    // search-only query), so the normalized schema admits
-                    // no valid read at all. The canonical schema, as
-                    // written, is the contract on every provider;
-                    // receivers validate the call.
-                    tools: tools.map((t) => ({
-                      type: "function",
-                      name: t.wire,
-                      description: t.spec.description,
-                      parameters: t.parameters,
-                      strict: false,
-                    })),
-                  }
-                : {}),
-              ...this.cfg.extra,
-            }),
+            retryable: false,
+            cause: "model_reconnect_required",
+            unavailable: true,
           },
         );
-      } catch (e) {
-        throw networkError(e, request.signal);
       }
       const refused = redirectRefusal(res);
       if (refused) throw refused;
+      if (chatgpt && res.status === 429) {
+        const text = (await res.text().catch(() => "")).slice(0, 4096);
+        throw (
+          usageLimitError(429, text) ??
+          (await httpError(new Response(text, res)))
+        );
+      }
       if (!res.ok || !res.body) {
         throw await httpError(res);
       }
@@ -393,6 +456,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
 function toInput(
   messages: ChatMessage[],
   toWire: Map<string, string>,
+  dialect: "standard" | "chatgpt" | "chatgpt-lite" = "standard",
 ): {
   instructions?: string;
   input: Record<string, unknown>[];
@@ -417,10 +481,15 @@ function toInput(
           // "presumed to have been generated by the model in previous
           // interactions" and needs no item id — unlike the output-message
           // form, where id is a required field the journal never stored.
+          // The Codex backend receives the content-part form its own
+          // client replays.
           input.push({
             type: "message",
             role: "assistant",
-            content: m.content,
+            content:
+              dialect === "standard"
+                ? m.content
+                : [{ type: "output_text", text: m.content }],
           });
         }
         for (const c of m.toolCalls ?? []) {
@@ -434,8 +503,11 @@ function toInput(
             // this request, so the deterministic transform is the
             // fallback.
             name: toWire.get(c.name) ?? sanitizeToolName(c.name),
+            ...(dialect === "chatgpt-lite"
+              ? { namespace: FUNCTION_NAMESPACE }
+              : {}),
             arguments: encodeCallArguments(c),
-            status: "completed",
+            ...(dialect === "standard" ? { status: "completed" } : {}),
           });
         }
         break;
@@ -457,4 +529,59 @@ function toInput(
 
 function numOr(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+type WireTool = ReturnType<typeof wireTools>[number];
+
+function functionTool(t: WireTool): Record<string, unknown> {
+  return {
+    type: "function",
+    name: t.wire,
+    description: t.spec.description,
+    parameters: t.parameters,
+    strict: false,
+  };
+}
+
+/**
+ * The Codex-backend request body, in the shape the Codex client sends:
+ * store:false + stream:true, tool_choice auto, no output bound, the
+ * persona as prompt_cache_key. "Lite" models carry tools and instructions
+ * as ordered input items (see litePrefix) instead of `tools` /
+ * `instructions`, and take no parallel tool calls.
+ */
+async function chatGPTBody(
+  model: string,
+  dialect: ChatGPTDialect,
+  request: ModelRequest,
+  tools: WireTool[],
+  toWire: Map<string, string>,
+): Promise<string> {
+  const lite = usesResponsesLite(model);
+  const { instructions, input } = toInput(
+    request.messages,
+    toWire,
+    lite ? "chatgpt-lite" : "chatgpt",
+  );
+  const functions = tools.map((t) => functionTool(t));
+  return JSON.stringify({
+    model,
+    ...(lite ? {} : instructions ? { instructions } : {}),
+    input: lite
+      ? [
+          ...(await litePrefix(request.personaId, instructions, functions)),
+          ...input,
+        ]
+      : input,
+    ...(!lite && functions.length ? { tools: functions } : {}),
+    tool_choice: "auto",
+    parallel_tool_calls: !lite,
+    ...(dialect.reasoningEffort
+      ? { reasoning: { effort: dialect.reasoningEffort } }
+      : {}),
+    store: false,
+    stream: true,
+    include: [],
+    prompt_cache_key: request.personaId,
+  });
 }

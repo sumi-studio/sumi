@@ -57,6 +57,14 @@ export interface AgentRun {
   trace: AgentTraceEvent[];
 }
 
+/** Model failures the user can fix from the connection settings. */
+export const MODEL_FAILURE_CAUSES = [
+  "no_model_connection",
+  "model_reconnect_required",
+  "model_usage_limit",
+] as const;
+export type ModelFailureCause = (typeof MODEL_FAILURE_CAUSES)[number];
+
 export type UserDelivery = "pending" | "admitted" | "rejected" | "durable";
 
 /**
@@ -140,9 +148,12 @@ export type ConversationEntry =
        * Bounded failure classification carried on the wire's provider_code.
        * "no_model_connection" = no usable model connection is selected; the
        * row renders localized guidance plus the connection-settings sheet.
-       * Unknown/absent codes keep the generic presentation.
+       * "model_reconnect_required" = the selected ChatGPT sign-in expired
+       * or was revoked; "model_usage_limit" = the selected ChatGPT plan's
+       * usage limit was reached. Unknown/absent codes keep the generic
+       * presentation.
        */
-      cause?: "no_model_connection";
+      cause?: ModelFailureCause;
     };
 
 /**
