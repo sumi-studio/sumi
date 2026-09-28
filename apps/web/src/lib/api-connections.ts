@@ -88,7 +88,7 @@ function chatGPTFailureMessage(status: number, code: unknown): string {
   if (status === 404)
     return "ログインが見つかりません。もう一度はじめてください。";
   if (code === "device_login_unavailable")
-    return "ChatGPTのデバイスコードによるログインを開始できませんでした。ChatGPTのセキュリティ設定でCodexのデバイスコード認証が有効か確認して、もう一度お試しください。";
+    return "ChatGPT側が現在、デバイスコードによるログインの開始を受け付けていません。しばらくしてからもう一度お試しください。";
   return "ChatGPTのログインを開始できませんでした。しばらくしてからもう一度お試しください。";
 }
 
@@ -168,12 +168,16 @@ export interface APIConnectionsClient {
    * one.
    */
   beginChatGPTLogin(
+    loginId: string,
     connectionId: string | undefined,
     signal: AbortSignal,
   ): Promise<ChatGPTLogin>;
   /** Read (and advance) a sign-in; completion stores and selects it. */
   chatGPTLogin(loginId: string, signal: AbortSignal): Promise<ChatGPTLogin>;
-  cancelChatGPTLogin(loginId: string, signal: AbortSignal): Promise<void>;
+  cancelChatGPTLogin(
+    loginId: string,
+    signal: AbortSignal,
+  ): Promise<ChatGPTLogin>;
   saveChatGPTSettings(
     id: string,
     input: ChatGPTSettingsInput,
@@ -247,14 +251,14 @@ export function createAPIConnectionsClient(
     select: async (body, signal) => {
       await request("/selection", signal, "PUT", body);
     },
-    beginChatGPTLogin: async (connectionId, signal) =>
+    beginChatGPTLogin: async (loginId, connectionId, signal) =>
       decode(
         loginSchema,
         await request(
           "/chatgpt/login",
           signal,
           "POST",
-          connectionId ? { connectionId } : {},
+          { loginId, ...(connectionId ? { connectionId } : {}) },
           true,
         ),
       ),
@@ -269,15 +273,17 @@ export function createAPIConnectionsClient(
           true,
         ),
       ),
-    cancelChatGPTLogin: async (loginId, signal) => {
-      await request(
-        `/chatgpt/login/${encodeURIComponent(loginId)}`,
-        signal,
-        "DELETE",
-        undefined,
-        true,
-      );
-    },
+    cancelChatGPTLogin: async (loginId, signal) =>
+      decode(
+        loginSchema,
+        await request(
+          `/chatgpt/login/${encodeURIComponent(loginId)}`,
+          signal,
+          "DELETE",
+          undefined,
+          true,
+        ),
+      ),
     saveChatGPTSettings: async (id, body, signal) =>
       decode(
         connectionSchema,

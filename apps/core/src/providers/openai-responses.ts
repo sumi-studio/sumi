@@ -228,7 +228,15 @@ export class OpenAIResponsesProvider implements ModelProvider {
         if (res.status === 400 && chatgpt && replaying) {
           await res.body?.cancel().catch(() => {});
           body = (
-            await chatGPTBody(this.cfg.model, chatgpt, request, tools, toWire)
+            await chatGPTBody(
+              this.cfg.model,
+              chatgpt,
+              request,
+              tools,
+              toWire,
+              scope,
+              true,
+            )
           ).body;
           replaying = false;
           continue;
@@ -277,8 +285,12 @@ export class OpenAIResponsesProvider implements ModelProvider {
       let finished = false;
       // The round's output order with its encrypted reasoning, kept for
       // continuation (ChatGPT dialect only).
-      const kept: Record<string, unknown>[] = [];
-      let reasoningBytes = 0;
+      const kept = new Map<number, Record<string, unknown>>();
+      const messageText = new Map<number, { text: string; bytes: number }>();
+      const encoder = new TextEncoder();
+      let pendingMessageBytes = 0;
+      let continuationBytes = 0;
+      let continuationTooLarge = false;
       let reasoningItems = 0;
       events = sseEvents(res.body);
 
@@ -320,7 +332,27 @@ export class OpenAIResponsesProvider implements ModelProvider {
         }
         switch (json.type) {
           case "response.output_text.delta":
-            if (json.delta) yield { type: "text", delta: json.delta };
+            if (json.delta) {
+              if (chatgpt && !continuationTooLarge) {
+                const idx = json.output_index ?? 0;
+                const prior = messageText.get(idx);
+                const deltaBytes = encoder.encode(json.delta).length;
+                pendingMessageBytes += deltaBytes;
+                if (
+                  continuationBytes + pendingMessageBytes >
+                  MAX_CONTINUATION_BYTES
+                ) {
+                  continuationTooLarge = true;
+                  messageText.clear();
+                  kept.clear();
+                } else
+                  messageText.set(idx, {
+                    text: (prior?.text ?? "") + json.delta,
+                    bytes: (prior?.bytes ?? 0) + deltaBytes,
+                  });
+              }
+              yield { type: "text", delta: json.delta };
+            }
             break;
           case "response.output_item.added": {
             const item = json.item;
@@ -355,13 +387,28 @@ export class OpenAIResponsesProvider implements ModelProvider {
           }
           case "response.output_item.done": {
             const item = json.item;
-            if (chatgpt) {
+            if (chatgpt && !continuationTooLarge) {
               const entry = continuationEntry(item);
               if (entry) {
-                kept.push(entry);
+                const idx = json.output_index ?? kept.size;
+                if (entry.type === "message" && entry.text === undefined) {
+                  entry.text = messageText.get(idx)?.text ?? "";
+                }
+                pendingMessageBytes -= messageText.get(idx)?.bytes ?? 0;
+                messageText.delete(idx);
+                continuationBytes += encoder.encode(
+                  JSON.stringify(entry),
+                ).length;
+                if (
+                  continuationBytes + pendingMessageBytes >
+                  MAX_CONTINUATION_BYTES
+                ) {
+                  continuationTooLarge = true;
+                  kept.clear();
+                  messageText.clear();
+                } else kept.set(idx, entry);
                 if (entry.type === "reasoning") {
                   reasoningItems += 1;
-                  reasoningBytes += String(entry.encrypted_content).length;
                 }
               }
             }
@@ -496,8 +543,13 @@ export class OpenAIResponsesProvider implements ModelProvider {
         yield { type: "tool_call", call };
       }
       const continuation: ProviderContinuation | undefined =
-        scope && reasoningItems > 0 && reasoningBytes <= MAX_CONTINUATION_BYTES
-          ? { scope, output: kept }
+        scope && reasoningItems > 0 && !continuationTooLarge
+          ? {
+              scope,
+              output: [...kept.entries()]
+                .sort(([a], [b]) => a - b)
+                .map(([, entry]) => entry),
+            }
           : undefined;
       yield { type: "done", usage, ...(continuation ? { continuation } : {}) };
     } finally {
@@ -519,6 +571,7 @@ function toInput(
   dialect: "standard" | "chatgpt" | "chatgpt-lite" = "standard",
   /** Continuation scope to replay; unset = replay none. */
   replayScope?: string,
+  omitReasoning = false,
 ): {
   instructions?: string;
   input: Record<string, unknown>[];
@@ -542,9 +595,11 @@ function toInput(
         break;
       case "assistant": {
         let textDone = !m.content;
-        const pushText = () => {
-          if (textDone) return;
+        const pushText = (part?: string) => {
+          if (part === undefined && textDone) return;
           textDone = true;
+          const text = part ?? m.content;
+          if (!text) return;
           // The easy input-message form: role "assistant" is documented as
           // "presumed to have been generated by the model in previous
           // interactions" and needs no item id — unlike the output-message
@@ -555,9 +610,7 @@ function toInput(
             type: "message",
             role: "assistant",
             content:
-              dialect === "standard"
-                ? m.content
-                : [{ type: "output_text", text: m.content }],
+              dialect === "standard" ? text : [{ type: "output_text", text }],
           });
         };
         const pending = new Map((m.toolCalls ?? []).map((c) => [c.id, c]));
@@ -594,13 +647,19 @@ function toInput(
         for (const o of cont) {
           const entry = continuationEntry(o);
           if (entry?.type === "reasoning") {
-            input.push(entry);
-            replaying = true;
+            if (!omitReasoning) {
+              input.push(entry);
+              replaying = true;
+            }
           } else if (entry?.type === "message") {
-            pushText();
+            pushText(typeof entry.text === "string" ? entry.text : undefined);
           } else if (entry?.type === "function_call") {
             const c = pending.get(String(entry.call_id));
-            if (c) pushCall(c, entry.id as string | undefined);
+            if (c)
+              pushCall(
+                c,
+                omitReasoning ? undefined : (entry.id as string | undefined),
+              );
           }
         }
         pushText();
@@ -662,6 +721,7 @@ async function chatGPTBody(
   tools: WireTool[],
   toWire: Map<string, string>,
   replayScope?: string,
+  omitReasoning = false,
 ): Promise<{ body: string; replaying: boolean }> {
   const lite = usesResponsesLite(model);
   const { instructions, input, replaying } = toInput(
@@ -669,6 +729,7 @@ async function chatGPTBody(
     toWire,
     lite ? "chatgpt-lite" : "chatgpt",
     replayScope,
+    omitReasoning,
   );
   const functions = tools.map((t) => functionTool(t));
   // The Codex client's reasoning parameters: the requested effort, and on

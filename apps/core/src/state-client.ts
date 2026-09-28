@@ -429,13 +429,13 @@ export const STATE_CALL_TIMEOUT_MS = 10_000;
 /**
  * Deadline for the two model-credential calls (binding and
  * credential-refresh). Either may refresh a subscription grant at the
- * issuer, which the service bounds at 30s (its issuer HTTP timeout is
- * 20s) and completes even if this call is abandoned. Waiting slightly
- * longer than that bound lets an ordinary slow refresh finish inside the
- * turn instead of failing it and retrying against a row that is still
+ * issuer. The service gives lock acquisition 5s, refresh 25s (its issuer
+ * HTTP timeout is 20s), and persistence a fresh 5s, completing even if this
+ * call is abandoned. Waiting longer than their sum lets a slow refresh finish
+ * inside the turn instead of failing it and retrying against a row that is still
  * locked; the call stays bounded.
  */
-export const MODEL_CREDENTIAL_CALL_TIMEOUT_MS = 35_000;
+export const MODEL_CREDENTIAL_CALL_TIMEOUT_MS = 40_000;
 
 /**
  * The deadline's rejection shape. call() passes only its own timeout

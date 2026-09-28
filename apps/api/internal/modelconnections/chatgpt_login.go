@@ -24,10 +24,6 @@ type LoginView struct {
 	Connection      *Connection `json:"connection,omitempty"`
 }
 
-// pollTimeout bounds one poll: the row lock wait, the issuer poll, the code
-// exchange (each bounded by the OAuth client's HTTP timeout) and the save.
-const pollTimeout = 45 * time.Second
-
 // Bounded login failure codes (the HTTP layer renders them).
 const (
 	loginErrFailed      = "login_failed"
@@ -60,109 +56,105 @@ func (s *Store) openDevice(human, login string, b []byte) (string, error) {
 	return string(v), nil
 }
 
-// resumeMargin: a pending login closer than this to expiry is not resumed;
-// there would be too little time left to enter its code.
-const resumeMargin = time.Minute
-
-// BeginChatGPTLogin starts a device-code login for the signed-in person
-// (bound to their browser session). target, when set, names the
-// subscription connection the login reconnects.
-//
-// When the same browser session already has a pending login for the same
-// target with time left, that login is returned instead (same code): a
-// reload, a discarded mobile tab or a reopened settings sheet continues
-// the sign-in the person may already have authorized, rather than
-// replacing it. Otherwise a new login starts and any earlier pending
-// login of the same person is cancelled.
-func (s *Store) BeginChatGPTLogin(ctx context.Context, human, session, target string) (LoginView, error) {
+// BeginChatGPTLogin starts or recovers one browser-chosen login ID. Retries
+// with the same ID return that attempt, including its completed connection.
+// A different ID is an intentional new login and replaces any pending one.
+// The browser persists only this opaque ID, never a code or credential.
+func (s *Store) BeginChatGPTLogin(ctx context.Context, human, session, target, loginID string) (LoginView, error) {
 	if !s.ChatGPTEnabled() {
 		return LoginView{}, ErrChatGPTDisabled
 	}
-	if session == "" {
+	id, err := uuid.Parse(loginID)
+	if err != nil || session == "" {
 		return LoginView{}, ErrInvalid
 	}
+	loginID = id.String()
 	var targetID *string
 	if target != "" {
 		parsed, err := uuid.Parse(target)
 		if err != nil {
 			return LoginView{}, ErrNotFound
 		}
-		var found bool
-		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_api_connections WHERE human_id=$1 AND connection_id=$2 AND preset=$3)`, human, parsed.String(), ChatGPTPreset).Scan(&found); err != nil {
-			return LoginView{}, err
-		}
-		if !found {
-			return LoginView{}, ErrNotFound
-		}
-		t := parsed.String()
-		targetID = &t
+		target = parsed.String()
+		targetID = &target
 	}
-	if v, ok, err := s.resumableLogin(ctx, human, session, targetID); err != nil || ok {
-		return v, err
-	}
-	device, err := s.oauth.BeginDevice(ctx)
-	if err != nil {
-		return LoginView{}, err
-	}
-	now := s.oauth.now()
-	id := uuid.NewString()
-	sealed, err := s.sealDevice(human, id, device.DeviceAuthID)
-	if err != nil {
-		return LoginView{}, err
-	}
-	view := LoginView{
-		LoginID: id, Status: "pending", VerificationURL: device.VerificationURL, UserCode: device.UserCode,
-		ExpiresAt: now.Add(deviceLoginLifetime), IntervalMs: device.Interval.Milliseconds(),
-	}
+	ctx, cancelLock := chatGPTPhase(ctx, chatGPTLockTimeout)
+	defer cancelLock()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return LoginView{}, err
 	}
-	defer tx.Rollback(context.Background())
-	// Lock order is login rows, then the person (see PollChatGPTLogin). A
-	// login whose poll is completing right now is waited for, not
-	// cancelled: its one-time code has been exchanged and its grant is
-	// saved. A pending login created and locked by another request after
-	// this point is skipped rather than waited on while holding the person.
-	if _, err = tx.Exec(ctx, `SELECT 1 FROM model_chatgpt_logins WHERE human_id=$1 AND status='pending' FOR UPDATE`, human); err != nil {
-		return LoginView{}, err
-	}
+	defer rollbackChatGPT(tx)
+	// All login operations use human -> login -> connection, including
+	// rechecking the attempt ID and replacement after acquiring the human.
 	if err = lockHuman(ctx, tx, human); err != nil {
 		return LoginView{}, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status='cancelled' WHERE login_id IN
- (SELECT login_id FROM model_chatgpt_logins WHERE human_id=$1 AND status='pending' FOR UPDATE SKIP LOCKED)`, human); err != nil {
+	r, err := readLogin(ctx, tx, human, session, loginID)
+	if err == nil {
+		if (r.target == nil) != (targetID == nil) || (r.target != nil && *r.target != target) {
+			return LoginView{}, ErrInvalid
+		}
+		cancelLock()
+		ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+		defer cancelSave()
+		if r.status == "pending" && !s.oauth.now().Before(r.expires) {
+			r.status = "expired"
+			if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status='expired' WHERE login_id=$1`, loginID); err != nil {
+				return LoginView{}, err
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return LoginView{}, err
+		}
+		return s.loginView(ctx, human, loginID, r), nil
+	}
+	if !errors.Is(err, ErrNotFound) {
 		return LoginView{}, err
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM model_chatgpt_logins WHERE human_id=$1 AND created_at < $2`, human, now.Add(-24*time.Hour)); err != nil {
+	// A login ID is immutable and cannot be rebound to another session or
+	// person. Do not issue a device code for a colliding ID.
+	var exists bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_chatgpt_logins WHERE login_id=$1)`, loginID).Scan(&exists); err != nil {
 		return LoginView{}, err
 	}
+	if exists {
+		return LoginView{}, ErrNotFound
+	}
+	if targetID != nil {
+		if err = lockChatGPTTarget(ctx, tx, human, target); err != nil {
+			return LoginView{}, err
+		}
+	}
+	if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status='cancelled' WHERE human_id=$1 AND status='pending'`, human); err != nil {
+		return LoginView{}, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM model_chatgpt_logins WHERE human_id=$1 AND created_at < $2`, human, s.oauth.now().Add(-24*time.Hour)); err != nil {
+		return LoginView{}, err
+	}
+	cancelLock()
+	issuerCtx, cancelIssuer := chatGPTPhase(ctx, chatGPTRefreshTimeout)
+	device, err := s.oauth.BeginDevice(issuerCtx)
+	cancelIssuer()
+	if err != nil {
+		return LoginView{}, err
+	}
+	ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+	defer cancelSave()
+	now := s.oauth.now()
+	sealed, err := s.sealDevice(human, loginID, device.DeviceAuthID)
+	if err != nil {
+		return LoginView{}, err
+	}
+	v := LoginView{LoginID: loginID, Status: "pending", VerificationURL: device.VerificationURL, UserCode: device.UserCode,
+		ExpiresAt: now.Add(deviceLoginLifetime), IntervalMs: device.Interval.Milliseconds()}
 	_, err = tx.Exec(ctx, `INSERT INTO model_chatgpt_logins(login_id,human_id,session_id,connection_id,device_ciphertext,user_code,verification_url,interval_seconds,expires_at,next_poll_at,status,created_at)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)`,
-		id, human, session, targetID, sealed, device.UserCode, device.VerificationURL, int(device.Interval/time.Second), view.ExpiresAt, now.Add(device.Interval), now)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11)`, loginID, human, session, targetID, sealed, device.UserCode, device.VerificationURL,
+		int(device.Interval/time.Second), v.ExpiresAt, now.Add(device.Interval), now)
 	if err != nil {
 		return LoginView{}, err
 	}
-	return view, tx.Commit(ctx)
-}
-
-// resumableLogin finds the session's pending login for the same target
-// that has at least resumeMargin left.
-func (s *Store) resumableLogin(ctx context.Context, human, session string, target *string) (LoginView, bool, error) {
-	var id string
-	var r loginRow
-	err := s.pool.QueryRow(ctx, `SELECT login_id::text,connection_id::text,user_code,verification_url,interval_seconds,expires_at,next_poll_at,status
- FROM model_chatgpt_logins
- WHERE human_id=$1 AND session_id=$2 AND status='pending' AND connection_id IS NOT DISTINCT FROM $3::uuid AND expires_at > $4
- ORDER BY created_at DESC LIMIT 1`, human, session, target, s.oauth.now().Add(resumeMargin)).Scan(
-		&id, &r.target, &r.userCode, &r.url, &r.interval, &r.expires, &r.nextPoll, &r.status)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return LoginView{}, false, nil
-	}
-	if err != nil {
-		return LoginView{}, false, err
-	}
-	return r.view(id), true, nil
+	return v, tx.Commit(ctx)
 }
 
 type loginRow struct {
@@ -178,6 +170,26 @@ type loginRow struct {
 	connection *string
 }
 
+func readLogin(ctx context.Context, tx pgx.Tx, human, session, id string) (loginRow, error) {
+	var r loginRow
+	err := tx.QueryRow(ctx, `SELECT connection_id::text,device_ciphertext,user_code,verification_url,interval_seconds,expires_at,next_poll_at,status,error_code,result_connection_id::text
+ FROM model_chatgpt_logins WHERE login_id=$1 AND human_id=$2 AND session_id=$3 FOR UPDATE`, id, human, session).Scan(
+		&r.target, &r.sealed, &r.userCode, &r.url, &r.interval, &r.expires, &r.nextPoll, &r.status, &r.errorCode, &r.connection)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = ErrNotFound
+	}
+	return r, err
+}
+
+func lockChatGPTTarget(ctx context.Context, tx pgx.Tx, human, target string) error {
+	var id string
+	err := tx.QueryRow(ctx, `SELECT connection_id::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2 AND preset=$3 FOR UPDATE`, human, target, ChatGPTPreset).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	return err
+}
+
 func (r loginRow) view(id string) LoginView {
 	v := LoginView{LoginID: id, Status: r.status, ExpiresAt: r.expires, IntervalMs: int64(r.interval) * 1000}
 	if r.status == "pending" {
@@ -189,19 +201,21 @@ func (r loginRow) view(id string) LoginView {
 	return v
 }
 
-// PollChatGPTLogin reports a login's state and, when it is pending and its
-// poll interval has elapsed, polls the issuer once. Polling happens on the
-// browser's reads under the login row's lock, so any API process can serve
-// it, concurrent reads never poll twice, and a restart loses nothing. On
-// authorization the grant is sealed and stored in the same transaction
-// that completes the login.
-//
-// Locks are taken in the order login row → person → connection row, the
-// same order BeginChatGPTLogin and CancelChatGPTLogin use. The person is
-// locked only after the issuer has answered, so a slow issuer never holds
-// the person's row. The poll runs on its own bounded context: once the
-// issuer may have consumed the one-time code, its result is stored even if
-// the browser request that triggered the poll has gone away.
+func (s *Store) loginView(ctx context.Context, human, id string, r loginRow) LoginView {
+	v := r.view(id)
+	if r.status == "completed" && r.connection != nil {
+		if a, err := s.Describe(ctx, human, *r.connection); err == nil {
+			v.Connection = &a.Connection
+		}
+	}
+	return v
+}
+
+// PollChatGPTLogin exchanges a code at most once under human -> login ->
+// connection locks. Acquire every contended lock BEFORE contacting the
+// issuer. Waiting for another login or refresh cannot consume the issuer
+// or persistence budgets, and a dropped browser request cannot discard a
+// successfully returned grant. A new process reads the same durable row.
 func (s *Store) PollChatGPTLogin(ctx context.Context, human, session, loginID string) (LoginView, error) {
 	if !s.ChatGPTEnabled() {
 		return LoginView{}, ErrChatGPTDisabled
@@ -211,115 +225,120 @@ func (s *Store) PollChatGPTLogin(ctx context.Context, human, session, loginID st
 		return LoginView{}, ErrNotFound
 	}
 	loginID = parsed.String()
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pollTimeout)
-	defer cancel()
+	ctx, cancelLock := chatGPTPhase(ctx, chatGPTLockTimeout)
+	defer cancelLock()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return LoginView{}, err
 	}
-	defer tx.Rollback(context.Background())
-	var r loginRow
-	err = tx.QueryRow(ctx, `SELECT connection_id::text,device_ciphertext,user_code,verification_url,interval_seconds,expires_at,next_poll_at,status,error_code,result_connection_id::text
- FROM model_chatgpt_logins WHERE login_id=$1 AND human_id=$2 AND session_id=$3 FOR UPDATE`, loginID, human, session).Scan(
-		&r.target, &r.sealed, &r.userCode, &r.url, &r.interval, &r.expires, &r.nextPoll, &r.status, &r.errorCode, &r.connection)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return LoginView{}, ErrNotFound
+	defer rollbackChatGPT(tx)
+	if err = lockHuman(ctx, tx, human); err != nil {
+		return LoginView{}, err
 	}
+	r, err := readLogin(ctx, tx, human, session, loginID)
 	if err != nil {
 		return LoginView{}, err
 	}
-	finish := func(status, code string) error {
-		r.status = status
-		if code != "" {
-			r.errorCode = &code
+	if r.status == "pending" && r.target != nil {
+		if err = lockChatGPTTarget(ctx, tx, human, *r.target); err != nil {
+			return LoginView{}, err
 		}
-		_, err := tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status=$2,error_code=NULLIF($3,'') WHERE login_id=$1`, loginID, status, code)
-		return err
 	}
+	cancelLock()
 	now := s.oauth.now()
+	var tokens OAuthTokens
+	var pending bool
+	var pollErr error
+	poll := r.status == "pending" && now.Before(r.expires) && !now.Before(r.nextPoll)
+	if poll {
+		device, err := s.openDevice(human, loginID, r.sealed)
+		if err != nil {
+			pollErr = err
+		} else {
+			issuerCtx, cancelIssuer := chatGPTPhase(ctx, chatGPTPollTimeout)
+			tokens, pending, pollErr = s.oauth.PollDevice(issuerCtx, device, r.userCode)
+			cancelIssuer()
+		}
+	}
+	// The write phase has a fresh budget even if the issuer used all of its
+	// own. All rows it needs are already locked, including the reconnect target.
+	ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+	defer cancelSave()
 	var connected *Connection
 	switch {
 	case r.status != "pending":
 	case !now.Before(r.expires):
-		if err = finish("expired", ""); err != nil {
-			return LoginView{}, err
-		}
-	case now.Before(r.nextPoll):
+		r.status = "expired"
+	case !poll:
+	case pending, errors.Is(pollErr, errIssuerTransient):
+		r.nextPoll = s.oauth.now().Add(time.Duration(r.interval) * time.Second)
+	case pollErr != nil:
+		r.status = "failed"
+		code := loginErrFailed
+		r.errorCode = &code
 	default:
-		device, err := s.openDevice(human, loginID, r.sealed)
+		target := ""
+		if r.target != nil {
+			target = *r.target
+		}
+		c, err := s.connectChatGPT(ctx, tx, human, target, tokens)
 		if err != nil {
-			if err = finish("failed", loginErrFailed); err != nil {
-				return LoginView{}, err
-			}
-			break
+			rollbackChatGPT(tx)
+			failureCtx, cancel := chatGPTPhase(ctx, chatGPTSaveTimeout)
+			defer cancel()
+			_, _ = s.pool.Exec(failureCtx, `UPDATE model_chatgpt_logins SET status='failed',error_code=$2 WHERE login_id=$1 AND status='pending'`, loginID, loginErrSave)
+			return LoginView{LoginID: loginID, Status: "failed", ExpiresAt: r.expires, IntervalMs: int64(r.interval) * 1000, Error: loginErrSave}, nil
 		}
-		tokens, pending, pollErr := s.oauth.PollDevice(ctx, device, r.userCode)
-		switch {
-		case pending, errors.Is(pollErr, errIssuerTransient):
-			r.nextPoll = now.Add(time.Duration(r.interval) * time.Second)
-			if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET next_poll_at=$2 WHERE login_id=$1`, loginID, r.nextPoll); err != nil {
-				return LoginView{}, err
-			}
-		case pollErr != nil:
-			if ctx.Err() != nil {
-				return LoginView{}, ctx.Err()
-			}
-			if err = finish("failed", loginErrFailed); err != nil {
-				return LoginView{}, err
-			}
-		default:
-			target := ""
-			if r.target != nil {
-				target = *r.target
-			}
-			c, err := s.connectChatGPT(ctx, tx, human, target, tokens)
-			if err != nil {
-				// The one-time code is spent; a new login is the only way on.
-				// Record the failure in a fresh transaction so the rollback
-				// of the partial save cannot lose it.
-				_ = tx.Rollback(context.Background())
-				_, _ = s.pool.Exec(context.Background(), `UPDATE model_chatgpt_logins SET status='failed',error_code=$2 WHERE login_id=$1 AND status='pending'`, loginID, loginErrSave)
-				return LoginView{LoginID: loginID, Status: "failed", ExpiresAt: r.expires, IntervalMs: int64(r.interval) * 1000, Error: loginErrSave}, nil
-			}
-			if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status='completed',result_connection_id=$2 WHERE login_id=$1`, loginID, c.ID); err != nil {
-				return LoginView{}, err
-			}
-			r.status = "completed"
-			connected = &c
-		}
+		r.status, r.connection, connected = "completed", &c.ID, &c
+	}
+	if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status=$2,error_code=$3,result_connection_id=$4,next_poll_at=$5 WHERE login_id=$1`, loginID, r.status, r.errorCode, r.connection, r.nextPoll); err != nil {
+		return LoginView{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return LoginView{}, err
 	}
-	v := r.view(loginID)
 	if connected != nil {
+		v := r.view(loginID)
 		v.Connection = connected
-	} else if r.status == "completed" && r.connection != nil {
-		if a, err := s.Describe(ctx, human, *r.connection); err == nil {
-			v.Connection = &a.Connection
-		}
+		return v, nil
 	}
-	return v, nil
+	return s.loginView(ctx, human, loginID, r), nil
 }
 
-// CancelChatGPTLogin cancels the person's pending login (idempotent). It
-// locks only the login row, so it waits for a poll in progress; a login
-// that completed meanwhile stays completed and is reported as such.
+// CancelChatGPTLogin waits out a consuming poll on a detached, bounded
+// context. An already-completed grant stays completed. Cancellation does
+// not depend on the browser remaining connected while it waits.
 func (s *Store) CancelChatGPTLogin(ctx context.Context, human, session, loginID string) (LoginView, error) {
 	parsed, err := uuid.Parse(loginID)
 	if err != nil {
 		return LoginView{}, ErrNotFound
 	}
-	var r loginRow
-	err = s.pool.QueryRow(ctx, `UPDATE model_chatgpt_logins SET status=CASE WHEN status='pending' THEN 'cancelled' ELSE status END
- WHERE login_id=$1 AND human_id=$2 AND session_id=$3
- RETURNING connection_id::text,device_ciphertext,user_code,verification_url,interval_seconds,expires_at,next_poll_at,status,error_code,result_connection_id::text`,
-		parsed.String(), human, session).Scan(&r.target, &r.sealed, &r.userCode, &r.url, &r.interval, &r.expires, &r.nextPoll, &r.status, &r.errorCode, &r.connection)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return LoginView{}, ErrNotFound
-	}
+	loginID = parsed.String()
+	ctx, cancelLock := chatGPTPhase(ctx, chatGPTCancelWait)
+	defer cancelLock()
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return LoginView{}, err
 	}
-	return r.view(parsed.String()), nil
+	defer rollbackChatGPT(tx)
+	if err = lockHuman(ctx, tx, human); err != nil {
+		return LoginView{}, err
+	}
+	r, err := readLogin(ctx, tx, human, session, loginID)
+	if err != nil {
+		return LoginView{}, err
+	}
+	cancelLock()
+	ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+	defer cancelSave()
+	if r.status == "pending" {
+		r.status = "cancelled"
+		if _, err = tx.Exec(ctx, `UPDATE model_chatgpt_logins SET status='cancelled' WHERE login_id=$1`, loginID); err != nil {
+			return LoginView{}, err
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return LoginView{}, err
+	}
+	return s.loginView(ctx, human, loginID, r), nil
 }

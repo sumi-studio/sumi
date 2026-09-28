@@ -3,10 +3,12 @@ package modelconnections
 import (
 	"bytes"
 	"context"
+
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +37,7 @@ type fakeIssuer struct {
 	refreshBody    string
 	refreshDelay   time.Duration
 	refreshes      atomic.Int32
+	begins         atomic.Int32
 	polls          atomic.Int32
 	exchanges      atomic.Int32
 	seq            atomic.Int32
@@ -67,6 +70,7 @@ func (f *fakeIssuer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
 	case "/api/accounts/deviceauth/usercode":
+		f.begins.Add(1)
 		if f.usercodeStatus != 0 {
 			w.WriteHeader(f.usercodeStatus)
 			return
@@ -161,7 +165,7 @@ func connect(t *testing.T, s *Store, issuer *fakeIssuer, clk *clock, human, targ
 	issuer.mu.Lock()
 	issuer.authorized = false
 	issuer.mu.Unlock()
-	v, err := s.BeginChatGPTLogin(ctx, human, "session-"+human, target)
+	v, err := s.BeginChatGPTLogin(ctx, human, "session-"+human, target, uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +187,7 @@ func connect(t *testing.T, s *Store, issuer *fakeIssuer, clk *clock, human, targ
 func TestChatGPTDeviceLoginStoresSealedSelectedConnection(t *testing.T) {
 	s, issuer, clk := chatGPTFixture(t)
 	ctx := context.Background()
-	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "")
+	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +273,7 @@ func TestChatGPTDeviceLoginStoresSealedSelectedConnection(t *testing.T) {
 func TestChatGPTLoginExpiryCancelAndUnavailable(t *testing.T) {
 	s, issuer, clk := chatGPTFixture(t)
 	ctx := context.Background()
-	v, err := s.BeginChatGPTLogin(ctx, owner, "s", "")
+	v, err := s.BeginChatGPTLogin(ctx, owner, "s", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,25 +281,25 @@ func TestChatGPTLoginExpiryCancelAndUnavailable(t *testing.T) {
 	if v, err = s.PollChatGPTLogin(ctx, owner, "s", v.LoginID); err != nil || v.Status != "expired" || v.UserCode != "" {
 		t.Fatal("expired", v, err)
 	}
-	v, _ = s.BeginChatGPTLogin(ctx, owner, "s", "")
+	v, _ = s.BeginChatGPTLogin(ctx, owner, "s", "", uuid.NewString())
 	// The same browser session starting again (a reload, a reopened
 	// sheet) resumes the pending login and its code.
-	same, err := s.BeginChatGPTLogin(ctx, owner, "s", "")
+	same, err := s.BeginChatGPTLogin(ctx, owner, "s", "", v.LoginID)
 	if err != nil || same.LoginID != v.LoginID || same.Status != "pending" || same.UserCode != v.UserCode {
 		t.Fatal("resume in the same session", same, err)
 	}
 	// Another session of the same person starts a new login; the earlier
 	// one is superseded.
-	w, _ := s.BeginChatGPTLogin(ctx, owner, "s2", "")
+	w, _ := s.BeginChatGPTLogin(ctx, owner, "s2", "", uuid.NewString())
 	if w.LoginID == v.LoginID {
 		t.Fatal("another session resumed a login it does not own")
 	}
 	if old, err := s.PollChatGPTLogin(ctx, owner, "s", v.LoginID); err != nil || old.Status != "cancelled" {
 		t.Fatal("superseded login", old, err)
 	}
-	// Near its expiry a pending login is not resumed.
+	// A deliberate new attempt replaces even a near-expiry pending login.
 	clk.Add(deviceLoginLifetime - 30*time.Second)
-	if fresh, err := s.BeginChatGPTLogin(ctx, owner, "s2", ""); err != nil || fresh.LoginID == w.LoginID {
+	if fresh, err := s.BeginChatGPTLogin(ctx, owner, "s2", "", uuid.NewString()); err != nil || fresh.LoginID == w.LoginID {
 		t.Fatal("near-expiry resume", fresh, err)
 	} else {
 		w = fresh
@@ -304,17 +308,17 @@ func TestChatGPTLoginExpiryCancelAndUnavailable(t *testing.T) {
 	if c, err := s.CancelChatGPTLogin(ctx, owner, "s2", w.LoginID); err != nil || c.Status != "cancelled" {
 		t.Fatal("cancel", c, err)
 	}
-	if again, err := s.BeginChatGPTLogin(ctx, owner, "s2", ""); err != nil || again.LoginID == w.LoginID {
+	if again, err := s.BeginChatGPTLogin(ctx, owner, "s2", "", uuid.NewString()); err != nil || again.LoginID == w.LoginID {
 		t.Fatal("start after cancel", again, err)
 	} else if _, err := s.CancelChatGPTLogin(ctx, owner, "s2", again.LoginID); err != nil {
 		t.Fatal(err)
 	}
 	issuer.usercodeStatus = 404
-	if _, err := s.BeginChatGPTLogin(ctx, owner, "s", ""); !errors.Is(err, ErrDeviceLoginUnavailable) {
+	if _, err := s.BeginChatGPTLogin(ctx, owner, "s", "", uuid.NewString()); !errors.Is(err, ErrDeviceLoginUnavailable) {
 		t.Fatal("device unavailable", err)
 	}
 	disabled := fixture(t)
-	if _, err := disabled.BeginChatGPTLogin(ctx, owner, "s", ""); !errors.Is(err, ErrChatGPTDisabled) {
+	if _, err := disabled.BeginChatGPTLogin(ctx, owner, "s", "", uuid.NewString()); !errors.Is(err, ErrChatGPTDisabled) {
 		t.Fatal("disabled", err)
 	}
 }
@@ -461,7 +465,12 @@ func TestChatGPTHTTPFlowAndSettings(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"chatgpt":{"available":true}`) {
 		t.Fatal(w.Body.String())
 	}
-	w = do("POST", "/api/model-connections/chatgpt/login", `{}`)
+	for _, body := range []string{`{}`, `{"loginId":"not-a-uuid"}`} {
+		if bad := do("POST", "/api/model-connections/chatgpt/login", body); bad.Code != 400 || issuer.begins.Load() != 0 {
+			t.Fatal("invalid attempt must not issue a code", bad.Code)
+		}
+	}
+	w = do("POST", "/api/model-connections/chatgpt/login", `{"loginId":"`+uuid.NewString()+`"}`)
 	var v LoginView
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &v) != nil || v.UserCode == "" || strings.Contains(w.Body.String(), "dev-secret") {
 		t.Fatal(w.Code, w.Body.String())
@@ -478,6 +487,20 @@ func TestChatGPTHTTPFlowAndSettings(t *testing.T) {
 		t.Fatal("selection change not reported", changed)
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &v)
+	for _, method := range []string{"POST", "DELETE"} {
+		path, body := "/api/model-connections/chatgpt/login", `{"loginId":"`+v.LoginID+`"}`
+		if method == "DELETE" {
+			path, body = path+"/"+v.LoginID, ""
+		}
+		recovered := do(method, path, body)
+		var got LoginView
+		if recovered.Code != 200 || json.Unmarshal(recovered.Body.Bytes(), &got) != nil || got.Status != "completed" || got.Connection == nil || got.Connection.ID != v.Connection.ID {
+			t.Fatal("completed login recovery/cancel", method, recovered.Code, recovered.Body.String())
+		}
+		if issuer.begins.Load() != 1 || issuer.exchanges.Load() != 1 || strings.Contains(recovered.Body.String(), "refresh-") {
+			t.Fatal("completed recovery contacted issuer or disclosed grant")
+		}
+	}
 	w = do("PUT", "/api/model-connections/chatgpt/"+v.Connection.ID, `{"model":"gpt-6-sol","reasoningEffort":"high"}`)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"reasoningEffort":"high"`) {
 		t.Fatal(w.Code, w.Body.String())

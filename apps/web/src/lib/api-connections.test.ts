@@ -163,15 +163,23 @@ it("drives the ChatGPT sign-in endpoints and shows only fixed failure text", asy
       method: init?.method ?? "GET",
       body: init?.body as string | undefined,
     });
-    return replies.shift() ?? new Response(null, { status: 204 });
+    return (
+      replies.shift() ??
+      Response.json({
+        loginId: "l/1",
+        status: "cancelled",
+        expiresAt: "2026-09-28T10:15:00Z",
+        intervalMs: 5000,
+      })
+    );
   });
   const signal = new AbortController().signal;
-  const login = await client.beginChatGPTLogin("conn-1", signal);
+  const login = await client.beginChatGPTLogin("attempt-1", "conn-1", signal);
   expect(login.userCode).toBe("ABCD-1234");
   expect(calls[0]).toEqual({
     path: "/api/model-connections/chatgpt/login",
     method: "POST",
-    body: JSON.stringify({ connectionId: "conn-1" }),
+    body: JSON.stringify({ loginId: "attempt-1", connectionId: "conn-1" }),
   });
   const refused = await client
     .chatGPTLogin(login.loginId, signal)
@@ -181,7 +189,7 @@ it("drives the ChatGPT sign-in endpoints and shows only fixed failure text", asy
   expect((refused as Error).message).toContain("デバイスコード");
   expect((refused as Error).message).not.toContain("private");
   const disabled = await client
-    .beginChatGPTLogin(undefined, signal)
+    .beginChatGPTLogin("attempt-2", undefined, signal)
     .catch((e: unknown) => e);
   expect((disabled as APIConnectionError).status).toBe(409);
   expect((disabled as Error).message).toContain("利用できません");

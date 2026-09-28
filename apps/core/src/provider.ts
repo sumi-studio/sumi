@@ -34,7 +34,8 @@ export interface ChatMessage {
  * and model that produced it (a digest, not an identifier); another
  * connection or model never receives it. `output` keeps the round's output
  * order: reasoning items verbatim, and references (type + ids) to the
- * message and function calls that the journal already records.
+ * function calls, and each message's own assistant text. These bounded
+ * message snapshots preserve positions that the round's combined text loses.
  */
 export interface ProviderContinuation {
   scope: string;

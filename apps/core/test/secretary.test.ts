@@ -2217,3 +2217,35 @@ test("continuation that cannot be stored is dropped, never failing the decision"
     "done-without",
   );
 });
+
+test("lost accepted SavePlan response resumes its recorded continuation without consulting the model again", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "lost-cont", "remember");
+  const save = state.savePlan.bind(state);
+  let saves = 0;
+  state.savePlan = async (...args) => {
+    const result = await save(...args);
+    if (++saves === 1) throw new Error("lost accepted plan response");
+    return result;
+  };
+  const provider = new ContinuingProvider("done");
+  const secretary = new Secretary(cfg(state, "holder", { provider }));
+  await secretary.start();
+  await assert.rejects(secretary.step(), /lost accepted plan response/);
+  const continuation = [...state.plans.values()][0]?.plan[0]?.continuation;
+  assert.ok(continuation);
+  await secretary.step();
+  assert.deepEqual(
+    provider.requests.map((r) => r.round),
+    [0, 1],
+  );
+  assert.deepEqual(
+    provider.requests[1]?.messages.find((m) => m.continuation)?.continuation,
+    continuation,
+  );
+  assert.equal(
+    (await state.events(PERSONA, 0)).filter((e) => e.kind === "note").length,
+    1,
+  );
+});

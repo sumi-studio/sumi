@@ -249,6 +249,7 @@ export function APIConnectionSettings({
       )}
       {signIn && (
         <ChatGPTLoginPanel
+          key={signIn.connectionId ?? "new"}
           client={client}
           connectionId={signIn.connectionId}
           onDone={() => signedIn(!!signIn.connectionId)}

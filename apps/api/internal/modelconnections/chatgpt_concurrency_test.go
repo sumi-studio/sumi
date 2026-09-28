@@ -2,7 +2,9 @@ package modelconnections
 
 import (
 	"context"
+
 	"fmt"
+	"github.com/google/uuid"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -134,7 +136,7 @@ func TestChatGPTRotatedGrantSurvivesCallerCancellation(t *testing.T) {
 func TestChatGPTCodeExchangeSurvivesCallerCancellation(t *testing.T) {
 	s, issuer, clk := slowChatGPTFixture(t, isCodeExchange, 400*time.Millisecond)
 	bg := context.Background()
-	v, err := s.BeginChatGPTLogin(bg, owner, "session-a", "")
+	v, err := s.BeginChatGPTLogin(bg, owner, "session-a", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +169,7 @@ func TestChatGPTCodeExchangeSurvivesCallerCancellation(t *testing.T) {
 func TestChatGPTBeginDuringCompletingPoll(t *testing.T) {
 	s, issuer, clk := slowChatGPTFixture(t, isDevicePoll, 700*time.Millisecond)
 	ctx := context.Background()
-	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "")
+	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +188,7 @@ func TestChatGPTBeginDuringCompletingPoll(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		time.Sleep(200 * time.Millisecond)
-		begun, beginErr = s.BeginChatGPTLogin(ctx, owner, "session-b", "")
+		begun, beginErr = s.BeginChatGPTLogin(ctx, owner, "session-b", "", uuid.NewString())
 	}()
 	wg.Wait()
 	if pollErr != nil || polled.Status != "completed" || polled.Connection == nil {
@@ -209,7 +211,7 @@ func TestChatGPTBeginDuringCompletingPoll(t *testing.T) {
 func TestChatGPTCancelDuringCompletingPoll(t *testing.T) {
 	s, issuer, clk := slowChatGPTFixture(t, isDevicePoll, 700*time.Millisecond)
 	ctx := context.Background()
-	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "")
+	v, err := s.BeginChatGPTLogin(ctx, owner, "session-a", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +249,7 @@ func TestChatGPTConcurrentBeginsLeaveOnePending(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = s.BeginChatGPTLogin(ctx, owner, fmt.Sprint("session-", i), "")
+			_, errs[i] = s.BeginChatGPTLogin(ctx, owner, fmt.Sprint("session-", i), "", uuid.NewString())
 		}(i)
 	}
 	wg.Wait()

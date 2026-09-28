@@ -39,3 +39,5 @@ CREATE TABLE public.model_chatgpt_logins (
 );
 
 CREATE INDEX model_chatgpt_logins_human_idx ON public.model_chatgpt_logins USING btree (human_id, created_at);
+
+CREATE UNIQUE INDEX model_chatgpt_logins_one_pending ON public.model_chatgpt_logins (human_id) WHERE status = 'pending';

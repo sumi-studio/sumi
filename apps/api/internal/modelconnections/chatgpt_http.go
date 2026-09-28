@@ -26,7 +26,7 @@ func chatGPTFailure(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrChatGPTDisabled):
 		respond(w, 409, map[string]any{"error": map[string]string{"message": "このサーバーではChatGPTのサブスクリプション接続を利用できません。"}})
 	case errors.Is(err, ErrDeviceLoginUnavailable):
-		respond(w, 502, map[string]any{"error": map[string]string{"code": loginErrUnavailable, "message": "ChatGPTのデバイスコードによるログインを開始できませんでした。ChatGPTのセキュリティ設定でCodexのデバイスコード認証が有効か確認して、もう一度お試しください。"}})
+		respond(w, 502, map[string]any{"error": map[string]string{"code": loginErrUnavailable, "message": "ChatGPT側が現在、デバイスコードによるログインの開始を受け付けていません。しばらくしてからもう一度お試しください。"}})
 	case errors.Is(err, errIssuerTransient), errors.Is(err, errLoginFailed):
 		respond(w, 502, map[string]any{"error": map[string]string{"message": "ChatGPTのログインを開始できませんでした。しばらくしてからもう一度お試しください。"}})
 	default:
@@ -36,6 +36,7 @@ func chatGPTFailure(w http.ResponseWriter, err error) {
 
 func (s *Service) chatGPTLogin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
+		LoginID      string `json:"loginId"`
 		ConnectionID string `json:"connectionId,omitempty"`
 	}
 	if !decode(w, r, &in) {
@@ -52,7 +53,7 @@ func (s *Service) chatGPTLogin(w http.ResponseWriter, r *http.Request) {
 	var view LoginView
 	err := id.Authorize(r.Context(), func(ctx context.Context) error {
 		var err error
-		view, err = s.Store.BeginChatGPTLogin(ctx, id.HumanID, id.SessionID, in.ConnectionID)
+		view, err = s.Store.BeginChatGPTLogin(ctx, id.HumanID, id.SessionID, in.ConnectionID, in.LoginID)
 		return err
 	})
 	if err != nil {

@@ -1007,3 +1007,192 @@ test("a ChatGPT token is never sent to an endpoint other than the Codex backend"
     assert.equal(seen.length, 0, "no request reached the other endpoint");
   });
 });
+
+test("continuation preserves multiple message positions and output-index order, including a 400 fallback", async () => {
+  const messagesAndCalls: Reply = (_s, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(
+      sse([
+        {
+          type: "response.output_text.delta",
+          output_index: 0,
+          delta: "before",
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            type: "message",
+            id: "msg_before",
+            content: [{ type: "output_text", text: "before" }],
+          },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 1,
+          item: {
+            type: "reasoning",
+            id: "rs_between",
+            encrypted_content: ENC_1,
+            summary: [{ text: READABLE }],
+          },
+        },
+        { type: "response.output_text.delta", output_index: 2, delta: "after" },
+        {
+          type: "response.output_item.done",
+          output_index: 2,
+          item: {
+            type: "message",
+            id: "msg_after",
+            content: [{ type: "output_text", text: "after" }],
+          },
+        },
+        // Completion events arrive in another order; output_index is authoritative.
+        {
+          type: "response.output_item.done",
+          output_index: 4,
+          item: {
+            type: "function_call",
+            id: "fc_b",
+            call_id: "call_b",
+            name: "remember",
+            arguments: '{"route":"normal","input":{"note":"b"}}',
+          },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 3,
+          item: {
+            type: "function_call",
+            id: "fc_a",
+            call_id: "call_a",
+            name: "remember",
+            arguments: '{"route":"normal","input":{"note":"a"}}',
+          },
+        },
+        {
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [],
+            usage: { input_tokens: 3, output_tokens: 2 },
+          },
+        },
+      ]),
+    );
+  };
+  await withBackend(
+    [messagesAndCalls, badRequest, textOnly],
+    async (baseUrl, seen) => {
+      const { state, provider, req } = await setup();
+      state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+      const first = await collect(provider(PA), req(PA, MESSAGES));
+      const calls = first
+        .filter(
+          (e): e is Extract<ModelEvent, { type: "tool_call" }> =>
+            e.type === "tool_call",
+        )
+        .map((e) => e.call);
+      const messages: ChatMessage[] = [
+        ...MESSAGES,
+        {
+          role: "assistant",
+          content: "beforeafter",
+          toolCalls: calls,
+          continuation: doneOf(first).continuation,
+        },
+        ...calls.map((c) => ({
+          role: "tool" as const,
+          toolCallId: c.id,
+          content: "{}",
+        })),
+      ];
+      await collect(provider(PA), { ...req(PA, messages), round: 1 });
+      const output = (i: number) =>
+        (nth(seen, i).body.input as Record<string, unknown>[]).filter(
+          (x) =>
+            x.type === "reasoning" ||
+            x.type === "function_call" ||
+            x.role === "assistant",
+        );
+      const replay = output(1);
+      assert.deepEqual(
+        replay.map((x) => x.type),
+        ["message", "reasoning", "message", "function_call", "function_call"],
+      );
+      assert.deepEqual(
+        replay.filter((x) => x.type === "message").map((x) => x.content),
+        [
+          [{ type: "output_text", text: "before" }],
+          [{ type: "output_text", text: "after" }],
+        ],
+      );
+      assert.deepEqual(
+        replay
+          .filter((x) => x.type === "function_call")
+          .map((x) => [x.id, x.call_id]),
+        [
+          ["fc_a", "call_a"],
+          ["fc_b", "call_b"],
+        ],
+      );
+      const without = replay
+        .filter((x) => x.type !== "reasoning")
+        .map((x) => {
+          if (x.type !== "function_call") return x;
+          const { id: _, ...rest } = x;
+          return rest;
+        });
+      assert.deepEqual(
+        output(2),
+        without,
+        "400 retry removes opaque reasoning and item IDs without moving messages or calls",
+      );
+      assert.equal(
+        JSON.stringify(doneOf(first).continuation).includes(READABLE),
+        false,
+      );
+    },
+  );
+});
+
+test("oversize message snapshots drop continuation without losing the decision", async () => {
+  const large: Reply = (_s, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    const text = "x".repeat(1 << 20);
+    res.end(
+      sse([
+        { type: "response.output_text.delta", output_index: 0, delta: text },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { type: "message", content: [{ type: "output_text", text }] },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 1,
+          item: { type: "reasoning", encrypted_content: ENC_1 },
+        },
+        {
+          type: "response.completed",
+          response: { status: "completed", output: [], usage: {} },
+        },
+      ]),
+    );
+  };
+  await withBackend([large], async (baseUrl) => {
+    const { state, provider, req } = await setup();
+    state.setModelBinding(PA, chatgpt(baseUrl, "tok-1"));
+    const ev = await collect(provider(PA), req(PA, MESSAGES));
+    assert.equal(doneOf(ev).continuation, undefined);
+    assert.equal(
+      ev
+        .filter(
+          (e): e is Extract<ModelEvent, { type: "text" }> => e.type === "text",
+        )
+        .map((e) => e.delta)
+        .join("").length,
+      1 << 20,
+    );
+  });
+});

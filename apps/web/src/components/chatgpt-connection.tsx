@@ -49,19 +49,34 @@ const LOGIN_ERRORS: Record<string, string> = {
     "ログインは完了しましたが、接続を保存できませんでした。もう一度はじめてください。",
 };
 
-/**
- * ChatGPT subscription sign-in with a device code: the person opens
- * ChatGPT's own page, enters the shown code there, and this panel reads
- * the sign-in until it completes. No token ever passes through the
- * browser. With `connectionId`, a completed sign-in reconnects that
- * connection instead of adding one.
- *
- * Only the explicit "キャンセル" ends a pending sign-in. Closing the sheet,
- * switching to ChatGPT's page or app, or a reload leaves it pending on the
- * server; opening this panel again in the same browser session continues
- * the same login (same code) until it expires — the person may already
- * have authorized it.
- */
+type LoginIntent = { id: string; action: "login" | "cancel" };
+const intentKey = (target?: string) =>
+  `sumi.chatgpt.login.v1:${target ?? "new"}`;
+function readIntent(target?: string): LoginIntent | null {
+  try {
+    const v = JSON.parse(sessionStorage.getItem(intentKey(target)) ?? "null");
+    return v &&
+      typeof v.id === "string" &&
+      /^[a-f0-9-]{36}$/i.test(v.id) &&
+      (v.action === "login" || v.action === "cancel")
+      ? v
+      : null;
+  } catch {
+    return null;
+  }
+}
+function saveIntent(target: string | undefined, intent: LoginIntent | null) {
+  try {
+    if (intent)
+      sessionStorage.setItem(intentKey(target), JSON.stringify(intent));
+    else sessionStorage.removeItem(intentKey(target));
+  } catch {
+    /* The mounted panel still works when browser storage is disabled. */
+  }
+}
+
+/** The browser retains an attempt ID, never a code or token. Its server row
+ * is bound to the initiating person, session and reconnect target. */
 export function ChatGPTLoginPanel({
   client,
   connectionId,
@@ -73,87 +88,109 @@ export function ChatGPTLoginPanel({
   onDone(connection: APIConnection | undefined): void;
   onClose(): void;
 }) {
+  const [intent, setIntent] = useState<LoginIntent | null>(() =>
+    readIntent(connectionId),
+  );
   const [login, setLogin] = useState<ChatGPTLogin | null>(null);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
   const [attempt, setAttempt] = useState(0);
-  const loginId = useRef<string | null>(null);
   const done = useRef(onDone);
   done.current = onDone;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt is the explicit "もう一度はじめる" restart trigger.
+  const close = useRef(onClose);
+  close.current = onClose;
+
+  // Only a saved user-initiated attempt is recovered on mount. Opening a
+  // fresh panel never issues a code before the explanation below is read.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt explicitly retries the same durable login/cancel.
   useEffect(() => {
+    if (!intent) return;
     const controller = new AbortController();
-    const { signal } = controller;
+    const signal = AbortSignal.any([
+      controller.signal,
+      AbortSignal.timeout(60_000),
+    ]);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    setLogin(null);
+    setBusy(true);
     setError("");
+    const forget = () => {
+      saveIntent(connectionId, null);
+      setIntent(null);
+    };
     const fail = (e: unknown) => {
-      if (signal.aborted) return;
+      if (controller.signal.aborted) return;
+      setBusy(false);
+      if (e instanceof APIConnectionError && e.status === 404) forget();
       setError(
-        e instanceof APIConnectionError
-          ? e.message
-          : "ChatGPTのログイン状態を確認できませんでした。しばらくしてからもう一度お試しください。",
+        intent.action === "cancel"
+          ? "キャンセルの結果を確認できませんでした。もう一度確認してください。"
+          : e instanceof APIConnectionError
+            ? e.message
+            : "ログイン状態を確認できませんでした。「再試行」で同じログインを確認できます。",
       );
     };
     const show = (view: ChatGPTLogin) => {
-      if (signal.aborted) return;
+      if (controller.signal.aborted) return;
+      setBusy(false);
+      setError("");
       setLogin(view);
       if (view.status === "completed") {
-        loginId.current = null;
+        forget();
         done.current(view.connection);
-        return;
+      } else if (view.status !== "pending") {
+        forget();
+        if (intent.action === "cancel" && view.status === "cancelled")
+          close.current();
+      } else if (intent.action === "login") {
+        timer = setTimeout(poll, Math.max(view.intervalMs, 1000));
       }
-      if (view.status !== "pending") {
-        loginId.current = null;
-        return;
-      }
-      timer = setTimeout(poll, Math.max(view.intervalMs, 1000));
     };
     const poll = () => {
-      const id = loginId.current;
-      if (!id || signal.aborted) return;
-      client.chatGPTLogin(id, signal).then(show, (e: unknown) => {
-        if (signal.aborted) return;
-        // A lost read is retried on the next tick; only a login the server
-        // no longer knows or offers ends the panel.
-        if (
-          e instanceof APIConnectionError &&
-          (e.status === 404 || e.status === 409)
-        ) {
-          loginId.current = null;
+      // Each poll gets its own deadline; waiting for the person to approve
+      // does not spend the next request's budget.
+      const pollSignal = AbortSignal.any([
+        controller.signal,
+        AbortSignal.timeout(60_000),
+      ]);
+      client.chatGPTLogin(intent.id, pollSignal).then(show, (e: unknown) => {
+        if (controller.signal.aborted) return;
+        if (e instanceof APIConnectionError && [404, 409].includes(e.status)) {
           fail(e);
           return;
         }
+        setError(
+          "接続を確認し直しています。コードの入力が済んでいれば、そのままお待ちください。",
+        );
         timer = setTimeout(poll, 5000);
       });
     };
-    client.beginChatGPTLogin(connectionId, signal).then((view) => {
-      if (signal.aborted) return;
-      loginId.current = view.loginId;
-      show(view);
-    }, fail);
+    const work =
+      intent.action === "cancel"
+        ? client.cancelChatGPTLogin(intent.id, signal)
+        : client.beginChatGPTLogin(intent.id, connectionId, signal);
+    work.then(show, fail);
     return () => {
       controller.abort();
       if (timer) clearTimeout(timer);
-      loginId.current = null;
     };
-  }, [client, connectionId, attempt]);
+  }, [client, connectionId, intent, attempt]);
 
-  const cancel = () => {
-    const id = loginId.current;
-    loginId.current = null;
-    if (id)
-      void client
-        .cancelChatGPTLogin(id, AbortSignal.timeout(15000))
-        .catch(() => undefined);
-    onClose();
+  const start = () => {
+    const next: LoginIntent = { id: crypto.randomUUID(), action: "login" };
+    saveIntent(connectionId, next); // before the POST, including a lost begin response
+    setLogin(null);
+    setError("");
+    setIntent(next);
   };
-
+  const cancel = () => {
+    if (!intent) return;
+    const next: LoginIntent = { ...intent, action: "cancel" };
+    saveIntent(connectionId, next);
+    setError("");
+    setIntent(next);
+  };
   const pending = login?.status === "pending";
-  const ended =
-    !!error ||
-    login?.status === "failed" ||
-    login?.status === "expired" ||
-    login?.status === "cancelled";
+  const cancelling = intent?.action === "cancel";
   return (
     <section
       className="mt-5 space-y-3 rounded-lg border border-border p-4 text-sm"
@@ -162,13 +199,24 @@ export function ChatGPTLoginPanel({
       <h3 className="font-medium">
         {connectionId ? "ChatGPTに再接続" : "ChatGPTで接続"}
       </h3>
-      {!login && !error && <p>ログインを準備しています…</p>}
-      {pending && login.verificationUrl && login.userCode && (
-        <p className="text-muted-foreground text-xs leading-relaxed">
-          はじめに、ChatGPTのセキュリティ設定でデバイスコードによるログインを有効にしてください（OpenAIの案内による前提です）。ワークスペースのアカウントでは、管理者がワークスペースの権限で許可している必要があります。
+      <p className="leading-relaxed">
+        Codexのデバイスコード認証で接続します。承認すると、このSumiサーバーが接続に必要な認証情報を受け取り、暗号化して保存します。Sumiの秘書はあなたのCodex利用枠で応答し、会話をOpenAIへ送ります。
+      </p>
+      <p className="text-muted-foreground text-xs leading-relaxed">
+        承認ページには「Codex
+        CLI」と表示されることがあります。このSumiで自分が発行したコードだけを承認してください。他の人から渡されたコードは使わないでください。
+      </p>
+      <p className="text-muted-foreground text-xs leading-relaxed">
+        はじめに、ChatGPTのセキュリティ設定でデバイスコードによるログインを有効にしてください。ワークスペースのアカウントでは、管理者による許可も必要です。
+      </p>
+      {busy && (
+        <p role="status">
+          {cancelling
+            ? "キャンセルしています。認証が完了している場合は、その結果を確認します…"
+            : "ログイン状態を確認しています…"}
         </p>
       )}
-      {pending && login.verificationUrl && login.userCode && (
+      {pending && !cancelling && login.verificationUrl && login.userCode && (
         <ol className="list-decimal space-y-3 pl-5">
           <li>
             <a
@@ -194,17 +242,17 @@ export function ChatGPTLoginPanel({
                 hour: "2-digit",
                 minute: "2-digit",
               })}
-              まで有効です。このコードを他の人に教えないでください。
+              まで有効です。
             </p>
           </li>
           <li>
-            入力が終わると、この画面は自動で完了します。途中で閉じても、有効期限までは同じブラウザでもう一度開くと続けられます。
+            承認を待っています。入力が終わると自動で完了します。途中で閉じても、同じブラウザのタブで開き直すと結果を確認できます。
           </li>
         </ol>
       )}
       {login?.status === "expired" && (
         <p role="alert">
-          コードの有効期限が切れました。もう一度はじめてください。
+          コードの有効期限が切れました。新しいコードで、もう一度はじめてください。
         </p>
       )}
       {login?.status === "failed" && (
@@ -212,25 +260,29 @@ export function ChatGPTLoginPanel({
           {LOGIN_ERRORS[login.error ?? ""] ?? LOGIN_ERRORS.login_failed}
         </p>
       )}
+      {login?.status === "cancelled" && (
+        <p role="status">ログインをキャンセルしました。</p>
+      )}
       {error && <p role="alert">{error}</p>}
-      <p className="text-muted-foreground text-xs leading-relaxed">
-        あなたのChatGPTプランの利用枠で応答します。会話はOpenAIへ送られます。ログイン情報はこのSumiサーバーに暗号化して保存し、表示しません。
-      </p>
-      <div className="flex gap-3">
-        {ended && (
-          <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>
-            もう一度はじめる
+      <div className="flex flex-wrap gap-3">
+        {!intent && (
+          <Button size="sm" onClick={start}>
+            {login ? "もう一度はじめる" : "ログインコードを発行"}
           </Button>
         )}
-        {pending ? (
+        {intent && error && !busy && (
+          <Button size="sm" onClick={() => setAttempt((n) => n + 1)}>
+            {cancelling ? "キャンセルの結果を確認" : "再試行"}
+          </Button>
+        )}
+        {pending && !cancelling && (
           <Button size="sm" variant="ghost" onClick={cancel}>
             キャンセル
           </Button>
-        ) : (
-          <Button size="sm" variant="ghost" onClick={onClose}>
-            閉じる
-          </Button>
         )}
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          閉じる
+        </Button>
       </div>
     </section>
   );

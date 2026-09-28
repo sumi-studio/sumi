@@ -116,11 +116,6 @@ func TokenDigest(token string) string {
 // use, so a streamed call does not start with a token about to lapse.
 const refreshMargin = 5 * time.Minute
 
-// resolveTimeout bounds one resolve (row lock wait, issuer refresh and the
-// write of its result). It is longer than the OAuth client's HTTP timeout so
-// an issuer answer that arrives is always stored.
-const resolveTimeout = 30 * time.Second
-
 // ResolveChatGPT returns a usable access token for the person's
 // subscription connection, refreshing it when it is near expiry or when
 // the caller reports it was rejected (rejectedDigest = TokenDigest of the
@@ -143,13 +138,13 @@ func (s *Store) ResolveChatGPT(ctx context.Context, human, id, rejectedDigest st
 	// timeout, a cancelled Worker request, a dropped connection), or the
 	// next refresh presents a spent token and the connection is lost. The
 	// operation therefore runs on its own bounded context, not the caller's.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
-	defer cancel()
+	ctx, cancelLock := chatGPTPhase(ctx, chatGPTLockTimeout)
+	defer cancelLock()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return ChatGPTAccess{}, err
 	}
-	defer tx.Rollback(context.Background())
+	defer rollbackChatGPT(tx)
 	var out ChatGPTAccess
 	var account *string
 	var expires *time.Time
@@ -164,6 +159,7 @@ func (s *Store) ResolveChatGPT(ctx context.Context, human, id, rejectedDigest st
 	if err != nil {
 		return ChatGPTAccess{}, err
 	}
+	cancelLock()
 	if out.Connection.Preset != ChatGPTPreset || account == nil || expires == nil {
 		return ChatGPTAccess{}, ErrInvalid
 	}
@@ -179,9 +175,16 @@ func (s *Store) ResolveChatGPT(ctx context.Context, human, id, rejectedDigest st
 	rejected := rejectedDigest != "" && rejectedDigest == TokenDigest(secret.AccessToken)
 	if !rejected && expires.After(now.Add(refreshMargin)) {
 		out.AccessToken, out.ExpiresAt = secret.AccessToken, *expires
+		ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+		defer cancelSave()
 		return out, tx.Commit(ctx)
 	}
-	fresh, err := s.oauth.Refresh(ctx, secret.RefreshToken)
+	issuerCtx, cancelIssuer := chatGPTPhase(ctx, chatGPTRefreshTimeout)
+	fresh, err := s.oauth.Refresh(issuerCtx, secret.RefreshToken)
+	cancelIssuer()
+	// Even an answer at the issuer deadline gets a full persistence budget.
+	ctx, cancelSave := chatGPTPhase(ctx, chatGPTSaveTimeout)
+	defer cancelSave()
 	if err == nil && fresh.AccountID != "" && fresh.AccountID != out.AccountID {
 		// The grant now names a different account than the one this
 		// connection (and its sealed AAD) belongs to: never switch
@@ -275,9 +278,7 @@ func (s *Store) connectChatGPT(ctx context.Context, tx pgx.Tx, human, target str
 	if !validAccount(t.AccountID) || t.AccessToken == "" || t.RefreshToken == "" || t.ExpiresAt.IsZero() {
 		return Connection{}, errLoginFailed
 	}
-	if err := lockHuman(ctx, tx, human); err != nil {
-		return Connection{}, err
-	}
+	// PollChatGPTLogin already holds the human and reconnect-target locks.
 	c := Connection{Name: "ChatGPT", Preset: ChatGPTPreset, BaseURL: ChatGPTBaseURL, Model: DefaultChatGPTModel, ReasoningEffort: DefaultChatGPTEffort}
 	existing := false
 	if target != "" {

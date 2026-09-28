@@ -2,9 +2,11 @@ package agentstate
 
 import (
 	"context"
+
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -91,7 +93,7 @@ func TestChatGPTBindingAndRejectedTokenRefresh(t *testing.T) {
 	if _, _, err := srv.store.EnsurePersona(ctx, pa, &human, "secretary"); err != nil {
 		t.Fatal(err)
 	}
-	login, err := conns.BeginChatGPTLogin(ctx, human, "s", "")
+	login, err := conns.BeginChatGPTLogin(ctx, human, "s", "", uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}

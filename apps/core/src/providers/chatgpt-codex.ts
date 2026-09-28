@@ -224,7 +224,8 @@ const ITEM_ID = /^[A-Za-z0-9_-]{1,128}$/;
  * One output entry kept for continuation, or null. A reasoning item keeps
  * only its opaque encrypted content (and item id); readable summary or
  * reasoning text, if any was sent, is dropped. A message or function call
- * keeps only its type and ids — its content is in the journal already.
+ * keeps only its type and ids. Messages also keep their own assistant text
+ * so several messages separated by reasoning/calls retain their positions.
  */
 export function continuationEntry(
   item: unknown,
@@ -235,6 +236,8 @@ export function continuationEntry(
     id?: unknown;
     call_id?: unknown;
     encrypted_content?: unknown;
+    text?: unknown;
+    content?: unknown;
   };
   const id =
     typeof it.id === "string" && ITEM_ID.test(it.id) ? { id: it.id } : {};
@@ -253,8 +256,26 @@ export function continuationEntry(
         summary: [],
         encrypted_content: it.encrypted_content,
       };
-    case "message":
-      return { type: "message", ...id };
+    case "message": {
+      const text =
+        typeof it.text === "string"
+          ? it.text
+          : Array.isArray(it.content)
+            ? it.content
+                .filter(
+                  (part): part is { type: "output_text"; text: string } =>
+                    part?.type === "output_text" &&
+                    typeof part.text === "string",
+                )
+                .map((part) => part.text)
+                .join("")
+            : undefined;
+      return {
+        type: "message",
+        ...id,
+        ...(text !== undefined ? { text } : {}),
+      };
+    }
     case "function_call":
       return typeof it.call_id === "string" && it.call_id !== ""
         ? { type: "function_call", ...id, call_id: it.call_id }

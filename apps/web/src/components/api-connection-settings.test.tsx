@@ -15,7 +15,10 @@ import {
 } from "../lib/api-connections";
 import { APIConnectionSettings } from "./api-connection-settings";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  sessionStorage.clear();
+});
 function setup() {
   const state: ConnectionsState = {
     available: true,
@@ -38,7 +41,12 @@ function setup() {
     select: vi.fn().mockResolvedValue(undefined),
     beginChatGPTLogin: vi.fn(),
     chatGPTLogin: vi.fn(),
-    cancelChatGPTLogin: vi.fn().mockResolvedValue(undefined),
+    cancelChatGPTLogin: vi.fn().mockResolvedValue({
+      loginId: "login-1",
+      status: "cancelled",
+      expiresAt: new Date().toISOString(),
+      intervalMs: 5000,
+    }),
     saveChatGPTSettings: vi.fn(),
   };
   return { client, state };
@@ -197,6 +205,10 @@ it("connects ChatGPT with a device code the person enters on ChatGPT's page", as
     });
   render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  if (screen.queryByRole("button", { name: "ログインコードを発行" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "ログインコードを発行" }),
+    );
   expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
     "ABCD-1234",
   );
@@ -204,6 +216,7 @@ it("connects ChatGPT with a device code the person enters on ChatGPT's page", as
     screen.getByRole("link", { name: "ChatGPTのログインページを開く" }),
   ).toHaveAttribute("href", "https://auth.openai.com/codex/device");
   expect(client.beginChatGPTLogin).toHaveBeenCalledWith(
+    expect.any(String),
     undefined,
     expect.any(AbortSignal),
   );
@@ -238,19 +251,23 @@ it("offers reconnecting an expired sign-in and cancels a login left open", async
     await screen.findByText(/ChatGPTへのログインが期限切れか取り消されました/),
   ).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "ChatGPTに再接続" }));
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
   await screen.findByLabelText("ログインコード");
   expect(client.beginChatGPTLogin).toHaveBeenCalledWith(
+    expect.any(String),
     "sub",
     expect.any(AbortSignal),
   );
   fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
   await waitFor(() =>
     expect(client.cancelChatGPTLogin).toHaveBeenCalledWith(
-      "login-1",
+      vi.mocked(client.beginChatGPTLogin).mock.calls[0]?.[0],
       expect.any(AbortSignal),
     ),
   );
-  expect(screen.queryByLabelText("ログインコード")).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByLabelText("ログインコード")).not.toBeInTheDocument(),
+  );
 });
 it("shows an expired code and a refused start without a stale code", async () => {
   const { client, state } = setup();
@@ -270,6 +287,10 @@ it("shows an expired code and a refused start without a stale code", async () =>
     );
   render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  if (screen.queryByRole("button", { name: "ログインコードを発行" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "ログインコードを発行" }),
+    );
   expect(
     await screen.findByText(/コードの有効期限が切れました/),
   ).toBeInTheDocument();
@@ -319,6 +340,10 @@ it("leaves a pending sign-in open when the panel goes away, and continues it whe
   });
   const first = render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  if (screen.queryByRole("button", { name: "ログインコードを発行" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "ログインコードを発行" }),
+    );
   expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
     "ABCD-1234",
   );
@@ -332,6 +357,10 @@ it("leaves a pending sign-in open when the panel goes away, and continues it whe
   // returns the same pending login; the same code is shown.
   render(<APIConnectionSettings client={client} />);
   fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  if (screen.queryByRole("button", { name: "ログインコードを発行" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "ログインコードを発行" }),
+    );
   expect(await screen.findByLabelText("ログインコード")).toHaveTextContent(
     "ABCD-1234",
   );
@@ -382,4 +411,181 @@ it("does not offer ChatGPT sign-in when the server does not support it", async (
   expect(
     screen.queryByRole("button", { name: "ChatGPTで接続" }),
   ).not.toBeInTheDocument();
+});
+
+it("explains the Codex device flow before issuing any code", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin).mockImplementation(async (id) => ({
+    ...pendingLogin,
+    loginId: id,
+    intervalMs: 60000,
+  }));
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  expect(client.beginChatGPTLogin).not.toHaveBeenCalled();
+  expect(screen.getByText(/Codexのデバイスコード認証で接続/)).toHaveTextContent(
+    /このSumiサーバーが接続に必要な認証情報を受け取り、暗号化して保存/,
+  );
+  expect(screen.getByText(/「Codex CLI」と表示/)).toHaveTextContent(
+    /このSumiで自分が発行したコードだけを承認/,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  await screen.findByLabelText("ログインコード");
+  const id = vi.mocked(client.beginChatGPTLogin).mock.calls[0]?.[0];
+  expect(
+    JSON.parse(sessionStorage.getItem("sumi.chatgpt.login.v1:new") ?? "null"),
+  ).toEqual({ id, action: "login" });
+});
+
+it("recovers a completed login after its poll response is lost and permits another connection", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin)
+    .mockImplementationOnce(async (id) => ({ ...pendingLogin, loginId: id }))
+    .mockImplementationOnce(async (id) => ({
+      ...pendingLogin,
+      loginId: id,
+      status: "completed",
+      connection: chatGPTConnection,
+    }))
+    .mockImplementation(async (id) => ({
+      ...pendingLogin,
+      loginId: id,
+      intervalMs: 60000,
+    }));
+  // The server completed, but the response never reached the first panel.
+  vi.mocked(client.chatGPTLogin).mockImplementation(
+    () => new Promise(() => {}),
+  );
+  const first = render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  await waitFor(() => expect(client.chatGPTLogin).toHaveBeenCalled(), {
+    timeout: 2500,
+  });
+  const id = vi.mocked(client.beginChatGPTLogin).mock.calls[0]?.[0];
+  first.unmount();
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  await screen.findByText(
+    /ChatGPTを接続し、この接続を使うように切り替えました/,
+  );
+  expect(vi.mocked(client.beginChatGPTLogin).mock.calls[1]?.[0]).toBe(id);
+  expect(sessionStorage.getItem("sumi.chatgpt.login.v1:new")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "ChatGPTで接続" }));
+  expect(client.beginChatGPTLogin).toHaveBeenCalledTimes(2);
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  await screen.findByLabelText("ログインコード");
+  expect(vi.mocked(client.beginChatGPTLogin).mock.calls[2]?.[0]).not.toBe(id);
+});
+
+it("retries the same attempt after an ambiguous code-issuance response", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin)
+    .mockRejectedValueOnce(new Error("lost response"))
+    .mockImplementation(async (id) => ({
+      ...pendingLogin,
+      loginId: id,
+      intervalMs: 60000,
+    }));
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  fireEvent.click(await screen.findByRole("button", { name: "再試行" }));
+  await screen.findByLabelText("ログインコード");
+  const calls = vi.mocked(client.beginChatGPTLogin).mock.calls;
+  expect(calls[1]?.[0]).toBe(calls[0]?.[0]);
+});
+
+it("keeps cancellation visible on failure and recovers that cancellation after reopening", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin).mockImplementation(async (id) => ({
+    ...pendingLogin,
+    loginId: id,
+    intervalMs: 60000,
+  }));
+  vi.mocked(client.cancelChatGPTLogin)
+    .mockRejectedValueOnce(new Error("lost cancel response"))
+    .mockImplementation(async (id) => ({
+      ...pendingLogin,
+      loginId: id,
+      status: "cancelled",
+    }));
+  const first = render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  await screen.findByLabelText("ログインコード");
+  fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "キャンセルの結果を確認できませんでした",
+  );
+  expect(
+    screen.getByRole("button", { name: "キャンセルの結果を確認" }),
+  ).toBeVisible();
+  first.unmount();
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("region", { name: "ChatGPTにログイン" }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(client.cancelChatGPTLogin).toHaveBeenCalledTimes(2);
+  expect(client.beginChatGPTLogin).toHaveBeenCalledTimes(1);
+  expect(sessionStorage.getItem("sumi.chatgpt.login.v1:new")).toBeNull();
+});
+
+it("reports completion when an explicit cancel arrives after authorization committed", async () => {
+  const { client, state } = setup();
+  vi.mocked(client.list).mockResolvedValue({
+    ...state,
+    chatgpt: { available: true },
+  });
+  vi.mocked(client.beginChatGPTLogin).mockImplementation(async (id) => ({
+    ...pendingLogin,
+    loginId: id,
+    intervalMs: 60000,
+  }));
+  let resolveCancel!: (
+    value: import("../lib/api-connections").ChatGPTLogin,
+  ) => void;
+  vi.mocked(client.cancelChatGPTLogin).mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        resolveCancel = resolve;
+      }),
+  );
+  render(<APIConnectionSettings client={client} />);
+  fireEvent.click(await screen.findByRole("button", { name: "ChatGPTで接続" }));
+  fireEvent.click(screen.getByRole("button", { name: "ログインコードを発行" }));
+  await screen.findByLabelText("ログインコード");
+  fireEvent.click(screen.getByRole("button", { name: "キャンセル" }));
+  expect(await screen.findByRole("status")).toHaveTextContent(
+    "キャンセルしています",
+  );
+  resolveCancel({
+    ...pendingLogin,
+    status: "completed",
+    connection: chatGPTConnection,
+  });
+  expect(
+    await screen.findByText(
+      /ChatGPTを接続し、この接続を使うように切り替えました/,
+    ),
+  ).toBeVisible();
 });
