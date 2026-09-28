@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import type { BrowserContext } from "@playwright/test";
-import type { WorkspaceBrowserBuild } from "./real-agent-stack";
+import type { WorkspaceBrowserBuild } from "./workspace-stack";
 
 /**
  * The Cloud browser journey's stack, on the product path:
@@ -303,7 +303,7 @@ export async function startCloudBrowserStack(build: WorkspaceBrowserBuild, optio
         PORT: String(PORTS.api),
         SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${PORTS.api}`,
         SUMI_DB_URL: options.databaseURL,
-        SUMI_AGENT_RUNTIME_STATE_DIR: join(runtimeDirectory, "gateway"),
+        SUMI_BROWSER_EVENT_DIR: join(runtimeDirectory, "gateway"),
         SUMI_COMMAND_LOG_DIR: join(runtimeDirectory, "commands"),
         SUMI_BROWSER_SESSION_SECRET: sessionSecret,
         SUMI_BROWSER_SESSION_AUDIENCE: sessionAudience,
@@ -312,7 +312,6 @@ export async function startCloudBrowserStack(build: WorkspaceBrowserBuild, optio
         SUMI_AUTH_FIREBASE_PROJECT_ID: "sumi-studio",
         SUMI_AUTH_TENANT_ID: "e2e-cloud-browser",
         FIREBASE_AUTH_EMULATOR_HOST: "127.0.0.1:9",
-        SUMI_AGENT_WRAPPING_KEY_ID: `e2e-${crypto.randomUUID().slice(0, 8)}`,
         SUMI_CORE_STATE_TOKEN: adminToken,
         SUMI_BROWSER_CLOUD_URL: workerURL,
         SUMI_BROWSER_CLOUD_TOKEN: runtimeToken,

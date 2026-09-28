@@ -67,9 +67,7 @@ sumi-local stop
 
 ## ソースから Web アプリを動かす
 
-`make dev` は、Web アプリ全体と秘書を手元のマシンで起動します。起動するのは Go API、Docker 上の PostgreSQL、ローカルの dev pool を通して動く TypeScript の秘書コア（`apps/core`）、Vite です。Local host と Sumi Cloud も同じ秘書コアを使います。Rust の agent runtime と tool executor（`apps/agent`）は、診断用の `make dev-rust` で明示的に起動できます。
 
-必要なもの: Node.js 22.18 以上、pnpm 11、Go、Docker、`curl`、`openssl`、`flock`。Google または GitHub のサインインを有効にした Firebase プロジェクトと、それに対応する Admin 認証情報。標準のコアは決定的な `mock` プロバイダを使うため、モデルの認証情報は不要です。`make dev-rust` では追加で Rust stable と、会話用モデルおよび別の2つのレビュー用モデルの認証情報が必要です。
 
 ```sh
 make setup
@@ -91,7 +89,6 @@ apps/
   api/                Go の API。サインインセッション、identity、Workspace、Messaging、承認、
                       モデル接続、利用量、秘書コアが使う state service
   core/               TypeScript の秘書コア。Node.js 用ホストと Cloudflare Durable Object 用ホスト
-  agent/              `make dev-rust` が使う Rust の agent runtime と分離された tool executor
 packages/
   ui/                 @sumi/ui コンポーネントカタログ（shadcn/ui ベース）
   sdui/               @sumi/sdui 宣言的 UI スキーマ（zod）とレンダラー
@@ -113,7 +110,6 @@ CONTEXT.md            ドメイン用語集
 | サインイン | Firebase Authentication と、Go API が発行するセッション |
 | API と正本の状態 | Go、PostgreSQL |
 | 秘書コア | TypeScript。Node.js（Local）と Cloudflare Workers Durable Objects（Cloud） |
-| 移行中の agent runtime（`make dev-rust`） | Rust |
 | 通話 | LiveKit |
 | 契約 | OpenAPI、JSON Schema |
 | モノレポとツール | pnpm workspaces、Turborepo、Biome |
@@ -132,11 +128,11 @@ make migrate   # API のスキーマ migration を適用（SUMI_DB_URL が必要
 
 `contracts/openapi.yaml` または `contracts/agent-events.yaml` を編集したら、`pnpm --filter @sumi/api-client generate` で TypeScript の型を再生成します。`make dev-workspaces` は各 package の dev タスクをそのまま実行するだけで、使える Sumi は起動しません。
 
-`.github/workflows/` の workflow は、すべての pull request と `main` への push で実行されるように設定されています。対象は Web と共有 TypeScript のチェック、Web edge の契約、PostgreSQL を使う API の契約、秘書コア、Rust の agent です。
+`.github/workflows/` の workflow は、すべての pull request と `main` への push で実行されるように設定されています。対象は Web と共有 TypeScript のチェック、Web edge の契約、PostgreSQL を使う API の契約、秘書Core です。
 
 ## 設計の原則
 
-- **人と秘書は同じアプリを使います。** 秘書は、人と同じアプリケーション、操作、認可チェックを通して働きます。agent 専用に別に作ったプロダクトの複製は使いません（[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md)、[ADR 0011（提案段階）](docs/adr/0011-messaging-surface-and-agent-participation.md)、[ADR 0013](docs/adr/0013-tool-invocation-routes-and-authority-provenance.md)）。
+- **人と秘書は同じアプリを使います。** 秘書は、人と同じアプリケーション、操作、認可チェックを通して働きます。agent 専用に別に作ったプロダクトの複製は使いません（[ADR 0008](docs/adr/0008-personality-agent-identity-and-execution-fabric.md)、[ADR 0011（提案段階）](docs/adr/0011-messaging-surface-and-agent-participation.md)、[Core architecture](docs/core-architecture.md)）。
 - **秘書は続いていく一個人です。** 人と秘書は同じ identity 台帳（戸籍）に登録されます。秘書を動かすプロセスの起動や停止はリソース管理であり、秘書が眠ったり終わったりすることではありません（[ADR 0009](docs/adr/0009-human-koseki-and-multi-user-auth.md)、[CONTEXT.md](CONTEXT.md)）。
 - **正本の状態は API の向こう側にあります。** 秘書を動かすプロセスは正本の状態を持たないため、停止、再起動、置き換えができ、次のプロセスは保存された状態から回復します。
 - **本人が選んだモデルが優先されます。** 新しい秘書コアは、本人が選んだ接続の代わりに運営側のモデルを使いません。

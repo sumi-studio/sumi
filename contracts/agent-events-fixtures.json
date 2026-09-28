@@ -27,193 +27,6 @@
       "reject_reason": "schema_violation"
     }
   },
-  "durable_agent_start": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 1,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "agent_start"
-        }
-      }
-    }
-  },
-  "durable_turn_end": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 2,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "turn_end",
-          "message": null,
-          "tool_results": []
-        }
-      }
-    }
-  },
-  "durable_message_start": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 3,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "message_start",
-          "message_id": "00000000-0000-4000-8000-000000000002",
-          "message": {
-            "role": "user",
-            "content": [
-              {
-                "type": "text",
-                "text": "hello"
-              }
-            ],
-            "timestamp": "2026-07-25T20:00:00Z"
-          }
-        }
-      }
-    }
-  },
-  "durable_message_end_assistant": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 4,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "message_end",
-          "message_id": "00000000-0000-4000-8000-000000000003",
-          "message": {
-            "role": "assistant",
-            "content": [
-              {
-                "type": "thinking",
-                "thinking": "...",
-                "signature_field": "reasoning_content",
-                "wire_item_index": 0
-              },
-              {
-                "type": "text",
-                "text": "ok",
-                "wire_item_index": 1
-              },
-              {
-                "type": "tool_call",
-                "tool_call": {
-                  "id": "018f1e72-6e9a-5c20-8e90-123456789abc",
-                  "provider_call_id": "call-1",
-                  "name": "read_file",
-                  "route": "normal",
-                  "arguments": {
-                    "path": "notes.txt"
-                  }
-                },
-                "wire_item_index": 2
-              },
-              {
-                "type": "rejected_tool_call",
-                "rejected": {
-                  "id": "018f1e72-6e9a-5c20-8e90-123456789abd",
-                  "provider_call_id": "call-2",
-                  "name": "read_file",
-                  "error": "schema_violation"
-                },
-                "wire_item_index": 3
-              }
-            ],
-            "model": "kimi-k3",
-            "provider": "moonshot",
-            "origin": {
-              "provider_instance_id": "moonshot:https://api.moonshot.ai/v1",
-              "protocol": "open_ai_chat_completions",
-              "model": "kimi-k3"
-            },
-            "usage": {
-              "input": 90,
-              "output": 12,
-              "cache_read": 10,
-              "cache_write": 0,
-              "reasoning": 4,
-              "total_tokens": 112
-            },
-            "stop_reason": "tool_use",
-            "error_message": null,
-            "provider_code": "tool_calls",
-            "interrupted": false,
-            "timestamp": "2026-07-25T20:00:00Z"
-          }
-        }
-      }
-    }
-  },
-  "volatile_message_update": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "message_update",
-          "message_id": "00000000-0000-4000-8000-000000000003",
-          "event": {
-            "type": "text_delta",
-            "content_index": 0,
-            "delta": "world"
-          }
-        }
-      }
-    }
-  },
-  "volatile_error": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "error",
-          "message": "bad"
-        }
-      }
-    }
-  },
-  "command_ack_received": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "command_ack",
-      "ack": {
-        "seq": 5,
-        "command_id": "00000000-0000-4000-8000-000000000001",
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "status": "received"
-      }
-    }
-  },
-  "command_ack_rejected_oversized": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "command_ack",
-      "ack": {
-        "seq": 6,
-        "command_id": "00000000-0000-4000-8000-000000000001",
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "status": "rejected",
-        "reject_reason": "oversized"
-      }
-    }
-  },
   "user_message_command": {
     "kind": "command_envelope",
     "wire": {
@@ -492,20 +305,6 @@
       "is_error": false
     }
   },
-  "durable_seq_max_safe_integer": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 9007199254740991,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "agent_start"
-        }
-      }
-    }
-  },
   "tool_execution_update_scalar_partial": {
     "kind": "agent_event",
     "wire": {
@@ -544,25 +343,6 @@
       }
     }
   },
-  "message_update_tool_call_preview_null": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "message_update",
-          "message_id": "00000000-0000-4000-8000-000000000003",
-          "event": {
-            "type": "tool_call_preview",
-            "content_index": 0,
-            "preview": null
-          }
-        }
-      }
-    }
-  },
   "public_message_tool_result_number_details": {
     "kind": "public_message",
     "wire": {
@@ -597,37 +377,6 @@
       "timestamp": "2026-07-25T20:00:00Z"
     }
   },
-  "turn_end_tool_result_boolean_details": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 10,
-        "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-        "audience": "direct_chat",
-        "event": {
-          "type": "turn_end",
-          "message": null,
-          "tool_results": [
-            {
-              "tool_call_id": "018f1e72-6e9a-5c20-8e90-123456789abc",
-              "provider_call_id": "call-1",
-              "tool_name": "read_file",
-              "content": [
-                {
-                  "type": "text",
-                  "text": "contents"
-                }
-              ],
-              "details": true,
-              "is_error": false,
-              "timestamp": "2026-07-25T20:00:00Z"
-            }
-          ]
-        }
-      }
-    }
-  },
   "approval_requested_scalar_and_array": {
     "kind": "agent_event",
     "wire": {
@@ -646,63 +395,6 @@
         "reason": null,
         "audit": null
       }
-    }
-  },
-  "agent_hello": {
-    "kind": "agent_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "generation": "7",
-      "last_sent_event_seq": "0",
-      "last_received_command_seq": "0",
-      "last_applied_command_seq": "1"
-    }
-  },
-  "api_hello": {
-    "kind": "api_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "accepted_generation": "7",
-      "last_received_event_seq": "3",
-      "next_command_seq": "2"
-    }
-  },
-  "agent_hello_max_seq": {
-    "kind": "agent_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "generation": "7",
-      "last_sent_event_seq": "9007199254740991",
-      "last_received_command_seq": "9007199254740991",
-      "last_applied_command_seq": "9007199254740991"
-    }
-  },
-  "api_hello_max_seq": {
-    "kind": "api_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "accepted_generation": "7",
-      "last_received_event_seq": "9007199254740991",
-      "next_command_seq": "9007199254740991"
-    }
-  },
-  "agent_hello_max_safe_generation": {
-    "kind": "agent_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "generation": "9007199254740991",
-      "last_sent_event_seq": "0",
-      "last_received_command_seq": "0",
-      "last_applied_command_seq": "0"
-    }
-  },
-  "api_hello_max_safe_generation": {
-    "kind": "api_hello",
-    "wire": {
-      "personality_agent_id": "018f1e72-6e9a-7c20-8e90-123456789abc",
-      "accepted_generation": "9007199254740991",
-      "last_received_event_seq": "0",
-      "next_command_seq": "1"
     }
   },
   "browser_hello": {
@@ -926,20 +618,6 @@
       "command": {
         "type": "external_event",
         "content": "Original reminder note"
-      }
-    }
-  },
-  "secretary_agent_start": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 1,
-        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
-        "audience": "secretary",
-        "event": {
-          "type": "agent_start"
-        }
       }
     }
   },
@@ -1248,40 +926,6 @@
         },
         "source": {
           "surface": "approval_operation",
-          "operation_id": "op-approval",
-          "tool_call_id": "call-approval",
-          "status": "succeeded",
-          "executed": true,
-          "result": {
-            "provider_call_id": "provider-original",
-            "tool_call_id": "call-approval",
-            "tool_name": "bash",
-            "content": [
-              {
-                "type": "text",
-                "text": "Original operation result"
-              }
-            ],
-            "details": {
-              "operation_id": "op-approval"
-            },
-            "is_error": false,
-            "timestamp": "2026-09-12T00:00:00Z"
-          }
-        }
-      }
-    }
-  },
-  "approval_operation_durable": {
-    "kind": "outbound_frame",
-    "wire": {
-      "frame_type": "event",
-      "envelope": {
-        "seq": 1,
-        "personality_agent_id": "01992000-0000-7000-8000-000000000001",
-        "audience": "direct_chat",
-        "event": {
-          "type": "approval_operation_outcome",
           "operation_id": "op-approval",
           "tool_call_id": "call-approval",
           "status": "succeeded",

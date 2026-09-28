@@ -9,11 +9,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"github.com/sumi-studio/sumi/apps/api/internal/mcpconnections"
 )
 
-func wireMCP(pool *pgxpool.Pool, core *agentstate.Server, mux *http.ServeMux, authenticate func(*http.Request) (chatgpt.LoginIdentity, error)) (*mcpconnections.Runner, error) {
+func wireMCP(pool *pgxpool.Pool, core *agentstate.Server, mux *http.ServeMux, authenticate func(*http.Request) (browseridentity.Identity, error)) (*mcpconnections.Runner, error) {
 	var store *mcpconnections.Store
 	// Reuse the server's credential-encryption key; MCP uses a distinct AAD
 	// domain so ciphertext cannot be substituted for model credentials.

@@ -13,7 +13,6 @@ import (
 )
 
 type processTestBackend struct {
-	*fakeBackend
 	launches    int
 	observation ProcessObservation
 }
@@ -33,7 +32,7 @@ func (b *processTestBackend) StopProcess(context.Context, ProcessOperation) erro
 }
 func TestProcessDurableReceiptAndNoReplay(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	directory := t.TempDir() + "/state"
 	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
 	if err != nil {
@@ -96,7 +95,7 @@ func TestProcessDurableReceiptAndNoReplay(t *testing.T) {
 }
 func TestProcessMissingContainerNeverReexecutes(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "call", Executable: "true"})
 	if err != nil {
@@ -113,7 +112,7 @@ func TestProcessMissingContainerNeverReexecutes(t *testing.T) {
 }
 func TestProcessCancelBeforeLaunch(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "call", Executable: "true"})
 	if err != nil {
@@ -146,7 +145,7 @@ func TestProcessRequestBounds(t *testing.T) {
 
 func TestProcessOutputBeyondEOFDoesNotRewind(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "eof", Executable: "true"})
 	if err != nil {
@@ -179,7 +178,7 @@ func (b *blockedProcessBackend) InspectProcess(ctx context.Context, o ProcessOpe
 }
 func TestProcessBlockedInspectionDoesNotBlockOtherOperations(t *testing.T) {
 	ctx := context.Background()
-	b := &blockedProcessBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, entered: make(chan struct{}), release: make(chan struct{})}
+	b := &blockedProcessBackend{processTestBackend: &processTestBackend{}, entered: make(chan struct{}), release: make(chan struct{})}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "blocked", Executable: "true"})
 	if err != nil {
@@ -224,7 +223,7 @@ func TestProcessBlockedInspectionDoesNotBlockOtherOperations(t *testing.T) {
 
 func TestProcessFailedCancelPersistenceDoesNotCancel(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "save-failure", Executable: "true"})
 	if err != nil {
@@ -282,7 +281,7 @@ esac
 
 func TestProcessPendingCompletionBatchIsFair(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	for i := 0; i < 20; i++ {
 		op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "completion", Executable: "true"})
@@ -318,7 +317,7 @@ func TestProcessPendingCompletionBatchIsFair(t *testing.T) {
 }
 func TestProcessSmallUTF8PagesAdvanceWithoutCorruption(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "utf8", Executable: "true"})
 	if err != nil {
@@ -345,7 +344,7 @@ func TestProcessSmallUTF8PagesAdvanceWithoutCorruption(t *testing.T) {
 
 func TestProcessEscapedCompletionBatchFitsProtocol(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s := newTestService(t, b)
 	for i := 0; i < 5; i++ {
 		op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: strings.Repeat("\x01", 1024), Executable: "true", Args: []string{strings.Repeat("\x01", (32<<10)-4)}})
@@ -394,7 +393,7 @@ func (b *removingProcessTestBackend) RemoveProcess(context.Context, ProcessOpera
 
 func TestProcessTerminalOutputIsLazyAndSurvivesMetadataRewrites(t *testing.T) {
 	ctx := context.Background()
-	backend := &removingProcessTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}}
+	backend := &removingProcessTestBackend{processTestBackend: &processTestBackend{}}
 	directory := t.TempDir() + "/state"
 	open := func() *Service {
 		t.Helper()
@@ -460,7 +459,7 @@ func TestProcessTerminalOutputIsLazyAndSurvivesMetadataRewrites(t *testing.T) {
 
 func TestProcessUnchangedObservationDoesNotRewriteJournal(t *testing.T) {
 	ctx := context.Background()
-	backend := &processTestBackend{fakeBackend: newFakeBackend()}
+	backend := &processTestBackend{}
 	s := newTestService(t, backend)
 	op, err := s.StartProcess(ctx, ProcessStartRequest{PersonalityAgentID: uuid.NewString(), OriginatingToolCallID: "unchanged", Executable: "true"})
 	if err != nil {
@@ -479,4 +478,13 @@ func TestProcessUnchangedObservationDoesNotRewriteJournal(t *testing.T) {
 	if err != nil || !info.ModTime().Equal(old) {
 		t.Fatal("unchanged observation rewrote journal", info, err)
 	}
+}
+
+func newTestService(t *testing.T, backend ProcessBackend) *Service {
+	t.Helper()
+	s, err := NewService(backend, ServiceConfig{StateDirectory: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

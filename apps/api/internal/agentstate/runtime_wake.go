@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // A Cloud placement runs the secretary core as a Durable Object that sleeps
@@ -27,6 +29,17 @@ import (
 // never depends on a wake landing. A persona whose pending work does not
 // change between wakes is re-woken with a doubling gap, so a runtime that
 // cannot make progress is not hammered.
+//
+// Memory preparation is the runtime's own schedule — it arms its wake from
+// memory maintenance and honours its in-process "model unavailable" shelf —
+// so the sweep does not chase it. It only rescues memory work left behind
+// by a missed signal: a chunk overdue by MemoryRescueGrace (longer than any
+// alarm drain lives) with no live writer — e.g. a persona reactivated after
+// a transfer while its runtime slept, or a planned wake the platform gave
+// up on during an outage. A rescue wake only makes the runtime re-plan;
+// preparation itself still starts from the runtime's own alarm, subject to
+// its shelf, and a memory-only persona is re-woken no sooner than
+// MemoryRescueGap.
 
 // AwaitingRuntime is one persona with work and no live writer lease.
 type AwaitingRuntime struct {
@@ -34,10 +47,27 @@ type AwaitingRuntime struct {
 	// Progress changes when the persona's pending work moves forward; an
 	// unchanged value across sweeps means the previous wake achieved nothing.
 	Progress string
+	// MemoryOnly: the only work is an overdue memory rescue.
+	MemoryOnly bool
 }
 
+// MemoryRescueGrace is how long memory work may sit overdue before the
+// sweep treats its wake as lost: longer than an alarm drain's lifetime, so
+// a runtime working on schedule is never rescued.
+const MemoryRescueGrace = 15 * time.Minute
+
+// memoryRescueSQL selects a persona's memory work overdue by the grace
+// ($3): a sealed chunk past its backoff (or its sealing), or a chunk left
+// 'preparing' by a writer that is gone. The caller also requires no live
+// writer lease.
+const memoryRescueSQL = `EXISTS (SELECT 1 FROM core_memory_chunks mc
+				WHERE mc.persona_id = p.persona_id
+				  AND ((mc.status = 'sealed' AND COALESCE(mc.not_before, mc.created_at) <= now() - $3::interval)
+				       OR (mc.status = 'preparing' AND mc.claimed_at <= now() - $3::interval)))`
+
 // PersonasAwaitingRuntime lists active personas whose work needs a runtime
-// and whose writer lease is absent or expired.
+// and whose writer lease is absent or expired: due inputs and schedules, and
+// memory work overdue past MemoryRescueGrace.
 //
 // after is a rotation cursor: rows with persona_id > after sort first, then
 // the result wraps to the smallest ids. The caller advances the cursor to
@@ -56,33 +86,95 @@ func (s *Store) PersonasAwaitingRuntime(ctx context.Context, limit int, after st
 			(SELECT count(*) FROM core_inputs i
 				WHERE i.persona_id = p.persona_id AND i.status IN ('queued','claimed')),
 			(SELECT count(*) FROM core_schedules sc
-				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now())
+				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now()),
+			w.work,
+			(SELECT count(*) FILTER (WHERE mc.status = 'sealed') || ':' || count(*) FILTER (WHERE mc.status = 'preparing')
+				FROM core_memory_chunks mc WHERE mc.persona_id = p.persona_id)
 		FROM core_personas p
-		WHERE p.authority = 'active'
-		  AND (EXISTS (SELECT 1 FROM core_inputs i
+		CROSS JOIN LATERAL (SELECT
+			EXISTS (SELECT 1 FROM core_inputs i
 				WHERE i.persona_id = p.persona_id
 				  AND ((i.status = 'queued' AND (i.not_before IS NULL OR i.not_before <= now()))
 				       OR i.status = 'claimed'))
-		    OR EXISTS (SELECT 1 FROM core_schedules sc
-				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now()))
+			OR EXISTS (SELECT 1 FROM core_schedules sc
+				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending' AND sc.wake_at <= now()) AS work) w
+		WHERE p.authority = 'active'
+		  AND (w.work OR `+memoryRescueSQL+`)
 		  AND NOT EXISTS (SELECT 1 FROM core_writer_leases l
 				WHERE l.persona_id = p.persona_id AND l.expires_at > now())
 		ORDER BY (p.persona_id > $2::text) DESC, p.persona_id
-		LIMIT $1`, limit, after)
+		LIMIT $1`, limit, after, MemoryRescueGrace.String())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []AwaitingRuntime
 	for rows.Next() {
-		var id string
+		var id, memory string
 		var oldest, pending, due int64
-		if err := rows.Scan(&id, &oldest, &pending, &due); err != nil {
+		var work bool
+		if err := rows.Scan(&id, &oldest, &pending, &due, &work, &memory); err != nil {
 			return nil, err
 		}
-		out = append(out, AwaitingRuntime{PersonaID: id, Progress: fmt.Sprintf("%d/%d/%d", oldest, pending, due)})
+		out = append(out, AwaitingRuntime{PersonaID: id,
+			Progress:   fmt.Sprintf("%d/%d/%d/%s", oldest, pending, due, memory),
+			MemoryOnly: !work})
 	}
 	return out, rows.Err()
+}
+
+// NextWork is when a persona next needs a runtime for work recorded here.
+// NextWorkAt is nil when nothing waits; otherwise it is never before Now,
+// the database clock, so a host can arm its own clock relative to Now.
+type NextWork struct {
+	NextWorkAt *time.Time `json:"next_work_at"`
+	Now        time.Time  `json:"now"`
+}
+
+// NextWorkFor is the runtime's own view of the work PersonasAwaitingRuntime
+// sweeps for, so a core host can sleep until it is needed instead of
+// polling: the earliest of a queued input's not_before (now when unset), a
+// pending schedule's wake_at, and — for an input left claimed by an
+// interrupted turn — the expiry of the live writer lease (now when none,
+// where the next start's recovery requeues it). With no writer lease live,
+// NextWorkAt <= Now exactly when the sweep would select the persona.
+//
+// Waiting inputs are excluded: an approval decision requeues its input,
+// which the sweep then finds. Memory preparation is excluded too — its
+// timing comes from memory maintenance, and only the runtime knows whether
+// its model layer is currently usable. An inactive persona has no work
+// here; a missing one is ErrPersonaNotFound.
+func (s *Store) NextWorkFor(ctx context.Context, personaID string) (NextWork, error) {
+	var out NextWork
+	var authority string
+	var next *time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT p.authority, now(), LEAST(
+			(SELECT min(COALESCE(i.not_before, now())) FROM core_inputs i
+				WHERE i.persona_id = p.persona_id AND i.status = 'queued'),
+			(SELECT CASE WHEN EXISTS (SELECT 1 FROM core_inputs i
+					WHERE i.persona_id = p.persona_id AND i.status = 'claimed')
+				THEN COALESCE((SELECT l.expires_at FROM core_writer_leases l
+					WHERE l.persona_id = p.persona_id AND l.expires_at > now()), now())
+				END),
+			(SELECT min(sc.wake_at) FROM core_schedules sc
+				WHERE sc.persona_id = p.persona_id AND sc.status = 'pending'))
+		FROM core_personas p WHERE p.persona_id = $1`, personaID).
+		Scan(&authority, &out.Now, &next)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return out, ErrPersonaNotFound
+	}
+	if err != nil {
+		return out, err
+	}
+	if authority != "active" || next == nil {
+		return out, nil
+	}
+	if next.Before(out.Now) {
+		next = &out.Now
+	}
+	out.NextWorkAt = next
+	return out, nil
 }
 
 // RuntimeWaker wakes a remote core host for personas awaiting a runtime.
@@ -93,10 +185,13 @@ type RuntimeWaker struct {
 	client *http.Client
 
 	// Interval between sweeps; MinGap/MaxGap bound re-waking a persona whose
-	// pending work did not move.
-	Interval time.Duration
-	MinGap   time.Duration
-	MaxGap   time.Duration
+	// pending work did not move. MemoryGap is the least gap before re-waking
+	// a persona whose only work is a memory rescue: its runtime may be
+	// deliberately resting on a shelf the database cannot see.
+	Interval  time.Duration
+	MinGap    time.Duration
+	MaxGap    time.Duration
+	MemoryGap time.Duration
 
 	mu    sync.Mutex
 	marks map[string]wakeMark
@@ -161,10 +256,11 @@ func NewRuntimeWaker(store *Store, baseURL, token string) (*RuntimeWaker, error)
 			// bearer somewhere this configuration did not name.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		Interval: time.Second,
-		MinGap:   5 * time.Second,
-		MaxGap:   5 * time.Minute,
-		marks:    map[string]wakeMark{},
+		Interval:  time.Second,
+		MinGap:    5 * time.Second,
+		MaxGap:    5 * time.Minute,
+		MemoryGap: 30 * time.Minute,
+		marks:     map[string]wakeMark{},
 	}, nil
 }
 
@@ -219,6 +315,9 @@ func (w *RuntimeWaker) Sweep(ctx context.Context) int {
 		gap := w.MinGap
 		if ok && m.progress == a.Progress {
 			gap = min(m.gap*2, w.MaxGap)
+		}
+		if a.MemoryOnly {
+			gap = max(gap, w.MemoryGap)
 		}
 		w.marks[a.PersonaID] = wakeMark{at: now, progress: a.Progress, gap: gap, failed: m.failed}
 		due = append(due, a)

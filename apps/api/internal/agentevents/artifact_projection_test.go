@@ -317,12 +317,10 @@ func TestBrowserWebSocketProjectsArtifactHandlesOnDurableAndVolatilePaths(t *tes
 	if err := conn.WriteJSON(browserHello{Type: "hello", LastEventSeq: 0}); err != nil {
 		t.Fatal(err)
 	}
-	assertDirectChatStatus(t, conn, "unavailable")
+	assertDirectChatStatus(t, conn, "ready")
 
-	claims := TokenClaims{TenantID: "tenant-1", PersonalityAgentID: artifactOwner, Generation: 1}
-	if err := gateway.PublishRuntimeState(artifactOwner, claims.Generation, nil); err != nil {
-		t.Fatal(err)
-	}
+	claims := JournalScope{TenantID: "tenant-1", PersonalityAgentID: artifactOwner}
+
 	seq := uint64(1)
 	if err := gateway.Receive(context.Background(), claims, Envelope{Audience: AudienceDirectChat,
 		Seq:                &seq,

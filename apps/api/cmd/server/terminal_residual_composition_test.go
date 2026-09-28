@@ -42,24 +42,6 @@ type journalBackend struct {
 	stopped                                    bool
 }
 
-func (b *journalBackend) Prepare(context.Context, runtimeprovision.PrepareRequest) (runtimeprovision.PreparedEpoch, error) {
-	return runtimeprovision.PreparedEpoch{}, nil
-}
-func (b *journalBackend) Activate(context.Context, runtimeprovision.ActivateRequest) error {
-	return nil
-}
-func (b *journalBackend) Abort(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *journalBackend) Inspect(context.Context, string) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *journalBackend) Stop(context.Context, runtimeprovision.PreparedEpoch) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
-func (b *journalBackend) Reconcile(context.Context, runtimeprovision.ReconcileRequest) (runtimeprovision.Inspection, error) {
-	return runtimeprovision.Inspection{}, nil
-}
 func (b *journalBackend) LaunchProcess(context.Context, runtimeprovision.ProcessOperation) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

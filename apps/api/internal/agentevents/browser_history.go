@@ -183,7 +183,7 @@ func (s *BrowserServer) ServeHistory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *DurableGateway) browserHistory(ctx context.Context, paid string, q browserHistoryQuery) (browserHistoryPage, error) {
+func (g *BrowserJournal) browserHistory(ctx context.Context, paid string, q browserHistoryQuery) (browserHistoryPage, error) {
 	page := browserHistoryPage{Events: []browserEventEnvelope{}, Context: []browserEventEnvelope{}, Index: []browserHistoryTick{}, PendingApprovals: []browserEventEnvelope{}, CommandDispositions: []browserEventEnvelope{}}
 	if err := ValidatePersonalityAgentID(paid); err != nil {
 		return page, err

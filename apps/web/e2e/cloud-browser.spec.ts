@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { type Browser, type BrowserContext, expect, type Page, test } from "@playwright/test";
 import { FIXTURE_KEY, fillDefaults, choice, startJevFixture } from "../../desktop/test/jev-fixture.mjs";
 import { type CloudBrowserStack, PORTS, startCloudBrowserStack } from "./support/cloud-browser-stack";
-import { buildWorkspaceBrowserStack, removeWorkspaceBrowserBuild, type WorkspaceBrowserBuild } from "./support/real-agent-stack";
+import { buildWorkspaceBrowserStack, removeWorkspaceBrowserBuild, type WorkspaceBrowserBuild } from "./support/workspace-stack";
 
 /**
  * The secretary's Cloud browser, end to end on the product path: the person

@@ -627,10 +627,6 @@ func completeExistingFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, uid, hu
 }
 
 func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow, identity VerifiedIdentity) (AuthFlow, error) {
-	wrappingKeyID, err := validateWrappingKeyID(s.wrappingKeyID)
-	if err != nil {
-		return AuthFlow{}, fmt.Errorf("configured wrapping key ID: %w", err)
-	}
 	// A verified credential that chose to bring its Local secretary has an
 	// open transfer session under its own subject. Claim it here, in the
 	// account transaction, so the account is created with the carried
@@ -642,6 +638,7 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	// unset the surface is off — no routes, no sweep — and leftover rows are
 	// inert data that must neither wedge sign-up nor silently adopt a
 	// carried secretary.
+	var err error
 	var claim transfersession.Claim
 	claimed := false
 	if s.Transfers != nil {
@@ -655,10 +652,6 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 	if claimed {
 		agentID = claim.PersonaID
 	}
-	wrappingKey, err := generateWrappingKey()
-	if err != nil {
-		return AuthFlow{}, err
-	}
 	displayName := initialHumanDisplayName(identity.DisplayName)
 	statements := []struct {
 		query string
@@ -667,7 +660,6 @@ func (s *Store) provisionFromFlow(ctx context.Context, tx pgx.Tx, flow AuthFlow,
 		{"INSERT INTO humans (human_id, display_name) VALUES ($1, COALESCE(NULLIF($2, ''), 'Sumi'))", []any{humanID, displayName}},
 		{"INSERT INTO agents (personality_agent_id, human_id) VALUES ($1, $2)", []any{agentID, humanID}},
 		{"INSERT INTO employments (agent_id, employer_type, employer_id) VALUES ($1, $2, $3)", []any{agentID, EmployerHuman, humanID}},
-		{"INSERT INTO agent_secrets (personality_agent_id, wrapping_key_id, wrapping_key) VALUES ($1, $2, $3)", []any{agentID, wrappingKeyID, wrappingKey}},
 		{"INSERT INTO credentials (provider, external_subject, human_id) VALUES ('firebase', $1, $2)", []any{identity.FirebaseUID, humanID}},
 	}
 	for _, statement := range statements {

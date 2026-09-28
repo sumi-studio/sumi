@@ -15,7 +15,7 @@ const stateSchema = z.object({
   connections: z.array(connectionSchema),
   selection: z
     .union([
-      z.object({ kind: z.enum(["none", "chatgpt"]) }),
+      z.object({ kind: z.literal("none") }),
       z.object({ kind: z.literal("api"), connectionId: z.string() }),
     ])
     .nullable(),
@@ -75,7 +75,7 @@ export interface APIConnection {
   maxOutputTokens?: number;
 }
 export type ConnectionSelection =
-  | { kind: "none" | "chatgpt" }
+  | { kind: "none" }
   | { kind: "api"; connectionId: string };
 export interface ConnectionsState {
   available: boolean;

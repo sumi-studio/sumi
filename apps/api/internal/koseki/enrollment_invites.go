@@ -79,7 +79,7 @@ func (s *Store) IssueEnrollmentInviteInTx(ctx context.Context, tx pgx.Tx, issuer
 }
 
 func (s *Store) ListEnrollmentInvites(ctx context.Context) ([]EnrollmentInvite, error) {
-	rows, err := s.pool.Query(ctx, `SELECT invite_id,issued_by,COALESCE(email,''),created_at,expires_at,revoked_at,consumed_at,COALESCE(consumed_by::text,'') FROM enrollment_invites ORDER BY created_at DESC,invite_id DESC LIMIT 100`)
+	rows, err := s.pool.Query(ctx, `SELECT invite_id,issued_by,COALESCE(email,''),created_at,expires_at,revoked_at,consumed_at,COALESCE(consumed_by::text,'') FROM enrollment_invites WHERE issued_by IS NOT NULL ORDER BY created_at DESC,invite_id DESC LIMIT 100`)
 	if err != nil {
 		return nil, err
 	}

@@ -125,7 +125,7 @@ func TestProcessAttachHandshakeHonorsCancellation(t *testing.T) {
 }
 
 func TestLiveTailLossMarkerReachesReaderAlreadyAhead(t *testing.T) {
-	backend := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journalFile(t, t.TempDir())}
+	backend := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journalFile(t, t.TempDir())}
 	svc := newTestService(t, backend)
 	ctx := context.Background()
 	op, err := svc.StartProcess(ctx, ProcessStartRequest{

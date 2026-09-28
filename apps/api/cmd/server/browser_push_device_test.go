@@ -79,7 +79,7 @@ func TestBrowserPushDeviceLoginRefreshSwitchAndLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = commands.Close() })
-	gateway, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commands)
+	gateway, err := agentevents.OpenBrowserJournal(privateRuntimeDir(t), commands)
 	if err != nil {
 		t.Fatal(err)
 	}

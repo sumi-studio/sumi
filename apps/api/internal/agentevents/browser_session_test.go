@@ -33,25 +33,25 @@ func newTestBrowserSessionRevocationStore() *testBrowserSessionRevocationStore {
 
 func openSharedBrowserSessionGateways(
 	t *testing.T,
-) (*CommandStore, *DurableGateway, *DurableGateway) {
+) (*CommandStore, *BrowserJournal, *BrowserJournal) {
 	t.Helper()
 	store, err := OpenCommandStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	runtimeDir := privateRuntimeDir(t)
-	first, err := OpenDurableGateway(runtimeDir, store)
+	journalDir := privateRuntimeDir(t)
+	first, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := OpenDurableGateway(runtimeDir, store)
+	second, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = first.runtimeDir.Close()
-		_ = second.runtimeDir.Close()
+		_ = first.journalDir.Close()
+		_ = second.journalDir.Close()
 	})
 	return store, first, second
 }
@@ -673,13 +673,13 @@ func TestHMACUserSessionVerifierBoundsAndReclaimsRotationLineage(t *testing.T) {
 
 func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := privateRuntimeDir(t)
+	journalDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	firstGateway, err := OpenDurableGateway(runtimeDir, store)
+	firstGateway, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,11 +719,11 @@ func TestDurableBrowserSessionRevocationSurvivesRestartAndIsShared(t *testing.T)
 	) {
 		t.Fatalf("shared manager verify = %v, want revoked", err)
 	}
-	if err := firstGateway.runtimeDir.Close(); err != nil {
+	if err := firstGateway.journalDir.Close(); err != nil {
 		t.Fatalf("close first gateway runtime directory: %v", err)
 	}
 
-	restartedGateway, err := OpenDurableGateway(runtimeDir, store)
+	restartedGateway, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,13 +881,13 @@ func TestV2BrowserSessionRotationSurvivesExpiredAncestorCleanupAndRestart(
 		t.Fatalf("rotate live successor after ancestor expiry: valid=%v err=%v", valid, err)
 	}
 
-	if err := firstGateway.runtimeDir.Close(); err != nil {
+	if err := firstGateway.journalDir.Close(); err != nil {
 		t.Fatalf("close first gateway runtime directory: %v", err)
 	}
-	if err := secondGateway.runtimeDir.Close(); err != nil {
+	if err := secondGateway.journalDir.Close(); err != nil {
 		t.Fatalf("close second gateway runtime directory: %v", err)
 	}
-	restartedGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	restartedGateway, err := OpenBrowserJournal(firstGateway.dir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,13 +1023,13 @@ func TestV2BrowserSessionRotationThenLogoutRevokesSuccessorAcrossRestart(
 		t.Fatalf("successor after ancestor logout = %v, want revoked", err)
 	}
 
-	if err := firstGateway.runtimeDir.Close(); err != nil {
+	if err := firstGateway.journalDir.Close(); err != nil {
 		t.Fatalf("close first gateway runtime directory: %v", err)
 	}
-	if err := secondGateway.runtimeDir.Close(); err != nil {
+	if err := secondGateway.journalDir.Close(); err != nil {
 		t.Fatalf("close second gateway runtime directory: %v", err)
 	}
-	restartedGateway, err := OpenDurableGateway(firstGateway.dir, store)
+	restartedGateway, err := OpenBrowserJournal(firstGateway.dir, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1162,13 +1162,13 @@ func TestDurableBrowserSessionLogoutThenRotationRejectsSuccessor(
 
 func TestDurableBrowserSessionRevocationFailuresFailClosed(t *testing.T) {
 	commandDir := t.TempDir()
-	runtimeDir := privateRuntimeDir(t)
+	journalDir := privateRuntimeDir(t)
 	store, err := OpenCommandStore(commandDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	gateway, err := OpenDurableGateway(runtimeDir, store)
+	gateway, err := OpenBrowserJournal(journalDir, store)
 	if err != nil {
 		t.Fatal(err)
 	}

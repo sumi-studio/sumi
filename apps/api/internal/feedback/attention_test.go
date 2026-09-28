@@ -2,7 +2,6 @@ package feedback
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"testing"
@@ -65,18 +64,6 @@ func TestFeedbackAttentionReconcilesLostAckWithOriginalSender(t *testing.T) {
 	e := d.events[0]
 	if e.Actor.Participant.HumanID != w.dev.ID || e.Actor.DisplayName != "Original developer" || e.PersonalityAgentID != w.pa.ID || e.EventID != reply.ID || e.Kind != "feedback_reply" || e.Revision != reply.Revision {
 		t.Fatalf("wrong provenance: %+v", e)
-	}
-	p, c, err := (&AttentionGateway{TenantID: "test"}).input(e)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Actor.PrincipalID != w.dev.ID || p.Actor.PrincipalID == w.human.ID || p.Source.Surface != "feedback" || p.Source.OccurredAt == "" {
-		t.Fatalf("sender became recipient: %+v", p)
-	}
-	var command map[string]any
-	_ = json.Unmarshal(c, &command)
-	if command["content"] != reply.Body {
-		t.Fatal("body changed")
 	}
 	// Recovery acknowledges the prior admission without a second delivery.
 	if _, err = w.pool.Exec(ctx, `UPDATE feedback_attention_outbox SET next_attempt_at=now()`); err != nil {

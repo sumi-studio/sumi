@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -34,7 +33,7 @@ const (
 type BrowserServer struct {
 	Sessions UserSessionAuthorizer
 	Appender CommandAppender
-	Events   *DurableGateway
+	Events   *BrowserJournal
 	// Authorizer gates admission and every live private-data boundary on Current
 	// Employer and the exact enabled Human-owned direct-chat AppInstallation. A
 	// nil Authorizer fails closed.
@@ -49,7 +48,6 @@ type BrowserServer struct {
 	LifecycleFence *directchat.LifecycleFence
 	// Spawner optionally lazily starts the target agent runtime on connect
 	// (ADR 0010). A nil Spawner assumes the agent is already running.
-	Spawner DirectChatSpawner
 	// Files, when set, backs the /files/* person routes (RegisterFileRoutes).
 	// Nil fails those routes closed.
 	Files FileBackend
@@ -72,9 +70,6 @@ type BrowserServer struct {
 	WriteTimeout   time.Duration
 	PongWait       time.Duration
 	PingInterval   time.Duration
-	// SpawnTimeout bounds lazy runtime provisioning without making the browser
-	// request or socket the owner of the resulting runtime lifetime.
-	SpawnTimeout time.Duration
 	// AuthorizationPollInterval bounds how long an otherwise-idle socket can
 	// retain stale Current-Employer authorization.
 	AuthorizationPollInterval time.Duration
@@ -87,16 +82,6 @@ type BrowserServer struct {
 	closing        bool
 	beforeWrite    func()
 	commandIngress *UserCommandIngress
-}
-
-// SetSpawner installs one lazy-runtime controller for both direct-chat
-// transports. HTTP command admission waits for the newly spawned runtime's
-// authenticated Ready publication before allocating a durable sequence.
-func (s *BrowserServer) SetSpawner(spawner DirectChatSpawner) {
-	s.Spawner = spawner
-	if s.commandIngress != nil {
-		s.commandIngress.Spawner = spawner
-	}
 }
 
 // SetAuthorizer installs one composite authority boundary for both browser
@@ -374,14 +359,13 @@ type browserCommandHead struct {
 	RequestID string `json:"request_id"`
 }
 
-func NewBrowserServer(sessions UserSessionAuthorizer, appender CommandAppender, events *DurableGateway) *BrowserServer {
+func NewBrowserServer(sessions UserSessionAuthorizer, appender CommandAppender, events *BrowserJournal) *BrowserServer {
 	s := &BrowserServer{
 		Sessions:                  sessions,
 		Appender:                  appender,
 		Events:                    events,
 		HelloTimeout:              10 * time.Second,
 		WriteTimeout:              10 * time.Second,
-		SpawnTimeout:              30 * time.Second,
 		AuthorizationPollInterval: 5 * time.Second,
 		MaxReadLimit:              MaxUserCommandBytes + 16*1024,
 	}
@@ -610,59 +594,6 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer releaseLifecycle()
-	runtimeUnavailable := false
-	if s.Spawner != nil {
-		// The global browser-session lease authorizes only this bounded,
-		// side-effect-free intent. EnsureRunning owns idempotent provisioning and
-		// runs after the lease is released so logout cannot wait on a cold start.
-		intentLeaseEntered := false
-		intentAuthorized := false
-		intentContext, cancelIntent := context.WithTimeout(
-			r.Context(),
-			s.writeTimeout(),
-		)
-		err = s.Sessions.AuthorizeSession(intentContext, claims, func() error {
-			intentLeaseEntered = true
-			if err := s.authorizeDirectChat(intentContext, claims, scope); err != nil {
-				return err
-			}
-			intentAuthorized = true
-			return nil
-		})
-		cancelIntent()
-		if err != nil {
-			if !intentLeaseEntered {
-				http.Error(w, "invalid session", http.StatusUnauthorized)
-			} else if errors.Is(err, ErrDirectChatAuthorizationUnavailable) {
-				http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
-			} else if !intentAuthorized {
-				http.Error(w, "not authorized for this agent", http.StatusForbidden)
-			} else {
-				http.Error(w, "authorization unavailable", http.StatusServiceUnavailable)
-			}
-			return
-		}
-
-		// Runtime lifecycle belongs to the provisioner and its idle/shutdown
-		// policy. The server-owned timeout bounds startup, while the browser
-		// request and socket do not become the runtime's lifetime context.
-		spawnContext, cancelSpawn := context.WithTimeout(
-			context.WithoutCancel(r.Context()),
-			s.spawnTimeout(),
-		)
-		err = s.Spawner.EnsureRunning(spawnContext, claims.PersonalityAgentID)
-		cancelSpawn()
-		if err != nil {
-			// A browser cannot read the HTTP status of a refused upgrade, so a
-			// pre-upgrade 503 reaches the page as an unattributable transport
-			// failure, indistinguishable from being offline or logged out. This
-			// session is already authorized for the socket, so accept the upgrade
-			// and state the cause in a close frame the page can read. The operator
-			// still needs the provisioner's (already secret-redacted) diagnostic.
-			log.Printf("direct chat lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
-			runtimeUnavailable = true
-		}
-	}
 
 	var conn *websocket.Conn
 	finalLeaseEntered := false
@@ -734,20 +665,6 @@ func (s *BrowserServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	releaseLifecycle()
 	defer s.removeConnection(conn)
 	defer conn.Close()
-	if runtimeUnavailable {
-		deadline := s.sessionDeadline(claims, s.writeTimeout())
-		if deadline.After(time.Now()) {
-			_ = conn.WriteControl(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(
-					DirectChatRuntimeUnavailableCloseCode,
-					DirectChatRuntimeUnavailableCloseReason,
-				),
-				deadline,
-			)
-		}
-		return
-	}
 	if err := s.run(r.Context(), conn, claims, scope); err != nil && !errors.Is(err, context.Canceled) {
 		deadline := s.sessionDeadline(claims, s.writeTimeout())
 		if deadline.After(time.Now()) {
@@ -891,9 +808,6 @@ func (s *BrowserServer) run(ctx context.Context, conn *websocket.Conn, claims Us
 	if s.pongWait() > 0 {
 		conn.SetPongHandler(func(string) error {
 			return authorize(func() error {
-				if s.Spawner != nil {
-					s.Spawner.Touch(claims.PersonalityAgentID)
-				}
 				return conn.SetReadDeadline(
 					s.sessionReadDeadline(claims, s.pongWait()),
 				)
@@ -1075,14 +989,6 @@ func (s *BrowserServer) browserEventPump(
 					return err
 				}
 			}
-			if s.Spawner != nil {
-				if err := authorizeOperation(func() error {
-					s.Spawner.Touch(personalityAgentID)
-					return nil
-				}); err != nil {
-					return fmt.Errorf("authorize browser event activity: %w", err)
-				}
-			}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-authorizationTick:
@@ -1149,9 +1055,6 @@ func (s *BrowserServer) browserReadPump(
 			return err
 		}
 		if err := s.authorizeBrowserOperation(ctx, claims, scope, func() error {
-			if s.Spawner != nil {
-				s.Spawner.Touch(claims.PersonalityAgentID)
-			}
 			return nil
 		}); err != nil {
 			return fmt.Errorf("authorize browser inbound frame: %w", err)
@@ -1193,11 +1096,6 @@ func (s *BrowserServer) browserReadPump(
 		writeErr := withExclusiveSocketWrite(func(writeSocketUnlocked func(any) error) error {
 			admissionErr = s.authorizeBrowserOperation(ctx, claims, scope, func() error {
 				appendCalled = true
-				release, err := holdRuntimeAdmission(s.Spawner, claims.PersonalityAgentID)
-				if err != nil {
-					return err
-				}
-				defer release()
 				var appendErr error
 				if appender, ok := s.Appender.(idempotencyAwareCommandAppender); ok {
 					envelope, existingAcceptance, appendErr = appender.AppendWithIdempotencyStatus(
@@ -1400,13 +1298,6 @@ func (s *BrowserServer) pingInterval() time.Duration {
 		return s.PingInterval
 	}
 	return 54 * time.Second
-}
-
-func (s *BrowserServer) spawnTimeout() time.Duration {
-	if s.SpawnTimeout > 0 {
-		return s.SpawnTimeout
-	}
-	return 30 * time.Second
 }
 
 func (s *BrowserServer) authorizationPollInterval() time.Duration {

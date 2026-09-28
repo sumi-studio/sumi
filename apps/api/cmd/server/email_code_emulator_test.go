@@ -70,7 +70,7 @@ func newEmailCodeEmulatorHarness(t *testing.T) *emailCodeEmulatorHarness {
 	t.Helper()
 	pool := kosekiResolverTestPool(t)
 	client := firebaseProviderEmulatorClient(t)
-	store := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := koseki.New(pool)
 	store.EmailChallengeKey = emulatorEmailChallengeKey
 	principals := &flakyEmailPrincipalClient{Client: client}
 	controller := newKosekiAuthFlowController(store, "local", &firebaseAdminProviderLifecycle{client: client})

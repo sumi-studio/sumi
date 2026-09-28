@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * Round-trip canonical wire examples through JavaScript's JSON parser. This
- * is the TypeScript/Node leg of the T28 three-language contract round-trip
- * harness and also guards lossless app-lifecycle request fields.
+ * validates current browser/API fixtures and lossless app-lifecycle fields.
  */
 
 import { readFileSync } from "node:fs";
@@ -27,7 +26,7 @@ const schemaPath = join(
 );
 const schema = readFileSync(schemaPath, "utf8");
 assertAnyJSONNumberBounds(schema);
-assertLosslessHelloBounds(schema);
+assertLosslessCursorBounds(schema);
 
 let passed = 0;
 for (const [name, fixture] of Object.entries(fixtures)) {
@@ -86,7 +85,6 @@ if (
 }
 
 console.log(`contract round-trip: ${passed} fixtures passed`);
-assertLosslessHelloRuntimeBounds();
 process.exit(0);
 
 function assertAnyJSONNumberBounds(schema) {
@@ -162,9 +160,8 @@ function assertAnyJSONRuntimeBounds(value, path) {
   }
 }
 
-function assertLosslessHelloBounds(schema) {
+function assertLosslessCursorBounds(schema) {
   for (const [name, format] of [
-    ["ProcessGeneration", "canonical-process-generation"],
     ["CanonicalDecimalU64", "canonical-decimal-u64"],
   ]) {
     const definition = schema.match(
@@ -180,14 +177,5 @@ function assertLosslessHelloBounds(schema) {
     ) {
       throw new Error(`${name} must be a lossless canonical decimal string`);
     }
-  }
-}
-
-function assertLosslessHelloRuntimeBounds() {
-  if (BigInt("9223372036854775807") !== 2n ** 63n - 1n) {
-    throw new Error("unexpected ProcessGeneration upper bound");
-  }
-  if (BigInt("18446744073709551615") !== 2n ** 64n - 1n) {
-    throw new Error("unexpected u64 cursor upper bound");
   }
 }

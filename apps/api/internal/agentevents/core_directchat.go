@@ -32,16 +32,14 @@ import (
 //     approval_*, command_disposition) appended to the existing event log —
 //     history, live WebSocket replay, and reconnect cursors keep working
 //     unchanged.
-//   - the core host itself is woken by the ordinary runtime wake sweep; no
-//     legacy runtime generation, connection lease, or Rust process is
-//     involved, and the projection refuses to write while one is live.
+//   - the configured Core host is woken when durable work needs execution.
 //
 // Projection is content-deduped: every generated event is a deterministic
 // function of durable core state, so a restart replays the journal and
 // re-emits nothing that already reached the event log.
 type CoreDirectChat struct {
 	Core    *agentstate.Store
-	Gateway *DurableGateway
+	Gateway *BrowserJournal
 	// Pool resolves the persona's owning Human and display name from the
 	// agents table, the same lookup Messaging attention delivery uses.
 	Pool *pgxpool.Pool
@@ -1006,8 +1004,7 @@ func (c *CoreDirectChat) translateInputReceived(personaID string, ev agentstate.
 	inputID, _ := ev.Payload["input_id"].(string)
 	// The browser reconciles its optimistic entry by the canonical message
 	// id — UUIDv5 over the command's UUID bytes under the wire namespace —
-	// the same id the legacy runtime minted. Anything else renders the sent
-	// message twice.
+	// also used by the Web optimistic entry. A different id duplicates it.
 	commandID := strings.TrimPrefix(inputID, "direct-chat:")
 	messageID, err := userMessageIDFromCommandID(commandID)
 	if err != nil {
@@ -1406,8 +1403,7 @@ func marshalEvent(m map[string]any) (json.RawMessage, error) {
 }
 
 // userMessageNamespace is the wire's canonical user-message namespace — the
-// same constant as apps/web/src/agent/user-message-id.ts and the legacy
-// Rust runtime's USER_MESSAGE_ID_NAMESPACE.
+// same constant as apps/web/src/agent/user-message-id.ts.
 var userMessageNamespace = uuid.MustParse("78f62d15-b945-4a4f-9d84-d73c7f932b51")
 
 // userMessageIDFromCommandID reproduces the browser's

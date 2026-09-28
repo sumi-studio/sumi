@@ -25,13 +25,11 @@ func main() {
 func run() error {
 	var socketPath string
 	var socketGID int
-	var supervisorPath string
 	var socketModeText string
 	var stateDirectory string
 	flag.StringVar(&socketPath, "socket", "/run/sumi/runtime-provisioner/control.sock", "root-managed Unix socket")
 	flag.IntVar(&socketGID, "socket-gid", 0, "group allowed to connect to the Unix socket")
 	flag.StringVar(&socketModeText, "socket-mode", "0660", "Unix socket permission mode")
-	flag.StringVar(&supervisorPath, "supervisor", "/usr/local/libexec/sumi-agent-supervisor", "host Docker supervisor")
 	flag.StringVar(&stateDirectory, "state-dir", "/run/sumi/runtime-provisioner/state", "durable runtime provision state directory")
 	flag.Parse()
 
@@ -40,7 +38,6 @@ func run() error {
 		return fmt.Errorf("parse socket mode: %w", err)
 	}
 	backend, err := runtimeprovision.NewDockerBackend(runtimeprovision.DockerBackendConfig{
-		SupervisorPath:  supervisorPath,
 		BaseEnvironment: hostEnvironment(),
 	})
 	if err != nil {
@@ -103,7 +100,7 @@ func run() error {
 }
 
 func hostEnvironment() []string {
-	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_AGENT_IMAGE_TAG", "SUMI_AGENT_IMAGE_PULL_POLICY", "SUMI_JOB_IMAGE_TAG", "SUMI_JOB_EGRESS_DIR", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG", "SUMI_FILES_MOUNTPOINT", "SUMI_FILES_VOLUME_UUID", "SUMI_FILES_CHECK", "SUMI_FILES_CHECK_WAIT_SECONDS", "SUMI_DOCKER_JOURNAL_ROOT"}
+	names := []string{"PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "SUMI_CONFIG_FILE", "SUMI_CONTROL_PLANE_NETWORK", "SUMI_JOB_IMAGE_TAG", "SUMI_JOB_EGRESS_DIR", "SUMI_DEV_ALLOW_APPARMOR_UNCONFINED", "SUMI_LOG", "SUMI_FILES_MOUNTPOINT", "SUMI_FILES_VOLUME_UUID", "SUMI_FILES_CHECK", "SUMI_FILES_CHECK_WAIT_SECONDS", "SUMI_DOCKER_JOURNAL_ROOT"}
 	environment := make([]string, 0, len(names))
 	for _, name := range names {
 		if value, ok := os.LookupEnv(name); ok {

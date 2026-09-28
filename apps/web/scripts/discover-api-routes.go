@@ -27,9 +27,8 @@ type discoveredRoute struct {
 }
 
 type discovery struct {
-	Routes                   []discoveredRoute `json:"routes"`
-	WorkspacePackagePresent  bool              `json:"workspace_package_present"`
-	PrivateDynamicRegistries int               `json:"private_dynamic_registries"`
+	Routes                  []discoveredRoute `json:"routes"`
+	WorkspacePackagePresent bool              `json:"workspace_package_present"`
 }
 
 func main() {
@@ -60,7 +59,6 @@ func main() {
 			if !ok || function.Body == nil {
 				continue
 			}
-			privateDynamicRegistry := receiverName(function) == "LocalControlServer" && function.Name.Name == "RegisterRoutes"
 			rangePatterns := literalRangePatterns(function.Body, constants[file.packageKey])
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				call, ok := node.(*ast.CallExpr)
@@ -75,10 +73,6 @@ func main() {
 					patterns, ok = rangePatterns[identifier.Obj]
 				}
 				if !ok {
-					if privateDynamicRegistry && isIdentifier(call.Args[0], "pattern") {
-						result.PrivateDynamicRegistries++
-						return true
-					}
 					position := fset.Position(call.Args[0].Pos())
 					fatalf("unresolved HTTP route expression at %s:%d; route parity cannot skip dynamic registrations", file.relative, position.Line)
 				}
@@ -319,21 +313,6 @@ func isRoutePattern(pattern string) bool {
 		}
 	}
 	return true
-}
-
-func receiverName(function *ast.FuncDecl) string {
-	if function.Recv == nil || len(function.Recv.List) != 1 {
-		return ""
-	}
-	expression := function.Recv.List[0].Type
-	if pointer, ok := expression.(*ast.StarExpr); ok {
-		expression = pointer.X
-	}
-	identifier, _ := expression.(*ast.Ident)
-	if identifier == nil {
-		return ""
-	}
-	return identifier.Name
 }
 
 func isIdentifier(expression ast.Expr, expected string) bool {

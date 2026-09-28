@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"time"
 	"unicode/utf8"
@@ -70,16 +69,10 @@ type CommandAppender interface {
 // Rejected requests never allocate a command_id or seq and cannot poison later
 // commands.
 type UserCommandIngress struct {
-	Appender  CommandAppender
-	Sessions  UserSessionAuthorizer
-	Spawner   DirectChatSpawner
-	Readiness interface {
-		IsPersonalityAgentReady(context.Context, string) (bool, error)
-	}
-	SpawnTimeout      time.Duration
-	SpawnReadyTimeout time.Duration
-	MaxBytes          int64
-	AllowedOrigins    []string
+	Appender       CommandAppender
+	Sessions       UserSessionAuthorizer
+	MaxBytes       int64
+	AllowedOrigins []string
 	// Authorizer gates direct chat on Current Employer and the exact enabled
 	// Human-owned direct-chat AppInstallation. A nil Authorizer fails closed.
 	Authorizer DirectChatAuthorizer
@@ -101,11 +94,6 @@ func NewUserCommandIngress(appender CommandAppender, sessions UserSessionAuthori
 		return nil, errCommandAppenderRequired
 	}
 	ingress := &UserCommandIngress{Appender: appender, Sessions: sessions, MaxBytes: MaxUserCommandBytes}
-	if readiness, ok := appender.(interface {
-		IsPersonalityAgentReady(context.Context, string) (bool, error)
-	}); ok {
-		ingress.Readiness = readiness
-	}
 	return ingress, nil
 }
 
@@ -200,23 +188,6 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRejection(w, RejectOversized)
 		return
 	}
-	if h.Spawner != nil {
-		spawnContext, cancelSpawn := context.WithTimeout(r.Context(), h.spawnTimeout())
-		err := h.Spawner.EnsureRunning(spawnContext, claims.PersonalityAgentID)
-		cancelSpawn()
-		if err != nil {
-			log.Printf("direct command lazy spawn failed for PAID %s: %v", claims.PersonalityAgentID, err)
-			writeUnavailable(w, idempotencyKey)
-			return
-		}
-		if h.Readiness != nil {
-			if err := h.awaitSpawnReady(r.Context(), claims.PersonalityAgentID); err != nil {
-				log.Printf("direct command runtime readiness failed for PAID %s: %v", claims.PersonalityAgentID, err)
-				writeUnavailable(w, idempotencyKey)
-				return
-			}
-		}
-	}
 
 	var env CommandEnvelope
 	sessionLeaseEntered := false
@@ -233,11 +204,6 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		appendCalled = true
-		release, err := holdRuntimeAdmission(h.Spawner, claims.PersonalityAgentID)
-		if err != nil {
-			return err
-		}
-		defer release()
 		var appendErr error
 		env, appendErr = h.Appender.Append(
 			operationContext,
@@ -350,38 +316,6 @@ func (h *UserCommandIngress) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CommandID:      env.CommandID,
 		Seq:            env.Seq,
 	})
-}
-
-func (h *UserCommandIngress) spawnTimeout() time.Duration {
-	if h.SpawnTimeout > 0 {
-		return h.SpawnTimeout
-	}
-	return 30 * time.Second
-}
-
-func (h *UserCommandIngress) awaitSpawnReady(ctx context.Context, personalityAgentID string) error {
-	timeout := h.SpawnReadyTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	readyCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	ticker := time.NewTicker(25 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		ready, err := h.Readiness.IsPersonalityAgentReady(readyCtx, personalityAgentID)
-		if err != nil {
-			return err
-		}
-		if ready {
-			return nil
-		}
-		select {
-		case <-readyCtx.Done():
-			return readyCtx.Err()
-		case <-ticker.C:
-		}
-	}
 }
 
 func writeUnavailable(w http.ResponseWriter, idempotencyKey string) {

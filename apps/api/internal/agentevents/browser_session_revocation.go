@@ -78,7 +78,7 @@ func newBrowserSessionRevocationState() browserSessionRevocationState {
 
 // CheckBrowserSession checks the shared durable denylist before a signed
 // cookie is accepted. Any storage, lineage, or integrity failure rejects it.
-func (g *DurableGateway) CheckBrowserSession(
+func (g *BrowserJournal) CheckBrowserSession(
 	ctx context.Context,
 	sessionID string,
 	expiresAt time.Time,
@@ -108,7 +108,7 @@ func (g *DurableGateway) CheckBrowserSession(
 // AuthorizeBrowserSession keeps the shared revocation lock held across a
 // security-sensitive operation. A successful logout therefore cannot race a
 // command append or browser data write in another API process.
-func (g *DurableGateway) AuthorizeBrowserSession(
+func (g *BrowserJournal) AuthorizeBrowserSession(
 	ctx context.Context,
 	sessionID string,
 	expiresAt time.Time,
@@ -146,7 +146,7 @@ func (g *DurableGateway) AuthorizeBrowserSession(
 // one session plus every live successor in its rotation lineage. The union of
 // lineage members and standalone revocations remains store-capacity bounded;
 // repeating logout is idempotent.
-func (g *DurableGateway) RevokeBrowserSession(
+func (g *BrowserJournal) RevokeBrowserSession(
 	ctx context.Context,
 	sessionID string,
 	expiresAt time.Time,
@@ -186,7 +186,7 @@ func (g *DurableGateway) RevokeBrowserSession(
 // replacement. It revokes currentSessionID, records the live successor, and
 // extends every ancestor's retention before the successor can be signed or
 // returned. A previously revoked or already-rotated current SID is rejected.
-func (g *DurableGateway) RotateBrowserSession(
+func (g *BrowserJournal) RotateBrowserSession(
 	ctx context.Context,
 	currentSessionID string,
 	currentExpiresAt time.Time,
@@ -277,7 +277,7 @@ var (
 // current authority is the live epoch session — the most recently admitted
 // session for this jar — falling back to the presented cookie; a different
 // successor Human requires SwitchFrom to name that authority.
-func (g *DurableGateway) AdmitBrowserSession(
+func (g *BrowserJournal) AdmitBrowserSession(
 	ctx context.Context,
 	admission BrowserSessionAdmission,
 	now time.Time,
@@ -586,7 +586,7 @@ func closeBrowserFlowState(state *browserSessionRevocationState, flowID string, 
 // and closes the issuing flows of everything it revokes plus the
 // nonce-verified pending flows the browser listed. All of it commits in one
 // store write.
-func (g *DurableGateway) CloseBrowserSessionsForLogout(
+func (g *BrowserJournal) CloseBrowserSessionsForLogout(
 	ctx context.Context,
 	presented []BrowserSessionIdentity,
 	epochs []string,
@@ -788,7 +788,7 @@ func epochReachesRetired(
 
 // CheckBrowserEpoch reports whether a browser epoch remains usable. A closed
 // epoch stays refused for its horizon so a stale cookie cannot name new work.
-func (g *DurableGateway) CheckBrowserEpoch(
+func (g *BrowserJournal) CheckBrowserEpoch(
 	ctx context.Context,
 	epochHash string,
 	now time.Time,
@@ -816,7 +816,7 @@ func (g *DurableGateway) CheckBrowserEpoch(
 // CloseBrowserFlow is the flow-scoped discard boundary. It closes exactly one
 // flow and revokes the sessions that flow issued, without touching the
 // browser's other sessions or flows.
-func (g *DurableGateway) CloseBrowserFlow(
+func (g *BrowserJournal) CloseBrowserFlow(
 	ctx context.Context,
 	flowID string,
 	retainUntil time.Time,
@@ -1101,7 +1101,7 @@ func cloneBrowserSessionRevocationState(
 	return cloned
 }
 
-func (g *DurableGateway) runBrowserSessionMutationHook(
+func (g *BrowserJournal) runBrowserSessionMutationHook(
 	kind browserSessionMutationKind,
 ) {
 	if g.browserSessionMutationHook != nil {
@@ -1109,7 +1109,7 @@ func (g *DurableGateway) runBrowserSessionMutationHook(
 	}
 }
 
-func (g *DurableGateway) withBrowserSessionRevocationLock(
+func (g *BrowserJournal) withBrowserSessionRevocationLock(
 	ctx context.Context,
 	mode int,
 	operation func() error,
@@ -1120,7 +1120,7 @@ func (g *DurableGateway) withBrowserSessionRevocationLock(
 	if operation == nil {
 		return errors.New("browser session revocation operation is required")
 	}
-	lock, err := g.openRuntimeLock(browserSessionRevocationLockID)
+	lock, err := g.openJournalLock(browserSessionRevocationLockID)
 	if err != nil {
 		return fmt.Errorf("open browser session revocation lock: %w", err)
 	}
@@ -1135,7 +1135,7 @@ func (g *DurableGateway) withBrowserSessionRevocationLock(
 	return operation()
 }
 
-func (g *DurableGateway) readBrowserSessionRevocations() (browserSessionRevocationState, error) {
+func (g *BrowserJournal) readBrowserSessionRevocations() (browserSessionRevocationState, error) {
 	state := browserSessionRevocationState{}
 	file, err := os.OpenFile(
 		g.browserSessionRevocationPath(),
@@ -1328,7 +1328,7 @@ func validateBrowserSessionRevocationState(
 	return nil
 }
 
-func (g *DurableGateway) writeBrowserSessionRevocations(
+func (g *BrowserJournal) writeBrowserSessionRevocations(
 	state browserSessionRevocationState,
 ) error {
 	if err := validateBrowserSessionRevocationState(state); err != nil {
@@ -1347,7 +1347,7 @@ func (g *DurableGateway) writeBrowserSessionRevocations(
 	return nil
 }
 
-func (g *DurableGateway) maxBrowserSessionRevocations() int {
+func (g *BrowserJournal) maxBrowserSessionRevocations() int {
 	if g.MaxBrowserSessionRevocations <= 0 ||
 		g.MaxBrowserSessionRevocations > maxRevokedSessions {
 		return maxRevokedSessions
@@ -1355,6 +1355,6 @@ func (g *DurableGateway) maxBrowserSessionRevocations() int {
 	return g.MaxBrowserSessionRevocations
 }
 
-func (g *DurableGateway) browserSessionRevocationPath() string {
+func (g *BrowserJournal) browserSessionRevocationPath() string {
 	return filepath.Join(g.dir, "browser-session-revocations.json")
 }

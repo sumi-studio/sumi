@@ -8,7 +8,7 @@ import {
   removeWorkspaceBrowserBuild,
   startWorkspaceBrowserStack,
   type WorkspaceBrowserBuild,
-} from "./support/real-agent-stack";
+} from "./support/workspace-stack";
 
 // Message-search end-to-end evidence on the real Workspace browser stack:
 // production API + Postgres + Vite + real Chrome. The search -> jump path is

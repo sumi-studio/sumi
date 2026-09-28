@@ -2,12 +2,10 @@ package messaging
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
@@ -424,77 +422,6 @@ func TestPublishMessageCreatedAuthorizesAllIntentVariantsOnce(t *testing.T) {
 		if got := len(sub.send); got != 1 {
 			t.Fatalf("subscriber %s received %d message variants, want one", sub.viewer.Key(), got)
 		}
-	}
-}
-
-func TestLocalNotificationSettingsUseTheSharedStore(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	_, general := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-
-	// An empty request is a read: the agent's default, same as a Human's.
-	status, body := callLocal(t, ctx, server.localNotificationSettings,
-		LocalNotificationSettingsPath, map[string]any{}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("read setting: status %d body %v", status, body)
-	}
-	setting := body["setting"].(map[string]any)
-	if setting["defaults"].(map[string]any)["level"] != NotifyLevelAll {
-		t.Fatalf("agent default = %v", setting)
-	}
-	owner := setting["owner"].(map[string]any)
-	if owner["kind"] != "personality_agent" || owner["personality_agent_id"] != w.agent.ID {
-		t.Fatalf("agent setting owner = %v", owner)
-	}
-
-	// Naming one preference changes only that one; the rest survives.
-	status, body = callLocal(t, ctx, server.localNotificationSettings, LocalNotificationSettingsPath,
-		map[string]any{"keywords": []any{"リリース"}}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("set keywords: status %d body %v", status, body)
-	}
-	status, body = callLocal(t, ctx, server.localNotificationSettings, LocalNotificationSettingsPath,
-		map[string]any{"defaults_level": NotifyLevelMentions}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("set defaults: status %d body %v", status, body)
-	}
-	setting = body["setting"].(map[string]any)
-	if setting["defaults"].(map[string]any)["level"] != NotifyLevelMentions {
-		t.Fatalf("agent defaults = %v", setting)
-	}
-	if keywords := setting["keywords"].([]any); len(keywords) != 1 || keywords[0] != "リリース" {
-		t.Fatalf("naming one field must not erase the others: %v", setting)
-	}
-
-	// The same store the human UI reads answers with the agent's own setting,
-	// and the keyword it named reaches it through the shared evaluator.
-	stored, err := w.store.NotificationSettingFor(ctx, w.agent)
-	if err != nil {
-		t.Fatalf("reload agent setting: %v", err)
-	}
-	if stored.Default() != NotifyLevelMentions || len(stored.Keywords) != 1 {
-		t.Fatalf("agent stored setting = %+v", stored)
-	}
-	msg := w.send(t, ctx, general.PlaceID, w.humanA, "今夜のリリースについて")
-	decisions, err := w.store.NotificationDecisionsFor(ctx, general, msg)
-	if err != nil {
-		t.Fatalf("decisions: %v", err)
-	}
-	if reasonFor(t, decisions, w.agent) != NotifyReasonKeyword {
-		t.Fatalf("agent reason = %q, want keyword", reasonFor(t, decisions, w.agent))
-	}
-
-	// An unknown level is a bad request on this lane too.
-	status, _ = callLocal(t, ctx, server.localNotificationSettings, LocalNotificationSettingsPath,
-		map[string]any{"defaults_level": "loud"}, authorization)
-	if status != http.StatusBadRequest {
-		t.Fatalf("invalid level: status %d, want 400", status)
-	}
-	if !errors.Is(ValidateNotifyLevel("loud"), ErrInvalidNotificationSetting) {
-		t.Fatal("an unknown level must be a request error, not an internal one")
 	}
 }
 

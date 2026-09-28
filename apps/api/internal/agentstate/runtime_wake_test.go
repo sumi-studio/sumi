@@ -3,6 +3,7 @@ package agentstate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -335,4 +336,285 @@ func TestRuntimeWakerRotatesFairlyUnderSlowSweeps(t *testing.T) {
 func jsonInt(v int64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// NextWorkFor is the runtime's half of the sweep: a sleeping core host arms
+// its own wake from it. Each kind of recorded work yields its due time, and
+// with no live writer "due now" matches exactly what the sweep selects.
+func TestNextWorkForMatchesRecordedWork(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	near := func(got *time.Time, want time.Time, label string) {
+		t.Helper()
+		if got == nil || got.Sub(want).Abs() > 2*time.Second {
+			t.Fatalf("%s: next_work_at %v, want ~%v", label, got, want)
+		}
+	}
+	nextFor := func(pa string) NextWork {
+		t.Helper()
+		nw, err := s.NextWorkFor(ctx, pa)
+		if err != nil {
+			t.Fatalf("next work: %v", err)
+		}
+		if nw.NextWorkAt != nil && nw.NextWorkAt.Before(nw.Now) {
+			t.Fatalf("next_work_at %v before now %v", nw.NextWorkAt, nw.Now)
+		}
+		return nw
+	}
+	swept := func(pa string) bool {
+		t.Helper()
+		awaiting, err := s.PersonasAwaitingRuntime(ctx, 1000, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range awaiting {
+			if a.PersonaID == pa {
+				return true
+			}
+		}
+		return false
+	}
+	agrees := func(pa, label string) {
+		t.Helper()
+		nw := nextFor(pa)
+		due := nw.NextWorkAt != nil && !nw.NextWorkAt.After(nw.Now)
+		if due != swept(pa) {
+			t.Fatalf("%s: next-work due=%v but sweep selected=%v", label, due, !due)
+		}
+	}
+	submit := func(pa, id string) {
+		t.Helper()
+		in := &Input{PersonaID: pa, InputID: id, Kind: "message",
+			Payload: map[string]any{"text": "hi"}, ActorKind: "human", ActorID: "h-1",
+			SourceSurface: "dev", Attention: "reply"}
+		if _, _, err := s.SubmitInput(ctx, in); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	// Missing persona: the coded absence Core retires on.
+	if _, err := s.NextWorkFor(ctx, pid(t)); !errors.Is(err, ErrPersonaNotFound) {
+		t.Fatalf("missing persona err = %v", err)
+	}
+
+	// Nothing recorded: sleep.
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	if nw := nextFor(pa); nw.NextWorkAt != nil {
+		t.Fatalf("idle persona next_work_at = %v", nw.NextWorkAt)
+	}
+	agrees(pa, "idle")
+
+	// A far schedule is the next wake; a waiting input is not work.
+	exec(`INSERT INTO core_schedules (persona_id, schedule_id, wake_at, payload, status)
+		VALUES ($1, 'later', now() + interval '3 hours', '{}'::jsonb, 'pending')`, pa)
+	submit(pa, "in-wait")
+	exec(`UPDATE core_inputs SET status = 'waiting' WHERE persona_id = $1 AND input_id = 'in-wait'`, pa)
+	near(nextFor(pa).NextWorkAt, time.Now().Add(3*time.Hour), "far schedule")
+	agrees(pa, "far schedule")
+
+	// A queued input backing off until not_before comes first.
+	submit(pa, "in-backoff")
+	exec(`UPDATE core_inputs SET not_before = now() + interval '10 minutes' WHERE persona_id = $1 AND input_id = 'in-backoff'`, pa)
+	near(nextFor(pa).NextWorkAt, time.Now().Add(10*time.Minute), "not_before")
+	agrees(pa, "not_before")
+
+	// A ready input is due now.
+	submit(pa, "in-ready")
+	near(nextFor(pa).NextWorkAt, time.Now(), "ready input")
+	agrees(pa, "ready input")
+	exec(`UPDATE core_inputs SET status = 'done' WHERE persona_id = $1 AND input_id IN ('in-ready', 'in-backoff')`, pa)
+
+	// An overdue schedule is due now, never in the past.
+	exec(`UPDATE core_schedules SET wake_at = now() - interval '1 hour' WHERE persona_id = $1`, pa)
+	near(nextFor(pa).NextWorkAt, time.Now(), "overdue schedule")
+	agrees(pa, "overdue schedule")
+	exec(`UPDATE core_schedules SET status = 'fired' WHERE persona_id = $1`, pa)
+
+	// An input left claimed by a live writer: due when its lease expires;
+	// once the writer is gone, due now (recovery requeues it).
+	submit(pa, "in-claimed")
+	lease, err := s.AcquireWriter(ctx, pa, "h", 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE core_inputs SET status = 'claimed', claimed_generation = $2 WHERE persona_id = $1 AND input_id = 'in-claimed'`, pa, lease.Generation)
+	near(nextFor(pa).NextWorkAt, lease.ExpiresAt, "claimed under live lease")
+	if swept(pa) {
+		t.Fatal("sweep selected a persona whose writer is live")
+	}
+	if err := s.ReleaseWriter(ctx, pa, "h", lease.Generation); err != nil {
+		t.Fatal(err)
+	}
+	near(nextFor(pa).NextWorkAt, time.Now(), "claimed, writer gone")
+	agrees(pa, "claimed, writer gone")
+
+	// An inactive persona has no work here (the sweep skips it too).
+	exec(`UPDATE core_personas SET authority = 'sealed' WHERE persona_id = $1`, pa)
+	if nw := nextFor(pa); nw.NextWorkAt != nil {
+		t.Fatalf("sealed persona next_work_at = %v", nw.NextWorkAt)
+	}
+	agrees(pa, "sealed")
+}
+
+func TestNextWorkRouteAndInactiveCode(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	pa := pid(t)
+	if r := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`); r.Code != 201 {
+		t.Fatalf("create: %d", r.Code)
+	}
+	r := do(t, mux, "GET", "/internal/core/personas/"+pa+"/next-work", testAdminSecret, "")
+	if r.Code != 200 || !strings.Contains(r.Body.String(), `"next_work_at":null`) || !strings.Contains(r.Body.String(), `"now":`) {
+		t.Fatalf("idle next-work: %d %s", r.Code, r.Body)
+	}
+	if r := do(t, mux, "GET", "/internal/core/personas/"+pa+"/next-work", "", ""); r.Code != 401 {
+		t.Fatalf("unauthenticated next-work: %d", r.Code)
+	}
+	if r := do(t, mux, "GET", "/internal/core/personas/"+pid(t)+"/next-work", testAdminSecret, ""); r.Code != 404 || !strings.Contains(r.Body.String(), `"code":"persona_not_found"`) {
+		t.Fatalf("missing persona next-work: %d %s", r.Code, r.Body)
+	}
+	if _, err := srv.Store().pool.Exec(context.Background(), `UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, pa); err != nil {
+		t.Fatal(err)
+	}
+	r = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", testAdminSecret, `{"holder_id":"h","ttl_ms":30000}`)
+	if r.Code != 409 || !strings.Contains(r.Body.String(), `"code":"persona_inactive"`) {
+		t.Fatalf("inactive acquire: %d %s", r.Code, r.Body)
+	}
+}
+
+// Memory work is the runtime's own schedule, so the sweep leaves it alone
+// while it is on time. Only work overdue past MemoryRescueGrace with no live
+// writer — the signature of a lost wake — is rescued. The reactivation case:
+// a persona transferred away while a chunk waited (its runtime disarmed on
+// persona_inactive), then made active again with no input or schedule.
+func TestRuntimeSweepRescuesOnlyOverdueMemory(t *testing.T) {
+	s, pool := newStore(t)
+	ctx := context.Background()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	selected := func(pa string) *AwaitingRuntime {
+		t.Helper()
+		awaiting, err := s.PersonasAwaitingRuntime(ctx, 1000, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range awaiting {
+			if a.PersonaID == pa {
+				return &a
+			}
+		}
+		return nil
+	}
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	exec(`INSERT INTO core_memory_chunks (persona_id, chunk_seq, first_seq, last_seq, est_tokens, status)
+		VALUES ($1, 1, 1, 10, 12000, 'sealed')`, pa)
+	if selected(pa) != nil {
+		t.Fatal("freshly sealed chunk rescued: the runtime plans its own wake")
+	}
+	if nw, err := s.NextWorkFor(ctx, pa); err != nil || nw.NextWorkAt != nil {
+		t.Fatalf("memory is not next-work: %+v %v", nw, err)
+	}
+
+	// Transferred away while the chunk waits: never swept.
+	exec(`UPDATE core_memory_chunks SET created_at = now() - interval '2 hours' WHERE persona_id = $1`, pa)
+	exec(`UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, pa)
+	if selected(pa) != nil {
+		t.Fatal("inactive persona swept")
+	}
+	// Active again, no input or schedule: the memory-only work is rescued.
+	exec(`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, pa)
+	a := selected(pa)
+	if a == nil || !a.MemoryOnly {
+		t.Fatalf("reactivated persona's overdue memory not rescued: %+v", a)
+	}
+	// A live writer is working on it: no rescue.
+	lease, err := s.AcquireWriter(ctx, pa, "h", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected(pa) != nil {
+		t.Fatal("rescued under a live writer")
+	}
+	if err := s.ReleaseWriter(ctx, pa, "h", lease.Generation); err != nil {
+		t.Fatal(err)
+	}
+	// A retry backoff set just now is on schedule again, however old the chunk.
+	exec(`UPDATE core_memory_chunks SET not_before = now() + interval '1 minute' WHERE persona_id = $1`, pa)
+	if selected(pa) != nil {
+		t.Fatal("chunk inside its retry backoff rescued")
+	}
+	exec(`UPDATE core_memory_chunks SET not_before = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
+	if selected(pa) == nil {
+		t.Fatal("retry overdue past the grace not rescued (e.g. a planned wake the platform gave up on)")
+	}
+	// A branch left 'preparing' by a writer that is gone.
+	exec(`UPDATE core_memory_chunks SET status = 'preparing', not_before = NULL, claimed_at = now() WHERE persona_id = $1`, pa)
+	if selected(pa) != nil {
+		t.Fatal("recent preparation rescued")
+	}
+	exec(`UPDATE core_memory_chunks SET claimed_at = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
+	if a := selected(pa); a == nil || !a.MemoryOnly {
+		t.Fatalf("orphaned preparation not rescued: %+v", a)
+	}
+	// Other work makes it an ordinary wake.
+	in := &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "hi"}, ActorKind: "human", ActorID: "h-1",
+		SourceSurface: "dev", Attention: "reply"}
+	if _, _, err := s.SubmitInput(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if a := selected(pa); a == nil || a.MemoryOnly {
+		t.Fatalf("input + memory: %+v", a)
+	}
+}
+
+// A memory-only rescue is re-sent no sooner than MemoryGap (its runtime may
+// be resting on a model-unavailable shelf the database cannot see), while
+// new ordinary work still wakes at once.
+func TestRuntimeWakerPacesMemoryRescue(t *testing.T) {
+	srv, _ := newHTTPServer(t)
+	rec := &wakeRecorder{}
+	rec.status.Store(200)
+	host := httptest.NewServer(rec.handler(t))
+	defer host.Close()
+	waker, err := NewRuntimeWaker(srv.Store(), host.URL, testWakeToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waker.MinGap = 50 * time.Millisecond
+	ctx := context.Background()
+	s := srv.Store()
+	pa := pid(t)
+	mustPersona(t, s, pa)
+	if _, err := s.pool.Exec(ctx, `INSERT INTO core_memory_chunks (persona_id, chunk_seq, first_seq, last_seq, est_tokens, status, created_at)
+		VALUES ($1, 1, 1, 10, 12000, 'sealed', now() - interval '1 hour')`, pa); err != nil {
+		t.Fatal(err)
+	}
+	if n := waker.Sweep(ctx); n != 1 {
+		t.Fatalf("rescue wake sent %d", n)
+	}
+	time.Sleep(120 * time.Millisecond) // past MinGap, far inside MemoryGap
+	if n := waker.Sweep(ctx); n != 0 {
+		t.Fatalf("memory-only rescue repeated inside MemoryGap: %d", n)
+	}
+	in := &Input{PersonaID: pa, InputID: "in-1", Kind: "message",
+		Payload: map[string]any{"text": "hi"}, ActorKind: "human", ActorID: "h-1",
+		SourceSurface: "dev", Attention: "reply"}
+	if _, _, err := s.SubmitInput(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if n := waker.Sweep(ctx); n != 1 {
+		t.Fatalf("new input not woken promptly: %d", n)
+	}
 }

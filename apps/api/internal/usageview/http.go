@@ -14,7 +14,7 @@ import (
 	"net/http"
 
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 )
 
 // Service is the human-facing usage/budget API. Store is the core state
@@ -22,7 +22,7 @@ import (
 // resolves the browser session to its human.
 type Service struct {
 	Store        *agentstate.Store
-	Authenticate func(*http.Request) (chatgpt.LoginIdentity, error)
+	Authenticate func(*http.Request) (browseridentity.Identity, error)
 	// Resumed is invoked after a funding change resumes parked inputs —
 	// useful for surfacing/telemetry wiring; optional.
 	Resumed func(humanID string, resumed int)
@@ -70,10 +70,10 @@ func failure(w http.ResponseWriter, err error) {
 	respond(w, status, map[string]any{"error": map[string]string{"message": message}})
 }
 
-func (s *Service) identity(w http.ResponseWriter, r *http.Request) (chatgpt.LoginIdentity, bool) {
+func (s *Service) identity(w http.ResponseWriter, r *http.Request) (browseridentity.Identity, bool) {
 	if s.Authenticate == nil {
 		respond(w, 401, map[string]string{"error": "Sign in to Sumi"})
-		return chatgpt.LoginIdentity{}, false
+		return browseridentity.Identity{}, false
 	}
 	id, err := s.Authenticate(r)
 	if err != nil {

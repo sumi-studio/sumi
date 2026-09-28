@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -41,15 +40,6 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 		}
 
 		switch kind {
-		case "outbound_frame":
-			var frame OutboundFrame
-			if err := json.Unmarshal(wireRaw, &frame); err != nil {
-				t.Fatalf("fixture %q: unmarshal OutboundFrame: %v", name, err)
-			}
-			if err := frame.Validate(); err != nil {
-				t.Fatalf("fixture %q: validate OutboundFrame: %v", name, err)
-			}
-			roundTripJSON(t, name, wireRaw, &frame)
 		case "command_envelope":
 			var env CommandEnvelope
 			if err := json.Unmarshal(wireRaw, &env); err != nil {
@@ -59,18 +49,6 @@ func TestContractFixturesRoundTrip(t *testing.T) {
 				t.Fatalf("fixture %q: validate command: %v", name, err)
 			}
 			roundTripJSON(t, name, wireRaw, &env)
-		case "agent_hello":
-			var hello AgentHello
-			if err := json.Unmarshal(wireRaw, &hello); err != nil {
-				t.Fatalf("fixture %q: unmarshal AgentHello: %v", name, err)
-			}
-			roundTripJSON(t, name, wireRaw, &hello)
-		case "api_hello":
-			var hello ApiHello
-			if err := json.Unmarshal(wireRaw, &hello); err != nil {
-				t.Fatalf("fixture %q: unmarshal ApiHello: %v", name, err)
-			}
-			roundTripJSON(t, name, wireRaw, &hello)
 		case "agent_event":
 			if err := validateEvent(wireRaw); err != nil {
 				t.Fatalf("fixture %q: validate AgentEvent: %v", name, err)
@@ -251,55 +229,6 @@ func TestValidateApprovalDecisionUsesCurrentCallVocabularyOnly(t *testing.T) {
 	}
 }
 
-func TestOutboundFrameRejectsExplicitNullRejectReason(t *testing.T) {
-	for _, status := range []string{"received", "applied", "superseded"} {
-		raw := []byte(fmt.Sprintf(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"%s","reject_reason":null}}`, status))
-		var frame OutboundFrame
-		if err := json.Unmarshal(raw, &frame); err == nil {
-			t.Fatalf("expected reject_reason:null to be rejected for status %s", status)
-		}
-	}
-
-	// rejected status with null reject_reason must also be rejected.
-	raw := []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"rejected","reject_reason":null}}`)
-	var frame OutboundFrame
-	if err := json.Unmarshal(raw, &frame); err == nil {
-		t.Fatal("expected reject_reason:null to be rejected for rejected status")
-	}
-
-	// rejected status with a valid string reject_reason must be accepted.
-	raw = []byte(`{"frame_type":"command_ack","ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","status":"rejected","reject_reason":"unknown_command"}}`)
-	if err := json.Unmarshal(raw, &frame); err != nil {
-		t.Fatalf("expected valid rejected ack to be accepted, got %v", err)
-	}
-}
-
-func TestOutboundFrameRejectsExplicitNullWrongBranch(t *testing.T) {
-	tests := []string{
-		`{"frame_type":"event","envelope":{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}},"ack":null}`,
-		`{"frame_type":"command_ack","envelope":null,"ack":{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"received"}}`,
-	}
-	for _, raw := range tests {
-		var frame OutboundFrame
-		if err := json.Unmarshal([]byte(raw), &frame); err == nil {
-			t.Fatalf("expected explicit null wrong branch to be rejected: %s", raw)
-		}
-	}
-}
-
-func TestCommandAckRejectsExplicitNullRejectReason(t *testing.T) {
-	for _, status := range []string{"received", "rejected"} {
-		raw := fmt.Sprintf(
-			`{"seq":1,"command_id":"00000000-0000-4000-8000-000000000001","status":"%s","reject_reason":null}`,
-			status,
-		)
-		var ack CommandAck
-		if err := json.Unmarshal([]byte(raw), &ack); err == nil {
-			t.Fatalf("expected standalone reject_reason:null to be rejected for status %s", status)
-		}
-	}
-}
-
 func TestValidateApprovalDecisionRequiresRequestID(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"approval_decision","decision":{"type":"approve_once"}}`,
@@ -382,105 +311,6 @@ func TestUnmarshalStrictRejectsTrailingData(t *testing.T) {
 	// Trailing whitespace is acceptable.
 	if err := unmarshalStrict([]byte(`{"type":"user_message","text":"hi","attachments":[]}   `+"\n"), &cmd); err != nil {
 		t.Fatalf("expected trailing whitespace to be accepted, got %v", err)
-	}
-}
-
-func TestOutboundFrameRejectsTrailingData(t *testing.T) {
-	raw := []byte(`{"frame_type":"event","envelope":{"audience":"direct_chat","seq":1,"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","event":{"type":"agent_start"}}} trailing`)
-	var frame OutboundFrame
-	if err := json.Unmarshal(raw, &frame); err == nil {
-		t.Fatal("expected trailing data to be rejected for OutboundFrame")
-	}
-}
-
-func TestAgentHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0","extra":true}`)
-	var hello AgentHello
-	if err := json.Unmarshal(raw, &hello); err == nil {
-		t.Fatal("expected unknown fields to be rejected for AgentHello")
-	}
-}
-
-func TestApiHelloRejectsUnknownFields(t *testing.T) {
-	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"7","last_received_event_seq":"0","next_command_seq":"1","extra":true}`)
-	var hello ApiHello
-	if err := json.Unmarshal(raw, &hello); err == nil {
-		t.Fatal("expected unknown fields to be rejected for ApiHello")
-	}
-}
-
-func TestAgentHelloAcceptsFullWidthGenerationAndCursors(t *testing.T) {
-	raw := []byte(`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"9223372036854775807","last_sent_event_seq":"18446744073709551615","last_received_command_seq":"18446744073709551615","last_applied_command_seq":"18446744073709551615"}`)
-	var hello AgentHello
-	if err := json.Unmarshal(raw, &hello); err != nil {
-		t.Fatalf("expected full-width hello to be accepted: %v", err)
-	}
-	if hello.Generation != maxProcessGeneration || hello.LastSentEventSeq != ^uint64(0) {
-		t.Fatalf("unexpected decoded full-width hello: %+v", hello)
-	}
-}
-
-func TestHelloRejectsNonCanonicalDecimalAndOverflow(t *testing.T) {
-	tests := []string{
-		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"07","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"+7","last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":"7","last_sent_event_seq":"18446744073709551616","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","generation":7,"last_sent_event_seq":"0","last_received_command_seq":"0","last_applied_command_seq":"0"}`,
-		`{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"9223372036854775808","last_received_event_seq":"0","next_command_seq":"1"}`,
-	}
-	for _, raw := range tests {
-		var hello AgentHello
-		if strings.Contains(raw, "accepted_generation") {
-			var apiHello ApiHello
-			if err := json.Unmarshal([]byte(raw), &apiHello); err == nil {
-				t.Fatalf("accepted noncanonical or overflowing API hello: %s", raw)
-			}
-			continue
-		}
-		if err := json.Unmarshal([]byte(raw), &hello); err == nil {
-			t.Fatalf("accepted noncanonical or overflowing agent hello: %s", raw)
-		}
-	}
-}
-
-func TestAgentHelloMarshalRejectsOutOfRangeGeneration(t *testing.T) {
-	hello := AgentHello{
-		PersonalityAgentID:     "018f47a2-9b3c-7def-8abc-0123456789ab",
-		Generation:             maxProcessGeneration + 1,
-		LastSentEventSeq:       0,
-		LastReceivedCommandSeq: 0,
-		LastAppliedCommandSeq:  0,
-	}
-	if _, err := json.Marshal(hello); err == nil {
-		t.Fatal("expected out-of-range generation to be rejected when marshaling AgentHello")
-	}
-}
-
-func TestApiHelloMarshalRejectsOutOfRangeAcceptedGeneration(t *testing.T) {
-	hello := ApiHello{
-		PersonalityAgentID:   "018f47a2-9b3c-7def-8abc-0123456789ab",
-		AcceptedGeneration:   maxProcessGeneration + 1,
-		LastReceivedEventSeq: 0,
-		NextCommandSeq:       1,
-	}
-	if _, err := json.Marshal(hello); err == nil {
-		t.Fatal("expected out-of-range accepted_generation to be rejected when marshaling ApiHello")
-	}
-}
-
-func TestHelloMarshalUsesCanonicalDecimalStrings(t *testing.T) {
-	hello := ApiHello{
-		PersonalityAgentID:   "018f47a2-9b3c-7def-8abc-0123456789ab",
-		AcceptedGeneration:   maxProcessGeneration,
-		LastReceivedEventSeq: ^uint64(0),
-		NextCommandSeq:       ^uint64(0),
-	}
-	encoded, err := json.Marshal(hello)
-	if err != nil {
-		t.Fatalf("marshal full-width API hello: %v", err)
-	}
-	if got, want := string(encoded), `{"personality_agent_id":"018f47a2-9b3c-7def-8abc-0123456789ab","accepted_generation":"9223372036854775807","last_received_event_seq":"18446744073709551615","next_command_seq":"18446744073709551615"}`; got != want {
-		t.Fatalf("hello wire mismatch\n got: %s\nwant: %s", got, want)
 	}
 }
 

@@ -7,12 +7,12 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 )
 
 type Service struct {
 	Store        *Store
-	Authenticate func(*http.Request) (chatgpt.LoginIdentity, error)
+	Authenticate func(*http.Request) (browseridentity.Identity, error)
 }
 
 func (s *Service) RegisterRoutes(mux *http.ServeMux) {

@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -62,12 +62,12 @@ func setup(t *testing.T) *fixture {
 	}
 	mux := http.NewServeMux()
 	core.RegisterRoutes(mux)
-	(&Service{Store: store, Authenticate: func(r *http.Request) (chatgpt.LoginIdentity, error) {
+	(&Service{Store: store, Authenticate: func(r *http.Request) (browseridentity.Identity, error) {
 		h := r.Header.Get("Test-Human")
 		if h != owner && h != other {
-			return chatgpt.LoginIdentity{}, fmt.Errorf("unauthorized")
+			return browseridentity.Identity{}, fmt.Errorf("unauthorized")
 		}
-		return chatgpt.LoginIdentity{HumanID: h, Authorize: func(ctx context.Context, effect func(context.Context) error) error { return effect(ctx) }}, nil
+		return browseridentity.Identity{HumanID: h, Authorize: func(ctx context.Context, effect func(context.Context) error) error { return effect(ctx) }}, nil
 	}}).RegisterRoutes(mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)

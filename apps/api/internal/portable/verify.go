@@ -389,7 +389,7 @@ var cutChecks = []struct{ name, sql string }{
 		WHERE p.persona_id = $1 AND p.model_intent IS NOT NULL AND (
 			jsonb_typeof(p.model_intent) IS DISTINCT FROM 'object'
 			OR jsonb_typeof(p.model_intent->'kind') IS DISTINCT FROM 'string'
-			OR p.model_intent->>'kind' NOT IN ('none','api','chatgpt'))`},
+			OR p.model_intent->>'kind' NOT IN ('none','api'))`},
 	{"generation_not_below_epoch", `
 		SELECT count(*) FROM (
 			SELECT generation AS g FROM core_turns WHERE persona_id = $1

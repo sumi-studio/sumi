@@ -13,7 +13,7 @@ import (
 )
 
 type Server struct {
-	Gateway                *agentevents.DurableGateway
+	Gateway                *agentevents.BrowserJournal
 	Store                  *Store
 	Sessions               agentevents.UserSessionAuthorizer
 	AllowedOrigins         []string
@@ -35,17 +35,6 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 }
 func (s *Server) public(op string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) { s.browser(w, r, op) }
-}
-func (s *Server) RegisterLocalControlRoutes(control *agentevents.LocalControlServer) error {
-	for _, op := range []string{"bootstrap", "list", "open", "create", "reply", "status", "read"} {
-		if err := control.RegisterAuthorizedRoute("POST /local-control/v1/feedback:"+op, func(w http.ResponseWriter, r *http.Request, auth agentevents.LocalRuntimeAuthorization) {
-			value, err := s.dispatch(r, participant.PersonalityAgent(auth.PersonalityAgentID), op, true)
-			respond(w, value, err, op)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 func (s *Server) browser(w http.ResponseWriter, r *http.Request, op string) {
 	if r.Method != http.MethodGet && !agentevents.BrowserOriginAllowed(r, s.AllowedOrigins) {

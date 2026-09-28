@@ -6,7 +6,7 @@
   - [ADR 0001](0001-frontend-stack.md)のTauri desktop/mobile shell、`src-tauri`、native mobile packaging、通知統合の選定
 - Preserves:
   - [ADR 0001](0001-frontend-stack.md)のReact / Vite / SDUIを一つのrenderer正本にする判断
-  - [ADR 0013](0013-tool-invocation-routes-and-authority-provenance.md)のinvocation route、AutoReview、Human Approval、authority provenance
+  - [ADR 0013](../core-architecture.md)のinvocation route、AutoReview、Human Approval、authority provenance
 - Related:
   - [#203](https://github.com/sumi-studio/sumi/issues/203)
   - [#204](https://github.com/sumi-studio/sumi/issues/204)

@@ -310,7 +310,7 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = commandStore.Close() })
-	revocations, err := agentevents.OpenDurableGateway(privateRuntimeDir(t), commandStore)
+	revocations, err := agentevents.OpenBrowserJournal(privateRuntimeDir(t), commandStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,10 +327,7 @@ func TestLogoutClosesMessagingSocketAndRevocationFencesCachedHubEvents(t *testin
 		UserID:             humanID,
 		PersonalityAgentID: agentID,
 	}
-	binding, err := agentevents.NewStaticIdentityBindingResolver("unused", claims)
-	if err != nil {
-		t.Fatal(err)
-	}
+	binding := unusedIdentityBinding{claims}
 	auth, err := agentevents.NewBrowserAuthServer(
 		unusedFirebaseVerifier{}, binding, sessions, []string{testOrigin}, false,
 	)
@@ -806,4 +803,10 @@ func TestWSTypingIsVolatileAndScoped(t *testing.T) {
 	if event["type"] != EventTyping || event["actor"].(map[string]any)["human_id"] != w.humanA.ID {
 		t.Fatalf("typing event = %v", event)
 	}
+}
+
+type unusedIdentityBinding struct{ claims agentevents.UserSessionClaims }
+
+func (b unusedIdentityBinding) ResolveIdentity(context.Context, agentevents.FirebaseIdentity) (agentevents.UserSessionClaims, error) {
+	return b.claims, nil
 }

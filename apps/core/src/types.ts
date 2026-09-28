@@ -131,6 +131,18 @@ export interface PersonaState {
 }
 
 /**
+ * When the persona next needs a runtime for recorded work — a queued input
+ * (at its not_before), a pending schedule, an input an interrupted turn
+ * left claimed. Null when nothing waits; memory preparation is not part of
+ * it (the secretary tracks that itself). `now` is the state service's
+ * clock: hosts arm relative to it, never comparing clocks directly.
+ */
+export interface NextWork {
+  next_work_at: string | null;
+  now: string;
+}
+
+/**
  * Invocation route (ADR 0013 §1): "normal" executes under the agent's own
  * authority; "elevated" explicitly asks a human for a one-shot decision.
  * Immutable once recorded — part of the durable decision.
@@ -193,7 +205,7 @@ export interface ApprovalDecision {
 
 /**
  * The persona's resolved model connection for the core. The selection is
- * authoritative: "unset"/"none"/"chatgpt"/"needs_rebinding" or an "api"
+ * authoritative: "unset"/"none"/"needs_rebinding" or an "api"
  * binding carrying the connection's identity, version, and — only when the
  * credential store is armed — the decrypted key. Never a substituted
  * model/provider.
@@ -202,7 +214,7 @@ export interface ModelBinding {
   // "needs_rebinding": the persona arrived by transfer carrying a model
   // selection intent; no model may run until the destination's bound
   // human selects a matching connection or the intent is cleared.
-  selection: "unset" | "none" | "api" | "chatgpt" | "needs_rebinding";
+  selection: "unset" | "none" | "api" | "needs_rebinding";
   /** The carried non-secret intent, echoed when selection is needs_rebinding. */
   intent?: { kind: string; connection?: Record<string, unknown> };
   connection?: {

@@ -322,17 +322,23 @@ func TestJobClaimExpiryLost(t *testing.T) {
 // further work. Kind-fenced, bounded per call, keeps claimed_by so the
 // recorded claimant can still attach its observed outcome.
 func TestSweepExpiredJobs(t *testing.T) {
-	s, _ := newStore(t)
+	s, pool := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
 	mustPersona(t, s, pa)
 
 	scriptReq := map[string]any{"code": "export async function run(){ return 1 }"}
+	// Every setup claim takes a long lease: ClaimJobs pre-sweeps any expired
+	// claim of the persona regardless of kind, so a short lease here would
+	// let a later setup claim mark the dead claims lost before the
+	// standalone sweep under test runs (timing-dependent on a slow DB). The
+	// dead claims are expired explicitly once setup is complete.
+	//
 	// Foreign-kind orphaned claim — must be invisible to a script sweep.
 	if _, _, err := s.SubmitJob(ctx, pa, "j-foreign", "subprocess", subReq("sleep", "9"), "api"); err != nil {
 		t.Fatalf("submit j-foreign: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"subprocess"}, 20*time.Millisecond, 4, "*"); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"subprocess"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-foreign: %v", err)
 	}
 	// Healthy claim and a queued job — neither may be touched.
@@ -342,15 +348,18 @@ func TestSweepExpiredJobs(t *testing.T) {
 	if _, _, err := s.ClaimJobs(ctx, pa, "runner-live", []string{"script"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-live: %v", err)
 	}
-	// Orphaned claim LAST — no intermediate claim pass can pre-sweep it:
-	// 'running' under a dead runner with an already-dead lease.
+	// Orphaned script claim: 'running' under a dead runner.
 	if _, _, err := s.SubmitJob(ctx, pa, "j-exp", "script", scriptReq, "api"); err != nil {
 		t.Fatalf("submit j-exp: %v", err)
 	}
-	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"script"}, 20*time.Millisecond, 4, "*"); err != nil {
+	if _, _, err := s.ClaimJobs(ctx, pa, "runner-dead", []string{"script"}, time.Minute, 4, "*"); err != nil {
 		t.Fatalf("claim j-exp: %v", err)
 	}
-	time.Sleep(40 * time.Millisecond)
+	// The dead runner's leases are both past; nothing else ran after this.
+	if tag, err := pool.Exec(ctx, `UPDATE core_jobs SET claim_expires_at = now() - interval '1 second'
+		WHERE persona_id = $1 AND job_id IN ('j-foreign', 'j-exp')`, pa); err != nil || tag.RowsAffected() != 2 {
+		t.Fatalf("expire dead claims: %v rows=%d", err, tag.RowsAffected())
+	}
 
 	swept, err := s.SweepExpiredJobs(ctx, []string{"script"}, 64)
 	if err != nil || len(swept) != 1 || swept[0].JobID != "j-exp" || swept[0].Status != "lost" {

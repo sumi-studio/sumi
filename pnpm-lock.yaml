@@ -15,8 +15,6 @@ importers:
         specifier: ^2.10.5
         version: 2.10.5
 
-  apps/agent: {}
-
   apps/api: {}
 
   apps/browser-cloud:

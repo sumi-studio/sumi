@@ -1,5 +1,11 @@
 import { jsonEqual } from "./json.ts";
-import { FencedError, type StateClient, StateError } from "./state-client.ts";
+import {
+  FencedError,
+  PersonaInactiveError,
+  PersonaNotFoundError,
+  type StateClient,
+  StateError,
+} from "./state-client.ts";
 import { isInternalActor } from "./memory.ts";
 import type {
   Approval,
@@ -17,6 +23,7 @@ import type {
   MemoryChunk,
   MemoryStatus,
   ModelBinding,
+  NextWork,
   OmittedMemory,
   Operation,
   OutboxEntry,
@@ -550,7 +557,7 @@ export class FakeState implements StateClient {
   /** Test fixture: set the persona's authority state (active|staged|sealed|transferred|retired). */
   setPersonaAuthority(personaId: string, authority: string) {
     const rec = this.personas.get(personaId);
-    if (!rec) throw new StateError(404, "persona not found");
+    if (!rec) throw new PersonaNotFoundError();
     rec.authority = authority;
   }
 
@@ -560,7 +567,7 @@ export class FakeState implements StateClient {
     intent: { kind: string; connection?: Record<string, unknown> } | null,
   ) {
     const rec = this.personas.get(personaId);
-    if (!rec) throw new StateError(404, "persona not found");
+    if (!rec) throw new PersonaNotFoundError();
     rec.model_intent = intent;
   }
 
@@ -569,10 +576,9 @@ export class FakeState implements StateClient {
    * one refuses (409) like the real store. */
   clearModelIntent(personaId: string) {
     const rec = this.personas.get(personaId);
-    if (!rec) throw new StateError(404, "persona not found");
+    if (!rec) throw new PersonaNotFoundError();
     if (rec.authority !== "staged" && rec.authority !== "active") {
-      throw new StateError(
-        409,
+      throw new PersonaInactiveError(
         `persona is not active in this placement: persona authority is ${rec.authority}`,
       );
     }
@@ -582,7 +588,7 @@ export class FakeState implements StateClient {
   /** Mirror of the Go bind route: an unbound staged/active persona binds; a bound or moved one refuses. */
   bindHuman(personaId: string, humanId: string) {
     const rec = this.personas.get(personaId);
-    if (!rec) throw new StateError(404, "persona not found");
+    if (!rec) throw new PersonaNotFoundError();
     if (rec.human_id !== null) {
       // Same-human retry is idempotent; a different one conflicts.
       if (rec.human_id === humanId) return;
@@ -592,8 +598,7 @@ export class FakeState implements StateClient {
       );
     }
     if (rec.authority !== "staged" && rec.authority !== "active") {
-      throw new StateError(
-        409,
+      throw new PersonaInactiveError(
         `persona is not active in this placement: persona authority is ${rec.authority}`,
       );
     }
@@ -647,11 +652,10 @@ export class FakeState implements StateClient {
     // missing persona is a 404 — not a fresh lease on a ghost.
     const rec = this.personas.get(persona);
     if (!rec) {
-      throw new StateError(404, "persona not found");
+      throw new PersonaNotFoundError();
     }
     if (rec.authority !== "active") {
-      throw new StateError(
-        409,
+      throw new PersonaInactiveError(
         `persona is not active in this placement: authority is ${rec.authority}`,
       );
     }
@@ -3385,6 +3389,36 @@ export class FakeState implements StateClient {
       ...Object.keys(TOOL_AUTHORITY),
       ...this.registeredEffects.keys(),
     ].sort();
+  }
+
+  /** Mirror of the Go next-work query. */
+  async nextWork(persona: string): Promise<NextWork> {
+    const p = this.personas.get(persona);
+    if (!p) throw new PersonaNotFoundError();
+    const now = Date.now();
+    const at = (iso: string | null) => (iso ? Date.parse(iso) : now);
+    const due: number[] = [];
+    const mine = this.inputs.filter((i) => i.persona_id === persona);
+    for (const i of mine) {
+      if (i.status === "queued") due.push(at(i.not_before));
+    }
+    if (mine.some((i) => i.status === "claimed")) {
+      const lease = this.leases.get(persona);
+      const live = lease && Date.parse(lease.expires_at) > now;
+      due.push(live ? Date.parse(lease.expires_at) : now);
+    }
+    for (const sch of this.schedules.values()) {
+      if (sch.persona_id === persona && sch.status === "pending")
+        due.push(Date.parse(sch.wake_at));
+    }
+    const next =
+      p.authority === "active" && due.length
+        ? Math.max(now, Math.min(...due))
+        : null;
+    return {
+      next_work_at: next === null ? null : new Date(next).toISOString(),
+      now: new Date(now).toISOString(),
+    };
   }
 
   async personaState(persona: string): Promise<PersonaState> {

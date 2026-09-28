@@ -20,7 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sumi-studio/sumi/apps/api/internal/agentstate"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
@@ -31,11 +31,12 @@ const persona = "0198f0f4-9b72-7000-8000-000000000203"
 const secret = "mcp-secret-write-only-903"
 
 type fixture struct {
-	store  *Store
-	core   *agentstate.Server
-	server *httptest.Server
-	runner *Runner
-	t      *testing.T
+	store     *Store
+	core      *agentstate.Server
+	server    *httptest.Server
+	runner    *Runner
+	t         *testing.T
+	lastJobID string
 }
 
 func setup(t *testing.T) *fixture {
@@ -65,16 +66,16 @@ func setup(t *testing.T) *fixture {
 	}
 	mux := http.NewServeMux()
 	core.RegisterRoutes(mux)
-	(&Service{Store: store, Authenticate: func(r *http.Request) (chatgpt.LoginIdentity, error) {
+	(&Service{Store: store, Authenticate: func(r *http.Request) (browseridentity.Identity, error) {
 		human := r.Header.Get("Test-Human")
 		if human != owner && human != other {
-			return chatgpt.LoginIdentity{}, fmt.Errorf("unauthenticated")
+			return browseridentity.Identity{}, fmt.Errorf("unauthenticated")
 		}
-		return chatgpt.LoginIdentity{HumanID: human, Authorize: func(ctx context.Context, f func(context.Context) error) error { return f(ctx) }}, nil
+		return browseridentity.Identity{HumanID: human, Authorize: func(ctx context.Context, f func(context.Context) error) error { return f(ctx) }}, nil
 	}}).RegisterRoutes(mux)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	return &fixture{store, core, server, NewRunner(store, core.Store()), t}
+	return &fixture{store: store, core: core, server: server, runner: NewRunner(store, core.Store()), t: t}
 }
 func strptr(s string) *string { return &s }
 func (f *fixture) api(method, path, human string, body any) (int, []byte) {
@@ -110,11 +111,39 @@ func (f *fixture) save(endpoint string) Connection {
 func (f *fixture) coreCall(tool string, request map[string]any) string {
 	f.t.Helper()
 	ctx := context.Background()
+	createsJob := tool == "mcp.call" || tool == "mcp.list_tools"
+	known := map[string]bool{}
+	if createsJob {
+		jobs, err := f.core.Store().ListJobs(ctx, persona, nil, 500)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		for _, job := range jobs {
+			known[job.JobID] = true
+		}
+		f.lastJobID = ""
+	}
 	if _, _, e := f.core.Store().SubmitInput(ctx, &agentstate.Input{PersonaID: persona, InputID: uuid.NewString(), Kind: "message", Payload: map[string]any{"text": "MCP acceptance " + tool}, ActorKind: "human", ActorID: owner, SourceSurface: "test", Attention: "reply"}); e != nil {
 		f.t.Fatal(e)
 	}
 	b, _ := json.Marshal(map[string]any{"tool": tool, "request": request})
-	return f.child(string(b))
+	out := f.child(string(b))
+	if createsJob {
+		jobs, err := f.core.Store().ListJobs(ctx, persona, nil, 500)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		for _, job := range jobs {
+			if known[job.JobID] {
+				continue
+			}
+			if f.lastJobID != "" {
+				f.t.Fatal("one MCP call created multiple jobs")
+			}
+			f.lastJobID = job.JobID
+		}
+	}
+	return out
 }
 func (f *fixture) child(call string) string {
 	f.t.Helper()
@@ -135,11 +164,17 @@ func (f *fixture) child(call string) string {
 }
 func (f *fixture) job() agentstate.Job {
 	f.t.Helper()
-	jobs, e := f.core.Store().ListJobs(context.Background(), persona, nil, 1)
-	if e != nil || len(jobs) != 1 {
-		f.t.Fatalf("jobs %v %v", jobs, e)
+	// Follow the job admitted by this call, not wall-clock sort order. A
+	// clock correction must not make a previous list_tools job stand in for
+	// the mcp.call whose result this integration test is verifying.
+	if f.lastJobID == "" {
+		f.t.Fatal("MCP call did not admit a job")
 	}
-	return jobs[0]
+	job, err := f.core.Store().GetJob(context.Background(), persona, f.lastJobID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return job
 }
 func (f *fixture) tick() {
 	f.t.Helper()

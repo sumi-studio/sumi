@@ -12,7 +12,7 @@ func TestHumanProfileIsParticipantGlobalAndPersistsPartialUpdates(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := New(pool)
 	registration, err := store.AutoRegisterWithDisplayName(
 		ctx, "firebase", "profile-owner", "Yohaku",
 	)
@@ -74,7 +74,7 @@ func TestHumanProfileRejectsInvalidFieldsWithoutPartialWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	pool := connectTestPool(t, ctx)
-	store := NewWithWrappingKeyID(pool, "test-wrapping/v1")
+	store := New(pool)
 	registration, err := store.AutoRegisterWithDisplayName(
 		ctx, "firebase", "profile-validation", "Before",
 	)

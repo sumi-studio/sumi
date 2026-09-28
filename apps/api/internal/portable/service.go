@@ -464,9 +464,6 @@ func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID
 						'model', c.model, 'version', c.version::text)
 					FROM model_api_connections c
 					WHERE c.human_id = m.human_id AND c.connection_id = m.connection_id)
-				WHEN m.kind = 'chatgpt' THEN (
-					SELECT jsonb_build_object('model', g.model, 'effort', g.effort)
-					FROM chatgpt_connections g WHERE g.human_id = m.human_id)
 				ELSE NULL END)
 			FROM model_connection_selections m
 			WHERE m.human_id = p.human_id), p.model_intent)

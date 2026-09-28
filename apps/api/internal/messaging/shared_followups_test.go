@@ -3,7 +3,6 @@ package messaging
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -692,22 +691,6 @@ func TestSharedIntakeEditOfReplyToSecretaryKeepsReplyAttention(t *testing.T) {
 // The legacy agentevents adapter cannot represent edited/deleted events:
 // they fail clear into a terminal unsupported_route suppression instead of
 // degrading into an unmarked external_event or retrying forever.
-func TestSharedIntakeLegacyGatewayFailsClearOnChangeEvents(t *testing.T) {
-	gateway := &AgentAttentionGateway{}
-	_, _, err := gateway.input(AgentAttentionEvent{Change: AttentionChangeDeleted})
-	if !errors.Is(err, errUnsupportedAttentionEvent) {
-		t.Fatalf("deleted event input() = %v", err)
-	}
-	if _, _, err := gateway.input(AgentAttentionEvent{Change: AttentionChangeEdited}); !errors.Is(err, errUnsupportedAttentionEvent) {
-		t.Fatalf("edited event input() = %v", err)
-	}
-	if reason, terminal := terminalDeliveryReason(err); !terminal || reason != "unsupported_route" {
-		t.Fatalf("terminalDeliveryReason = %q,%v", reason, terminal)
-	}
-	if _, _, err := gateway.input(AgentAttentionEvent{}); errors.Is(err, errUnsupportedAttentionEvent) {
-		t.Fatal("plain event must not hit the change guard")
-	}
-}
 
 // The real Node core against the real state service and real PostgreSQL: an
 // edit lands as a second journaled input_received carrying message_change,

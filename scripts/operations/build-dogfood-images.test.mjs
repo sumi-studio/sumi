@@ -151,7 +151,7 @@ async function createFixture() {
     0o755,
   );
   await chmod(join(root, "scripts/operations/dogfood-docker.mjs"), 0o755);
-  for (const role of ["api", "agent", "provisioner", "web"]) {
+  for (const role of ["api", "core", "job", "provisioner", "web"]) {
     await mkdir(join(root, "deploy", role), { recursive: true });
     await writeFile(join(root, "deploy", role, "Dockerfile"), "FROM scratch\n");
   }
@@ -214,9 +214,10 @@ printf '\\n' >> "$state/docker.log"
 role_hex() {
   case "$1" in
     api) printf a ;;
-    agent) printf b ;;
+    core) printf b ;;
     provisioner) printf c ;;
     web) printf d ;;
+    job) printf f ;;
     *) exit 90 ;;
   esac
 }
@@ -297,9 +298,10 @@ if [[ "$subject" == sha256:* ]]; then
   hex="\${subject#sha256:}"
   case "\${hex:0:1}" in
     a) role=api ;;
-    b) role=agent ;;
+    b) role=core ;;
     c) role=provisioner ;;
     d) role=web ;;
+    f) role=job ;;
     *) exit 92 ;;
   esac
   id="$subject"
@@ -549,12 +551,12 @@ async function withFixture(fn) {
   }
 }
 
-test("dry-run constructs four exact builds without invoking Docker or writing a manifest", async () => {
+test("dry-run constructs five exact builds without invoking Docker or writing a manifest", async () => {
   await withFixture(async (fixture) => {
     const result = await run(fixture, ["--dry-run"]);
     const expected = [
       `DRY-RUN: export raw Git commit ${fixture.sha} tree ${fixture.tree} to /PRIVATE/EXACT-CONTEXT`,
-      ...["api", "agent", "provisioner", "web"].map(
+      ...["api", "core", "job", "provisioner", "web"].map(
         (role) =>
           `DRY-RUN: docker --config /PRIVATE/EMPTY-DOCKER-CONFIG --context default build --iidfile /PRIVATE/IID-${role} --file /PRIVATE/EXACT-CONTEXT/deploy/${role}/Dockerfile --label org.opencontainers.image.revision=${fixture.sha} --label org.opencontainers.image.source=https://github.com/sumi-studio/sumi --tag ghcr.io/sumi-studio/sumi-${role}:${fixture.sha} /PRIVATE/EXACT-CONTEXT`,
       ),
@@ -571,7 +573,7 @@ test("dry-run constructs four exact builds without invoking Docker or writing a 
 
 test("a partial build failure publishes no COMPLETE manifest", async () => {
   await withFixture(async (fixture) => {
-    await assert.rejects(run(fixture, [], { FAKE_FAIL_ROLE: "agent" }), {
+    await assert.rejects(run(fixture, [], { FAKE_FAIL_ROLE: "core" }), {
       code: 42,
     });
     await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
@@ -878,7 +880,7 @@ test("all builds use one exported tree and exclude live edits and ignored secret
     )
       .trim()
       .split("\n");
-    assert.equal(contexts.length, 4);
+    assert.equal(contexts.length, 5);
     assert.equal(new Set(contexts).size, 1);
     await assert.rejects(stat(dirname(contexts[0])), { code: "ENOENT" });
   });
@@ -1207,7 +1209,7 @@ test("submodule, symlink, and Git LFS trees fail closed before export", async (t
 test("wrong immutable image labels fail closed", async () => {
   await withFixture(async (fixture) => {
     await assert.rejects(
-      run(fixture, [], { FAKE_BAD_LABEL_ROLE: "agent" }),
+      run(fixture, [], { FAKE_BAD_LABEL_ROLE: "core" }),
       /wrong revision label/,
     );
     await assert.rejects(stat(fixture.manifest), { code: "ENOENT" });
@@ -1223,7 +1225,7 @@ test("mixed immutable-ID inspection responses and iidfile attacks fail closed", 
     ],
     [
       "iid mismatch",
-      { FAKE_IID_MISMATCH_ROLE: "agent" },
+      { FAKE_IID_MISMATCH_ROLE: "core" },
       /invalid immutable-ID inspection evidence/,
     ],
     [
@@ -1676,7 +1678,7 @@ test("retag after API build cannot falsify immutable COMPLETE evidence", async (
   });
 });
 
-test("live binding rejects four tags aliased to one component IID", async () => {
+test("live binding rejects five tags aliased to one component IID", async () => {
   await withFixture(async (fixture) => {
     await run(fixture);
     await setFakeControls(fixture, { FAKE_ALIAS_ALL_BINDINGS: "1" });
@@ -1708,7 +1710,7 @@ test("live binding inspection times out without exposing Docker output", async (
     await run(fixture);
     const secret = "must-not-escape-docker-stderr";
     await setFakeControls(fixture, {
-      FAKE_HANG_BINDING_ROLE: "agent",
+      FAKE_HANG_BINDING_ROLE: "core",
       FAKE_DOCKER_SECRET: secret,
     });
     const started = Date.now();
@@ -1751,7 +1753,7 @@ test("live binding distinguishes verified absence from inspection unavailability
   await t.test("verified absence", async () => {
     await withFixture(async (fixture) => {
       await run(fixture);
-      await rm(join(fixture.state, "built-agent"));
+      await rm(join(fixture.state, "built-core"));
       await assert.rejects(
         execFileAsync(
           join(
@@ -1988,11 +1990,12 @@ test("successful inspection writes the exact complete mode-safe manifest", async
     const manifest = JSON.parse(await readFile(fixture.manifest, "utf8"));
     const repositories = {
       api: "ghcr.io/sumi-studio/sumi-api",
-      agent: "ghcr.io/sumi-studio/sumi-agent",
+      core: "ghcr.io/sumi-studio/sumi-core",
+      job: "ghcr.io/sumi-studio/sumi-job",
       provisioner: "ghcr.io/sumi-studio/sumi-provisioner",
       web: "ghcr.io/sumi-studio/sumi-web",
     };
-    const hexes = { api: "a", agent: "b", provisioner: "c", web: "d" };
+    const hexes = { api: "a", core: "b", job: "f", provisioner: "c", web: "d" };
     assert.deepEqual(manifest, {
       schema_version: 2,
       status: "COMPLETE",
@@ -2004,7 +2007,7 @@ test("successful inspection writes the exact complete mode-safe manifest", async
         tree: fixture.tree,
       },
       build: { context_tree: fixture.tree, requested_tag: fixture.sha },
-      images: ["api", "agent", "provisioner", "web"].map((role) => ({
+      images: ["api", "core", "job", "provisioner", "web"].map((role) => ({
         role,
         id: `sha256:${hexes[role].repeat(64)}`,
         dockerfile: `deploy/${role}/Dockerfile`,

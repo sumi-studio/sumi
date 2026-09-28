@@ -184,7 +184,7 @@ func TestJobEgressPreludeKeepsBridgeDiagnosticsOffTheTerminal(t *testing.T) {
 // commits the line.
 func TestReadProcessOutputLiveTailThenJournalNoDuplicate(t *testing.T) {
 	dir := t.TempDir()
-	b := &interactiveTestBackend{processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()}, journal: journalFile(t, dir)}
+	b := &interactiveTestBackend{processTestBackend: &processTestBackend{}, journal: journalFile(t, dir)}
 	svc := newTestService(t, b)
 	ctx := context.Background()
 	op, err := svc.StartProcess(ctx, ProcessStartRequest{

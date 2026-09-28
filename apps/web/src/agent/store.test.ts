@@ -27,7 +27,7 @@ const InstallationBinding = {
   authorityEpoch: "1",
 } satisfies DirectChatInstallationBinding;
 
-test("UUIDv5 derivation matches the Rust USER_MESSAGE_ID_NAMESPACE contract", () => {
+test("UUIDv5 derivation matches the Core USER_MESSAGE_ID_NAMESPACE contract", () => {
   assert.equal(
     userMessageIdFromCommandId("00000000-0000-4000-8000-000000000001"),
     "b508ee8b-fa35-59b0-8772-6f75ba135990",

@@ -33,19 +33,9 @@ ajv.addFormat("canonical-decimal-u64", (s) => {
     BigInt(s) <= 18446744073709551615n
   );
 });
-ajv.addFormat("canonical-process-generation", (s) => {
-  return (
-    typeof s === "string" &&
-    /^(0|[1-9][0-9]*)$/.test(s) &&
-    BigInt(s) <= 9223372036854775807n
-  );
-});
 
 const kindToDef = {
-  outbound_frame: "OutboundFrame",
   command_envelope: "CommandEnvelope",
-  agent_hello: "AgentHello",
-  api_hello: "ApiHello",
   agent_event: "AgentEvent",
   public_message: "PublicMessage",
   browser_hello: "BrowserHello",
@@ -208,22 +198,6 @@ if (
 }
 
 const boundedDecimalCases = [
-  {
-    name: "ProcessGeneration",
-    valid: [
-      ["zero", "0"],
-      ["exact maximum", "9223372036854775807"],
-    ],
-    invalid: [
-      ["maximum plus one", "9223372036854775808"],
-      ["same-length near overflow", "9223372036854775900"],
-      ["same-length high overflow", "9999999999999999999"],
-      ["leading zero", "01"],
-      ["zero with a leading zero", "00"],
-      ["negative", "-1"],
-      ["negative zero", "-0"],
-    ],
-  },
   {
     name: "CanonicalDecimalU64",
     valid: [
@@ -869,7 +843,10 @@ assert.equal(
   }),
   false,
 );
-const envelope = fixtures.secretary_agent_start.wire.envelope;
+const envelope = {
+  ...fixtures.browser_event_frame.wire.envelope,
+  personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
+};
 const validateEnvelope = getValidator("Envelope");
 assert.ok(validateEnvelope(envelope));
 for (const invalid of [
@@ -950,37 +927,6 @@ const counterexamples = [
     value: { audience: "direct_chat", event: { type: "error", message: "x" } },
   },
   {
-    name: "hello rejects noncanonical decimal",
-    def: "AgentHello",
-    value: {
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      generation: "07",
-      last_sent_event_seq: "0",
-      last_received_command_seq: "0",
-      last_applied_command_seq: "0",
-    },
-  },
-  {
-    name: "hello rejects overflowing cursor",
-    def: "ApiHello",
-    value: {
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      accepted_generation: "7",
-      last_received_event_seq: "18446744073709551616",
-      next_command_seq: "1",
-    },
-  },
-  {
-    name: "hello rejects overflowing generation",
-    def: "ApiHello",
-    value: {
-      personality_agent_id: "018f1e72-6e9a-7c20-8e90-123456789abc",
-      accepted_generation: "9223372036854775808",
-      last_received_event_seq: "0",
-      next_command_seq: "1",
-    },
-  },
-  {
     name: "durable envelope missing seq",
     def: "Envelope",
     value: {
@@ -1050,34 +996,6 @@ const counterexamples = [
       command_id: "00000000-0000-4000-8000-000000000001",
       agent_id: "agent-1",
       command: { type: "abort" },
-    },
-  },
-  {
-    name: "command ack rejects missing personality agent ID",
-    def: "CommandAck",
-    value: {
-      seq: 1,
-      command_id: "00000000-0000-4000-8000-000000000001",
-      status: "received",
-    },
-  },
-  {
-    name: "command ack rejects malformed personality agent ID",
-    def: "CommandAck",
-    value: {
-      seq: 1,
-      command_id: "00000000-0000-4000-8000-000000000001",
-      personality_agent_id: "018f1e72-6e9a-7c20-7e90-123456789abc",
-      status: "received",
-    },
-  },
-  {
-    name: "API hello rejects missing personality agent ID",
-    def: "ApiHello",
-    value: {
-      accepted_generation: "7",
-      last_received_event_seq: "0",
-      next_command_seq: "1",
     },
   },
   {

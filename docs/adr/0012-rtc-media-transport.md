@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Related:
   - [ADR 0011](0011-messaging-surface-and-agent-participation.md)
-  - [メッセージング接続契約（凍結 v1）](../messaging-boundary-contract.md)
+  - [メッセージング接続契約（凍結 v1）](core-architecture.md)
 
 ## コンテキスト
 

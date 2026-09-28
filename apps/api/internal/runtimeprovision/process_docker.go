@@ -39,16 +39,9 @@ func processContainer(o ProcessOperation) string { return "sumi-process-" + o.Op
 // Identity is labelled, not named, so an interrupted launch leaves no
 // colliding container name behind.
 //
-// An operation resolved onto a canonical files scope (WorkspaceBind set by
-// the service after the mount/volume/binding checks) gets a bind mount of
-// that verified path plus the volume-UUID label — never the legacy shared
-// workspace volume. Operations without a resolved bind keep the established
-// per-agent named-volume workspace with its ownership check.
+// LaunchProcess runs the pinned job image on the verified canonical files scope.
 func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) error {
-	repo, tagEnv := "ghcr.io/sumi-studio/sumi-agent", "SUMI_AGENT_IMAGE_TAG"
-	if o.Image == "job" {
-		repo, tagEnv = "ghcr.io/sumi-studio/sumi-job", "SUMI_JOB_IMAGE_TAG"
-	}
+	repo, tagEnv := "ghcr.io/sumi-studio/sumi-job", "SUMI_JOB_IMAGE_TAG"
 	tag := ""
 	for _, v := range b.baseEnvironment {
 		if strings.HasPrefix(v, tagEnv+"=") {
@@ -59,29 +52,12 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 		return errors.New("process image requires a pinned full revision")
 	}
 	labels := []string{"--label", "sumi.operation_id=" + o.OperationID, "--label", "sumi.personality_agent_id=" + o.PersonalityAgentID}
-	mount := ""
-	if o.WorkspaceBind != "" {
-		labels = append(labels, "--label", "sumi.files_volume_uuid="+o.FilesVolumeUUID)
-		mount = "type=bind,src=" + o.WorkspaceBind + ",dst=/workspace"
-	} else {
-		volume := "sumi-" + strings.ReplaceAll(o.PersonalityAgentID, "-", "") + "_workspace"
-		raw, err := b.processDocker(ctx, "volume", "inspect", volume)
-		if err != nil {
-			return err
-		}
-		var volumes []struct {
-			Name   string
-			Labels map[string]string
-		}
-		if err = json.Unmarshal(raw, &volumes); err != nil {
-			return err
-		}
-		project := strings.TrimSuffix(volume, "_workspace")
-		if len(volumes) != 1 || volumes[0].Name != volume || volumes[0].Labels["com.docker.compose.project"] != project || volumes[0].Labels["com.docker.compose.volume"] != "workspace" {
-			return errors.New("workspace volume ownership mismatch")
-		}
-		mount = "type=volume,src=" + volume + ",dst=/workspace,volume-nocopy"
+	if o.WorkspaceBind == "" || o.FilesVolumeUUID == "" {
+		return ErrProcessWorkspace
 	}
+	labels = append(labels, "--label", "sumi.files_volume_uuid="+o.FilesVolumeUUID)
+	mount := "type=bind,src=" + o.WorkspaceBind + ",dst=/workspace"
+
 	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", repo+":"+tag)
 	if err != nil {
 		return err
@@ -96,18 +72,14 @@ func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) e
 	// mountpoint is pre-created in the image), a fixed loopback proxy
 	// environment, and a bridge spawn in the launch wrapper. The container
 	// itself still runs --network none: the socket is the entire path out,
-	// and the proxy behind it dials public addresses only. Agent-image ops
-	// and unconfigured deployments keep the exact no-network contract.
-	egressDir := ""
-	if o.Image == "job" {
-		egressDir = b.jobEgressDir()
-	}
+	// and the proxy behind it dials public addresses only. Unconfigured
+	// deployments have no network access.
+	egressDir := b.jobEgressDir()
 	// pip --user installs console scripts into /workspace/.local/bin
 	// (HOME=/workspace). Egress-enabled job ops put it first on PATH —
 	// the normal user-site precedence — so an installed CLI is runnable
 	// by name in the installing job and in later sessions on the same
-	// workspace. Agent ops and no-egress launches keep the old PATH
-	// byte-for-byte.
+	// workspace. No-egress launches use the system PATH.
 	pathEnv := "PATH=/usr/local/bin:/usr/bin:/bin"
 	if egressDir != "" {
 		pathEnv = "PATH=/workspace/.local/bin:/usr/local/bin:/usr/bin:/bin"

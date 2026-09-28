@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 )
 
 func TestThreadsAreWorkspaceVisibleButBootstrapParticipationScoped(t *testing.T) {
@@ -138,29 +137,6 @@ func TestThreadRejectsDeletedOriginMessage(t *testing.T) {
 	}
 	if _, _, err := owner.CreateThread(ctx, channel.PlaceID, "削除済み起点", origin.MessageID, "deleted-origin-1"); !errors.Is(err, ErrMessageNotFound) {
 		t.Fatalf("create from deleted origin: got %v, want ErrMessageNotFound", err)
-	}
-}
-
-func TestCreateThreadRejectsNULClientNonceAtBothIngresses(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w, ts := newTestServer(t, ctx)
-
-	resp, body := call(t, ts, http.MethodPost,
-		"/messaging/places/"+DefaultGeneralChannelID+"/threads", w.humanA.ID,
-		map[string]any{"name": "NUL nonce", "client_nonce": "bad\x00nonce"})
-	if resp.StatusCode != http.StatusBadRequest || body["error"] != "invalid_client_nonce" {
-		t.Fatalf("browser NUL nonce = %d %v, want 400 invalid_client_nonce", resp.StatusCode, body)
-	}
-
-	workspace, channel := w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	status, localBody := callLocal(t, ctx, server.localCreateThread, LocalCreateThreadPath, map[string]any{
-		"workspace_id": workspace.WorkspaceID, "parent_place_id": channel.PlaceID,
-		"name": "NUL nonce", "client_nonce": "bad\x00nonce",
-	}, agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID})
-	if status != http.StatusBadRequest || localBody["error"] != "invalid_request" {
-		t.Fatalf("local NUL nonce = %d %v, want 400 invalid_request", status, localBody)
 	}
 }
 

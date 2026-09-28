@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sumi-studio/sumi/apps/api/internal/browseridentity"
 	"github.com/sumi-studio/sumi/apps/api/internal/browsertabs"
-	"github.com/sumi-studio/sumi/apps/api/internal/chatgpt"
 	"github.com/sumi-studio/sumi/apps/api/internal/cloudbrowser"
 )
 
@@ -25,7 +25,7 @@ import (
 // Checkpoints and the optional Jev key are sealed with a key derived from
 // SUMI_MODEL_CONNECTION_KEY. Without the three, the person's routes answer
 // {configured:false} and Cloud tabs never become available.
-func wireCloudBrowser(pool *pgxpool.Pool, tabs *browsertabs.Store, mux *http.ServeMux, authenticate func(*http.Request) (chatgpt.LoginIdentity, error)) (*cloudbrowser.Service, error) {
+func wireCloudBrowser(pool *pgxpool.Pool, tabs *browsertabs.Store, mux *http.ServeMux, authenticate func(*http.Request) (browseridentity.Identity, error)) (*cloudbrowser.Service, error) {
 	service := &cloudbrowser.Service{Authenticate: authenticate}
 	wake := strings.TrimSpace(os.Getenv("SUMI_BROWSER_CLOUD_URL"))
 	token := strings.TrimSpace(os.Getenv("SUMI_BROWSER_CLOUD_TOKEN"))

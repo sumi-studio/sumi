@@ -13,7 +13,7 @@ import (
 
 const historyPA = "018f47a2-9b3c-7def-8abc-0123456789ab"
 
-func historyAppend(t *testing.T, g *DurableGateway, seq uint64, event any) {
+func historyAppend(t *testing.T, g *BrowserJournal, seq uint64, event any) {
 	t.Helper()
 	raw, err := json.Marshal(event)
 	if err != nil {

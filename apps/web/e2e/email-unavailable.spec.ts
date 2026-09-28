@@ -152,7 +152,7 @@ async function startStack(): Promise<Stack> {
         PORT: apiPort,
         SUMI_PUBLIC_LOOPBACK_LISTEN: `127.0.0.1:${apiPort}`,
         SUMI_DB_URL: databaseURL,
-        SUMI_AGENT_RUNTIME_STATE_DIR: join(runtime, "gateway"),
+        SUMI_BROWSER_EVENT_DIR: join(runtime, "gateway"),
         SUMI_COMMAND_LOG_DIR: join(runtime, "commands"),
         SUMI_BROWSER_SESSION_SECRET: Buffer.from(
           crypto.getRandomValues(new Uint8Array(48)),
@@ -162,7 +162,6 @@ async function startStack(): Promise<Stack> {
         SUMI_AUTH_ALLOW_INSECURE_COOKIES: "true",
         SUMI_AUTH_FIREBASE_PROJECT_ID: projectID,
         SUMI_AUTH_TENANT_ID: "e2e-ui",
-        SUMI_AGENT_WRAPPING_KEY_ID: wrappingKeyID,
         FIREBASE_AUTH_EMULATOR_HOST: emulatorHost,
         SUMI_TRANSFER_PUBLIC_BASE_URL: apiURL,
       },

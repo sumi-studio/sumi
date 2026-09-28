@@ -50,7 +50,7 @@ type composedTerminalWorld struct {
 	humanID   string
 	agentID   string
 	cookie    *http.Cookie
-	gateway   *agentevents.DurableGateway
+	gateway   *agentevents.BrowserJournal
 	cmdStore  *agentevents.CommandStore
 	terminals agentevents.TerminalBackend
 }
@@ -60,7 +60,7 @@ func newComposedTerminalWorld(t *testing.T) *composedTerminalWorld {
 	pool := kosekiResolverTestPool(t)
 	ctx := context.Background()
 	fence := directchat.NewLifecycleFence()
-	kosekiStore := koseki.NewWithWrappingKeyID(pool, "test-wrapping/v1", fence)
+	kosekiStore := koseki.New(pool, fence)
 	wsStore := workspacecontrol.New(pool)
 	appStore := applicationapps.New(pool, wsStore, fence)
 	stateStore := agentstate.NewStore(pool)
@@ -73,7 +73,7 @@ func newComposedTerminalWorld(t *testing.T) *composedTerminalWorld {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cmdStore.Close() })
-	gateway, err := agentevents.OpenDurableGateway(dir+"/runtime", cmdStore)
+	gateway, err := agentevents.OpenBrowserJournal(dir+"/runtime", cmdStore)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,9 +97,9 @@ func newComposedTerminalWorld(t *testing.T) *composedTerminalWorld {
 	}
 
 	authorizer := newDirectChatAuthorizer(pool, kosekiStore, appStore)
-	mux, browser, _, err := agentevents.NewProductionMux(
-		cmdStore, gateway, nil, sessions,
-		nil, []string{compositionOrigin}, authorizer, fence,
+	mux, browser, err := agentevents.NewProductionMux(
+		cmdStore, gateway, sessions,
+		[]string{compositionOrigin}, authorizer, fence,
 	)
 	if err != nil {
 		t.Fatal(err)

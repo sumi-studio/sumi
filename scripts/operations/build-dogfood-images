@@ -26,16 +26,18 @@ EXPECTED_TREE=
 ACTIVE_DOCKER_WRAPPER_PID=
 RECEIVED_SIGNAL=
 
-declare -a ROLES=(api agent provisioner web)
+declare -a ROLES=(api core job provisioner web)
 declare -A REPOSITORIES=(
+  [core]="ghcr.io/sumi-studio/sumi-core"
   [api]="ghcr.io/sumi-studio/sumi-api"
-  [agent]="ghcr.io/sumi-studio/sumi-agent"
+  [job]="ghcr.io/sumi-studio/sumi-job"
   [provisioner]="ghcr.io/sumi-studio/sumi-provisioner"
   [web]="ghcr.io/sumi-studio/sumi-web"
 )
 declare -A DOCKERFILES=(
+  [core]="deploy/core/Dockerfile"
   [api]="deploy/api/Dockerfile"
-  [agent]="deploy/agent/Dockerfile"
+  [job]="deploy/job/Dockerfile"
   [provisioner]="deploy/provisioner/Dockerfile"
   [web]="deploy/web/Dockerfile"
 )
@@ -61,7 +63,7 @@ usage: scripts/operations/build-dogfood-images \
   --commit <full-lowercase-sha> --tag <same-full-lowercase-sha> \
   --manifest <new-path> [--dry-run]
 
-Builds and locally verifies the API, agent, provisioner, and web images. It
+Builds and locally verifies the API, job, provisioner, and web images. It
 never pushes an image and never invokes Docker Compose.
 EOF
 }

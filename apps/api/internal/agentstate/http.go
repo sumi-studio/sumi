@@ -133,6 +133,9 @@ func (s *Server) adminOnly(r *http.Request) bool {
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/core/personas", s.createPersona)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/state", s.personaState)
+	// When the persona next needs a runtime: a core host that sleeps
+	// between drains arms its own wake from this instead of polling.
+	mux.HandleFunc("GET /internal/core/personas/{persona}/next-work", s.nextWork)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/inputs", s.submitInput)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/inputs/{input}", s.getInput)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/writer/acquire", s.acquireWriter)
@@ -274,14 +277,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func storeError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, ErrPersonaNotFound), errors.Is(err, ErrInputNotFound),
+	case errors.Is(err, ErrPersonaNotFound):
+		// The code is authoritative: the persona row does not exist, so Core
+		// retires its Durable Object instead of retrying. Every other 404
+		// (a missing input, job, route) and every 5xx stays retryable.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error(), "code": "persona_not_found"})
+	case errors.Is(err, ErrInputNotFound),
 		errors.Is(err, ErrTurnNotFound), errors.Is(err, ErrOpNotFound),
 		errors.Is(err, ErrApprovalNotFound), errors.Is(err, ErrJobNotFound),
 		errors.Is(err, ErrChunkNotFound), errors.Is(err, ErrFundingNotFound),
 		errors.Is(err, ErrTerminalNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrPersonaInactive):
+		// Coded like persona_not_found: Core stops arming wakes for a
+		// persona that is staged, sealed or moved away (the sweep wakes it
+		// again if it becomes active with work).
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "persona_inactive"})
 	case errors.Is(err, ErrWriterHeld), errors.Is(err, ErrGenerationFence), errors.Is(err, ErrTurnConflict),
-		errors.Is(err, ErrApprovalConflict), errors.Is(err, ErrPersonaInactive),
+		errors.Is(err, ErrApprovalConflict),
 		errors.Is(err, ErrPersonaBound), errors.Is(err, ErrJobConflict), errors.Is(err, ErrJobNotClaimed),
 		errors.Is(err, ErrMemoryConflict), errors.Is(err, ErrUsageFactConflict),
 		errors.Is(err, ErrTerminalNotClaimed), errors.Is(err, ErrTerminalNotLive),
@@ -408,6 +421,19 @@ func (s *Server) personaState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) nextWork(w http.ResponseWriter, r *http.Request) {
+	personaID, ok := s.scope(w, r)
+	if !ok {
+		return
+	}
+	next, err := s.store.NextWorkFor(r.Context(), personaID)
+	if err != nil {
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, next)
 }
 
 func (s *Server) submitInput(w http.ResponseWriter, r *http.Request) {

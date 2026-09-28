@@ -16,7 +16,6 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/directchat"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
-	"github.com/sumi-studio/sumi/apps/api/internal/runtimeprovision"
 	workspacecontrol "github.com/sumi-studio/sumi/apps/api/internal/workspace"
 )
 
@@ -27,11 +26,8 @@ const (
 )
 
 var browserAuthEnvironmentNames = []string{
-	"SUMI_AUTH_FIREBASE_UID",
 	"SUMI_AUTH_FIREBASE_TENANT_ID",
 	"SUMI_AUTH_TENANT_ID",
-	"SUMI_AUTH_USER_ID",
-	"SUMI_AUTH_PERSONALITY_AGENT_ID",
 	"SUMI_AUTH_FIREBASE_PROJECT_ID",
 	"SUMI_AUTH_ALLOW_INSECURE_COOKIES",
 	"SUMI_AUTH_SESSION_TTL",
@@ -163,25 +159,7 @@ func (v *firebaseAdminIDTokenVerifier) VerifyIDToken(
 	}, nil
 }
 
-// browserAuthServerFromEnv creates the Firebase exchange boundary. When a
-// control-plane database pool is unavailable it falls back to the legacy
-// StaticIdentityBindingResolver (single configured Firebase UID). Partial static
-// opt-in is a startup error; no authentication route is registered for an
-// entirely absent configuration.
-func browserAuthServerFromEnv(
-	ctx context.Context,
-	sessions *agentevents.HMACUserSessionVerifier,
-	allowedOrigins []string,
-) (*agentevents.BrowserAuthServer, bool, error) {
-	server, _, enabled, err := browserAuthServerFromEnvWithDB(ctx, sessions, allowedOrigins, nil)
-	return server, enabled, err
-}
-
-// browserAuthServerFromEnvWithDB enables the explicit 戸籍 auth-flow boundary
-// when pool is non-nil. Production routes then require a persisted sign-in or
-// sign-up intent and never invoke the old resolver's silent auto-registration
-// exchange. A nil pool is retained only for the isolated static-binding test
-// fixture.
+// browserAuthServerFromEnvWithDB mounts the invite-only persisted identity flow.
 func browserAuthServerFromEnvWithDB(
 	ctx context.Context,
 	sessions *agentevents.HMACUserSessionVerifier,
@@ -189,18 +167,8 @@ func browserAuthServerFromEnvWithDB(
 	pool *pgxpool.Pool,
 	directChatLifecycle ...*directchat.LifecycleFence,
 ) (*agentevents.BrowserAuthServer, *secretaryTransferMount, bool, error) {
-	firebaseUID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_UID"))
-	kosekiMode := pool != nil
-	if !kosekiMode && firebaseUID == "" {
-		for _, name := range browserAuthEnvironmentNames {
-			if name == "SUMI_AUTH_FIREBASE_UID" {
-				continue
-			}
-			if strings.TrimSpace(os.Getenv(name)) != "" {
-				return nil, nil, false, errors.New("SUMI_AUTH_FIREBASE_UID is required when any SUMI_AUTH_* setting is configured")
-			}
-		}
-		return nil, nil, false, nil
+	if pool == nil {
+		return nil, nil, false, errors.New("browser authentication requires PostgreSQL")
 	}
 	if sessions == nil {
 		return nil, nil, false, errors.New("SUMI_BROWSER_SESSION_SECRET is required when Firebase auth is enabled")
@@ -215,41 +183,13 @@ func browserAuthServerFromEnvWithDB(
 	}
 
 	firebaseTenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_FIREBASE_TENANT_ID"))
-	var bindings agentevents.IdentityBindingResolver
-	var registrationStore *koseki.Store
-	if kosekiMode {
-		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
-		if tenantID == "" {
-			return nil, nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for 戸籍-backed authentication")
-		}
-		wrappingKeyID := strings.TrimSpace(os.Getenv("SUMI_AGENT_WRAPPING_KEY_ID"))
-		if err := runtimeprovision.ValidateAgentWrappingKeyID(wrappingKeyID); err != nil {
-			return nil, nil, false, fmt.Errorf("SUMI_AGENT_WRAPPING_KEY_ID: %w", err)
-		}
-		registrationStore = koseki.NewWithWrappingKeyID(pool, wrappingKeyID, directChatLifecycle...)
-		registrationStore.EnrollmentWorkspaceAuthority = workspacecontrol.New(pool)
-		bindings = newKosekiIdentityBindingResolver(registrationStore, tenantID, "firebase")
-	} else {
-		tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
-		userID := strings.TrimSpace(os.Getenv("SUMI_AUTH_USER_ID"))
-		personalityAgentID := strings.TrimSpace(os.Getenv("SUMI_AUTH_PERSONALITY_AGENT_ID"))
-		if tenantID == "" || userID == "" || personalityAgentID == "" {
-			return nil, nil, false, errors.New("SUMI_AUTH_TENANT_ID, SUMI_AUTH_USER_ID, and SUMI_AUTH_PERSONALITY_AGENT_ID are required when Firebase auth is enabled")
-		}
-		resolver, err := agentevents.NewStaticIdentityBindingResolverForTenant(
-			firebaseUID,
-			firebaseTenantID,
-			agentevents.UserSessionClaims{
-				TenantID:           tenantID,
-				UserID:             userID,
-				PersonalityAgentID: personalityAgentID,
-			},
-		)
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("Firebase identity binding: %w", err)
-		}
-		bindings = resolver
+	tenantID := strings.TrimSpace(os.Getenv("SUMI_AUTH_TENANT_ID"))
+	if tenantID == "" {
+		return nil, nil, false, errors.New("SUMI_AUTH_TENANT_ID is required for authentication")
 	}
+	registrationStore := koseki.New(pool, directChatLifecycle...)
+	registrationStore.EnrollmentWorkspaceAuthority = workspacecontrol.New(pool)
+	bindings := newKosekiIdentityBindingResolver(registrationStore, tenantID, "firebase")
 
 	// Custom tokens are signed locally with a service-account JSON key, or via
 	// IAM signBlob for SUMI_AUTH_FIREBASE_SERVICE_ACCOUNT_ID or the metadata
@@ -302,7 +242,7 @@ func browserAuthServerFromEnvWithDB(
 		return nil, nil, false, err
 	}
 	server.SessionTTL = ttl
-	if kosekiMode {
+	{
 		server.Profiles = registrationStore
 		server.EnrollmentInvitations = enrollmentInvitationAdapter{registrationStore}
 		server.EnrollmentAdmins = make(map[string]bool)

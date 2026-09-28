@@ -7,8 +7,8 @@
   - [ADR 0010](0010-attention-triggers-and-warmth.md)
 - Related:
   - [ADR 0009](0009-human-koseki-and-multi-user-auth.md)
-  - [メッセージング接続契約（凍結 v1）](../messaging-boundary-contract.md)
-  - [メッセージング契約ドラフト](../messaging-contracts-draft.md)
+  - [メッセージング接続契約（凍結 v1）](core-architecture.md)
+  - [メッセージング契約ドラフト](core-architecture.md)
   - [#87](https://github.com/sumi-studio/sumi/issues/87)
 
 ## Context
@@ -19,15 +19,15 @@ Workspace 由来の provenance を人生ログへ残す方針を置いた。ADR 
 の実体は、現在の実装には direct chat しか存在しない。
 
 - `DirectChatSurface` の variant は `DirectChat` の一つだけである
-  （`apps/agent/src/runtime/contracts.rs`）。
+  （`apps/core/src`）。
 - `HumanActorProvenance` の `kind` は `Human` の一つだけであり、人格 agent
   から人格 agent への呼びかけを provenance として表現できない。
 - agent への inbound は `WireCommand::UserMessage { text, attachments }` で
   あり、どの place で誰に向けて発せられたか、緊急度は何かを載せる場所がない
-  （`apps/agent/src/gateway/wire.rs`）。
+  （`apps/api/internal/agentevents/wire.go`）。
 - agent が direct chat 以外へ発話する道具は存在しない。tool は `bash` と
   `fs` のみで、`ToolCtx` は `WorkspacePaths` しか持たず、Workspace API へ
-  出ていく経路がない。`apps/agent/src/apiclient` は空である。
+  出ていく経路がない。`apps/api/internal/messaging/core_tools.go` は空である。
 - `apps/api` に messaging の実装は存在しない。
 
 一方 web 側にはメッセージングの UI が存在し、モックサーバー上で動作して
@@ -469,7 +469,7 @@ messaging service と agent runtime の境界そのものなので、接続契�
   移行するか新しい id で再 provision する（§2）。
 - `HumanActorProvenance` の `principal_id` は自由文字列の検証しか持たない。
   canonical `HumanId`（UUIDv7）へ寄せる必要がある（§2）。
-- `apps/agent/src/apiclient` に Workspace API クライアントの実装が必要になる。
+- `apps/api/internal/messaging/core_tools.go` に Workspace API クライアントの実装が必要になる。
   現在は空ファイルである。
 - `ToolCtx` は `WorkspacePaths` しか持たないため、Workspace API を叩く tool を
   受け入れる拡張が必要になる。tool の risk 分類（送信は取り消せない発話で

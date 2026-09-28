@@ -31,7 +31,7 @@ func startJournalPump(t *testing.T, journal string, alive bool) (*processStore, 
 	t.Helper()
 	dir := t.TempDir()
 	b := &interactiveTestBackend{
-		processTestBackend: &processTestBackend{fakeBackend: newFakeBackend()},
+		processTestBackend: &processTestBackend{},
 		journal:            journal,
 	}
 	s, err := newProcessStore(dir+"/state", b)

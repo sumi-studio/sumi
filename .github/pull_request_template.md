@@ -11,7 +11,7 @@ schema, or operational changes reviewers must not miss.
 
 Checks actually run, with results. Distinguish real components
 (Postgres, workerd, browser) from mocks and mark gaps explicitly.
-Required checks: `agent-rust`, `api-postgres-contracts`, `web-quality`,
+Required checks: `api-postgres-contracts`, `web-quality`,
 `web-edge`.
 
 ## Review focus

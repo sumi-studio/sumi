@@ -4,7 +4,7 @@ import {
   removeWorkspaceBrowserBuild,
   startWorkspaceBrowserStack,
   type WorkspaceBrowserBuild,
-} from "./support/real-agent-stack";
+} from "./support/workspace-stack";
 
 test.describe.configure({ timeout: 300_000 });
 test.use({ actionTimeout: 10_000 });

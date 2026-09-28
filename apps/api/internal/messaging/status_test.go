@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sumi-studio/sumi/apps/api/internal/agentevents"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
 
@@ -182,52 +181,6 @@ func TestStatusOverHTTPPublishesToParticipantScopedSubscribers(t *testing.T) {
 		map[string]any{"status": "busy", "participant": map[string]any{"kind": "human", "human_id": w.humanB.ID}})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("participant field: status %d, want 400", resp.StatusCode)
-	}
-}
-
-func TestLocalStatusSetsTheAgentsOwnAttentionState(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	w := newWorld(t, ctx)
-	w.workspaceWithChannel(t, ctx)
-	server := NewServer(w.store.core, nil)
-	authorization := agentevents.LocalRuntimeAuthorization{PersonalityAgentID: w.agent.ID}
-
-	status, body := callLocal(t, ctx, server.localStatus, LocalStatusPath, map[string]any{
-		"status": "busy", "note": "別の対応中です", "expires_in_minutes": 45,
-	}, authorization)
-	if status != http.StatusOK {
-		t.Fatalf("agent status: status %d body %v", status, body)
-	}
-	declared := body["status"].(map[string]any)
-	participant := declared["participant"].(map[string]any)
-	if participant["kind"] != "personality_agent" || participant["personality_agent_id"] != w.agent.ID {
-		t.Fatalf("agent status participant = %v", participant)
-	}
-	if declared["status"] != "busy" || declared["note"] != "別の対応中です" {
-		t.Fatalf("agent status = %v", declared)
-	}
-	if declared["expires_at"] == nil {
-		t.Fatalf("a relative expiry must resolve to an instant: %v", declared)
-	}
-
-	// Explicit membership, not the Human-Agent relation, makes the status
-	// visible through the same store the UI reads.
-	w.workspaceWithChannel(t, ctx)
-	statuses, err := w.store.StatusesVisibleTo(ctx, w.humanA)
-	if err != nil {
-		t.Fatalf("list statuses: %v", err)
-	}
-	if got, ok := statusOf(t, statuses, w.agent); !ok || got.Status != StatusBusy {
-		t.Fatalf("human view of the agent status = %+v (found %v)", got, ok)
-	}
-
-	// Same vocabulary, same bounds as the human lane.
-	status, _ = callLocal(t, ctx, server.localStatus, LocalStatusPath, map[string]any{
-		"status": "invisible",
-	}, authorization)
-	if status != http.StatusBadRequest {
-		t.Fatalf("unknown agent status: %d, want 400", status)
 	}
 }
 

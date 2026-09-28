@@ -70,16 +70,9 @@ type ProcessStartRequest struct {
 	// names (PATH, HOME, LANG) are refused rather than overridden so the
 	// fixed launch contract cannot be weakened from a request.
 	Env map[string]string `json:"env,omitempty"`
-	// Image selects among server-pinned image references only: "" (or
-	// "agent") is the agent image, "job" is the job toolchain image. It is
-	// never a free-form reference — a requester cannot pick the container
-	// it runs in beyond the deployment's own pins.
+	// Image names the deployment-pinned job toolchain. Empty selects job.
 	Image string `json:"image,omitempty"`
-	// Workspace selects where /workspace comes from. "" keeps the backend's
-	// legacy workspace volume; "files-scope" bind-mounts the persona's
-	// canonical files scope, resolved and verified server-side (mount +
-	// volume UUID check, binding record). A requester cannot name a path —
-	// it can only ask for the canonical scope or the legacy default.
+	// Workspace requests the persona's verified canonical files scope.
 	Workspace string `json:"workspace,omitempty"`
 	// Interactive keeps the container's stdin open and accepts
 	// WriteProcessInput/ResizeProcess/SignalProcess calls for the
@@ -146,7 +139,7 @@ func (r ProcessStartRequest) Validate() error {
 		return err
 	}
 	switch r.Image {
-	case "", "agent", "job":
+	case "", "job":
 	default:
 		return fmt.Errorf("%w: unknown image selector", ErrInvalidProcessRequest)
 	}

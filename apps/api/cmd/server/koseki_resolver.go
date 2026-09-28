@@ -13,12 +13,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/participant"
 )
 
-// kosekiIdentityBindingResolver replaces StaticIdentityBindingResolver with a
-// 戸籍-backed implementation (ADR 0009 §3). A verified Firebase identity is
-// mapped to Sumi claims via the credential registry: known credentials resolve
-// to their existing HumanId and Secretary; unbound credentials trigger first-
-// login auto-registration (mint HumanId + Secretary + per-agent secrets + bind
-// the credential).
+// kosekiIdentityBindingResolver resolves the registered identity for auth fixtures.
 type kosekiIdentityBindingResolver struct {
 	store    *koseki.Store
 	tenantID string // deployment provenance tenant, e.g. "local"

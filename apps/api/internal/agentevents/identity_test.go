@@ -298,28 +298,3 @@ func TestCommandStoreRestartRejectsLegacyTargetlessRecord(t *testing.T) {
 		t.Fatal("legacy targetless command record must fail closed after restart")
 	}
 }
-
-func TestRuntimeGenerationIsGlobalByPersonalityAgentID(t *testing.T) {
-	gateway := openRuntimeGateway(t)
-	personalityAgentID := "018f47a2-9b3c-7def-8abc-0123456789ab"
-	otherPersonalityAgentID := "018f47a2-9b3c-7def-9abc-0123456789ac"
-	receipt := "hydrated-1"
-	if err := gateway.PublishRuntimeState(personalityAgentID, 7, &receipt); err != nil {
-		t.Fatal(err)
-	}
-	for _, tenantID := range []string{"tenant-a", "tenant-b"} {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		err := gateway.WaitFor(ctx, TokenClaims{
-			TenantID:           tenantID,
-			PersonalityAgentID: personalityAgentID,
-			Generation:         7,
-		}, 7)
-		cancel()
-		if err != nil {
-			t.Fatalf("same personality in %s did not share generation: %v", tenantID, err)
-		}
-	}
-	if ready, err := gateway.IsPersonalityAgentReady(context.Background(), otherPersonalityAgentID); err != nil || ready {
-		t.Fatalf("distinct personality reused runtime state: ready=%v err=%v", ready, err)
-	}
-}

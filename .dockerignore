@@ -19,7 +19,6 @@ packages/*/node_modules
 
 # Temporary and artifact directories
 target
-apps/agent/target
 **/target
 dist
 **/dist

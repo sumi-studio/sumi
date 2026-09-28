@@ -107,7 +107,7 @@ Cookieや認証トークンは収集しない。全コンソールや全リク�
 
 Sumiとの会話から共同で報告を作成し、本人が画面を取得する経路は、まだこのモードに
 接続していない。専用CLI・スキル・画面操作の認可を含む実装案は
-[client-operations.md](../agent/client-operations.md) に記載する。
+[client-operations.md](../core-architecture.md) に記載する。
 
 The new-report screen uses a document surface: its title wraps and both native
 textareas grow with their content. The document has one scroll area; the send

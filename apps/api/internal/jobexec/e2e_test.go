@@ -89,14 +89,13 @@ printf '%s\n' "$(cd "$dir" && pwd -P)"
 	volumeUUID := "3f6f2d92-8b34-4f1a-9c8e-2c7f1a9b0d44"
 
 	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
-		"SUMI_AGENT_IMAGE_TAG=" + jobTag, "SUMI_JOB_IMAGE_TAG=" + jobTag}
+		"SUMI_JOB_IMAGE_TAG=" + jobTag}
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONFIG"} {
 		if v := os.Getenv(key); v != "" {
 			environment = append(environment, key+"="+v)
 		}
 	}
 	backend, err := runtimeprovision.NewDockerBackend(runtimeprovision.DockerBackendConfig{
-		SupervisorPath:  "/bin/true", // process ops never invoke the supervisor
 		BaseEnvironment: environment,
 	})
 	if err != nil {
@@ -415,14 +414,13 @@ printf '%s\n' "$(cd "$dir" && pwd -P)"
 		t.Fatal(err)
 	}
 	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
-		"SUMI_AGENT_IMAGE_TAG=" + jobTag, "SUMI_JOB_IMAGE_TAG=" + jobTag}
+		"SUMI_JOB_IMAGE_TAG=" + jobTag}
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONFIG"} {
 		if v := os.Getenv(key); v != "" {
 			environment = append(environment, key+"="+v)
 		}
 	}
 	backend, err := runtimeprovision.NewDockerBackend(runtimeprovision.DockerBackendConfig{
-		SupervisorPath:  "/bin/true",
 		BaseEnvironment: environment,
 	})
 	if err != nil {

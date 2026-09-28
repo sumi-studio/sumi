@@ -21,7 +21,7 @@ import (
 // command channel awaits it).
 func TestProcessCancelTombstoneFencesAbsentOp(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	directory := t.TempDir() + "/state"
 	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
 	if err != nil {
@@ -119,7 +119,7 @@ func TestProcessCancelTombstoneFencesAbsentOp(t *testing.T) {
 // verdict cannot be followed by a late launch.
 func TestProcessTombstoneFencesDelayedStart(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	pu, err := uuid.NewV7()
 	if err != nil {
 		t.Fatal(err)
@@ -220,7 +220,7 @@ printf '%s\n' "$(cd "$dir" && pwd -P)"
 // context is honored once more before the journal write (the point of no
 // return for the operation's existence).
 func TestProcessStartHonorsClientCancellation(t *testing.T) {
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s, err := NewService(b, ServiceConfig{StateDirectory: t.TempDir() + "/state"})
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +248,7 @@ func TestProcessStartHonorsClientCancellation(t *testing.T) {
 // journal section; its context is cancelled mid-wait; the save-boundary
 // recheck must keep the expired caller from publishing a zombie record.
 func TestProcessStartCancelledDuringJournalWait(t *testing.T) {
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s, err := NewService(b, ServiceConfig{StateDirectory: t.TempDir() + "/state"})
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +304,7 @@ func TestProcessStartCancelledDuringJournalWait(t *testing.T) {
 // ops that attempted a launch keep their history.
 func TestReleaseProcessTombstoneRestoresLaunch(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	directory := t.TempDir() + "/state"
 	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
 	if err != nil {
@@ -382,7 +382,7 @@ func TestReleaseProcessTombstoneRestoresLaunch(t *testing.T) {
 // StartProcess could silently overwrite into a launch.
 func TestReleaseProcessTombstoneRetainsFenceOnRemoveFailure(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	directory := t.TempDir() + "/state"
 	s, err := NewService(b, ServiceConfig{StateDirectory: directory})
 	if err != nil {
@@ -468,7 +468,7 @@ func TestReleaseProcessTombstoneRetainsFenceOnRemoveFailure(t *testing.T) {
 // cancel re-establishes it.
 func TestReleaseProcessTombstoneRefences(t *testing.T) {
 	ctx := context.Background()
-	b := &processTestBackend{fakeBackend: newFakeBackend()}
+	b := &processTestBackend{}
 	s, err := NewService(b, ServiceConfig{StateDirectory: t.TempDir() + "/state"})
 	if err != nil {
 		t.Fatal(err)

@@ -7,9 +7,8 @@ WORKDIR /src
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc* ./
-RUN mkdir -p apps/api apps/agent apps/web
+RUN mkdir -p apps/api apps/web
 COPY apps/api/package.json ./apps/api/
-COPY apps/agent/package.json ./apps/agent/
 COPY apps/web/package.json ./apps/web/
 COPY packages ./packages
 RUN pnpm install --frozen-lockfile

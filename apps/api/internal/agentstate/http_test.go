@@ -800,3 +800,45 @@ func TestHTTPJobDiscoverySeam(t *testing.T) {
 		t.Fatalf("missing runner_id: %d", rec.Code)
 	}
 }
+
+// A missing persona is the one 404 Core treats as permanent (it retires the
+// Durable Object), so it alone carries the persona_not_found code; a missing
+// row under a live persona and a held writer stay ordinary, retryable errors.
+func TestHTTPPersonaNotFoundCode(t *testing.T) {
+	_, mux := newHTTPServer(t)
+	code := func(rec *httptest.ResponseRecorder) string {
+		var body struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		return body.Code
+	}
+	acquire := `{"holder_id":"h1","ttl_ms":30000}`
+
+	missing := pid(t)
+	for _, path := range []string{"/writer/acquire", "/state"} {
+		method := "POST"
+		if path == "/state" {
+			method = "GET"
+		}
+		rec := do(t, mux, method, "/internal/core/personas/"+missing+path, testAdminSecret, acquire)
+		if rec.Code != 404 || code(rec) != "persona_not_found" {
+			t.Fatalf("%s on missing persona: %d %s", path, rec.Code, rec.Body)
+		}
+	}
+
+	live := pid(t)
+	if rec := do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+live+`"}`); rec.Code != 201 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, mux, "GET", "/internal/core/personas/"+live+"/jobs/"+pid(t), testAdminSecret, ""); rec.Code != 404 || code(rec) != "" {
+		t.Fatalf("missing job under live persona: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, mux, "POST", "/internal/core/personas/"+live+"/writer/acquire", testAdminSecret, acquire); rec.Code != 200 {
+		t.Fatalf("acquire: %d %s", rec.Code, rec.Body)
+	}
+	rec := do(t, mux, "POST", "/internal/core/personas/"+live+"/writer/acquire", testAdminSecret, `{"holder_id":"h2","ttl_ms":30000}`)
+	if rec.Code != 409 || code(rec) != "" {
+		t.Fatalf("held writer: %d %s", rec.Code, rec.Body)
+	}
+}

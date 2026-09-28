@@ -1429,7 +1429,7 @@ func (s *Store) ResumeWaitsForHuman(ctx context.Context, humanID string) (int, e
 // the park is about to insert; when the selection now resolves to a
 // different usable source the input requeues to re-resolve instead of
 // waiting on a funding it will never retry. A binding that cannot run at
-// all — 'none', 'chatgpt', an unsatisfied carried intent, a vanished
+// all — 'none', an unsatisfied carried intent, a vanished
 // connection — leaves the wait parked: requeueing would only error the
 // input, and the human's next selection or intent change resumes
 // human-wide anyway. A non-selection funding kind ('sumi' grants) is not
@@ -1491,7 +1491,7 @@ func (s *Store) waitFundingStale(ctx context.Context, tx pgx.Tx, personaID strin
 			cur = &FundingRef{Kind: "connection", ID: selConn}
 		}
 	default:
-		// none, chatgpt, or an unknown kind — unusable.
+		// none or an unknown kind — unusable.
 	}
 	if cur == nil {
 		return false, nil
