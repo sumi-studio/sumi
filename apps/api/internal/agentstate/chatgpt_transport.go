@@ -18,8 +18,29 @@ import (
 const chatGPTResponsesURL = modelconnections.ChatGPTBaseURL + "/responses"
 const chatGPTRejectedHeader = "X-Sumi-ChatGPT-Rejected-Token"
 const chatGPTErrorHeader = "X-Sumi-Model-Error"
+
+// Set on every response this handler writes, including forwarded upstream
+// statuses. Core interprets only marked responses; an unmarked one came from
+// an intermediary (tunnel/VPC 5xx, a missing route) after an unknown amount of
+// progress and is never replayed.
+const chatGPTTransportHeader = "X-Sumi-Model-Transport"
 const chatGPTStreamLimit = 32 << 20
+
+// Envelope bound for one model request. Core refuses to send a request body
+// over CHATGPT_MAX_REQUEST_BYTES (16 MiB, chatgpt-codex.ts); the extra 64 KiB
+// covers the envelope fields. 16 MiB is well above a turn replaying six 1 MiB
+// continuations plus its context, and keeps the request, its envelope and
+// the parsed context within a Worker isolate's memory. The generic 4 MiB state
+// body limit does not apply to this route.
+const chatGPTRequestLimit = 16<<20 + 64<<10
+const chatGPTRequestReadTimeout = 60 * time.Second
+
+// Core sends its remaining model deadline (SUMI_MODEL_TIMEOUT_MS minus time
+// already spent) as timeout_ms, so admission, a refresh and the upstream
+// exchange share the one budget Core also enforces. The default applies to a
+// caller that sends none; the maximum bounds a held upstream connection.
 const chatGPTTransportTimeout = 120 * time.Second
+const chatGPTTransportMaxTimeout = time.Hour
 
 var chatGPTLiteModel = regexp.MustCompile(`^(gpt-6(\.\d+)?-|gpt-5\.6-|gpt-daybreak-|codex-auto-review$)`)
 var chatGPTDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -32,7 +53,19 @@ type chatGPTTransportRequest struct {
 	ConnectionID string          `json:"connection_id"`
 	Version      string          `json:"connection_version"`
 	Rejected     string          `json:"rejected_token_sha256,omitempty"`
+	TimeoutMS    int64           `json:"timeout_ms,omitempty"`
 	Request      json.RawMessage `json:"request"`
+}
+
+// The caller's remaining budget, clamped to the server bound.
+func (r chatGPTTransportRequest) timeout() time.Duration {
+	if r.TimeoutMS == 0 {
+		return chatGPTTransportTimeout
+	}
+	if r.TimeoutMS >= chatGPTTransportMaxTimeout.Milliseconds() {
+		return chatGPTTransportMaxTimeout
+	}
+	return time.Duration(r.TimeoutMS) * time.Millisecond
 }
 
 func chatGPTTransportError(w http.ResponseWriter, status int, code string) {
@@ -91,6 +124,7 @@ func (s *Server) chatGPTAdmission(ctx context.Context, persona string, req chatG
 var errChatGPTBindingChanged = errors.New("model binding changed")
 
 func (s *Server) chatGPTResponses(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set(chatGPTTransportHeader, "1")
 	persona, ok := s.scope(w, r) // Core capabilities only; browser cookies do not authenticate.
 	if !ok {
 		return
@@ -98,13 +132,19 @@ func (s *Server) chatGPTResponses(w http.ResponseWriter, r *http.Request) {
 	// Bound input separately from the streamed output. Never echo malformed
 	// request content (which includes private context) in an error message.
 	rc := http.NewResponseController(w)
-	_ = rc.SetReadDeadline(time.Now().Add(15 * time.Second))
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBody))
+	_ = rc.SetReadDeadline(time.Now().Add(chatGPTRequestReadTimeout))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, chatGPTRequestLimit))
 	_ = rc.SetReadDeadline(time.Time{})
+	if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+		// Deterministic and nothing was dispatched: Core reports it as a
+		// size refusal instead of an opaque invalid request.
+		chatGPTTransportError(w, 413, "request_too_large")
+		return
+	}
 	var req chatGPTTransportRequest
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err != nil || dec.Decode(&req) != nil || dec.Decode(new(any)) != io.EOF || req.ConnectionID == "" || req.Version == "" || (req.Rejected != "" && !chatGPTDigest.MatchString(req.Rejected)) {
+	if err != nil || dec.Decode(&req) != nil || dec.Decode(new(any)) != io.EOF || req.ConnectionID == "" || req.Version == "" || req.TimeoutMS < 0 || (req.Rejected != "" && !chatGPTDigest.MatchString(req.Rejected)) {
 		chatGPTTransportError(w, 400, "invalid_request")
 		return
 	}
@@ -121,7 +161,7 @@ func (s *Server) chatGPTResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), chatGPTTransportTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), req.timeout())
 	defer cancel()
 	human, err := s.chatGPTAdmission(ctx, persona, req, body)
 	if err != nil {
@@ -148,8 +188,11 @@ func (s *Server) chatGPTResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ctx.Err() != nil {
+		// Refresh may finish detached; do not start a cancelled model call.
+		// The caller's budget has ended; like any deadline, it is not replayed.
+		chatGPTTransportError(w, 504, "transport_ambiguous")
 		return
-	} // Refresh may finish detached; do not start a cancelled model call.
+	}
 	upstream, err := http.NewRequestWithContext(ctx, http.MethodPost, chatGPTResponsesURL, bytes.NewReader(req.Request))
 	if err != nil {
 		chatGPTTransportError(w, 400, "invalid_request")
@@ -167,7 +210,8 @@ func (s *Server) chatGPTResponses(w http.ResponseWriter, r *http.Request) {
 	if chatGPTLiteModel.MatchString(requestModel) {
 		upstream.Header.Set("x-openai-internal-codex-responses-lite", "true")
 	}
-	client := http.Client{Timeout: chatGPTTransportTimeout}
+	// ctx carries the deadline for the whole exchange, including the streamed body.
+	client := http.Client{}
 	if s.chatGPTHTTP != nil {
 		client = *s.chatGPTHTTP
 	} // in-package synthetic transport fixture only

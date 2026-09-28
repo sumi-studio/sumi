@@ -23,12 +23,44 @@ export interface ChatGPTDialect {
   /** Used only to scope encrypted continuation, never to set upstream headers. */
   accountId: string;
   reasoningEffort?: string;
-  /** One transport attempt. A digest is supplied only after an explicit 401. */
+  /**
+   * One transport attempt. A digest is supplied only after an explicit 401.
+   * `timeoutMs` is what remains of the model deadline, so the API bounds the
+   * exchange by the same budget instead of a fixed transport timeout.
+   */
   send(
     body: string,
     signal: AbortSignal,
     rejectedTokenSha256?: string,
+    timeoutMs?: number,
   ): Promise<Response>;
+}
+
+/**
+ * Largest request body the subscription transport sends (the API bounds the
+ * envelope at this plus 64 KiB). Well above a turn replaying six 1 MiB
+ * continuations with its context and tool results, and small enough that
+ * the body, its envelope and the context stay within a Worker isolate's
+ * memory.
+ */
+export const CHATGPT_MAX_REQUEST_BYTES = 16 << 20;
+
+/** UTF-8 byte length without allocating an encoded copy. */
+export function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d < 0xe000) {
+        n += 4;
+        i++;
+      } else n += 3;
+    } else n += 3;
+  }
+  return n;
 }
 
 export const CHATGPT_REJECTED_HEADER = "X-Sumi-ChatGPT-Rejected-Token";

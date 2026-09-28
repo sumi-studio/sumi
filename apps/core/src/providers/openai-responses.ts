@@ -8,6 +8,7 @@ import {
   type ToolCall,
 } from "../provider.ts";
 import {
+  CHATGPT_MAX_REQUEST_BYTES,
   CHATGPT_REJECTED_HEADER,
   type ChatGPTDialect,
   continuationEntry,
@@ -18,6 +19,7 @@ import {
   safeDiagnosticCode,
   usageLimitError,
   usesResponsesLite,
+  utf8Length,
 } from "./chatgpt-codex.ts";
 import {
   assertExtraHeaders,
@@ -112,10 +114,9 @@ export class OpenAIResponsesProvider implements ModelProvider {
     const toWire = new Map(tools.map((t) => [t.spec.name, t.wire]));
     const fromWire = new Map(tools.map((t) => [t.wire, t.spec.name]));
 
-    const deadline = requestDeadline(
-      request.signal,
-      this.cfg.timeoutMs ?? 120_000,
-    );
+    const timeoutMs = this.cfg.timeoutMs ?? 120_000;
+    const deadlineAt = Date.now() + timeoutMs;
+    const deadline = requestDeadline(request.signal, timeoutMs);
     let events: AsyncGenerator<{ event: string; data: string }> | null = null;
     try {
       const chatgpt = this.cfg.chatgpt;
@@ -165,13 +166,45 @@ export class OpenAIResponsesProvider implements ModelProvider {
               : {}),
             ...this.cfg.extra,
           });
+      if (chatgpt) {
+        // An oversized request is refused before sending, with a size
+        // cause. Recorded continuation is an optimization, so it is dropped
+        // first; a request still too large without it is a size refusal the
+        // turn can answer with a smaller working view.
+        if (replaying && utf8Length(body) > CHATGPT_MAX_REQUEST_BYTES) {
+          body = (
+            await chatGPTBody(
+              this.cfg.model,
+              chatgpt,
+              request,
+              tools,
+              toWire,
+              scope,
+              true,
+            )
+          ).body;
+          replaying = false;
+        }
+        const bytes = utf8Length(body);
+        if (bytes > CHATGPT_MAX_REQUEST_BYTES) {
+          throw new ModelError(
+            `ChatGPT request is ${bytes} bytes, above the ${CHATGPT_MAX_REQUEST_BYTES}-byte transport limit; it was not sent`,
+            { retryable: false, refusal: "context_length" },
+          );
+        }
+      }
       let rejectedDigest: string | undefined;
       let refreshed = false;
       let res: Response;
       for (;;) {
         try {
           res = chatgpt
-            ? await chatgpt.send(body, deadline.signal, rejectedDigest)
+            ? await chatgpt.send(
+                body,
+                deadline.signal,
+                rejectedDigest,
+                Math.max(1, deadlineAt - Date.now()),
+              )
             : await this.fetchImpl(
                 `${this.cfg.baseUrl.replace(/\/$/, "")}/responses`,
                 {

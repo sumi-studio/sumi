@@ -347,10 +347,10 @@ func TestChatGPTTransportBoundsRedirectAndFailures(t *testing.T) {
 	if res.StatusCode != 302 || res.Header.Get("Location") != "" || strings.Contains(string(data), "private") || calls.Load() != 1 {
 		t.Fatal("redirect followed or exposed")
 	}
-	oversize := map[string]any{"connection_id": f.conn.ID, "connection_version": f.version, "request": map[string]any{"input": strings.Repeat("x", 4<<20)}}
+	oversize := map[string]any{"connection_id": f.conn.ID, "connection_version": f.version, "request": map[string]any{"input": strings.Repeat("x", chatGPTRequestLimit)}}
 	res = f.call(t, context.Background(), f.token, oversize)
-	if res.StatusCode != 400 || calls.Load() != 1 {
-		t.Fatal("oversize dispatched")
+	if res.StatusCode != 413 || res.Header.Get(chatGPTErrorHeader) != "request_too_large" || calls.Load() != 1 {
+		t.Fatal("oversize dispatched or not classified", res.StatusCode, res.Header.Get(chatGPTErrorHeader))
 	}
 	f.s.chatGPTHTTP = &http.Client{Transport: transportFunc(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -555,8 +555,9 @@ func TestChatGPTTransportUpstreamDeadline(t *testing.T) {
 		}
 	})
 	t.Cleanup(func() { close(release) })
-	f.s.chatGPTHTTP.Timeout = 50 * time.Millisecond // scale the production 120s HTTP bound
-	res := f.call(t, context.Background(), f.token, f.request())
+	req := f.request()
+	req.TimeoutMS = 300 // Core's remaining budget; bounds the upstream exchange
+	res := f.call(t, context.Background(), f.token, req)
 	if res.StatusCode != 502 || res.Header.Get(chatGPTErrorHeader) != "transport_ambiguous" {
 		t.Fatal("timeout misclassified")
 	}
@@ -582,5 +583,155 @@ func TestChatGPTTransportErrorIdentifierShapes(t *testing.T) {
 		if !bytes.Contains(b, []byte(tc.code)) || bytes.Contains(b, []byte("secret-token")) {
 			t.Fatalf("diagnostic: %s", b)
 		}
+	}
+}
+
+// A request envelope padded to exactly n bytes.
+func (f *chatGPTFixture) sizedRequest(t *testing.T, n int) []byte {
+	t.Helper()
+	base, err := json.Marshal(map[string]any{"connection_id": f.conn.ID, "connection_version": f.version, "request": json.RawMessage(strings.Replace(transportBody, `"store":false`, `"store":false,"prompt_cache_key":""`, 1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := n - len(base)
+	if pad < 0 {
+		t.Fatal("envelope larger than requested size")
+	}
+	out := bytes.Replace(base, []byte(`"prompt_cache_key":""`), []byte(`"prompt_cache_key":"`+strings.Repeat("A", pad)+`"`), 1)
+	if len(out) != n {
+		t.Fatalf("sized envelope is %d bytes, want %d", len(out), n)
+	}
+	return out
+}
+
+func (f *chatGPTFixture) post(t *testing.T, body []byte) *http.Response {
+	t.Helper()
+	r, err := http.NewRequest("POST", f.api.URL+"/internal/core/personas/"+f.persona+"/model/chatgpt/responses", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("Authorization", "Bearer "+f.token)
+	res, err := f.api.Client().Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { res.Body.Close() })
+	return res
+}
+
+// Review F1: a legitimate multi-round continuation request above the generic
+// 4 MiB state-body limit is dispatched byte-for-byte; the route's own bound is
+// exact, and a request above it is refused as request_too_large, not as an
+// opaque invalid request, without reaching upstream.
+func TestChatGPTTransportDedicatedRequestBound(t *testing.T) {
+	var calls atomic.Int32
+	var received atomic.Int64
+	f := chatGPTTransportFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		n, _ := io.Copy(io.Discard, r.Body)
+		received.Store(n)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, completedStream)
+	})
+	reasoning := map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": strings.Repeat("A", 1<<20)}
+	input := []any{map[string]any{"role": "user", "content": "synthetic prompt"}}
+	for i := 0; i < 6; i++ { // six replayed 1 MiB continuations
+		input = append(input, reasoning)
+	}
+	raw, _ := json.Marshal(map[string]any{"model": "gpt-6-astra", "stream": true, "store": false, "reasoning": map[string]string{"effort": "medium", "context": "all_turns"}, "input": input})
+	if len(raw) <= 6<<20 {
+		t.Fatal("fixture is not above the old 4 MiB bound")
+	}
+	req := f.request()
+	req.Request = raw
+	res := f.call(t, context.Background(), f.token, req)
+	got, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 || string(got) != completedStream || received.Load() != int64(len(raw)) || calls.Load() != 1 {
+		t.Fatalf("large legitimate request: status=%d received=%d want=%d calls=%d", res.StatusCode, received.Load(), len(raw), calls.Load())
+	}
+	res = f.post(t, f.sizedRequest(t, chatGPTRequestLimit))
+	io.Copy(io.Discard, res.Body)
+	if res.StatusCode != 200 || calls.Load() != 2 {
+		t.Fatal("request at the exact bound was refused", res.StatusCode, res.Header.Get(chatGPTErrorHeader))
+	}
+	res = f.post(t, f.sizedRequest(t, chatGPTRequestLimit+1))
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 413 || res.Header.Get(chatGPTErrorHeader) != "request_too_large" || res.Header.Get(chatGPTTransportHeader) != "1" || bytes.Contains(b, []byte("AAAA")) || calls.Load() != 2 {
+		t.Fatalf("excess request: status=%d code=%q calls=%d", res.StatusCode, res.Header.Get(chatGPTErrorHeader), calls.Load())
+	}
+}
+
+// Review F2: every response the route authors carries the transport marker,
+// including its own refusals and forwarded upstream statuses, so Core can
+// tell them apart from an intermediary's unmarked 5xx.
+func TestChatGPTTransportMarksEveryAuthoredResponse(t *testing.T) {
+	status := atomic.Int32{}
+	f := chatGPTTransportFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if s := int(status.Load()); s != 200 {
+			w.WriteHeader(s)
+			io.WriteString(w, `{"error":{"type":"server_error"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, completedStream)
+	})
+	check := func(name string, res *http.Response, want int) {
+		t.Helper()
+		io.Copy(io.Discard, res.Body)
+		if res.StatusCode != want || res.Header.Get(chatGPTTransportHeader) != "1" {
+			t.Fatalf("%s: status=%d marker=%q", name, res.StatusCode, res.Header.Get(chatGPTTransportHeader))
+		}
+	}
+	check("unauthorized", f.call(t, context.Background(), "", f.request()), 401)
+	bad := f.request()
+	bad.Version = ""
+	check("invalid", f.call(t, context.Background(), f.token, bad), 400)
+	changed := f.request()
+	changed.Version = uuid.NewString()
+	check("binding", f.call(t, context.Background(), f.token, changed), 409)
+	for _, s := range []int{429, 500, 503} {
+		status.Store(int32(s))
+		check(fmt.Sprint("upstream ", s), f.call(t, context.Background(), f.token, f.request()), s)
+	}
+	status.Store(200)
+	check("stream", f.call(t, context.Background(), f.token, f.request()), 200)
+}
+
+// Review F3: the deadline is Core's remaining model budget, not a fixed 120 s.
+// Budgets above 120 s reach the upstream exchange unchanged (observed as the
+// dispatched request's context deadline, without waiting), an absent budget
+// keeps the default, an excessive one is bounded, and a negative one is refused.
+func TestChatGPTTransportHonorsCallerBudget(t *testing.T) {
+	f := chatGPTTransportFixture(t, func(http.ResponseWriter, *http.Request) { t.Fatal("unexpected fixture route") })
+	var remaining atomic.Int64
+	f.s.chatGPTHTTP = &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Error("upstream request has no deadline")
+		}
+		remaining.Store(int64(time.Until(deadline)))
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(completedStream))}, nil
+	})}
+	for _, tc := range []struct {
+		ms       int64
+		min, max time.Duration
+	}{
+		{0, 110 * time.Second, 120 * time.Second},
+		{200_000, 190 * time.Second, 200 * time.Second},
+		{45 * 60_000, 44 * time.Minute, 45 * time.Minute},
+		{5 * 3600_000, 59 * time.Minute, time.Hour},
+	} {
+		req := f.request()
+		req.TimeoutMS = tc.ms
+		res := f.call(t, context.Background(), f.token, req)
+		io.Copy(io.Discard, res.Body)
+		if got := time.Duration(remaining.Load()); res.StatusCode != 200 || got < tc.min || got > tc.max {
+			t.Fatalf("timeout_ms=%d: status=%d upstream budget=%s, want %s..%s", tc.ms, res.StatusCode, got, tc.min, tc.max)
+		}
+	}
+	req := f.request()
+	req.TimeoutMS = -1
+	if res := f.call(t, context.Background(), f.token, req); res.StatusCode != 400 || res.Header.Get(chatGPTErrorHeader) != "invalid_request" {
+		t.Fatal("negative budget accepted", res.StatusCode)
 	}
 }

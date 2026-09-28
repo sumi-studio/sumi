@@ -238,7 +238,12 @@ export interface StateClient {
    * binding or report it unavailable; never substitute another provider.
    */
   modelBinding(persona: string): Promise<ModelBinding>;
-  /** One authenticated subscription HTTP attempt, with no transport retries. */
+  /**
+   * One authenticated subscription HTTP attempt, with no transport retries.
+   * `timeoutMs` is the caller's remaining model deadline; the API applies
+   * the same budget (bounded server-side) to admission, refresh and the
+   * upstream exchange.
+   */
   chatGPTResponses(
     persona: string,
     connectionId: string,
@@ -246,6 +251,7 @@ export interface StateClient {
     body: string,
     signal: AbortSignal,
     rejectedTokenSha256?: string,
+    timeoutMs?: number,
   ): Promise<Response>;
   completeOperation(
     persona: string,
@@ -810,9 +816,24 @@ export class HttpStateClient implements StateClient {
     body: string,
     signal: AbortSignal,
     rejectedTokenSha256?: string,
+    timeoutMs?: number,
   ): Promise<Response> {
     // The model deadline covers the stream. The short JSON state deadline
     // must not truncate it; neither this client nor Go replays on a network failure.
+    // `body` is the provider's JSON.stringify output. Splicing it in avoids
+    // holding a parsed copy of a multi-megabyte context in the isolate; the
+    // API still decodes and validates the whole envelope before dispatch.
+    const envelope = `{${[
+      `"connection_id":${JSON.stringify(connectionId)}`,
+      `"connection_version":${JSON.stringify(version)}`,
+      ...(rejectedTokenSha256
+        ? [`"rejected_token_sha256":${JSON.stringify(rejectedTokenSha256)}`]
+        : []),
+      ...(timeoutMs !== undefined
+        ? [`"timeout_ms":${Math.max(1, Math.ceil(timeoutMs))}`]
+        : []),
+      `"request":${body}`,
+    ].join(",")}}`;
     const res = await this.fetchImpl(
       `${this.baseUrl}/internal/core/personas/${persona}/model/chatgpt/responses`,
       {
@@ -823,19 +844,30 @@ export class HttpStateClient implements StateClient {
           Authorization: `Bearer ${this.token}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          connection_id: connectionId,
-          connection_version: version,
-          request: JSON.parse(body),
-          ...(rejectedTokenSha256
-            ? { rejected_token_sha256: rejectedTokenSha256 }
-            : {}),
-        }),
+        body: envelope,
       },
     );
-    const code = res.headers?.get("X-Sumi-Model-Error");
+    // Only a response the API authored is interpreted. Anything else (a
+    // tunnel/VPC 5xx after the API may already have dispatched, a missing
+    // route) has unknown acceptance and is never replayed automatically.
+    if (!res.headers?.get("X-Sumi-Model-Transport")) {
+      await res.body?.cancel().catch(() => {});
+      throw new ModelError(
+        `ChatGPT transport: HTTP ${res.status} did not come from the Sumi API; acceptance is unknown`,
+        { retryable: false },
+      );
+    }
+    const code = res.headers.get("X-Sumi-Model-Error");
     if (code) {
-      await res.body?.cancel();
+      await res.body?.cancel().catch(() => {});
+      if (code === "request_too_large") {
+        // Nothing was sent. Deterministic for this request, so the turn
+        // may continue with a smaller working view like any size refusal.
+        throw new ModelError(
+          "ChatGPT transport: request exceeds the transport size limit; it was not sent",
+          { retryable: false, refusal: "context_length" },
+        );
+      }
       const cause =
         code === "model_reconnect_required" ||
         code === "model_connection_disabled"
@@ -853,9 +885,9 @@ export class HttpStateClient implements StateClient {
     }
     if (
       res.status === 401 &&
-      !res.headers?.get("X-Sumi-ChatGPT-Rejected-Token")
+      !res.headers.get("X-Sumi-ChatGPT-Rejected-Token")
     ) {
-      await res.body?.cancel();
+      await res.body?.cancel().catch(() => {});
       throw new ModelError("Core service authorization failed", {
         retryable: false,
         unavailable: true,

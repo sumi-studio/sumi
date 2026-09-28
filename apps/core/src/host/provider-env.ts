@@ -38,7 +38,9 @@
  *                                      JSON object, e.g. max_tokens)
  *   SUMI_MODEL_TIMEOUT_MS             (openai and selected connections;
  *                                      per-request wall timeout, default
- *                                      120000)
+ *                                      120000; a ChatGPT subscription
+ *                                      request sends its remaining budget
+ *                                      to the API, which bounds it at 1h)
  *   SUMI_MODEL_PROVIDER=fixture       (scripted deterministic model for
  *                                      integration tests)
  *   SUMI_MODEL_FIXTURE_JSON           (fixture; the script as inline JSON —
@@ -465,7 +467,7 @@ export class SelectedModelProvider implements ModelProvider {
         chatgpt: {
           accountId: c.account_id,
           reasoningEffort: c.reasoning_effort || undefined,
-          send: (body, signal, rejected) =>
+          send: (body, signal, rejected, timeoutMs) =>
             state.chatGPTResponses(
               persona,
               c.id,
@@ -473,6 +475,7 @@ export class SelectedModelProvider implements ModelProvider {
               body,
               signal,
               rejected,
+              timeoutMs,
             ),
         },
       });
