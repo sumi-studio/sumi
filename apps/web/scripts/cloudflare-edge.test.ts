@@ -132,7 +132,6 @@ interface DiscoveredRoute {
 interface RouteDiscovery {
   routes: DiscoveredRoute[];
   workspace_package_present: boolean;
-  private_dynamic_registries: number;
 }
 
 test("the browser API, private transports, service worker, and SPA have distinct dispositions", () => {
@@ -405,7 +404,10 @@ test("the Cloud browser viewer reaches only its Worker binding, without cookies"
     ["/browser-cloud/viewer", {}],
     ["/browser-cloud/viewer", { method: "POST", body: "{}" }],
     ["/browser-cloud/profiles/x/wake", { method: "POST", body: "{}" }],
-    ["/api/cloud-browser-host/profiles/x/begin", { method: "POST", body: "{}" }],
+    [
+      "/api/cloud-browser-host/profiles/x/begin",
+      { method: "POST", body: "{}" },
+    ],
   ] as const) {
     const denied = await handleRequest(
       new Request(`https://workspace.example.com${path}`, init),
@@ -421,7 +423,10 @@ test("the Cloud browser viewer reaches only its Worker binding, without cookies"
   );
   assert.equal(absent.status, 404);
   assert.equal(classifyPath("/api/cloud-browser"), "origin");
-  assert.equal(classifyPath("/api/cloud-browser/profiles/x/viewer-ticket"), "origin");
+  assert.equal(
+    classifyPath("/api/cloud-browser/profiles/x/viewer-ticket"),
+    "origin",
+  );
 });
 
 test("a WebSocket 101 response is returned by identity", async () => {
@@ -754,18 +759,16 @@ test("every production API registration has an explicit edge disposition", async
   for (const route of discovery.routes) {
     const path = route.pattern.slice(route.pattern.indexOf(" ") + 1);
     // Server-only surfaces stay private at the front door: the
-    // local-control transport, the readiness probe, the agent WebSocket,
+    // readiness probe,
     // the /internal/* state/provider namespace the secretary core
     // reaches through its own service URL rather than this edge, and the
     // Cloud browser Worker's host routes (reached over the private VPC).
     const expected =
-      path === "/agent/ws" ||
       path.startsWith("/api/cloud-browser-host/") ||
       path === "/ready" ||
       path === "/internal" ||
       path.startsWith("/internal/") ||
-      path.startsWith("/fm/") ||
-      path.startsWith("/local-control/v1/")
+      path.startsWith("/fm/")
         ? "deny"
         : "origin";
     assert.equal(
@@ -790,7 +793,12 @@ test("every production API registration has an explicit edge disposition", async
   assert.ok(
     discovery.routes.some((route) => route.pattern.endsWith(" /health")),
   );
-  assert.ok(discovery.private_dynamic_registries >= 1);
+  assert.ok(
+    discovery.routes.some((route) =>
+      route.pattern.includes(" /internal/core/"),
+    ),
+    "Core service registrations must be inspected and kept private",
+  );
   assertWorkspaceIntegrationContract(discovery);
 
   for (const path of originRoutes.exact) {
@@ -833,6 +841,22 @@ func register(mux *http.ServeMux) { mux.HandleFunc("GET " + healthPath, nil) }
 import "net/http"
 func register(mux *http.ServeMux) {
   pattern := "GET /health"
+  mux.HandleFunc(pattern, nil)
+}
+`,
+    );
+    await assert.rejects(
+      discoverApiRoutes(temporary),
+      /route parity cannot skip dynamic registrations/,
+    );
+    // A retired receiver name must not exempt unknown routes from inspection.
+    await writeFile(
+      resolve(serverDirectory, "main.go"),
+      `package main
+import "net/http"
+type LocalControlServer struct {}
+func (s *LocalControlServer) RegisterRoutes(mux *http.ServeMux) {
+  pattern := "POST /internal/unknown"
   mux.HandleFunc(pattern, nil)
 }
 `,
