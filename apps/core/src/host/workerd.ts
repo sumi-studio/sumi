@@ -261,24 +261,40 @@ export class SecretaryObject {
     });
   }
 
-  private async build(personaId: string): Promise<Secretary> {
+  /**
+   * `stored` is the persona id the caller already read from storage (the
+   * alarm path); otherwise build reads it itself.
+   */
+  private async build(personaId: string, stored?: string): Promise<Secretary> {
+    this.assertServes(personaId);
+    if (this.secretary) return this.secretary;
+    // Construct before persisting: an unprovisioned persona (no token
+    // binding, bad provider config) must not arm a heartbeat that can
+    // never succeed — the persona id lands in storage only once the
+    // secretary could actually be built. (Review-A F2 / B F3.)
+    const s = this.newSecretary(personaId);
+    // A reconstructed instance (after eviction or restart) finds its id
+    // already stored; writing it again is one more storage write per wake.
+    const current =
+      stored ?? (await this.ctx.storage.get(PERSONA_KEY))?.toString();
+    if (current !== personaId) {
+      await this.ctx.storage.put(PERSONA_KEY, personaId);
+    }
+    // Bound in memory only once storage holds the id: a failed read or
+    // write leaves the instance unbound, so the next wake retries the
+    // durable binding instead of serving without one.
+    this.assertServes(personaId);
+    this.personaId = personaId;
+    this.secretary ??= s;
+    return this.secretary;
+  }
+
+  private assertServes(personaId: string): void {
     if (this.personaId && this.personaId !== personaId) {
       throw new Error(
         `persona mismatch: DO serves ${this.personaId}, got ${personaId}`,
       );
     }
-    if (!this.personaId) {
-      // Construct before persisting: an unprovisioned persona (no token
-      // binding, bad provider config) must not arm a heartbeat that can
-      // never succeed — the persona id lands in storage only once the
-      // secretary could actually be built. (Review-A F2 / B F3.)
-      const s = this.newSecretary(personaId);
-      this.personaId = personaId;
-      await this.ctx.storage.put(PERSONA_KEY, personaId);
-      this.secretary = s;
-    }
-    this.secretary ??= this.newSecretary(personaId);
-    return this.secretary;
   }
 
   /**
@@ -429,17 +445,17 @@ export class SecretaryObject {
    * from DO storage, so the heartbeat survives restarts.
    */
   async alarm(): Promise<void> {
-    const persona =
-      this.personaId ||
-      (await this.ctx.storage.get(PERSONA_KEY))?.toString() ||
-      "";
+    const stored = this.personaId
+      ? undefined
+      : (await this.ctx.storage.get(PERSONA_KEY))?.toString();
+    const persona = this.personaId || stored || "";
     if (!persona) return; // never activated — nothing to re-arm either
     const heartbeat = this.heartbeatMs();
     let rearmIn = heartbeat;
     let dormant = false;
     this.alarmStartedAt = Date.now();
     try {
-      const s = await this.build(persona);
+      const s = await this.build(persona, stored);
       this.missingTokenLogged = false;
       await this.requestDrain(s);
     } catch (e) {
