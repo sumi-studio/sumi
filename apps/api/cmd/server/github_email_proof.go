@@ -128,7 +128,8 @@ func (p *githubAPIEmailProver) get(ctx context.Context, path, accessToken string
 	defer response.Body.Close()
 	switch {
 	case response.StatusCode == http.StatusOK:
-	case response.StatusCode == http.StatusForbidden && response.Header.Get("X-RateLimit-Remaining") == "0":
+	case response.StatusCode == http.StatusForbidden &&
+		(response.Header.Get("X-RateLimit-Remaining") == "0" || response.Header.Get("Retry-After") != ""):
 		return errGitHubUnavailable
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden ||
 		response.StatusCode == http.StatusNotFound:

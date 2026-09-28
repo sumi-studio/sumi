@@ -90,6 +90,11 @@ func TestGitHubEmailEvidenceClassifiesOutagesAndNeverFollowsRedirects(t *testing
 			w.Header().Set("X-RateLimit-Remaining", "0")
 			w.WriteHeader(http.StatusForbidden)
 		}, errGitHubUnavailable},
+		{"secondary rate limited", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-RateLimit-Remaining", "4999")
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusForbidden)
+		}, errGitHubUnavailable},
 		{"server error", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
 		}, errGitHubUnavailable},
