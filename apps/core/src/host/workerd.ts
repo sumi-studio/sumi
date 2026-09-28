@@ -5,13 +5,26 @@
  * DO's alarm) so an evicted instance can resume its own life — durable
  * secretary state is never written here.
  *
- * Liveness: activating a persona arms a periodic heartbeat alarm
- * (SUMI_HEARTBEAT_MS, default 30s). Each alarm drains pending work —
- * including dispatching due schedules — and re-arms. A wake via fetch drains
- * immediately and ensures the alarm exists. Honest scope: this is a fixed
- * heartbeat per active persona, not next-due-wake scheduling; the state
- * contract does not yet expose pending wake times. Memory preparation that
- * waits is the exception: the alarm is armed for when it can start.
+ * Liveness: no fixed heartbeat. A drain that ends cleanly arms the alarm
+ * for the next needed wake — the state service's next-work time (a queued
+ * input's not_before, a pending schedule, an input an interrupted turn left
+ * claimed) or waiting memory preparation, whichever is first — and deletes
+ * it when nothing waits, so an idle object sleeps without alarms or
+ * storage writes. Work recorded while it sleeps reaches it as a wake from
+ * the state service's runtime sweep. A wake via fetch first arms a guard
+ * alarm SUMI_HEARTBEAT_MS ahead, so a drain cut short by a crash or
+ * eviction runs again; the drain's plan replaces the guard. A failed drain
+ * (state outage, a writer held elsewhere) retries after SUMI_HEARTBEAT_MS.
+ *
+ * Retirement: when the state service authoritatively reports the persona
+ * does not exist (PersonaNotFoundError — a 404 carrying the
+ * persona_not_found code), the object deletes its alarm and storage and
+ * stops waking; a later wake for a persona created under that id starts it
+ * afresh. A persona that exists but is not active here (PersonaInactiveError
+ * — staged, sealed, moved away) keeps its stored id but arms nothing; the
+ * sweep wakes it once it is active with work. Every other start failure
+ * (state outage, timeout, a held writer, an uncoded 404) keeps the ordinary
+ * retry cadence.
  *
  * Concurrency: drains are serialized per DO instance. A wake arriving while
  * a drain runs marks a re-drain instead of starting a parallel drain — two
@@ -33,8 +46,8 @@
  * After a drain that left preparation waiting, the alarm is armed for when
  * it can start (at least 1s ahead). When the model layer reports itself
  * unavailable the secretary shelves memory work for a pause interval, so
- * this wake rests on the shelf/heartbeat cadence — an unbound persona does
- * not spin claim/probe/release at the 1s floor.
+ * this wake rests on the shelf's end — an unbound persona does not spin
+ * claim/probe/release at the 1s floor.
  *
  * Env bindings (worker config):
  *   SUMI_STATE_URL    — base URL of the Go state service (with SUMI_STATE,
@@ -50,7 +63,7 @@
  *                       SUMI_CORE_WAKE_OPEN=loopback-dev on a loopback
  *                       host (local wrangler dev)
  *   SUMI_MODEL_*      — provider config (same as local host)
- *   SUMI_HEARTBEAT_MS — alarm interval override (default 30000)
+ *   SUMI_HEARTBEAT_MS — guard and failure-retry interval (default 30000)
  *   SUMI_DORMANT_REARM_MS — re-arm interval while the persona token
  *                       binding is missing (default 30min)
  *   SUMI_DRAIN_TURN_BUDGET_MS — how long a fetch-started drain takes new
@@ -71,6 +84,8 @@ import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory.ts";
 import { Secretary } from "../secretary.ts";
 import {
   HttpStateClient,
+  PersonaInactiveError,
+  PersonaNotFoundError,
   StateError,
   UnauthorizedError,
 } from "../state-client.ts";
@@ -82,6 +97,8 @@ interface DOStorage {
   put(key: string, value: unknown): Promise<void>;
   setAlarm(when: number): Promise<void>;
   getAlarm(): Promise<number | null>;
+  deleteAlarm(): Promise<void>;
+  deleteAll(): Promise<void>;
 }
 
 interface AlarmState {
@@ -160,7 +177,7 @@ function envToken(env: EnvLike, persona: string): string {
 export class SecretaryObject {
   private secretary: Secretary | null = null;
   private personaId = "";
-  private drainPromise: Promise<void> | null = null;
+  private drainPromise: Promise<DrainOutcome> | null = null;
   private wakeAgain = false;
   private missingTokenLogged = false;
   /** Set while alarm() runs: the drain may use the alarm's lifetime. */
@@ -333,21 +350,38 @@ export class SecretaryObject {
     try {
       await this.gated(this.startSerialized(s));
     } catch (e) {
-      // The heartbeat still arms so this DO keeps retrying on its own
-      // cadence; the drain itself would only repeat the failed start.
-      console.log(
-        `[core] persona ${persona} start failed:`,
-        e instanceof Error ? `${e.name}: ${e.message}` : e,
-      );
-      await this.ensureAlarm();
+      const outcome = drainOutcomeOf(e);
+      if (outcome.kind === "failed") {
+        console.log(
+          `[core] persona ${persona} start failed:`,
+          e instanceof Error ? `${e.name}: ${e.message}` : e,
+        );
+      }
+      // Absent: retired, nothing armed. Inactive: asleep. Otherwise the
+      // retry alarm arms — the drain itself would only repeat the start.
+      await this.settle(outcome, persona, s);
       return Response.json(
         { ok: false, persona, reason: startFailureReason(e) },
-        { status: 503 },
+        {
+          status:
+            outcome.kind === "absent"
+              ? 404
+              : outcome.kind === "inactive"
+                ? 409
+                : 503,
+        },
       );
     }
     const coalesced = this.drainPromise !== null;
-    this.ctx.waitUntil(this.requestDrain(s));
-    await this.ensureAlarm();
+    // The guard: should this isolate die mid-drain, the alarm drains
+    // again. A clean drain replaces it with the planned wake.
+    await this.armAlarmBy(Date.now() + this.heartbeatMs());
+    this.ctx.waitUntil(
+      this.requestDrain(s)
+        .then((o) => this.settle(o, persona, s))
+        // The guard (or a retry already armed) still stands.
+        .catch(() => undefined),
+    );
     return Response.json({ ok: true, persona, coalesced });
   }
 
@@ -440,24 +474,23 @@ export class SecretaryObject {
   }
 
   /**
-   * Alarm-driven wake: drains pending work (due schedules become wake inputs)
-   * and re-arms the heartbeat. After an eviction the persona id is recovered
-   * from DO storage, so the heartbeat survives restarts.
+   * Alarm-driven wake: drains pending work (due schedules become wake
+   * inputs) and arms the next planned wake, if any. After an eviction the
+   * persona id is recovered from DO storage.
    */
   async alarm(): Promise<void> {
     const stored = this.personaId
       ? undefined
       : (await this.ctx.storage.get(PERSONA_KEY))?.toString();
     const persona = this.personaId || stored || "";
-    if (!persona) return; // never activated — nothing to re-arm either
-    const heartbeat = this.heartbeatMs();
-    let rearmIn = heartbeat;
-    let dormant = false;
+    if (!persona) return; // never activated (or retired) — nothing to arm
+    let outcome: DrainOutcome = FAILED;
+    let s: Secretary | null = null;
     this.alarmStartedAt = Date.now();
     try {
-      const s = await this.build(persona, stored);
+      s = await this.build(persona, stored);
       this.missingTokenLogged = false;
-      await this.requestDrain(s);
+      outcome = await this.requestDrain(s);
     } catch (e) {
       if (e instanceof MissingPersonaTokenError) {
         // The binding is absent until provisioned — re-arming at
@@ -466,14 +499,14 @@ export class SecretaryObject {
         // (fresh-review F5). Log once and re-arm on the long dormant
         // cadence: no model/state calls while the token is absent, yet
         // the persona recovers on its own once the binding exists.
-        dormant = true;
-        rearmIn = this.dormantRearmMs();
+        const rearmIn = this.dormantRearmMs();
         if (!this.missingTokenLogged) {
           this.missingTokenLogged = true;
           console.log(
             `[core] no persona token binding for ${persona}; dormant re-arm in ${rearmIn}ms`,
           );
         }
+        outcome = { kind: "failed", retryAt: Date.now() + rearmIn };
       } else {
         console.log(
           `[core] alarm error: ${e instanceof Error ? e.message : e}`,
@@ -481,19 +514,65 @@ export class SecretaryObject {
       }
     } finally {
       this.alarmStartedAt = null;
-      // Memory preparation that is waiting (a retry backoff, an
-      // interrupted branch, one that could not fit this lifetime) starts
-      // at the next alarm, armed for when it can start.
-      const memoryAt = dormant ? null : this.secretary?.memoryWakeAt();
-      if (memoryAt != null) {
-        rearmIn = Math.min(
-          Math.max(memoryAt - Date.now(), MEMORY_WAKE_MIN_MS),
-          heartbeat,
-        );
+      await this.settle(outcome, persona, s);
+    }
+  }
+
+  /**
+   * Arm this object's alarm for what the finished drain found. Nothing
+   * else may disarm an activated persona: a failure always re-arms.
+   *
+   * - planned: the next wake the state service and the secretary's memory
+   *   work call for (at least MEMORY_WAKE_MIN_MS ahead), or no alarm at
+   *   all when nothing waits — an idle object sleeps until a wake.
+   * - failed: retry after the heartbeat interval (or the dormant cadence).
+   * - inactive: no alarm; the stored persona stays for a later wake.
+   * - absent: retire (alarm and storage deleted); if that fails, retry.
+   *
+   * A drain that started meanwhile settles for itself when it ends.
+   */
+  private async settle(
+    outcome: DrainOutcome,
+    persona: string,
+    s: Secretary | null,
+  ): Promise<void> {
+    if (this.drainPromise) return;
+    try {
+      switch (outcome.kind) {
+        case "planned":
+          return await this.armPlanned(outcome.wakeAt);
+        case "inactive":
+          return await this.disarm();
+        case "absent":
+          return await this.retire(persona, s);
+        case "failed":
+          return await this.armAlarmBy(
+            outcome.retryAt ?? Date.now() + this.heartbeatMs(),
+          );
       }
-      // Re-arm on every outcome — nothing must permanently disarm an
-      // activated writer.
-      await this.ctx.storage.setAlarm(Date.now() + rearmIn);
+    } catch (e) {
+      console.log(
+        `[core] persona ${persona} alarm update failed:`,
+        e instanceof Error ? `${e.name}: ${e.message}` : e,
+      );
+      if (outcome.kind === "failed") throw e;
+      await this.armAlarmBy(Date.now() + this.heartbeatMs());
+    }
+  }
+
+  private async armPlanned(at: number | null): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (at === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const when = Math.max(at, Date.now() + MEMORY_WAKE_MIN_MS);
+    if (current !== when) await this.ctx.storage.setAlarm(when);
+  }
+
+  private async disarm(): Promise<void> {
+    if ((await this.ctx.storage.getAlarm()) !== null) {
+      await this.ctx.storage.deleteAlarm();
     }
   }
 
@@ -501,7 +580,7 @@ export class SecretaryObject {
    * Serialize drains: one runs at a time; a trigger during a drain marks a
    * re-drain so new work is still picked up without a parallel writer.
    */
-  private requestDrain(s: Secretary): Promise<void> {
+  private requestDrain(s: Secretary): Promise<DrainOutcome> {
     if (this.drainPromise) {
       this.wakeAgain = true;
       return this.drainPromise;
@@ -513,17 +592,13 @@ export class SecretaryObject {
     return p;
   }
 
-  private async drainLoop(s: Secretary): Promise<void> {
+  private async drainLoop(s: Secretary): Promise<DrainOutcome> {
+    let outcome: DrainOutcome;
     do {
       this.wakeAgain = false;
-      await this.drain(s);
+      outcome = await this.drain(s);
     } while (this.wakeAgain);
-  }
-
-  private async ensureAlarm(): Promise<void> {
-    if ((await this.ctx.storage.getAlarm()) === null) {
-      await this.ctx.storage.setAlarm(Date.now() + this.heartbeatMs());
-    }
+    return outcome;
   }
 
   /** Arm the alarm no later than `at` (at least MEMORY_WAKE_MIN_MS ahead). */
@@ -535,15 +610,35 @@ export class SecretaryObject {
     }
   }
 
-  private async drain(s: Secretary): Promise<void> {
+  /**
+   * The persona does not exist: stop the secretary and delete this
+   * object's alarm and storage, so no heartbeat wakes it again. Storage
+   * goes first — if the alarm deletion then fails, a leftover alarm finds
+   * no persona id and does not re-arm.
+   */
+  private async retire(persona: string, s: Secretary | null): Promise<void> {
+    if (this.secretary === s) {
+      this.secretary = null;
+      this.personaId = "";
+    }
+    await s?.stop().catch(() => undefined);
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.deleteAlarm();
+    console.log(`[core] persona ${persona} does not exist; retired its wake`);
+  }
+
+  private async drain(s: Secretary): Promise<DrainOutcome> {
     try {
       await this.startSerialized(s);
     } catch (e) {
-      // Lease held by another live writer — it owns the life; back off.
-      console.log(
-        `[core] drain start failed: ${e instanceof Error ? e.message : e}`,
-      );
-      return;
+      const outcome = drainOutcomeOf(e);
+      // E.g. a lease held by another live writer — it owns the life; back off.
+      if (outcome.kind === "failed") {
+        console.log(
+          `[core] drain start failed: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+      return outcome;
     }
     try {
       const turnDeadline = Date.now() + this.turnBudgetMs();
@@ -581,10 +676,19 @@ export class SecretaryObject {
       // At the lifetime end this aborts a still-running branch: it records
       // nothing and the next claim counts an interruption.
       await s.stop();
-      if (this.alarmStartedAt === null) {
-        const memoryAt = s.memoryWakeAt();
-        if (memoryAt !== null) await this.armAlarmBy(memoryAt);
-      }
+      // The next wake: recorded work (asked after the lease is released,
+      // so nothing admitted meanwhile is missed) or waiting memory
+      // preparation — a retry backoff, an interrupted branch, one a fetch
+      // drain may not start — whichever comes first.
+      const workAt = await s.nextWorkAt();
+      const memoryAt = s.memoryWakeAt();
+      const wakeAt =
+        workAt === null
+          ? memoryAt
+          : memoryAt === null
+            ? workAt
+            : Math.min(workAt, memoryAt);
+      return { kind: "planned", wakeAt };
     } catch (e) {
       // A mid-drain error (state outage, transient step failure) leaves
       // the Secretary running and the lease held — deliberately: the next
@@ -595,8 +699,28 @@ export class SecretaryObject {
       console.log(
         `[core] drain error: ${e instanceof Error ? (e.stack ?? e.message) : e}`,
       );
+      return drainOutcomeOf(e);
     }
   }
+}
+
+/**
+ * What a finished drain leaves the object to do next — see settle().
+ * `retryAt` overrides the heartbeat retry (the dormant cadence).
+ */
+type DrainOutcome =
+  | { kind: "planned"; wakeAt: number | null }
+  | { kind: "failed"; retryAt?: number }
+  | { kind: "inactive" }
+  | { kind: "absent" };
+
+const FAILED: DrainOutcome = { kind: "failed" };
+
+/** Only the state service's coded answers end the retry cadence. */
+function drainOutcomeOf(e: unknown): DrainOutcome {
+  if (e instanceof PersonaNotFoundError) return { kind: "absent" };
+  if (e instanceof PersonaInactiveError) return { kind: "inactive" };
+  return FAILED;
 }
 
 /**
@@ -606,6 +730,8 @@ export class SecretaryObject {
 function startFailureReason(e: unknown): string {
   if (e instanceof MissingPersonaTokenError) return "no_credential";
   if (e instanceof UnauthorizedError) return "unauthorized";
+  if (e instanceof PersonaNotFoundError) return "persona_not_found";
+  if (e instanceof PersonaInactiveError) return "persona_inactive";
   if (e instanceof StateError) return `state_${e.status}`;
   return "start_failed";
 }

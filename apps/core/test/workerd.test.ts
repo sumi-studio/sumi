@@ -13,7 +13,11 @@ import type {
 } from "../src/provider.ts";
 import { MockProvider } from "../src/providers/mock.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import { type StateClient, StateError } from "../src/state-client.ts";
+import {
+  PersonaNotFoundError,
+  type StateClient,
+  StateError,
+} from "../src/state-client.ts";
 
 const PERSONA = "01930e00-0000-7000-8000-000000000002";
 
@@ -31,6 +35,10 @@ function fakeCtx() {
         alarmAt = when;
       },
       getAlarm: async () => alarmAt,
+      deleteAlarm: async () => {
+        alarmAt = null;
+      },
+      deleteAll: async () => data.clear(),
     },
     waitUntil: (p: Promise<unknown>) => void waits.push(p),
     alarmAt: () => alarmAt,
@@ -77,6 +85,14 @@ class TestObject extends SecretaryObject {
 const wakeReq = (p = PERSONA) =>
   new Request(`https://do.internal/personas/${p}/wake`, { method: "POST" });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Deliver the alarm as the platform does: the fired alarm is consumed. */
+const fire = async (
+  ctx: { storage: { deleteAlarm(): Promise<void> } },
+  obj: SecretaryObject,
+) => {
+  await ctx.storage.deleteAlarm();
+  await obj.alarm();
+};
 const settle = (ctx: { waits: Promise<unknown>[] }) =>
   Promise.all(ctx.waits.splice(0));
 
@@ -106,32 +122,27 @@ test("duplicate wake is coalesced into one serialized drain — no self-fencing 
     state.inputs.find((i) => i.input_id === "in-dup")!.status,
     "done",
   );
-  assert.ok(ctx.alarmAt() !== null, "fetch armed the heartbeat alarm");
+  assert.equal(ctx.alarmAt(), null, "idle after the drain: no alarm");
 });
 
-test("alarm drains work and re-arms; survives DO eviction via stored persona (F3)", async () => {
+test("an alarm drains work via the stored persona after eviction (F3)", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const ctx = fakeCtx();
   const obj = new TestObject(ctx as never, fakeEnv as never, state);
   await obj.fetch(wakeReq());
   await settle(ctx);
-  const armed = ctx.alarmAt();
-  assert.ok(armed !== null);
 
   // Simulate eviction: a fresh DO instance over the same storage, personaId
-  // forgotten. Work arriving now must still be picked up by the alarm.
+  // forgotten. An alarm (e.g. a guard left by a drain the eviction cut
+  // short) still finds the persona and drains the waiting input.
   const obj2 = new TestObject(ctx as never, fakeEnv as never, state);
   state.addInput(PERSONA, "in-evicted", "hello after eviction");
-  const before = ctx.alarmAt();
-  await obj2.alarm();
+  await fire(ctx, obj2);
 
   const outbox = await state.outbox(PERSONA, 0);
   assert.equal(outbox.length, 1, "evicted DO's alarm still drains the input");
-  assert.ok(
-    ctx.alarmAt() !== null && ctx.alarmAt()! >= before!,
-    "alarm re-armed for the next heartbeat",
-  );
+  assert.equal(ctx.alarmAt(), null, "nothing left: no alarm");
 });
 
 test("due schedule fires via alarm without any further fetch (F3)", async () => {
@@ -151,9 +162,12 @@ test("due schedule fires via alarm without any further fetch (F3)", async () => 
     1,
     "schedule.set committed",
   );
+  // The drain armed its own wake for the schedule (the 1s floor).
+  const armed = ctx.alarmAt();
+  assert.ok(armed !== null && armed - Date.now() <= 1_100, `armed: ${armed}`);
 
   await sleep(60); // wake_at now in the past; no fetch arrives — alarm drives
-  await obj.alarm();
+  await fire(ctx, obj);
   const evs = await state.events(PERSONA, 0);
   const wake = evs.find(
     (e) => e.kind === "input_received" && e.payload.actor_kind === "schedule",
@@ -165,6 +179,7 @@ test("due schedule fires via alarm without any further fetch (F3)", async () => 
     /alarm-fired ping/.test(JSON.stringify(o.payload)),
   );
   assert.ok(reply, "wake turn reply reached the outbox");
+  assert.equal(ctx.alarmAt(), null, "schedule fired: nothing left to wake for");
 });
 
 test("alarm on a never-activated DO is a no-op", async () => {
@@ -193,13 +208,13 @@ test("missing persona token re-arms on the dormant cadence and recovers (F5)", a
   const active = new TestObject(ctx as never, env as never, state);
   await active.fetch(wakeReq());
   await settle(ctx);
-  assert.ok(ctx.alarmAt() !== null, "heartbeat armed");
+  assert.equal(ctx.alarmAt(), null, "idle: asleep");
 
-  // Eviction with the binding now gone: the alarm must not die silently —
+  // Eviction with the binding now gone: an alarm must not die silently —
   // it re-arms on the long dormant cadence instead of the heartbeat.
   const dormant = new MissingTokenObject(ctx as never, env as never, state);
   const t0 = Date.now();
-  await dormant.alarm();
+  await fire(ctx, dormant);
   const dormantIn = ctx.alarmAt()! - t0;
   assert.ok(
     dormantIn > 1_000 && dormantIn <= 5_500,
@@ -207,21 +222,20 @@ test("missing persona token re-arms on the dormant cadence and recovers (F5)", a
   );
   // A second dormant alarm re-arms again — eventual recovery is durable,
   // not a one-shot.
-  await dormant.alarm();
+  await fire(ctx, dormant);
   assert.ok(ctx.alarmAt()! > Date.now());
 
   // The binding returns: the dormant alarm drains normally again.
   const healed = new TestObject(ctx as never, env as never, state);
   state.addInput(PERSONA, "in-healed", "hello after provisioning");
-  await healed.alarm();
+  await fire(ctx, healed);
   await settle(ctx);
   const out = await state.outbox(PERSONA, 0);
   assert.ok(
     out.some((o) => o.payload.input_id === "in-healed"),
     "provisioned persona drains on the dormant alarm",
   );
-  const hb = ctx.alarmAt()! - Date.now();
-  assert.ok(hb > 30_000, "back on the heartbeat cadence after recovery");
+  assert.equal(ctx.alarmAt(), null, "recovered and idle: asleep again");
 });
 
 /** ~11k estimated tokens per message: each exchange clears the 10k seal. */
@@ -280,6 +294,87 @@ test("fetch drain never starts memory preparation and arms the alarm to start it
   assert.equal(provider.branchRequests, 0, "no model call from a fetch drain");
   const armedIn = ctx.alarmAt()! - Date.now();
   assert.ok(armedIn <= 1_500, `alarm armed soon for preparation: ${armedIn}ms`);
+});
+
+test("memory-only work survives a transfer round trip: the rescue wake re-plans it", async () => {
+  // A chunk waits for preparation; the persona moves away before the alarm
+  // runs, so the object disarms (persona_inactive). Reactivated with no
+  // input or schedule, only the sweep's memory rescue wakes it. That fetch
+  // drain may not prepare, but it plans the alarm that does.
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const provider = new BranchProvider();
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state, provider);
+  await twoExchanges(state, obj, ctx);
+  await obj.fetch(wakeReq()); // seals chunk 1
+  await settle(ctx);
+  assert.equal(state.memoryChunks[0]?.status, "sealed");
+  assert.ok(ctx.alarmAt() !== null, "preparation planned");
+
+  state.setPersonaAuthority(PERSONA, "transferred");
+  await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
+  assert.equal(ctx.alarmAt(), null, "inactive: disarmed");
+  assert.equal(state.memoryChunks[0]?.status, "sealed");
+
+  // Reactivated; the missed activation signal leaves it asleep until the
+  // sweep's rescue wake (an ordinary fetch) arrives.
+  state.setPersonaAuthority(PERSONA, "active");
+  const revived = new TestObject(ctx as never, env as never, state, provider);
+  const r = await revived.fetch(wakeReq());
+  assert.equal(r.status, 200);
+  await settle(ctx);
+  assert.equal(provider.branchRequests, 0, "no model call from a fetch drain");
+  const armedIn = ctx.alarmAt()! - Date.now();
+  assert.ok(armedIn <= 1_500, `rescue planned the preparation: ${armedIn}ms`);
+  await fire(ctx, revived);
+  assert.equal(state.memoryChunks[0]?.status, "prepared");
+  assert.equal(provider.branchRequests, 1);
+});
+
+test("a planned memory wake lost in an outage is recovered by the rescue wake", async () => {
+  const state = new FailingAcquireState();
+  state.addPersona(PERSONA);
+  const provider = new BranchProvider();
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state, provider);
+  await twoExchanges(state, obj, ctx);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  assert.ok(ctx.alarmAt() !== null, "preparation planned");
+
+  // State outage: every alarm re-arms the retry — the plan is never dropped.
+  state.failWith = () => new StateError(503, "state service 503");
+  for (let i = 0; i < 3; i++) {
+    await fire(ctx, obj);
+    assert.ok(ctx.alarmAt()! - Date.now() > 50_000, "retry armed");
+  }
+  // Storage fails too: the alarm handler throws (the platform retries it a
+  // bounded number of times, then gives up) and no alarm remains.
+  const { setAlarm } = ctx.storage;
+  ctx.storage.setAlarm = async () => {
+    throw new Error("storage unavailable");
+  };
+  await assert.rejects(fire(ctx, obj));
+  assert.equal(ctx.alarmAt(), null, "the planned wake is gone");
+
+  // Everything resumes. The sweep rescues the overdue chunk with a wake;
+  // the plan it arms prepares the memory.
+  ctx.storage.setAlarm = setAlarm;
+  state.failWith = null;
+  const r = await new TestObject(
+    ctx as never,
+    env as never,
+    state,
+    provider,
+  ).fetch(wakeReq());
+  assert.equal(r.status, 200);
+  await settle(ctx);
+  assert.ok(ctx.alarmAt()! - Date.now() <= 1_500, "preparation re-planned");
+  await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
+  assert.equal(state.memoryChunks[0]?.status, "prepared");
 });
 
 test("alarm drain keeps a branch alive past the turn budget and shelves its result", async () => {
@@ -534,17 +629,13 @@ test("a reconstructed instance reuses the stored persona id without rewriting it
   await settle(ctx);
   assert.equal(counts.put, 1, "activation stores the persona id once");
 
-  // Alarm on a fresh instance: the id it read drives the drain, and the
-  // heartbeat re-arms as before.
+  // Alarm on a fresh instance: the id it read drives the drain.
   state.addInput(PERSONA, "in-alarm", "after eviction");
-  const t0 = Date.now();
-  await new TestObject(ctx as never, env as never, state).alarm();
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
   assert.equal(
     state.inputs.find((i) => i.input_id === "in-alarm")!.status,
     "done",
   );
-  const armedIn = ctx.alarmAt()! - t0;
-  assert.ok(armedIn >= 60_000 && armedIn < 61_000, `heartbeat: ${armedIn}`);
 
   // Wake on another fresh instance.
   state.addInput(PERSONA, "in-fetch", "wake after eviction");
@@ -597,8 +688,310 @@ test("a failed persona-id read or write never answers a wake without a stored bi
   );
   assert.equal(counts.put, 1);
 
-  // The durable binding carries the alarm across a further reconstruction.
+  // The durable binding carries an alarm across a further reconstruction.
+  state.addInput(PERSONA, "in-after-reconstruction", "hello");
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-after-reconstruction")!.status,
+    "done",
+  );
+});
+
+/** FakeState whose writer acquire or next-work fails while scripted. */
+class FailingAcquireState extends FakeState {
+  failWith: (() => Error) | null = null;
+  nextWorkFails = false;
+  override acquireWriter(persona: string, holder: string, ttlMs: number) {
+    if (this.failWith) return Promise.reject(this.failWith());
+    return super.acquireWriter(persona, holder, ttlMs);
+  }
+  override nextWork(persona: string) {
+    if (this.nextWorkFails)
+      return Promise.reject(new StateError(503, "state service 503"));
+    return super.nextWork(persona);
+  }
+}
+
+const HOUR = 3_600_000;
+
+test("an authoritatively absent persona retires its alarm and storage; a created one wakes afresh", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+
+  // The persona row disappears (reset, deletion). An alarm on a
+  // reconstructed instance learns it and stops for good.
+  state.personas.delete(PERSONA);
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(ctx.alarmAt(), null, "no re-arm for a nonexistent persona");
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), undefined);
+  // A leftover alarm on the retired object finds nothing to serve.
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(ctx.alarmAt(), null);
+
+  // A wake for the absent persona answers 404, stores nothing and deletes
+  // an alarm that was still armed.
+  await ctx.storage.setAlarm(Date.now() + HOUR);
+  const obj = new TestObject(ctx as never, env as never, state);
+  const r = await obj.fetch(wakeReq());
+  assert.equal(r.status, 404);
+  assert.equal(
+    ((await r.json()) as { reason?: string }).reason,
+    "persona_not_found",
+  );
+  await settle(ctx);
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), undefined);
+
+  // The same instance serves a persona created later under that id.
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-created", "hello");
+  const r2 = await obj.fetch(wakeReq());
+  assert.equal(r2.status, 200);
+  await settle(ctx);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-created")!.status,
+    "done",
+  );
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA);
+});
+
+test("a running persona deleted mid-life retires on its next alarm", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  state.personas.delete(PERSONA);
+  await fire(ctx, obj);
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), undefined);
+});
+
+test("a persona not active here sleeps without retrying and keeps its stored id", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+
+  state.setPersonaAuthority(PERSONA, "transferred");
+  await ctx.storage.setAlarm(Date.now() + HOUR);
+  const r = await new TestObject(ctx as never, env as never, state).fetch(
+    wakeReq(),
+  );
+  assert.equal(r.status, 409);
+  assert.equal(
+    ((await r.json()) as { reason?: string }).reason,
+    "persona_inactive",
+  );
+  await settle(ctx);
+  assert.equal(ctx.alarmAt(), null, "no retry cadence for a moved persona");
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA);
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(ctx.alarmAt(), null);
+
+  // Active again with work: the (sweep's) wake serves it as before.
+  state.setPersonaAuthority(PERSONA, "active");
+  state.addInput(PERSONA, "in-back", "hello again");
+  const r2 = await new TestObject(ctx as never, env as never, state).fetch(
+    wakeReq(),
+  );
+  assert.equal(r2.status, 200);
+  await settle(ctx);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-back")!.status,
+    "done",
+  );
+});
+
+test("transient and ambiguous failures keep a retry alarm and the stored persona", async () => {
+  const state = new FailingAcquireState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+
+  const failures: Array<[string, () => Error]> = [
+    ["outage", () => new StateError(503, "state service 503")],
+    ["timeout", () => new StateError(503, "state call timed out")],
+    ["uncoded 404", () => new StateError(404, "persona not found")],
+    ["writer held", () => new StateError(409, "writer lease held")],
+    ["uncoded 409", () => new StateError(409, "persona is not active")],
+    ["internal", () => new StateError(500, "internal error")],
+  ];
+  for (const [label, err] of failures) {
+    state.failWith = err;
+    const t0 = Date.now();
+    // Alarm path on a reconstructed instance.
+    await fire(ctx, new TestObject(ctx as never, env as never, state));
+    const armedIn = ctx.alarmAt()! - t0;
+    assert.ok(armedIn >= 60_000 && armedIn < 61_000, `${label}: ${armedIn}`);
+    assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA, label);
+    // Fetch path: 503, never 404/409, and a retry alarm stays armed.
+    await ctx.storage.deleteAlarm();
+    const r = await new TestObject(ctx as never, env as never, state).fetch(
+      wakeReq(),
+    );
+    assert.equal(r.status, 503, label);
+    await settle(ctx);
+    assert.ok(ctx.alarmAt() !== null, label);
+    assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA, label);
+  }
+
+  // The plan itself cannot be read: retry rather than sleep.
+  state.failWith = null;
+  state.nextWorkFails = true;
+  state.addInput(PERSONA, "in-plan-fails", "hello");
   const t0 = Date.now();
-  await new TestObject(ctx as never, env as never, state).alarm();
-  assert.ok(ctx.alarmAt()! - t0 >= 60_000, "alarm re-armed from storage");
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-plan-fails")!.status,
+    "done",
+  );
+  const retryIn = ctx.alarmAt()! - t0;
+  assert.ok(retryIn >= 60_000 && retryIn < 61_000, `plan failure: ${retryIn}`);
+
+  // The backend recovers: ordinary retry picks up waiting work, then sleeps.
+  state.nextWorkFails = false;
+  state.addInput(PERSONA, "in-recovered", "hello");
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-recovered")!.status,
+    "done",
+  );
+  assert.equal(ctx.alarmAt(), null);
+});
+
+test("a failed retirement falls back to a retry alarm", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+  state.personas.delete(PERSONA);
+
+  const { deleteAll } = ctx.storage;
+  ctx.storage.deleteAll = async () => {
+    throw new Error("storage delete failed");
+  };
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.ok(ctx.alarmAt() !== null, "re-armed to retry the retirement");
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), PERSONA);
+
+  ctx.storage.deleteAll = deleteAll;
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(await ctx.storage.get(PERSONA_KEY_FOR_TEST), undefined);
+});
+
+test("an idle persona sleeps: no alarm after a wake, none from a stray alarm", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-1", "hello");
+  const ctx = fakeCtx();
+  let sets = 0;
+  const { setAlarm } = ctx.storage;
+  ctx.storage.setAlarm = async (when: number) => {
+    sets++;
+    return setAlarm(when);
+  };
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const obj = new TestObject(ctx as never, env as never, state);
+  await obj.fetch(wakeReq());
+  await settle(ctx);
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(sets, 1, "only the in-flight guard was written");
+  sets = 0;
+  await fire(ctx, obj);
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(sets, 0, "an idle alarm writes no alarm");
+});
+
+test("a fetch arms a guard while its drain runs; the plan replaces it", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.addInput(PERSONA, "in-slow", "!slow 200 hi");
+  const ctx = fakeCtx();
+  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
+  const t0 = Date.now();
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  const guard = ctx.alarmAt()! - t0;
+  assert.ok(guard >= 60_000 && guard < 61_000, `guard: ${guard}`);
+  await settle(ctx);
+  assert.equal(ctx.alarmAt(), null, "clean drain: guard replaced by no wake");
+});
+
+test("the plan wakes for backed-off inputs, schedules and turn-budget leftovers", async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  const ctx = fakeCtx();
+  const env = {
+    ...fakeEnv,
+    SUMI_HEARTBEAT_MS: "60000",
+    SUMI_DRAIN_TURN_BUDGET_MS: "100",
+  };
+  const near = (want: number, label: string) => {
+    const got = ctx.alarmAt();
+    assert.ok(
+      got !== null && Math.abs(got - want) < 1_500,
+      `${label}: armed ${got === null ? "nothing" : got - Date.now()}ms, want ${want - Date.now()}ms`,
+    );
+  };
+
+  // A queued input backing off: the alarm waits for its not_before.
+  state.addInput(PERSONA, "in-backoff", "later");
+  const input = state.inputs.find((i) => i.input_id === "in-backoff")!;
+  input.not_before = new Date(Date.now() + 10 * 60_000).toISOString();
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+  near(Date.now() + 10 * 60_000, "not_before");
+  input.status = "done";
+
+  // A far schedule: the alarm waits for it — no heartbeat meanwhile.
+  state.schedules.set(`${PERSONA}|far`, {
+    persona_id: PERSONA,
+    schedule_id: "far",
+    wake_at: new Date(Date.now() + 3 * HOUR).toISOString(),
+    payload: { text: "far" },
+    miss_policy: "fire_late",
+    status: "pending",
+    claimed_generation: null,
+    created_at: new Date().toISOString(),
+    fired_at: null,
+  });
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  near(Date.now() + 3 * HOUR, "schedule");
+
+  // A fetch drain out of turn budget with work queued: an alarm drain
+  // continues within the second, not at a heartbeat.
+  state.addInput(PERSONA, "in-a", "!slow 200 a");
+  state.addInput(PERSONA, "in-b", "b");
+  await new TestObject(ctx as never, env as never, state).fetch(wakeReq());
+  await settle(ctx);
+  assert.equal(
+    state.inputs.find((i) => i.input_id === "in-b")!.status,
+    "queued",
+  );
+  near(Date.now() + 1_000, "leftover");
+  await fire(ctx, new TestObject(ctx as never, env as never, state));
+  assert.equal(state.inputs.find((i) => i.input_id === "in-b")!.status, "done");
+  near(Date.now() + 3 * HOUR, "back to the schedule");
+});
+
+test("PersonaNotFoundError is what the fake raises for an unknown persona", async () => {
+  const state = new FakeState();
+  await assert.rejects(
+    state.acquireWriter(PERSONA, "h", 1_000),
+    PersonaNotFoundError,
+  );
 });

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { test } from "node:test";
-import { HttpStateClient, StateError } from "../src/state-client.ts";
+import {
+  HttpStateClient,
+  PersonaNotFoundError,
+  StateError,
+} from "../src/state-client.ts";
 
 /**
  * A real local HTTP server that stalls on demand: a path containing
@@ -232,4 +236,37 @@ test("a fetcher that ignores the signal remains pending past the deadline", asyn
     new Promise<"pending">((r) => setTimeout(() => r("pending"), 200)),
   ]);
   assert.equal(raced, "pending");
+});
+
+test("only the coded 404 is an authoritative persona-not-found", async () => {
+  const answer = (status: number, body: unknown) =>
+    new HttpStateClient("http://unused.invalid", "tok", async () =>
+      Response.json(body, { status }),
+    );
+  const coded = await answer(404, {
+    error: "persona not found",
+    code: "persona_not_found",
+  })
+    .acquireWriter("p", "h", 1_000)
+    .catch((e) => e);
+  assert.ok(coded instanceof PersonaNotFoundError);
+  assert.equal(coded.status, 404);
+
+  // An uncoded 404 (unknown route, a missing input or job), the same code
+  // on another status, and a non-JSON 404 all stay ordinary StateErrors.
+  for (const [status, body] of [
+    [404, { error: "persona not found" }],
+    [404, { error: "job not found", code: "not_found" }],
+    [503, { error: "x", code: "persona_not_found" }],
+    [404, "not json"],
+  ] as const) {
+    const e = await answer(status, body)
+      .acquireWriter("p", "h", 1_000)
+      .catch((err) => err);
+    assert.ok(e instanceof StateError, `${status} ${JSON.stringify(body)}`);
+    assert.ok(
+      !(e instanceof PersonaNotFoundError),
+      `${status} ${JSON.stringify(body)} treated as permanent`,
+    );
+  }
 });

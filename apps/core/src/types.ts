@@ -131,6 +131,18 @@ export interface PersonaState {
 }
 
 /**
+ * When the persona next needs a runtime for recorded work — a queued input
+ * (at its not_before), a pending schedule, an input an interrupted turn
+ * left claimed. Null when nothing waits; memory preparation is not part of
+ * it (the secretary tracks that itself). `now` is the state service's
+ * clock: hosts arm relative to it, never comparing clocks directly.
+ */
+export interface NextWork {
+  next_work_at: string | null;
+  now: string;
+}
+
+/**
  * Invocation route (ADR 0013 §1): "normal" executes under the agent's own
  * authority; "elevated" explicitly asks a human for a one-shot decision.
  * Immutable once recorded — part of the durable decision.

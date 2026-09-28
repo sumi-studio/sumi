@@ -597,6 +597,21 @@ export class Secretary {
   }
 
   /**
+   * When recorded work (a queued input, a pending schedule, an input left
+   * claimed) next needs this persona's runtime, as epoch ms on this host's
+   * clock, or null when none waits. Memory preparation is memoryWakeAt's.
+   */
+  async nextWorkAt(): Promise<number | null> {
+    const { next_work_at, now } = await this.cfg.state.nextWork(
+      this.cfg.personaId,
+    );
+    if (next_work_at === null) return null;
+    // Relative to the state service's clock, so skew between the two
+    // clocks never moves a wake.
+    return Date.now() + Math.max(0, Date.parse(next_work_at) - Date.parse(now));
+  }
+
+  /**
    * Wait for the running preparation branch to end on its own — by
    * recording its result or a failure within its timeout — without starting
    * another. Bounded by that timeout plus a margin for recording the
@@ -836,7 +851,10 @@ export class Secretary {
           await this.commitTurnFinal(turn, {
             outcome: "complete",
             events,
-            output: { text: decision.text, tool_results: summarizeToolResults(results) },
+            output: {
+              text: decision.text,
+              tool_results: summarizeToolResults(results),
+            },
             usage: { rounds: usages },
           });
           this.log("turn committed", {
@@ -1497,7 +1515,10 @@ function withFailureMarker(
   if (events.some((e) => e.kind === "turn_failed")) return events;
   return [
     ...events,
-    { kind: "turn_failed", payload: { error_kind: errorKind ?? null, ...extra } },
+    {
+      kind: "turn_failed",
+      payload: { error_kind: errorKind ?? null, ...extra },
+    },
   ];
 }
 
@@ -1643,8 +1664,9 @@ function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       message_id: typeof p.message_id === "string" ? p.message_id : null,
       message_seq: typeof p.message_seq === "number" ? p.message_seq : null,
       workspace_id: typeof p.workspace_id === "string" ? p.workspace_id : null,
-      message_revision:
-        Number.isSafeInteger(p.message_revision) ? p.message_revision : null,
+      message_revision: Number.isSafeInteger(p.message_revision)
+        ? p.message_revision
+        : null,
       session_id: typeof p.session_id === "string" ? p.session_id : null,
       status: typeof p.status === "string" ? p.status : null,
       end_reason: typeof p.end_reason === "string" ? p.end_reason : null,

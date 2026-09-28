@@ -15,22 +15,13 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/testdb"
 )
 
-// migratedURL returns the URL of an empty, migrated database. The bootstrap
-// DDL is applied here until the consolidated schema carries it (see
-// reset-bootstrap/SCHEMA-REQUEST.md); both statements are then no-ops.
+// migratedURL returns the URL of an empty, migrated database.
 func migratedURL(t *testing.T) (string, context.Context) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	pool := testdb.Create(t)
 	if err := db.Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `
-		ALTER TABLE enrollment_invites ALTER COLUMN issued_by DROP NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS enrollment_invites_one_open_bootstrap
-			ON enrollment_invites ((true))
-			WHERE issued_by IS NULL AND consumed_at IS NULL AND revoked_at IS NULL`); err != nil {
 		t.Fatal(err)
 	}
 	return pool.Config().ConnString(), ctx

@@ -15,15 +15,7 @@ import (
 // the target contract. Both statements are no-ops once the schema has it.
 func bootstrapStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
-	s, ctx := authFlowStore(t)
-	if _, err := s.pool.Exec(ctx, `
-		ALTER TABLE enrollment_invites ALTER COLUMN issued_by DROP NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS enrollment_invites_one_open_bootstrap
-			ON enrollment_invites ((true))
-			WHERE issued_by IS NULL AND consumed_at IS NULL AND revoked_at IS NULL`); err != nil {
-		t.Fatal(err)
-	}
-	return s, ctx
+	return authFlowStore(t)
 }
 
 func bootstrapCount(t *testing.T, ctx context.Context, s *Store, query string, args ...any) int {

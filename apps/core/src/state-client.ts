@@ -11,6 +11,7 @@ import type {
   MemoryChunk,
   MemoryStatus,
   ModelBinding,
+  NextWork,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -55,6 +56,32 @@ export class StateError extends Error {
     this.name = "StateError";
     this.status = status;
     this.job = job;
+  }
+}
+
+/**
+ * Raised when the persona exists but is not active in this placement
+ * (409 with code "persona_inactive": staged, sealed, transferred or
+ * retired). No runtime here can work for it until it is active again.
+ */
+export class PersonaInactiveError extends StateError {
+  constructor(message = "persona is not active in this placement") {
+    super(409, message);
+    this.name = "PersonaInactiveError";
+  }
+}
+
+/**
+ * Raised when the state service authoritatively reports that the persona
+ * row does not exist (404 with code "persona_not_found"). Unlike every other
+ * failure it is permanent: the SecretaryObject retires instead of retrying.
+ * A 404 without the code (a missing input, job, or an unknown route) stays a
+ * plain StateError.
+ */
+export class PersonaNotFoundError extends StateError {
+  constructor(message = "persona not found") {
+    super(404, message);
+    this.name = "PersonaNotFoundError";
   }
 }
 
@@ -291,6 +318,8 @@ export interface StateClient {
    */
   listTools(persona: string): Promise<string[]>;
   personaState(persona: string): Promise<PersonaState>;
+  /** When the persona next needs a runtime for recorded work. */
+  nextWork(persona: string): Promise<NextWork>;
   /**
    * Record a background job for later runner claiming. Idempotent on
    * job_id: an identical resend returns `created: false` with the stored
@@ -478,14 +507,24 @@ export class HttpStateClient implements StateClient {
       }
       let message = `state service ${res.status}`;
       let job: Job | undefined;
+      let code: string | undefined;
       try {
-        const parsed = (await res.json()) as { error?: string; job?: Job };
+        const parsed = (await res.json()) as {
+          error?: string;
+          code?: string;
+          job?: Job;
+        };
         if (parsed.error) message = parsed.error;
         if (parsed.job) job = parsed.job;
+        if (typeof parsed.code === "string") code = parsed.code;
       } catch {
         /* non-JSON error body */
       }
       if (res.status === 401) throw new UnauthorizedError(message);
+      if (res.status === 404 && code === "persona_not_found")
+        throw new PersonaNotFoundError(message);
+      if (res.status === 409 && code === "persona_inactive")
+        throw new PersonaInactiveError(message);
       if (res.status === 409 && message.includes("fenced"))
         throw new FencedError(message);
       throw new StateError(res.status, message, job);
@@ -839,6 +878,12 @@ export class HttpStateClient implements StateClient {
     return this.call<PersonaState>(
       "GET",
       `/internal/core/personas/${persona}/state`,
+    );
+  }
+  nextWork(persona: string) {
+    return this.call<NextWork>(
+      "GET",
+      `/internal/core/personas/${persona}/next-work`,
     );
   }
   async submitJob(

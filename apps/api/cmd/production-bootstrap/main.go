@@ -32,7 +32,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/sumi-studio/sumi/apps/api/internal/db"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 )
@@ -130,10 +129,6 @@ func runInvite(ctx context.Context, args []string, getenv func(string) string, s
 	}
 	defer closeStore()
 	invite, token, err := store.IssueBootstrapEnrollmentInvite(ctx, *email, *ttl)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23502" && pgErr.ColumnName == "issued_by" {
-		return errors.New("the database schema does not accept bootstrap invitations (enrollment_invites.issued_by is NOT NULL)")
-	}
 	if err != nil {
 		return err
 	}
