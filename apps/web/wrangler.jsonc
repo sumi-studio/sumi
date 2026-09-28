@@ -41,6 +41,25 @@
         "SUMI_ORIGIN_PROTOCOL": "http",
         "SUMI_FIREBASE_AUTH_DOMAIN": "sumi-studio.firebaseapp.com"
       }
+    },
+    // Isolated proof of the WSL-independent API: the same Web Worker, with
+    // SUMI_ORIGIN bound to the api-container Worker instead of the VPC
+    // Service that tunnels to the WSL host. See docs/operations/cloud-api-container.md.
+    "proof": {
+      "name": "sumi-proof",
+      "workers_dev": true,
+      "preview_urls": false,
+      "compatibility_flags": [
+        "enable_request_signal",
+        "request_signal_passthrough"
+      ],
+      "services": [
+        { "binding": "SUMI_ORIGIN", "service": "sumi-api-proof" }
+      ],
+      "vars": {
+        "SUMI_ORIGIN_PROTOCOL": "http",
+        "SUMI_FIREBASE_AUTH_DOMAIN": "sumi-studio.firebaseapp.com"
+      }
     }
   }
 }

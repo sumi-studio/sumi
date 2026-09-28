@@ -21,14 +21,14 @@ import (
 // Create returns a pool connected to a freshly created, isolated temporary
 // database. It skips the test when SUMI_TEST_DB_URL is unset. The temporary
 // database is dropped on test cleanup. The caller must apply migrations.
-func Create(t *testing.T) *pgxpool.Pool {
+func Create(t testing.TB) *pgxpool.Pool {
 	return CreateWithMaxConns(t, 10)
 }
 
 // CreateWithMaxConns is Create with an explicit pool size. It exists for
 // integration tests that need to prove behavior at a particular connection
 // boundary, such as session-level advisory locking.
-func CreateWithMaxConns(t *testing.T, maxConns int32) *pgxpool.Pool {
+func CreateWithMaxConns(t testing.TB, maxConns int32) *pgxpool.Pool {
 	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("SUMI_TEST_DB_URL"))
 	if databaseURL == "" {

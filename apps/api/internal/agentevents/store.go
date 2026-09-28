@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,15 +36,71 @@ import (
 // and reconstructs the per-personality-agent next seq and idempotency maps, so
 // restart preserves the log and allocation continuity.
 type CommandStore struct {
-	mu              sync.Mutex
-	dir             string
-	states          map[string]*personalityAgentState
-	idempotencyLock *os.File
-	// idempotencyGuard serializes keyed appends that share this store's one
-	// flock file description. flock alone does not exclude goroutines using
-	// the same open file description.
-	idempotencyGuard chan struct{}
-	closed           bool
+	mu  sync.Mutex
+	dir string
+	// mirror, when set, makes each command log fsync durable beyond this
+	// host's disk (see FileMirror).
+	mirror FileMirror
+	states map[string]*personalityAgentState
+	closed bool
+}
+
+// Keyed admissions check every log for their idempotency key and append in
+// one step, serialized per key across processes by an flock on one of
+// idempotencyStripes lock files chosen by the key's hash. The same key always
+// maps to the same file, so its admission stays exactly-once; different keys
+// usually do not, so a slow append (a mirror waiting on the database) delays
+// only the keys that share its stripe, not every persona. Each acquisition
+// opens its own descriptor: flock excludes other descriptors, including other
+// goroutines of this process, so no in-process guard is needed.
+//
+// Keyed writers also hold legacyIdempotencyLock shared. Builds before the
+// stripes held it exclusively, so a process of such a build that shares the
+// directory during a rolling restart still excludes every new keyed writer.
+const (
+	idempotencyStripes    = 64
+	legacyIdempotencyLock = ".idempotency.lock"
+)
+
+func idempotencyLockName(key string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return fmt.Sprintf(".idempotency-%02d.lock", h.Sum32()%idempotencyStripes)
+}
+
+// lockIdempotencyKey takes the key's stripe (exclusive for an admission,
+// shared for a lookup). unlock closes the descriptors, releasing the locks.
+func (s *CommandStore) lockIdempotencyKey(ctx context.Context, key string, mode int) (unlock func(), err error) {
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return nil, err
+	}
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return nil, errors.New("command store is closed")
+	}
+	var files []*os.File
+	unlock = func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}
+	for _, lock := range []struct {
+		name string
+		mode int
+	}{{legacyIdempotencyLock, syscall.LOCK_SH}, {idempotencyLockName(key), mode}} {
+		f, err := os.OpenFile(filepath.Join(s.dir, lock.name), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			unlock()
+			return nil, fmt.Errorf("open idempotency lock: %w", err)
+		}
+		files = append(files, f)
+		if err := flockContext(ctx, f.Fd(), lock.mode); err != nil {
+			unlock()
+			return nil, fmt.Errorf("lock idempotency index: %w", err)
+		}
+	}
+	return unlock, nil
 }
 
 // fileHandle abstracts the per-personality-agent log file so tests can inject
@@ -183,6 +240,20 @@ var ErrSeqExhausted = errors.New("command sequence number exhausted")
 
 // OpenCommandStore opens or creates the command log under dir.
 func OpenCommandStore(dir string) (*CommandStore, error) {
+	return openCommandStore(dir, nil)
+}
+
+// OpenMirroredCommandStore is OpenCommandStore with every command log write
+// committed through mirror before its Sync succeeds. The mirror must already
+// have reconciled dir.
+func OpenMirroredCommandStore(dir string, mirror FileMirror) (*CommandStore, error) {
+	if mirror == nil {
+		return nil, errors.New("command store mirror is required")
+	}
+	return openCommandStore(dir, mirror)
+}
+
+func openCommandStore(dir string, mirror FileMirror) (*CommandStore, error) {
 	if dir == "" {
 		return nil, errors.New("command log directory is required")
 	}
@@ -206,32 +277,23 @@ func OpenCommandStore(dir string) (*CommandStore, error) {
 	}
 
 	s := &CommandStore{
-		dir:              abs,
-		states:           make(map[string]*personalityAgentState),
-		idempotencyGuard: make(chan struct{}, 1),
+		dir:    abs,
+		mirror: mirror,
+		states: make(map[string]*personalityAgentState),
 	}
-	idempotencyLockPath := filepath.Join(abs, ".idempotency.lock")
-	idempotencyLock, err := os.OpenFile(idempotencyLockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open global idempotency lock: %w", err)
-	}
-	s.idempotencyLock = idempotencyLock
 
 	matches, err := filepath.Glob(filepath.Join(abs, "commands-*.jsonl"))
 	if err != nil {
-		_ = idempotencyLock.Close()
 		return nil, fmt.Errorf("scan command log dir: %w", err)
 	}
 	sort.Strings(matches)
 	for _, path := range matches {
 		personalityAgentID, err := personalityAgentIDFromPath(path)
 		if err != nil {
-			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("invalid command log file %q: %w", path, err)
 		}
 		st := newPersonalityAgentState(path)
 		if err := s.loadStateLocked(context.Background(), st, personalityAgentID); err != nil {
-			_ = idempotencyLock.Close()
 			return nil, fmt.Errorf("load command log %q: %w", path, err)
 		}
 		s.states[personalityAgentID] = st
@@ -265,31 +327,7 @@ func (s *CommandStore) Close() error {
 		st.closed = true
 		st.mu.Unlock()
 	}
-	// A keyed append holds this guard from before its flock acquisition until
-	// after its per-PAID append completes. Taking it here keeps the shared flock
-	// descriptor alive for every in-flight keyed path.
-	s.idempotencyGuard <- struct{}{}
-	if s.idempotencyLock != nil {
-		if err := s.idempotencyLock.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		s.idempotencyLock = nil
-	}
-	<-s.idempotencyGuard
 	return firstErr
-}
-
-func (s *CommandStore) acquireIdempotencyGuard(ctx context.Context) error {
-	select {
-	case s.idempotencyGuard <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (s *CommandStore) releaseIdempotencyGuard() {
-	<-s.idempotencyGuard
 }
 
 // poisonLocked marks a personality-agent state as unusable and closes its file so
@@ -305,11 +343,21 @@ func (s *CommandStore) poisonLocked(st *personalityAgentState, reason error) {
 
 // rollbackLocked attempts to truncate the log back to offset and fsync. If the
 // rollback cannot be durably confirmed, it poisons the personality-agent state.
+//
+// A Sync that failed only to replicate (the local truncation is durable) is
+// confirmed locally: the file, fileSize, nextSeq and the idempotency index
+// all describe the log without the failed record, and the mirror repairs its
+// copy before the next append is acknowledged. Poisoning there would disable
+// Direct Chat for the personality until restart after a transient database
+// outage.
 func (s *CommandStore) rollbackLocked(st *personalityAgentState, offset int64, origErr error) error {
 	var truncErr, syncErr error
 	if st.file != nil {
 		truncErr = st.file.Truncate(offset)
 		syncErr = st.file.Sync()
+	}
+	if truncErr == nil && syncErr != nil && replicationOnly(syncErr) {
+		return nil
 	}
 	if truncErr != nil || syncErr != nil {
 		reason := fmt.Errorf("append failure %v; rollback could not be confirmed (truncate=%v, sync=%v)", origErr, truncErr, syncErr)
@@ -358,25 +406,11 @@ func (s *CommandStore) append(
 	}
 
 	if idempotencyKey != "" {
-		if err := s.acquireIdempotencyGuard(ctx); err != nil {
-			return CommandEnvelope{}, fmt.Errorf("lock in-process global idempotency index: %w", err)
-		}
-		defer s.releaseIdempotencyGuard()
-
-		if err := lockMutexContext(ctx, &s.mu); err != nil {
+		unlock, err := s.lockIdempotencyKey(ctx, idempotencyKey, syscall.LOCK_EX)
+		if err != nil {
 			return CommandEnvelope{}, err
 		}
-		if s.closed || s.idempotencyLock == nil {
-			s.mu.Unlock()
-			return CommandEnvelope{}, errors.New("command store is closed")
-		}
-		idempotencyLock := s.idempotencyLock
-		s.mu.Unlock()
-
-		if err := flockContext(ctx, idempotencyLock.Fd(), syscall.LOCK_EX); err != nil {
-			return CommandEnvelope{}, fmt.Errorf("lock global idempotency index: %w", err)
-		}
-		defer func() { _ = syscall.Flock(int(idempotencyLock.Fd()), syscall.LOCK_UN) }()
+		defer unlock()
 
 		existing, found, err := s.findIdempotencyRecord(ctx, idempotencyKey)
 		if err != nil {
@@ -487,14 +521,21 @@ func (s *CommandStore) append(
 	return env, nil
 }
 
-// findIdempotencyRecord scans only records that contain storage-authored
-// idempotency metadata. Every keyed writer holds idempotencyLock, so those
-// records are stable even while unrelated unkeyed logs append concurrently.
+// findIdempotencyRecord scans only records that carry idempotencyKey as
+// storage-authored metadata. The caller holds the key's stripe lock, so no
+// record with this key is being written; records of other keys may be, and a
+// last line without its newline (still being written, or torn by a crash) is
+// never an admission.
 func (s *CommandStore) findIdempotencyRecord(ctx context.Context, idempotencyKey string) (CommandEnvelope, bool, error) {
 	matches, err := filepath.Glob(filepath.Join(s.dir, "commands-*.jsonl"))
 	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
+	encodedKey, err := json.Marshal(idempotencyKey)
+	if err != nil {
+		return CommandEnvelope{}, false, err
+	}
+	keyField := append([]byte(`"idempotency_key":`), encodedKey...)
 	sort.Strings(matches)
 	for _, path := range matches {
 		if err := ctx.Err(); err != nil {
@@ -507,7 +548,7 @@ func (s *CommandStore) findIdempotencyRecord(ctx context.Context, idempotencyKey
 		reader := bufio.NewReader(file)
 		for {
 			line, readErr := reader.ReadBytes('\n')
-			if bytes.Contains(line, []byte(`"idempotency_key"`)) {
+			if bytes.HasSuffix(line, []byte("\n")) && bytes.Contains(line, keyField) {
 				var record LogRecord
 				if err := json.Unmarshal(bytes.TrimSpace(line), &record); err != nil {
 					_ = file.Close()
@@ -897,9 +938,19 @@ func (s *CommandStore) loadStateLocked(ctx context.Context, st *personalityAgent
 		return fmt.Errorf("stat command log for %q: %w", personalityAgentID, err)
 	}
 
-	file, err := os.OpenFile(st.path, os.O_CREATE|os.O_RDWR|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+	const logFlags = os.O_CREATE | os.O_RDWR | os.O_APPEND | syscall.O_NOFOLLOW
+	var file fileHandle
+	file, err = os.OpenFile(st.path, logFlags, 0o600)
 	if err != nil {
 		return fmt.Errorf("open command log for %q: %w", personalityAgentID, err)
+	}
+	if s.mirror != nil {
+		mirrored, mirrorErr := s.mirror.Wrap(st.path, logFlags, file)
+		if mirrorErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("mirror command log for %q: %w", personalityAgentID, mirrorErr)
+		}
+		file = mirrored
 	}
 	if err := flockContext(ctx, file.Fd(), syscall.LOCK_EX); err != nil {
 		_ = file.Close()
@@ -985,7 +1036,7 @@ func newCommandID() (string, error) {
 }
 
 // Lookup returns only an existing exact durable admission. It shares Append's
-// global idempotency lock and never starts a PA or allocates a sequence.
+// idempotency lock for the key and never starts a PA or allocates a sequence.
 func (s *CommandStore) Lookup(ctx context.Context, provenance IncomingProvenance, idempotencyKey string, command json.RawMessage) (CommandEnvelope, bool, error) {
 	if err := validateIncomingCommand(provenance, command); err != nil {
 		return CommandEnvelope{}, false, err
@@ -993,23 +1044,11 @@ func (s *CommandStore) Lookup(ctx context.Context, provenance IncomingProvenance
 	if idempotencyKey == "" {
 		return CommandEnvelope{}, false, errors.New("lookup requires an idempotency key")
 	}
-	if err := s.acquireIdempotencyGuard(ctx); err != nil {
+	unlock, err := s.lockIdempotencyKey(ctx, idempotencyKey, syscall.LOCK_SH)
+	if err != nil {
 		return CommandEnvelope{}, false, err
 	}
-	defer s.releaseIdempotencyGuard()
-	if err := lockMutexContext(ctx, &s.mu); err != nil {
-		return CommandEnvelope{}, false, err
-	}
-	if s.closed || s.idempotencyLock == nil {
-		s.mu.Unlock()
-		return CommandEnvelope{}, false, errors.New("command store is closed")
-	}
-	lock := s.idempotencyLock
-	s.mu.Unlock()
-	if err := flockContext(ctx, lock.Fd(), syscall.LOCK_SH); err != nil {
-		return CommandEnvelope{}, false, err
-	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	defer unlock()
 	existing, found, err := s.findIdempotencyRecord(ctx, idempotencyKey)
 	if err != nil || !found {
 		return existing, found, err

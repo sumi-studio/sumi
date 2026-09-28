@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  // The Sumi Go API in one Cloudflare Container. No public route: the Web
+  // Worker (SUMI_ORIGIN) and the Core Worker (SUMI_STATE) reach it through
+  // service bindings. Configuration and secrets are Worker vars/secrets named
+  // like the API's environment (SUMI_DB_URL, SUMI_CORE_STATE_TOKEN, ...);
+  // src/index.ts forwards them into the container. Never put them here.
+  "name": "sumi-api-container",
+  "main": "./src/index.ts",
+  "compatibility_date": "2026-08-11",
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "containers": [
+    {
+      "class_name": "SumiApiContainer",
+      "image": "../../deploy/api-container/Dockerfile",
+      "image_build_context": "../..",
+      // Measured on the current host: ~20 MiB resident, ~1% of one core.
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "SUMI_API", "class_name": "SumiApiContainer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SumiApiContainer"] }],
+  // Starts the API again after a crash or rollout (idle policy "keep").
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    "SUMI_API_IDLE_POLICY": "keep"
+  },
+  "env": {
+    // Isolated proof deployment, bound from sumi-proof and sumi-core-proof.
+    "proof": {
+      "name": "sumi-api-proof",
+      "workers_dev": false,
+      "preview_urls": false,
+      "observability": { "enabled": true },
+      "containers": [
+        {
+          "class_name": "SumiApiContainer",
+          "image": "../../deploy/api-container/Dockerfile",
+          "image_build_context": "../..",
+          "instance_type": "basic",
+          "max_instances": 1
+        }
+      ],
+      "durable_objects": {
+        "bindings": [{ "name": "SUMI_API", "class_name": "SumiApiContainer" }]
+      },
+      "triggers": { "crons": ["* * * * *"] },
+      "vars": {
+        "SUMI_API_IDLE_POLICY": "keep"
+      }
+    }
+  }
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/sumi-studio/sumi/apps/api/internal/fileaccess"
 	"github.com/sumi-studio/sumi/apps/api/internal/handler"
 	"github.com/sumi-studio/sumi/apps/api/internal/jobexec"
+	"github.com/sumi-studio/sumi/apps/api/internal/journalmirror"
 	"github.com/sumi-studio/sumi/apps/api/internal/koseki"
 	"github.com/sumi-studio/sumi/apps/api/internal/mcpconnections"
 	"github.com/sumi-studio/sumi/apps/api/internal/messaging"
@@ -61,26 +62,11 @@ func run(ctx context.Context) (runErr error) {
 		return err
 	}
 
-	app, err := newApplicationFromEnv()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		runErr = errors.Join(runErr, app.Close())
-	}()
-	if app.messagingServer != nil {
-		// Readers resolve temporary status expiry themselves; this worker makes
-		// it visible on already-open screens. Start it only after run owns the
-		// application so Close can cancel it.
-		go app.messagingServer.RunStatusExpiry(
-			app.backgroundCtx,
-			messaging.DefaultStatusExpiryInterval,
-		)
-	}
-
+	// The port answers while the application starts; see startupGate.
+	gate := newStartupGate()
 	publicServer := &http.Server{
 		Addr:              publicAddress,
-		Handler:           app.publicMux,
+		Handler:           gate,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -89,29 +75,76 @@ func run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("listen on public API: %w", err)
 	}
-
+	serving := make(chan error, 1)
+	go func() { serving <- publicServer.Serve(publicListener) }()
 	log.Printf("sumi api listening on %s", publicListener.Addr())
-	app.startAgentAttention()
-	app.startCoreWaker()
-	app.startCoreDirectChat()
-	app.startFeedbackAttention()
-	app.startJobExec()
-	app.startMCP()
-	app.startBrowserTabs()
-	app.startCloudBrowser()
-	app.startTermExec()
-	app.startEmailDelivery()
-	if app.transferSessions != nil {
-		// Owes activation after a committed account claim, retires staged
-		// copies of closed sessions, and promotes interrupted imports.
-		go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+
+	app, err := newApplication(ctx, gate)
+	if err != nil {
+		return errors.Join(err, shutdownHTTPServer(publicServer))
 	}
-	if app.returnSessions != nil {
-		// Expires unbound admission and lands ledger outcomes (seal,
-		// complete, abort) the request that owed the update lost.
-		go app.returnSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+	defer func() {
+		runErr = errors.Join(runErr, app.Close())
+	}()
+	// Losing the journal mirror lease stops background work and browser
+	// connections at once; the process then exits through SIGTERM.
+	gate.onStop(func() { _ = app.Close() })
+	started := app.startBackground(func() {
+		if app.messagingServer != nil {
+			// Readers resolve temporary status expiry themselves; this worker
+			// makes it visible on already-open screens.
+			go app.messagingServer.RunStatusExpiry(
+				app.backgroundCtx,
+				messaging.DefaultStatusExpiryInterval,
+			)
+		}
+
+		app.startAgentAttention()
+		app.startCoreWaker()
+		app.startCoreDirectChat()
+		app.startFeedbackAttention()
+		app.startJobExec()
+		app.startMCP()
+		app.startBrowserTabs()
+		app.startCloudBrowser()
+		app.startTermExec()
+		app.startEmailDelivery()
+		if app.transferSessions != nil {
+			// Owes activation after a committed account claim, retires staged
+			// copies of closed sessions, and promotes interrupted imports.
+			go app.transferSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+		}
+		if app.returnSessions != nil {
+			// Expires unbound admission and lands ledger outcomes (seal,
+			// complete, abort) the request that owed the update lost.
+			go app.returnSessions.Run(app.backgroundCtx, transferSweepInterval, log.Printf)
+		}
+	})
+	if started {
+		gate.open(app.publicMux)
+		log.Printf("sumi api ready")
+	} else {
+		log.Printf("sumi api stopped before it was ready; no background work was started")
 	}
-	return serveHTTPServers(ctx, serverAndListener{server: publicServer, listener: publicListener})
+
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case err := <-serving:
+		if !errors.Is(err, http.ErrServerClosed) {
+			serveErr = err
+		}
+	}
+	return errors.Join(serveErr, shutdownHTTPServer(publicServer))
+}
+
+func shutdownHTTPServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("shut down HTTP server: %w", err)
+	}
+	return nil
 }
 
 func publicListenAddressFromEnv(port string) (string, error) {
@@ -159,48 +192,13 @@ func literalListenAddress(name, address string, requireLoopback bool) (string, e
 	return net.JoinHostPort(ip.String(), strconv.Itoa(numericPort)), nil
 }
 
-type serverAndListener struct {
-	server   *http.Server
-	listener net.Listener
-}
-
-func serveHTTPServers(ctx context.Context, servers ...serverAndListener) error {
-	if len(servers) == 0 {
-		return errors.New("at least one HTTP server is required")
-	}
-	errs := make(chan error, len(servers))
-	for _, item := range servers {
-		item := item
-		go func() {
-			errs <- item.server.Serve(item.listener)
-		}()
-	}
-
-	var firstErr error
-	select {
-	case <-ctx.Done():
-	case err := <-errs:
-		if !errors.Is(err, http.ErrServerClosed) {
-			firstErr = err
-		}
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for _, item := range servers {
-		if err := item.server.Shutdown(shutdownCtx); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("shut down HTTP server: %w", err)
-		}
-	}
-	return firstErr
-}
-
 type application struct {
 	emailDelivery              *emailDeliveryWorker
 	publicMux                  *http.ServeMux
 	store                      *agentevents.CommandStore
 	browser                    *agentevents.BrowserServer
 	database                   *db.Pool
+	journalMirror              *journalmirror.Mirror
 	messagingServer            *messaging.Server
 	backgroundCtx              context.Context
 	deliverAttention           func(context.Context) (messaging.AgentAttentionDeliveryStats, error)
@@ -219,8 +217,27 @@ type application struct {
 	// stopBackground cancels process-lifetime workers such as the attachment
 	// reconciler and status expiry sweep.
 	stopBackground context.CancelFunc
-	closeOnce      sync.Once
-	closeErr       error
+	// backgroundMu orders startBackground and Close; backgroundClosed is set
+	// once Close has begun.
+	backgroundMu     sync.Mutex
+	backgroundClosed bool
+	closeOnce        sync.Once
+	closeErr         error
+}
+
+// startBackground runs start, which launches the background workers, unless
+// Close has begun. Close takes the same lock before it cancels and waits for
+// the workers, so each worker is either started before Close, which then
+// stops it, or never started: a journal mirror lease lost while the API
+// starts cannot leave a side-effect loop running on a closed application.
+func (a *application) startBackground(start func()) bool {
+	a.backgroundMu.Lock()
+	defer a.backgroundMu.Unlock()
+	if a.backgroundClosed {
+		return false
+	}
+	start()
+	return true
 }
 
 type browserSessionConnectionClosers []agentevents.BrowserSessionConnectionCloser
@@ -238,6 +255,9 @@ func (a *application) Close() error {
 		return nil
 	}
 	a.closeOnce.Do(func() {
+		a.backgroundMu.Lock()
+		a.backgroundClosed = true
+		a.backgroundMu.Unlock()
 		if a.stopBackground != nil {
 			a.stopBackground()
 		}
@@ -249,6 +269,9 @@ func (a *application) Close() error {
 		}
 		if a.store != nil {
 			a.closeErr = errors.Join(a.closeErr, a.store.Close())
+		}
+		if a.journalMirror != nil {
+			a.closeErr = errors.Join(a.closeErr, a.journalMirror.Close())
 		}
 		if a.database != nil {
 			a.database.Close()
@@ -266,33 +289,75 @@ func newRouter() (*http.ServeMux, error) {
 }
 
 func newApplicationFromEnv() (*application, error) {
+	return newApplication(context.Background(), nil)
+}
+
+// newApplication builds the API from the environment. gate, if not nil,
+// receives the startup phases and is stopped when the journal mirror lease
+// is lost.
+func newApplication(ctx context.Context, gate *startupGate) (_ *application, err error) {
 	cmdDir := os.Getenv("SUMI_COMMAND_LOG_DIR")
 	if cmdDir == "" {
 		return nil, errors.New("SUMI_COMMAND_LOG_DIR not set")
 	}
-	store, err := agentevents.OpenCommandStore(cmdDir)
-	if err != nil {
-		return nil, fmt.Errorf("open command store: %w", err)
-	}
 	runtimeDir := os.Getenv("SUMI_BROWSER_EVENT_DIR")
 	if runtimeDir == "" {
-		_ = store.Close()
 		return nil, errors.New("SUMI_BROWSER_EVENT_DIR not set")
 	}
-	runtime, err := agentevents.OpenBrowserJournal(runtimeDir, store)
+	// With the journal mirror the database opens first: it holds the
+	// acknowledged journal bytes that must be restored into the (possibly
+	// fresh) directories before the journals read them.
+	database, mirror, err := journalMirrorFromEnv(ctx, cmdDir, runtimeDir, gate)
 	if err != nil {
+		return nil, err
+	}
+	if mirror != nil {
+		defer func() {
+			if err != nil {
+				_ = mirror.Close()
+			}
+		}()
+	}
+	gate.setPhase("opening")
+	var store *agentevents.CommandStore
+	if mirror != nil {
+		store, err = agentevents.OpenMirroredCommandStore(cmdDir, mirror)
+	} else {
+		store, err = agentevents.OpenCommandStore(cmdDir)
+	}
+	if err != nil {
+		if database != nil {
+			database.Close()
+		}
+		return nil, fmt.Errorf("open command store: %w", err)
+	}
+	closeEarly := func() {
 		_ = store.Close()
+		if database != nil {
+			database.Close()
+		}
+	}
+	var runtime *agentevents.BrowserJournal
+	if mirror != nil {
+		runtime, err = agentevents.OpenMirroredBrowserJournal(runtimeDir, store, mirror)
+	} else {
+		runtime, err = agentevents.OpenBrowserJournal(runtimeDir, store)
+	}
+	if err != nil {
+		closeEarly()
 		return nil, fmt.Errorf("open agent runtime gateway: %w", err)
 	}
 	sv, browserOrigins, err := browserSessionConfigFromEnv(runtime)
 	if err != nil {
-		_ = store.Close()
+		closeEarly()
 		return nil, fmt.Errorf("browser session configuration: %w", err)
 	}
-	database, err := databaseFromEnv(context.Background())
-	if err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("control-plane database: %w", err)
+	if database == nil {
+		database, err = databaseFromEnv(context.Background())
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("control-plane database: %w", err)
+		}
 	}
 	var databasePool *pgxpool.Pool
 	var messagingServer *messaging.Server
@@ -416,7 +481,7 @@ func newApplicationFromEnv() (*application, error) {
 		if authEnabled {
 			authServer.PushDevices = messagingStore
 		}
-		if err := configureMessagingAttachmentsFromEnv(messagingStore); err != nil {
+		if err := configureMessagingAttachmentsFromEnv(messagingStore, database.Pool); err != nil {
 			closeOnError()
 			return nil, fmt.Errorf("messaging attachments: %w", err)
 		}
@@ -817,6 +882,7 @@ func newApplicationFromEnv() (*application, error) {
 		store:                      store,
 		browser:                    browser,
 		database:                   database,
+		journalMirror:              mirror,
 		messagingServer:            messagingServer,
 		backgroundCtx:              backgroundCtx,
 		stopBackground:             stopBackground,
@@ -828,6 +894,7 @@ func newApplicationFromEnv() (*application, error) {
 // answer 503) when all are absent, and startup fails for a partial policy so
 // the API never runs with an unbounded Workspace or whole blob store.
 const (
+	messagingAttachmentStoreEnv            = "SUMI_MESSAGING_ATTACHMENT_STORE"
 	messagingAttachmentRootEnv             = "SUMI_MESSAGING_ATTACHMENT_ROOT"
 	messagingAttachmentWorkspaceBytesEnv   = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_BYTES"
 	messagingAttachmentWorkspaceObjectsEnv = "SUMI_MESSAGING_ATTACHMENT_WORKSPACE_QUOTA_OBJECTS"
@@ -835,8 +902,25 @@ const (
 	messagingAttachmentTotalObjectsEnv     = "SUMI_MESSAGING_ATTACHMENT_TOTAL_QUOTA_OBJECTS"
 )
 
-func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
+// SUMI_MESSAGING_ATTACHMENT_STORE=postgres keeps the bytes in the database
+// instead of under a root directory, for hosts without a durable disk. It
+// takes the place of the root; the caps are required either way.
+func configureMessagingAttachmentsFromEnv(store *messaging.Store, pool *pgxpool.Pool) error {
+	backend := strings.TrimSpace(os.Getenv(messagingAttachmentStoreEnv))
 	root := strings.TrimSpace(os.Getenv(messagingAttachmentRootEnv))
+	switch backend {
+	case "", "disk":
+	case "postgres":
+		if root != "" {
+			return fmt.Errorf("%s=postgres and %s are mutually exclusive", messagingAttachmentStoreEnv, messagingAttachmentRootEnv)
+		}
+	default:
+		return fmt.Errorf("%s must be unset, \"disk\" or \"postgres\"", messagingAttachmentStoreEnv)
+	}
+	if backend == "postgres" {
+		// The root stands for "a store is configured" in the checks below.
+		root = "postgres"
+	}
 	values := map[string]string{
 		messagingAttachmentWorkspaceBytesEnv:   strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceBytesEnv)),
 		messagingAttachmentWorkspaceObjectsEnv: strings.TrimSpace(os.Getenv(messagingAttachmentWorkspaceObjectsEnv)),
@@ -862,9 +946,20 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 		}
 		parsed[name] = value
 	}
-	blobs, err := messaging.NewDiskAttachments(root)
-	if err != nil {
-		return err
+	var blobs messaging.AttachmentBlobs
+	location := root
+	if backend == "postgres" {
+		pgBlobs, err := messaging.NewPostgresAttachments(pool)
+		if err != nil {
+			return err
+		}
+		blobs, location = pgBlobs, "PostgreSQL"
+	} else {
+		disk, err := messaging.NewDiskAttachments(root)
+		if err != nil {
+			return err
+		}
+		blobs, location = disk, disk.RootPath()
 	}
 	policy := messaging.AttachmentPolicy{
 		WorkspaceQuotaBytes:   parsed[messagingAttachmentWorkspaceBytesEnv],
@@ -876,7 +971,7 @@ func configureMessagingAttachmentsFromEnv(store *messaging.Store) error {
 		return err
 	}
 	log.Printf("messaging attachments ready at %s (workspace %d bytes/%d objects; total %d bytes/%d objects)",
-		blobs.RootPath(), policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
+		location, policy.WorkspaceQuotaBytes, policy.WorkspaceQuotaObjects,
 		policy.TotalQuotaBytes, policy.TotalQuotaObjects)
 	return nil
 }
@@ -908,6 +1003,138 @@ func liveKitConfigFromEnv() (messaging.LiveKitConfig, bool, error) {
 		}
 	}
 	return config, true, nil
+}
+
+const (
+	journalMirrorEnv               = "SUMI_API_JOURNAL_MIRROR"
+	journalMirrorAcquireTimeoutEnv = "SUMI_API_JOURNAL_MIRROR_ACQUIRE_TIMEOUT"
+	journalMirrorRestoreTimeoutEnv = "SUMI_API_JOURNAL_MIRROR_RESTORE_TIMEOUT"
+)
+
+// journalMirrorFromEnv enables the PostgreSQL journal mirror. The API then
+// treats its command log and browser event directories as a cache that
+// PostgreSQL restores on start, so it can run on a host whose disk is
+// discarded on replacement.
+//
+//   - SUMI_API_JOURNAL_MIRROR=postgres restores from a mirror that was
+//     initialized before (adopted from a host's journals, or declared empty
+//     for a new installation with `sumi-journal-mirror init-empty`). A
+//     database without that initialization stops the start; it is never
+//     taken as empty journals.
+//   - postgres-adopt also initializes an uninitialized mirror from the
+//     directories' existing journal files. It is for the one host that holds
+//     the journals today, and behaves like postgres once initialized.
+//
+// One API process owns the mirror at a time. A start waits for the lease
+// while another process holds it (SUMI_API_JOURNAL_MIRROR_ACQUIRE_TIMEOUT,
+// default no limit), then restores (SUMI_API_JOURNAL_MIRROR_RESTORE_TIMEOUT,
+// default 30m; files restored before an interruption are kept, so the next
+// start continues). A process that loses the lease stops serving, stops its
+// background work and exits.
+func journalMirrorFromEnv(ctx context.Context, cmdDir, runtimeDir string, gate *startupGate) (*db.Pool, *journalmirror.Mirror, error) {
+	value := strings.TrimSpace(os.Getenv(journalMirrorEnv))
+	var mode journalmirror.AttachMode
+	switch value {
+	case "":
+		return nil, nil, nil
+	case "postgres":
+		mode = journalmirror.AttachRestore
+	case "postgres-adopt":
+		mode = journalmirror.AttachAdopt
+	default:
+		return nil, nil, fmt.Errorf("%s must be unset, \"postgres\" or \"postgres-adopt\"", journalMirrorEnv)
+	}
+	acquireTimeout, err := durationFromEnv(journalMirrorAcquireTimeoutEnv, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	restoreTimeout, err := durationFromEnv(journalMirrorRestoreTimeoutEnv, 30*time.Minute)
+	if err != nil {
+		return nil, nil, err
+	}
+	gate.setPhase("database")
+	database, err := databaseFromEnv(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("control-plane database: %w", err)
+	}
+	if database == nil {
+		return nil, nil, fmt.Errorf("%s=%s requires SUMI_DB_URL", journalMirrorEnv, value)
+	}
+	hostname, _ := os.Hostname()
+	holder := fmt.Sprintf("%s pid %d", hostname, os.Getpid())
+	if instance := strings.TrimSpace(os.Getenv("SUMI_API_INSTANCE")); instance != "" {
+		holder = instance + " (" + holder + ")"
+	}
+
+	gate.setPhase("journal_lease")
+	acquireCtx, cancelAcquire := withOptionalTimeout(ctx, acquireTimeout)
+	mirror, err := journalmirror.Acquire(acquireCtx, database.Pool, journalmirror.Options{
+		Holder: holder,
+		Logf:   log.Printf,
+		OnLost: func(err error) {
+			// Another API process may own the journals now. This one can no
+			// longer acknowledge a journal write, so it stops answering and
+			// stops its background work at once, then exits.
+			log.Printf("journal mirror: %v; stopping", err)
+			gate.stop(err)
+			stopProcess()
+		},
+	})
+	cancelAcquire()
+	if err != nil {
+		database.Close()
+		return nil, nil, fmt.Errorf("journal mirror: %w", err)
+	}
+	log.Printf("journal mirror: lease acquired as %s (epoch %d)", holder, mirror.Epoch())
+
+	gate.setPhase("journal_restore")
+	restoreCtx, cancelRestore := withOptionalTimeout(ctx, restoreTimeout)
+	defer cancelRestore()
+	for _, dir := range []struct{ name, path string }{{"commands", cmdDir}, {"browser-events", runtimeDir}} {
+		report, err := mirror.Attach(restoreCtx, dir.name, dir.path, journalmirror.AttachOptions{Mode: mode, Progress: gate.restoreProgress})
+		if err != nil {
+			_ = mirror.Close()
+			database.Close()
+			return nil, nil, fmt.Errorf("journal mirror %s: %w", dir.name, err)
+		}
+		action := "restored"
+		if report.Initialized {
+			action = "initialized from local files"
+		}
+		if report.OverUnusedEmpty {
+			action = "initialized from local files over an empty initialization that had acknowledged nothing"
+		}
+		log.Printf("journal mirror %s %s: %d files, %d bytes, %d written locally, %d replaced, %s (lineage %s)",
+			dir.name, action, report.Files, report.Bytes, len(report.Restored), len(report.Replaced), report.Duration.Round(time.Millisecond), report.Lineage)
+		if len(report.Quarantined) > 0 {
+			log.Printf("journal mirror %s: kept %d unacknowledged local files in %s: %v",
+				dir.name, len(report.Quarantined), report.QuarantineDir, report.Quarantined)
+		}
+	}
+	return database, mirror, nil
+}
+
+// stopProcess ends the process through the same path as an operator's stop.
+var stopProcess = func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) }
+
+// durationFromEnv parses a Go duration; unset is fallback, 0 is no limit.
+func durationFromEnv(name string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be a duration such as 10m, or 0 for no limit", name)
+	}
+	return value, nil
+}
+
+func withOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // databaseFromEnv opens and migrates the control-plane Postgres database when
