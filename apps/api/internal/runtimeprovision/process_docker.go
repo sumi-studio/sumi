@@ -18,18 +18,82 @@ import (
 
 const processOutputLimit = 1 << 20
 
-var processImageTag = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var (
+	processImageTag = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	processImageID  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+)
+
+const processImageRepository = "ghcr.io/sumi-studio/sumi-job"
+
+// processImagePin reads SUMI_JOB_IMAGE_TAG. Two immutable pins are
+// accepted: a full 40-hex source revision, resolved as the job image tag,
+// or a local image ID (sha256:<64 hex>) used directly. Anything else —
+// unset, a short revision, a movable tag like "latest" — is refused.
+func processImagePin(environment []string) (reference, wantID string, err error) {
+	pin := ""
+	for _, v := range environment {
+		if value, ok := strings.CutPrefix(v, "SUMI_JOB_IMAGE_TAG="); ok {
+			pin = value
+		}
+	}
+	switch {
+	case processImageTag.MatchString(pin):
+		return processImageRepository + ":" + pin, "", nil
+	case processImageID.MatchString(pin):
+		return pin, pin, nil
+	case pin == "":
+		return "", "", errors.New("job image is not configured: SUMI_JOB_IMAGE_TAG is unset")
+	default:
+		return "", "", errors.New("job image pin is invalid: SUMI_JOB_IMAGE_TAG must be a full 40-hex revision or a sha256 image ID")
+	}
+}
+
+// ResolveProcessImage resolves the pinned job image to its local image ID.
+// The provisioner never pulls: an image missing here refuses every launch,
+// so startup calls this to fail the deployment instead of each terminal.
+func (b *DockerBackend) ResolveProcessImage(ctx context.Context) (string, error) {
+	reference, wantID, err := processImagePin(b.baseEnvironment)
+	if err != nil {
+		return "", err
+	}
+	raw, err := b.runDocker(ctx, "image", "inspect", "--format", "{{.Id}}", reference)
+	switch {
+	case err == nil:
+	case ctx.Err() != nil:
+		// A cancelled or timed-out check proves nothing about the image.
+		return "", fmt.Errorf("job image check did not complete: %w", ctx.Err())
+	case bytes.Contains(raw, []byte("No such image")):
+		return "", fmt.Errorf("pinned job image %s is not present locally (the provisioner never pulls)", reference)
+	default:
+		return "", fmt.Errorf("pinned job image %s could not be checked: %w", reference, err)
+	}
+	image := strings.TrimSpace(string(raw))
+	if !processImageID.MatchString(image) || (wantID != "" && image != wantID) {
+		return "", fmt.Errorf("pinned job image %s resolved to an unexpected ID", reference)
+	}
+	return image, nil
+}
 
 // Process Docker calls execute only in the root provisioner. Callers provide
 // inert argv; all container authority and image selection remain server-owned.
 func (b *DockerBackend) processDocker(ctx context.Context, args ...string) ([]byte, error) {
+	out, err := b.runDocker(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// runDocker is processDocker that also returns the combined output on
+// failure, for callers that must tell "absent" from "check failed".
+func (b *DockerBackend) runDocker(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Env = b.baseEnvironment
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("process Docker operation failed: %w", err)
+		return out.Bytes(), fmt.Errorf("process Docker operation failed: %w", err)
 	}
 	return out.Bytes(), nil
 }
@@ -41,31 +105,19 @@ func processContainer(o ProcessOperation) string { return "sumi-process-" + o.Op
 //
 // LaunchProcess runs the pinned job image on the verified canonical files scope.
 func (b *DockerBackend) LaunchProcess(ctx context.Context, o ProcessOperation) error {
-	repo, tagEnv := "ghcr.io/sumi-studio/sumi-job", "SUMI_JOB_IMAGE_TAG"
-	tag := ""
-	for _, v := range b.baseEnvironment {
-		if strings.HasPrefix(v, tagEnv+"=") {
-			tag = strings.TrimPrefix(v, tagEnv+"=")
-		}
+	// Every refusal before `docker create` is a definite never-started
+	// outcome: no container carries this operation's name or label.
+	if o.WorkspaceBind == "" || o.FilesVolumeUUID == "" {
+		return processNotStarted(ErrProcessWorkspace)
 	}
-	if !processImageTag.MatchString(tag) {
-		return errors.New("process image requires a pinned full revision")
+	image, err := b.ResolveProcessImage(ctx)
+	if err != nil {
+		return processNotStarted(err)
 	}
 	labels := []string{"--label", "sumi.operation_id=" + o.OperationID, "--label", "sumi.personality_agent_id=" + o.PersonalityAgentID}
-	if o.WorkspaceBind == "" || o.FilesVolumeUUID == "" {
-		return ErrProcessWorkspace
-	}
 	labels = append(labels, "--label", "sumi.files_volume_uuid="+o.FilesVolumeUUID)
 	mount := "type=bind,src=" + o.WorkspaceBind + ",dst=/workspace"
 
-	raw, err := b.processDocker(ctx, "image", "inspect", "--format", "{{.Id}}", repo+":"+tag)
-	if err != nil {
-		return err
-	}
-	image := strings.TrimSpace(string(raw))
-	if !regexp.MustCompile(`^sha256:[0-9a-f]{64}$`).MatchString(image) {
-		return errors.New("invalid pinned process image")
-	}
 	// Public egress is opt-in per deployment: SUMI_JOB_EGRESS_DIR names the
 	// host directory holding the egress proxy's unix socket. Job-image
 	// containers get that directory bind-mounted (read-only rootfs, so the

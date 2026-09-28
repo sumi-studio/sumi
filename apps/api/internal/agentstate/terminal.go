@@ -1299,6 +1299,17 @@ func (s *Store) AppendTerminalOutput(ctx context.Context, personaID, sessionID, 
 				}
 				continue
 			}
+			// Bytes below output_bytes are already stored. A re-drain
+			// that overlaps them (a lost commit reply, a restarted
+			// pump) keeps only its new tail; dropping the whole chunk
+			// on the base conflict would lose that tail silently.
+			if c.Base < high {
+				skip := high - c.Base
+				if skip >= int64(len(c.Data)) {
+					continue
+				}
+				c.Data, c.Base = c.Data[skip:], high
+			}
 			if len(c.Data) == 0 {
 				continue
 			}
