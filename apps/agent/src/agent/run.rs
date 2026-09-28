@@ -354,15 +354,48 @@ pub(crate) struct BoundToolResult {
 /// only loss of the event consumer escapes as `RunCompletion::Failed`.
 pub(crate) struct SequentialRunWorker {
     driver: Arc<dyn RunDriver>,
+    reflex_model: crate::config::ReflexModelConfig,
 }
 
 impl SequentialRunWorker {
     pub(crate) fn new(driver: Arc<dyn RunDriver>) -> Self {
-        Self { driver }
+        Self {
+            driver,
+            reflex_model: Default::default(),
+        }
+    }
+}
+
+impl SequentialRunWorker {
+    pub(crate) fn with_reflex_model(mut self, selection: crate::config::ReflexModelConfig) -> Self {
+        self.reflex_model = selection;
+        self
     }
 }
 
 impl RunWorker for SequentialRunWorker {
+    fn evaluate_reflex<'a>(
+        &'a self,
+        parent: &'a crate::provider::types::ParentContextSnapshot,
+        event: &'a crate::provider::types::UserMessage,
+        limits: super::reflex::ReflexLimits,
+        cancel: CancellationToken,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<super::reflex::ReflexDecision, super::reflex::ReflexError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(super::reflex::evaluate_selected(
+            parent,
+            event,
+            limits,
+            &self.reflex_model,
+            cancel,
+        ))
+    }
+
     fn latest_reflex_snapshot(&self) -> Option<crate::provider::types::ParentContextSnapshot> {
         self.driver.latest_reflex_snapshot()
     }

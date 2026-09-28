@@ -1370,7 +1370,9 @@ async fn run_after_not_ready(
             &hydrated,
         )
         .context("install authenticated memory/provider context")?;
-        let worker: Arc<dyn RunWorker> = Arc::new(SequentialRunWorker::new(Arc::new(driver)));
+        let worker: Arc<dyn RunWorker> = Arc::new(
+            SequentialRunWorker::new(Arc::new(driver)).with_reflex_model(config.reflex.clone()),
+        );
         let command_digest_factory = store.command_digest_factory().await?;
         let connector = if context.allow_insecure_loopback_gateway {
             tracing::warn!(

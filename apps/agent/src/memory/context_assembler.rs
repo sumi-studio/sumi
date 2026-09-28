@@ -115,6 +115,50 @@ impl ReplayProvenance {
 }
 
 impl PromptContext {
+    /// Only the model can change, and only when the complete send view has no
+    /// model-bound opaque items. Never drop or reconstruct parent history.
+    pub(crate) fn with_reflex_model_destination(
+        &self,
+        source: &ProviderOrigin,
+        destination: &ProviderOrigin,
+    ) -> Result<Self, String> {
+        if source.provider_instance_id != destination.provider_instance_id
+            || source.protocol != destination.protocol
+        {
+            return Err("reflex cannot change provider connection or protocol".into());
+        }
+        let proof = self.verified_replay_provenance_for(source)?;
+        if matches!(
+            proof,
+            Some(VerifiedReplayProvenance::ProviderNativeExact { .. })
+        ) || !self.provider_context.is_empty()
+        {
+            return Err("reflex model change cannot replay opaque provider context".into());
+        }
+        if self.messages.iter().any(|message| {
+            let message = match message { ContextMessage::Persisted { message, .. } | ContextMessage::Synthetic { message } => message };
+            matches!(message, Message::Assistant(assistant) if assistant.content.iter().any(|part| matches!(part, crate::provider::types::AssistantContent::Thinking { .. })))
+        }) {
+            return Err("reflex model change cannot discard model-bound thinking".into());
+        }
+        let mut fork = self.clone();
+        if let Some(VerifiedReplayProvenance::SumiNormalized {
+            canonical_through_seq,
+            ..
+        }) = proof
+        {
+            let kind = ReplayProvenanceKind::SumiNormalized {
+                provider_origin: destination.clone(),
+                canonical_through_seq,
+            };
+            fork.replay_provenance = Some(ReplayProvenance {
+                seal: replay_binding_seal(&kind, fork.replay_send_view_digest()?)?,
+                kind,
+            });
+        }
+        Ok(fork)
+    }
+
     /// Extend a validated send view without normalizing or rebuilding its
     /// prefix. A synthetic user directive cannot change the persisted history
     /// covered by either form of replay provenance.
@@ -4332,5 +4376,62 @@ mod tests {
                 .any(|m| matches!(m, ContextMessage::Persisted { seq: 3, .. })),
             "latest user message must survive replay"
         );
+    }
+    #[test]
+    fn reflex_rebind_preserves_content_and_rejects_foreign_native_or_tampered_replay() {
+        let spec = crate::provider::ModelSpec::preset("openai-responses").unwrap();
+        let source = spec.origin();
+        let mut destination = source.clone();
+        destination.model = "small-model".into();
+        let mut prompt = PromptContext::new("parent system".into(), vec![], vec![], vec![], vec![]);
+        bind_sumi_normalized_replay(&mut prompt, source.clone(), None).unwrap();
+        let original = prompt.clone();
+        let changed = prompt
+            .with_reflex_model_destination(&source, &destination)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert!(changed.verified_replay_provenance_for(&destination).is_ok());
+        assert!(changed.verified_replay_provenance_for(&source).is_err());
+        assert_eq!(prompt, original);
+        let mut foreign = destination.clone();
+        foreign.provider_instance_id.push_str("other-account");
+        assert!(
+            prompt
+                .with_reflex_model_destination(&source, &foreign)
+                .is_err()
+        );
+        foreign = destination.clone();
+        foreign.protocol = crate::provider::types::ApiProtocol::AnthropicMessages;
+        assert!(
+            prompt
+                .with_reflex_model_destination(&source, &foreign)
+                .is_err()
+        );
+        prompt.system_prompt.push_str("tampered");
+        assert!(
+            prompt
+                .with_reflex_model_destination(&source, &destination)
+                .is_err()
+        );
+        let mut native = original;
+        let kind = ReplayProvenanceKind::ProviderNativeExact {
+            provider_origin: source.clone(),
+            native_coverage_through_seq: 1,
+            canonical_suffix_through_seq: None,
+        };
+        native.replay_provenance = Some(ReplayProvenance {
+            seal: replay_binding_seal(&kind, native.replay_send_view_digest().unwrap()).unwrap(),
+            kind,
+        });
+        let before = native.clone();
+        assert!(
+            native
+                .with_reflex_model_destination(&source, &destination)
+                .is_err()
+        );
+        assert_eq!(native, before);
     }
 }
