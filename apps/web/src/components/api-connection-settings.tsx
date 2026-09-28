@@ -4,11 +4,13 @@ import {
   type APIConnection,
   APIConnectionError,
   type APIConnectionsClient,
+  CHATGPT_PRESET,
   type ConnectionInput,
   type ConnectionSelection,
   type ConnectionsState,
   createAPIConnectionsClient,
 } from "../lib/api-connections";
+import { ChatGPTLoginPanel, ChatGPTSettingsForm } from "./chatgpt-connection";
 
 const defaultClient = createAPIConnectionsClient();
 const blank: ConnectionInput = {
@@ -41,6 +43,8 @@ export function APIConnectionSettings({
   const [maxOutText, setMaxOutText] = useState("");
   const [clearHeaders, setClearHeaders] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
+  // An open ChatGPT sign-in: a new connection, or a reconnect of one.
+  const [signIn, setSignIn] = useState<{ connectionId?: string } | null>(null);
   const lifetime = useRef<AbortController | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -80,6 +84,7 @@ export function APIConnectionSettings({
     }
   }
   function edit(connection?: APIConnection) {
+    setSignIn(null);
     setEditing(connection?.id ?? null);
     setForm(
       connection
@@ -99,6 +104,20 @@ export function APIConnectionSettings({
     setClearHeaders(false);
     setRemoving(null);
     setError("");
+  }
+  const editingChatGPT = state?.connections.find(
+    (c) => c.id === editing && c.preset === CHATGPT_PRESET,
+  );
+  function signedIn(reconnected: boolean) {
+    setSignIn(null);
+    void run(async (signal) => {
+      if (!signal.aborted)
+        setNotice(
+          reconnected
+            ? "ChatGPTに再接続しました。使う接続の選択は変わっていません。"
+            : "ChatGPTを接続し、この接続を使うように切り替えました。新しい接続は作業が止まってから起動します。",
+        );
+    });
   }
   function choose(selection: ConnectionSelection) {
     void run(async (signal) => {
@@ -127,7 +146,11 @@ export function APIConnectionSettings({
             <div key={c.id} className="rounded-lg border border-border p-3">
               <ConnectionRow
                 name={c.name}
-                detail={`${c.model} · ${c.baseUrl}`}
+                detail={
+                  c.preset === CHATGPT_PRESET
+                    ? `ChatGPTのサブスクリプション · ${c.model}`
+                    : `${c.model} · ${c.baseUrl}`
+                }
                 selected={
                   state?.selection?.kind === "api" &&
                   state.selection.connectionId === c.id
@@ -135,10 +158,27 @@ export function APIConnectionSettings({
                 busy={busy || !state.available}
                 onSelect={() => choose({ kind: "api", connectionId: c.id })}
               />
+              {c.reconnectRequired && (
+                <p className="mt-1 text-sm" role="status">
+                  ChatGPTへのログインが期限切れか取り消されました。再接続するまでこの接続では応答できません。
+                </p>
+              )}
               <div className="mt-2 flex gap-3 text-sm">
                 <button type="button" disabled={busy} onClick={() => edit(c)}>
                   編集
                 </button>
+                {c.preset === CHATGPT_PRESET && state.chatgpt?.available && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      setEditing(undefined);
+                      setSignIn({ connectionId: c.id });
+                    }}
+                  >
+                    ChatGPTに再接続
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={busy}
@@ -191,15 +231,30 @@ export function APIConnectionSettings({
           />
         </div>
       )}
-      {state?.available && editing === undefined && (
-        <Button
-          className="mt-4"
-          variant="outline"
-          disabled={busy}
-          onClick={() => edit()}
-        >
-          APIを追加
-        </Button>
+      {state?.available && editing === undefined && !signIn && (
+        <div className="mt-4 flex flex-wrap gap-3">
+          <Button variant="outline" disabled={busy} onClick={() => edit()}>
+            APIを追加
+          </Button>
+          {state.chatgpt?.available && (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => setSignIn({})}
+            >
+              ChatGPTで接続
+            </Button>
+          )}
+        </div>
+      )}
+      {signIn && (
+        <ChatGPTLoginPanel
+          key={signIn.connectionId ?? "new"}
+          client={client}
+          connectionId={signIn.connectionId}
+          onDone={() => signedIn(!!signIn.connectionId)}
+          onClose={() => setSignIn(null)}
+        />
       )}
       {state && !state.available && (
         <p className="mt-4 text-sm text-muted-foreground">
@@ -207,7 +262,28 @@ export function APIConnectionSettings({
             "このサーバーではAPIの登録を利用できません。"}
         </p>
       )}
-      {editing !== undefined && (
+      {editingChatGPT && (
+        <ChatGPTSettingsForm
+          key={editingChatGPT.id}
+          connection={editingChatGPT}
+          busy={busy}
+          onClose={() => setEditing(undefined)}
+          onSave={(input) =>
+            void run(async (signal) => {
+              await client.saveChatGPTSettings(
+                editingChatGPT.id,
+                input,
+                signal,
+              );
+              if (!signal.aborted) {
+                setEditing(undefined);
+                setNotice("接続を保存しました。");
+              }
+            })
+          }
+        />
+      )}
+      {editing !== undefined && !editingChatGPT && (
         <form
           className="mt-5 space-y-4"
           onSubmit={(e) => {

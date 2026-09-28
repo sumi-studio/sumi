@@ -27,7 +27,7 @@ export function ModelProviderSettings({
         <SheetHeader className="border-border border-b px-6 py-5 pr-12">
           <SheetTitle>AIの接続</SheetTitle>
           <SheetDescription>
-            APIキーでAIサービスをSumiに接続します。ChatGPTのサブスクリプション接続には対応していません。
+            APIキー、またはサーバーが対応していればChatGPTのサブスクリプションで、AIサービスをSumiに接続します。
           </SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">

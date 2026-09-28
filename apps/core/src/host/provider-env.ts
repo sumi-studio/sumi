@@ -10,7 +10,13 @@
  *   api      → exactly that connection's base_url / model / api_key /
  *              extra_headers, on the wire its preset declares (chat
  *              completions, OpenAI Responses, or Anthropic Messages).
- *              Any other preset fails the request.
+ *              Any other preset fails the request. The chatgpt-codex
+ *              preset is the person's ChatGPT subscription: the state
+ *              service hands over a short-lived access token for it, the
+ *              call goes to the Codex backend's Responses endpoint, and a
+ *              401 asks the state service to refresh once (a revoked grant
+ *              is a visible "reconnect ChatGPT" failure, never another
+ *              model).
  *   none     → the user chose "接続しない" (do not switch to another
  *              account): the request fails; no operator model is used.
  *   unset    → no selection exists (dev personas without a human, or a
@@ -32,7 +38,9 @@
  *                                      JSON object, e.g. max_tokens)
  *   SUMI_MODEL_TIMEOUT_MS             (openai and selected connections;
  *                                      per-request wall timeout, default
- *                                      120000)
+ *                                      120000; a ChatGPT subscription
+ *                                      request sends its remaining budget
+ *                                      to the API, which bounds it at 1h)
  *   SUMI_MODEL_PROVIDER=fixture       (scripted deterministic model for
  *                                      integration tests)
  *   SUMI_MODEL_FIXTURE_JSON           (fixture; the script as inline JSON —
@@ -45,10 +53,12 @@
 import {
   ModelError,
   type ModelEvent,
+  type ModelFailureCause,
   type ModelProvider,
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
+import { CHATGPT_BASE_URL } from "../providers/chatgpt-codex.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
 import { OpenAIProvider } from "../providers/openai.ts";
@@ -80,6 +90,13 @@ export const CHAT_COMPLETIONS_PRESETS: ReadonlySet<string> = new Set([
 export const RESPONSES_PRESETS: ReadonlySet<string> = new Set([
   "openai-responses",
 ]);
+
+/**
+ * ChatGPT subscription connections: the Responses wire on the Codex
+ * backend, authenticated by the person's own "Sign in with ChatGPT" grant
+ * (an OAuth access token the state service refreshes), not an API key.
+ */
+export const CHATGPT_PRESETS: ReadonlySet<string> = new Set(["chatgpt-codex"]);
 
 /** Presets on the Anthropic Messages wire (POST {base}/v1/messages). */
 export const ANTHROPIC_PRESETS: ReadonlySet<string> = new Set(["anthropic"]);
@@ -224,7 +241,7 @@ export class SelectedModelProvider implements ModelProvider {
         usage = ev.usage;
         // The recorded plan's usage names the connection that produced the
         // decision, so "which model answered" is durable evidence.
-        yield { type: "done", usage: { ...ev.usage, model_binding: identity } };
+        yield { ...ev, usage: { ...ev.usage, model_binding: identity } };
       }
     } catch (e) {
       streamError = e;
@@ -421,11 +438,49 @@ export class SelectedModelProvider implements ModelProvider {
     if (
       !CHAT_COMPLETIONS_PRESETS.has(c.preset) &&
       !RESPONSES_PRESETS.has(c.preset) &&
-      !ANTHROPIC_PRESETS.has(c.preset)
+      !ANTHROPIC_PRESETS.has(c.preset) &&
+      !CHATGPT_PRESETS.has(c.preset)
     ) {
       throw unusable(
         `the selected connection ${c.name} uses preset ${c.preset}, whose protocol this core does not implement`,
       );
+    }
+    const identity: BindingIdentity = {
+      selection: "api",
+      connection_id: c.id,
+      preset: c.preset,
+      model: c.model,
+      version: c.version,
+    };
+    if (CHATGPT_PRESETS.has(c.preset)) {
+      if (!binding.credential_available || !c.account_id) {
+        throw chatGPTUnavailable(c.name, binding);
+      }
+      if (c.base_url !== CHATGPT_BASE_URL) {
+        throw unusable("the ChatGPT connection names an unsupported backend");
+      }
+      const provider = new OpenAIResponsesProvider({
+        baseUrl: c.base_url,
+        apiKey: "", // Subscription credentials never leave the Go API.
+        model: c.model,
+        timeoutMs: this.opts.timeoutMs,
+        chatgpt: {
+          accountId: c.account_id,
+          reasoningEffort: c.reasoning_effort || undefined,
+          send: (body, signal, rejected, timeoutMs) =>
+            state.chatGPTResponses(
+              persona,
+              c.id,
+              c.version,
+              body,
+              signal,
+              rejected,
+              timeoutMs,
+            ),
+        },
+      });
+      this.opts.log?.("model bound to selected connection", identity);
+      return { provider, identity };
     }
     if (!binding.credential_available || !binding.api_key) {
       throw unusable(
@@ -456,19 +511,31 @@ export class SelectedModelProvider implements ModelProvider {
       : ANTHROPIC_PRESETS.has(c.preset)
         ? new AnthropicProvider({ ...shared, maxTokens: c.max_output_tokens })
         : new OpenAIProvider(shared);
-    const identity: BindingIdentity = {
-      selection: "api",
-      connection_id: c.id,
-      preset: c.preset,
-      model: c.model,
-      version: c.version,
-    };
     this.opts.log?.("model bound to selected connection", identity);
     return { provider, identity };
   }
 }
 
-function unusable(message: string, cause?: "no_model_connection"): ModelError {
+function chatGPTUnavailable(name: string, binding: ModelBinding): ModelError {
+  if (binding.credential_state === "reconnect_required") {
+    return unusable(
+      `the ChatGPT sign-in for connection ${name} expired or was revoked; reconnect ChatGPT in AI connection settings`,
+      "model_reconnect_required",
+    );
+  }
+  if (binding.credential_state === "disabled") {
+    // A connection is selected; this server does not offer its kind.
+    return unusable(
+      `the selected connection ${name} is a ChatGPT subscription connection, which is not enabled on this server`,
+      "model_connection_disabled",
+    );
+  }
+  return unusable(
+    `the selected connection ${name} has no usable ChatGPT sign-in (${binding.reason ?? "unavailable"})`,
+  );
+}
+
+function unusable(message: string, cause?: ModelFailureCause): ModelError {
   return new ModelError(message, {
     retryable: false,
     unavailable: true,

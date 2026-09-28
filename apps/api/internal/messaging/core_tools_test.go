@@ -1536,7 +1536,7 @@ func TestCoreToolsTerminalFailureNoticeIsolation(t *testing.T) {
 // conversation; unknown causes get truthful generic wording.
 func TestFailureNoticeCauseStaysPublic(t *testing.T) {
 	const canary = "CANARY-PRIVATE-TOKEN-123456"
-	for _, kind := range []string{"", "no_model_connection", "oversize_plan", "unlisted_kind"} {
+	for _, kind := range []string{"", "no_model_connection", "oversize_plan", "model_reconnect_required", "model_auth_rejected", "model_connection_disabled", "model_usage_limit", "unlisted_kind"} {
 		f := agentstate.TerminalFailure{
 			Error:     "provider rejected request containing " + canary,
 			ErrorKind: kind,
@@ -1558,6 +1558,19 @@ func TestFailureNoticeCauseStaysPublic(t *testing.T) {
 	}
 	if got := failureNoticeCause(agentstate.TerminalFailure{}); !strings.Contains(got, "予期しない問題") {
 		t.Fatalf("unclassified cause = %q, want honest generic wording", got)
+	}
+	// A rejected fresh sign-in is not an expired one: its notice does not
+	// send the person to reconnect, and a disabled kind is not "no
+	// connection selected".
+	rejected := agentstate.TerminalFailure{ErrorKind: "model_auth_rejected"}
+	for _, got := range []string{failureNoticeCause(rejected), failureNoticeNext(rejected, false), failureNoticeNext(rejected, true)} {
+		if strings.Contains(got, "再接続") || strings.Contains(got, "期限切れ") || strings.Contains(got, "予期しない問題") {
+			t.Fatalf("model_auth_rejected wording = %q", got)
+		}
+	}
+	disabled := agentstate.TerminalFailure{ErrorKind: "model_connection_disabled"}
+	if got := failureNoticeCause(disabled); strings.Contains(got, "選択されていない") || strings.Contains(got, "予期しない問題") {
+		t.Fatalf("model_connection_disabled cause = %q", got)
 	}
 }
 

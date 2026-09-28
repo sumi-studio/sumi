@@ -299,6 +299,41 @@ test("a no-model-connection failure carries its classified cause", () => {
   );
 });
 
+test("ChatGPT sign-in and plan-limit failures keep their bounded cause", () => {
+  for (const code of [
+    "model_reconnect_required",
+    "model_auth_rejected",
+    "model_connection_disabled",
+    "model_usage_limit",
+  ]) {
+    let session = createAgentSession();
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 1,
+      event: { type: "agent_start" },
+    });
+    session = apply(session, {
+      audience: "direct_chat",
+      seq: 2,
+      event: {
+        type: "message_end",
+        message_id: AssistantMessageId,
+        message: {
+          ...assistantMessage(""),
+          stop_reason: "error",
+          error_message: "model failed",
+          provider_code: code,
+        },
+      },
+    });
+    const entry = session.conversation.entries[
+      `message-error:${AssistantMessageId}`
+    ] as { cause?: string; message: string };
+    assert.equal(entry.cause, code);
+    assert.equal(entry.message, "model failed");
+  }
+});
+
 test("durable tool start and end upsert without volatile tool-call events", () => {
   let session = createAgentSession();
   session = apply(session, {

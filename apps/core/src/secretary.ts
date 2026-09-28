@@ -31,6 +31,7 @@ import type {
   Decision,
   Event,
   EventInput,
+  FailureKind,
   Input,
   Json,
   MemoryBlock,
@@ -897,6 +898,12 @@ export class Secretary {
             route: c.route,
             arguments: c.request,
           })),
+          // The round's recorded provider continuation (opaque encrypted
+          // reasoning) — replayed from the plan, so a resumed or retried
+          // attempt sends the same bytes the live one would have.
+          ...(decision.continuation
+            ? { continuation: decision.continuation }
+            : {}),
         });
         for (const res of roundResults) {
           messages.push({
@@ -1109,6 +1116,7 @@ export class Secretary {
     let text = "";
     let calls: ToolCall[] = [];
     let usage: Record<string, unknown> = {};
+    let continuation: Decision["continuation"];
     // A decision whose recorded plan would exceed the request budget gets a
     // bounded re-plan: nothing was journaled or claimed for it, so asking the
     // model again with an explicit size notice is safe. Past the cap the turn
@@ -1120,11 +1128,13 @@ export class Secretary {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     } | null = null;
     for (;;) {
       text = "";
       calls = [];
       usage = {};
+      continuation = undefined;
       try {
         for await (const ev of this.cfg.provider.stream({
           personaId,
@@ -1139,7 +1149,10 @@ export class Secretary {
         })) {
           if (ev.type === "text") text += ev.delta;
           else if (ev.type === "tool_call") calls.push(ev.call);
-          else usage = ev.usage;
+          else {
+            usage = ev.usage;
+            continuation = ev.continuation;
+          }
         }
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
@@ -1310,18 +1323,37 @@ export class Secretary {
       // the wire contract the agentstate body limit applies to. Individually
       // valid arguments (e.g. two near-cap uploads) can exceed it in
       // aggregate, so the bound lives on the whole decision, not per call.
-      const planBytes = utf8Bytes(
-        JSON.stringify({
-          generation: gen,
-          turn_id: candidate.turnId,
-          round: candidate.round,
-          text: candidate.text,
-          calls: candidate.calls,
-          usage: candidate.usage,
-        }),
-      );
+      const measure = (c?: Decision["continuation"]) =>
+        utf8Bytes(
+          JSON.stringify({
+            generation: gen,
+            turn_id: candidate.turnId,
+            round: candidate.round,
+            text: candidate.text,
+            calls: candidate.calls,
+            usage: candidate.usage,
+            ...(c ? { continuation: c } : {}),
+          }),
+        );
+      const planBytes = measure();
       if (planBytes <= PLAN_REQUEST_MAX_BYTES) {
-        planBody = candidate;
+        // Provider continuation is opaque and optional: it is recorded with
+        // the round only when it is storable byte-for-byte and fits, never
+        // at the price of the decision itself.
+        const keep =
+          continuation !== undefined &&
+          !JSON.stringify(continuation).includes("\\u0000") &&
+          measure(continuation) <= PLAN_REQUEST_MAX_BYTES;
+        if (continuation !== undefined && !keep) {
+          this.log(
+            "provider continuation not recorded (unstorable or over budget)",
+            {
+              turn_id: turn.turn_id,
+              round,
+            },
+          );
+        }
+        planBody = keep ? { ...candidate, continuation } : candidate;
         break;
       }
       oversizeRecoveries += 1;
@@ -1391,7 +1423,7 @@ export class Secretary {
     turn: Turn,
     events: { kind: string; payload: Record<string, unknown> }[],
     error: string,
-    errorKind?: "no_model_connection" | "oversize_plan",
+    errorKind?: FailureKind,
   ): Promise<void> {
     await this.commitTurnFinal(turn, {
       outcome: "fail",

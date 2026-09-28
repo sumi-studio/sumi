@@ -20,7 +20,11 @@ import type {
   ConversationEntry,
   ConversationModel,
 } from "./model";
-import { createConversationChanges, createEmptyConversation } from "./model";
+import {
+  createConversationChanges,
+  createEmptyConversation,
+  MODEL_FAILURE_CAUSES,
+} from "./model";
 
 interface MessageStream {
   textByIndex: Record<number, string>;
@@ -384,10 +388,7 @@ function applyMessage(
   if (complete && message.stop_reason === "error") {
     const detail = message.error_message?.trim() || "Provider request failed";
     const providerCode = message.provider_code?.trim();
-    const cause =
-      providerCode === "no_model_connection"
-        ? "no_model_connection"
-        : undefined;
+    const cause = MODEL_FAILURE_CAUSES.find((c) => c === providerCode);
     conversation = upsertEntry(conversation, {
       kind: "error",
       id: `message-error:${messageId}`,

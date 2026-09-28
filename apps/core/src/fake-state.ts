@@ -12,6 +12,7 @@ import type {
   ApprovalDecision,
   ClaimedMemoryChunk,
   CommitRequest,
+  Decision,
   Event,
   FundingRef,
   Input,
@@ -1474,6 +1475,7 @@ export class FakeState implements StateClient {
       text: string;
       calls: PlanCall[];
       usage: Record<string, unknown>;
+      continuation?: Decision["continuation"];
     },
   ): Promise<{ plan: TurnPlan; created: boolean }> {
     this.mustHold(persona, generation);
@@ -1486,16 +1488,22 @@ export class FakeState implements StateClient {
     }
     // Go rejects a decision containing NUL at SavePlan — jsonb cannot
     // store it, and retrying can never succeed.
-    if (hasNul(req.text) || hasNul(req.calls) || hasNul(req.usage ?? {})) {
+    if (
+      hasNul(req.text) ||
+      hasNul(req.calls) ||
+      hasNul(req.usage ?? {}) ||
+      hasNul(req.continuation ?? {})
+    ) {
       throw new StateError(
         400,
         "decision contains a NUL byte jsonb cannot store",
       );
     }
-    const decision = {
+    const decision: Decision = {
       text: req.text,
       calls: req.calls,
       usage: req.usage ?? {},
+      ...(req.continuation ? { continuation: req.continuation } : {}),
     };
     const key = `${persona}|${turn.input_id}`;
     const stored = this.plans.get(key);
@@ -1505,7 +1513,11 @@ export class FakeState implements StateClient {
         const same =
           existing.text === decision.text &&
           jsonEqual(existing.calls, decision.calls) &&
-          jsonEqual(existing.usage, decision.usage);
+          jsonEqual(existing.usage, decision.usage) &&
+          jsonEqual(
+            existing.continuation ?? null,
+            decision.continuation ?? null,
+          );
         if (!same) throw new StateError(409, "conflicting stored plan round");
         return { plan: stored, created: false };
       }
@@ -2487,6 +2499,11 @@ export class FakeState implements StateClient {
     }
     return Promise.resolve({ selection: "unset" });
   }
+
+  /** Tests may provide a synthetic API transport; no live default exists. */
+  chatGPTResponses: StateClient["chatGPTResponses"] = async () => {
+    throw new Error("synthetic ChatGPT transport not configured");
+  };
 
   /**
    * conversation_history: opens this persona's stored journal records —

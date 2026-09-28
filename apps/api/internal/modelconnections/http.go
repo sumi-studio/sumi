@@ -23,6 +23,7 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/model-connections/api/{id}", s.save)
 	mux.HandleFunc("DELETE /api/model-connections/api/{id}", s.remove)
 	mux.HandleFunc("PUT /api/model-connections/selection", s.selectConnection)
+	s.registerChatGPTRoutes(mux)
 }
 func respond(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -84,7 +85,7 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Store == nil {
-		respond(w, 200, map[string]any{"available": false, "unavailableReason": "このサーバーにはAPI接続の保存用キーが設定されていません。", "connections": []Connection{}, "selection": nil, "activation": "next_start"})
+		respond(w, 200, map[string]any{"available": false, "unavailableReason": "このサーバーにはAPI接続の保存用キーが設定されていません。", "connections": []Connection{}, "selection": nil, "activation": "next_start", "chatgpt": s.chatGPTAvailability()})
 		return
 	}
 	list, err := s.Store.List(r.Context(), id.HumanID)
@@ -101,7 +102,7 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	if exists {
 		selected = &v
 	}
-	response := map[string]any{"available": s.Store.CredentialsAvailable(), "connections": list, "selection": selected, "activation": "next_start"}
+	response := map[string]any{"available": s.Store.CredentialsAvailable(), "connections": list, "selection": selected, "activation": "next_start", "chatgpt": s.chatGPTAvailability()}
 	if !s.Store.CredentialsAvailable() {
 		response["unavailableReason"] = "このサーバーにはAPI接続の保存用キーが設定されていません。保存済みの選択は維持されています。"
 	}

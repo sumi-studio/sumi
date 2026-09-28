@@ -36,6 +36,12 @@ type Connection struct {
 	// default budget; Responses omits the field so the model's own cap
 	// applies. Non-secret metadata — returned in list/read responses.
 	MaxOutputTokens *int `json:"maxOutputTokens,omitempty"`
+	// ReasoningEffort is the requested reasoning effort (ChatGPT
+	// subscription connections only; empty = the adapter default).
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	// ReconnectRequired marks a ChatGPT subscription connection whose grant
+	// can no longer be refreshed; the person must sign in again.
+	ReconnectRequired bool `json:"reconnectRequired,omitempty"`
 }
 type Input struct {
 	Name    string  `json:"name"`
@@ -68,6 +74,8 @@ type Access struct {
 type Store struct {
 	pool *pgxpool.Pool
 	aead cipher.AEAD
+	// oauth enables ChatGPT subscription connections (nil = disabled).
+	oauth *OAuthClient
 }
 
 // MetadataOnly keeps persisted selection authoritative while decryption is unavailable.
@@ -83,7 +91,7 @@ func New(pool *pgxpool.Pool, key []byte) (*Store, error) {
 		return nil, err
 	}
 	aead, err := cipher.NewGCM(block)
-	return &Store{pool, aead}, err
+	return &Store{pool: pool, aead: aead}, err
 }
 func bounded(s string, n int) bool {
 	return strings.TrimSpace(s) != "" && len(s) <= n && strings.IndexFunc(s, unicode.IsControl) < 0
@@ -318,6 +326,11 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 			return Connection{}, err
 		}
 	}
+	if !create && previousPreset == ChatGPTPreset {
+		// A subscription grant is replaced only by signing in again; an API
+		// key must never overwrite (or be merged into) its sealed tokens.
+		return Connection{}, invalid("a ChatGPT subscription connection is changed by reconnecting ChatGPT, not with an API key")
+	}
 	if !create && in.APIKey == nil && previousURL != in.BaseURL {
 		return Connection{}, invalid("changing the base URL requires resubmitting the API key")
 	}
@@ -357,10 +370,10 @@ func (s *Store) save(ctx context.Context, human, id string, in Input) (Connectio
 	if err = tx.Commit(ctx); err != nil {
 		return Connection{}, err
 	}
-	return Connection{id, in.Name, in.Preset, in.BaseURL, in.Model, in.MaxOutputTokens}, nil
+	return Connection{ID: id, Name: in.Name, Preset: in.Preset, BaseURL: in.BaseURL, Model: in.Model, MaxOutputTokens: in.MaxOutputTokens}, nil
 }
 func (s *Store) List(ctx context.Context, human string) ([]Connection, error) {
-	rows, err := s.pool.Query(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens FROM model_api_connections WHERE human_id=$1 ORDER BY name,connection_id", human)
+	rows, err := s.pool.Query(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens,COALESCE(reasoning_effort,''),reconnect_required FROM model_api_connections WHERE human_id=$1 ORDER BY name,connection_id", human)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +381,7 @@ func (s *Store) List(ctx context.Context, human string) ([]Connection, error) {
 	out := []Connection{}
 	for rows.Next() {
 		var c Connection
-		if err = rows.Scan(&c.ID, &c.Name, &c.Preset, &c.BaseURL, &c.Model, &c.MaxOutputTokens); err != nil {
+		if err = rows.Scan(&c.ID, &c.Name, &c.Preset, &c.BaseURL, &c.Model, &c.MaxOutputTokens, &c.ReasoningEffort, &c.ReconnectRequired); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -465,6 +478,11 @@ func (s *Store) Resolve(ctx context.Context, human, id string) (Access, error) {
 	if err != nil {
 		return a, err
 	}
+	if a.Connection.Preset == ChatGPTPreset {
+		// Subscription tokens resolve only through ResolveChatGPT, which
+		// owns their refresh; they are never an "API key".
+		return a, ErrInvalid
+	}
 	cred, err := s.open(human, id, b)
 	if err != nil {
 		return a, err
@@ -491,7 +509,7 @@ func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) 
 		return Access{}, ErrNotFound
 	}
 	var a Access
-	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens,version::text FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, parsed.String()).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &a.Connection.MaxOutputTokens, &a.Version)
+	err = s.pool.QueryRow(ctx, "SELECT connection_id::text,name,preset,base_url,model,max_output_tokens,version::text,COALESCE(reasoning_effort,''),reconnect_required FROM model_api_connections WHERE human_id=$1 AND connection_id=$2", human, parsed.String()).Scan(&a.Connection.ID, &a.Connection.Name, &a.Connection.Preset, &a.Connection.BaseURL, &a.Connection.Model, &a.Connection.MaxOutputTokens, &a.Version, &a.Connection.ReasoningEffort, &a.Connection.ReconnectRequired)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -501,7 +519,7 @@ func (s *Store) Describe(ctx context.Context, human, id string) (Access, error) 
 // RuntimeFingerprint excludes display-only fields and inactive connections.
 func (s *Store) RuntimeFingerprint(ctx context.Context, human string) (string, error) {
 	var value string
-	err := s.pool.QueryRow(ctx, `SELECT s.kind || ':' || COALESCE(s.connection_id::text,'') || ':' || COALESCE(c.version::text,'') || ':' || COALESCE(c.model,'') || ':' || COALESCE(c.max_output_tokens::text,'') FROM model_connection_selections s LEFT JOIN model_api_connections c ON c.human_id=s.human_id AND c.connection_id=s.connection_id WHERE s.human_id=$1`, human).Scan(&value)
+	err := s.pool.QueryRow(ctx, `SELECT s.kind || ':' || COALESCE(s.connection_id::text,'') || ':' || COALESCE(c.version::text,'') || ':' || COALESCE(c.model,'') || ':' || COALESCE(c.max_output_tokens::text,'') || ':' || COALESCE(c.reasoning_effort,'') FROM model_connection_selections s LEFT JOIN model_api_connections c ON c.human_id=s.human_id AND c.connection_id=s.connection_id WHERE s.human_id=$1`, human).Scan(&value)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}

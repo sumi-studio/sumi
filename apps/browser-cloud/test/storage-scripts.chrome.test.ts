@@ -16,7 +16,7 @@ const CHROME = process.env.CHROME ?? ["/usr/bin/google-chrome", "/usr/bin/google
 const skip = CHROME ? false : "google-chrome not found";
 
 let chrome: ChildProcess | undefined;
-let dir = "";
+const dirs: string[] = [];
 let server: http.Server | undefined;
 let socket: WebSocket | undefined;
 let nextId = 0;
@@ -30,11 +30,7 @@ before(async () => {
   });
   await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  dir = mkdtempSync(join(tmpdir(), "sumi-cloud-browser-20260927-idb-"));
-  chrome = spawn(CHROME as string, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", "--remote-allow-origins=*", `--user-data-dir=${dir}`, origin], { stdio: "ignore", detached: true });
-  const portFile = join(dir, "DevToolsActivePort");
-  for (let i = 0; i < 100 && !existsSync(portFile); i++) await new Promise((r) => setTimeout(r, 100));
-  const [port] = readFileSync(portFile, "utf8").trim().split("\n");
+  const port = await launchChrome(origin);
   type PageTarget = { type: string; url: string; webSocketDebuggerUrl: string };
   let page: PageTarget | undefined;
   for (let i = 0; i < 50 && !page; i++) {
@@ -63,14 +59,59 @@ before(async () => {
 after(async () => {
   socket?.close();
   server?.close();
-  if (chrome && chrome.exitCode === null) {
-    const exited = new Promise((resolve) => chrome?.once("exit", resolve));
-    // The whole process group: renderer and utility processes too.
-    process.kill(-(chrome.pid as number), "SIGKILL");
-    await exited;
-  }
-  if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  if (chrome) await stopChrome(chrome);
+  for (const d of dirs) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
+
+/** Stops a launched Chrome and its whole process group (renderer and utility processes too). */
+async function stopChrome(proc: ChildProcess): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+  const exited = new Promise((resolve) => proc.once("exit", resolve));
+  try {
+    process.kill(-(proc.pid as number), "SIGKILL");
+  } catch {
+    return; // the group is already gone
+  }
+  await exited;
+}
+
+/**
+ * Starts Chrome on a fresh profile and returns its DevTools port. CI has
+ * intermittently seen no DevToolsActivePort within the wait while Chrome's
+ * output was discarded, so its exit status and stderr tail are reported and
+ * one failed launch is retried on a new profile. The scripts under test are
+ * unchanged by a relaunch.
+ */
+async function launchChrome(origin: string): Promise<string> {
+  const failures: string[] = [];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const dir = mkdtempSync(join(tmpdir(), "sumi-cloud-browser-20260927-idb-"));
+    dirs.push(dir);
+    const proc = spawn(CHROME as string, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", "--remote-allow-origins=*", `--user-data-dir=${dir}`, origin], { stdio: ["ignore", "ignore", "pipe"], detached: true });
+    chrome = proc;
+    let stderr = "";
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(-4096);
+    });
+    let spawnError: Error | undefined;
+    proc.once("error", (e) => {
+      spawnError = e;
+    });
+    const portFile = join(dir, "DevToolsActivePort");
+    // Chrome writes the port, then the browser target path on a second line.
+    const port = () => {
+      const lines = existsSync(portFile) ? readFileSync(portFile, "utf8").split("\n") : [];
+      return lines.length >= 2 && /^\d+$/.test(lines[0] ?? "") ? lines[0] : undefined;
+    };
+    const deadline = Date.now() + 30_000;
+    while (!port() && !spawnError && proc.exitCode === null && proc.signalCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    const found = port();
+    if (found) return found;
+    await stopChrome(proc);
+    failures.push(`attempt ${attempt}: ${spawnError ? `spawn error ${spawnError.message}` : proc.exitCode !== null || proc.signalCode !== null ? `Chrome exited (code ${proc.exitCode}, signal ${proc.signalCode})` : "no DevToolsActivePort after 30s"}; stderr tail: ${stderr.trim() || "(empty)"}`);
+  }
+  throw new Error(`Chrome fixture did not start.\n${failures.join("\n")}`);
+}
 
 async function run<T>(expression: string): Promise<T> {
   const id = ++nextId;

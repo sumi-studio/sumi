@@ -60,6 +60,9 @@ type interactiveIO struct {
 	op   ProcessOperation
 	tty  *ttyLog
 	done chan struct{}
+	// supervised is closed when the supervisor goroutine has returned and
+	// will write nothing more; nil when no supervisor was started.
+	supervised chan struct{}
 
 	// attached reports whether the journal pump currently has the
 	// daemon journal open and is appending records. False on a live op
@@ -103,7 +106,11 @@ func (s *processStore) ensureInteractive(r *processRecord) (*interactiveIO, erro
 	io_ := &interactiveIO{op: r.Operation, tty: tty, done: make(chan struct{})}
 	r.interactive = io_
 	if !r.Operation.State.terminal() {
-		go s.superviseInteractive(io_)
+		io_.supervised = make(chan struct{})
+		go func() {
+			defer close(io_.supervised)
+			s.superviseInteractive(io_)
+		}()
 	}
 	return io_, nil
 }
@@ -139,6 +146,11 @@ func (s *processStore) superviseInteractive(io_ *interactiveIO) {
 		alive := !s.interactiveTerminal(io_.op.OperationID)
 		path, err := ib.ProcessJournalPath(ctx, io_.op)
 		if err != nil {
+			if !alive && s.interactiveNeverStarted(io_.op.OperationID) {
+				// No container was ever created: there is no journal
+				// and no output to lose, so no loss boundary either.
+				return
+			}
 			if !alive {
 				misses++
 				if misses >= journalMissBound {
@@ -446,6 +458,18 @@ func (s *processStore) interactiveTerminal(opID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.Operation.State.terminal()
+}
+
+func (s *processStore) interactiveNeverStarted(opID string) bool {
+	s.mu.Lock()
+	r := s.records[opID]
+	s.mu.Unlock()
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Operation.NotStarted
 }
 
 // stopInteractive ends supervision. Called after the operation goes

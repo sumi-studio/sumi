@@ -2,6 +2,7 @@ package agentstate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -76,7 +77,12 @@ type ModelBinding struct {
 	Connection          *ModelConnectionBinding `json:"connection,omitempty"`
 	APIKey              string                  `json:"api_key,omitempty"`
 	CredentialAvailable bool                    `json:"credential_available"`
-	Reason              string                  `json:"reason,omitempty"`
+	// CredentialState classifies an unavailable subscription credential
+	// for the surfaces that render it: "reconnect_required" (the person
+	// must sign in to ChatGPT again) or "disabled" (this server does not
+	// offer subscription connections). Empty otherwise.
+	CredentialState string `json:"credential_state,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 type ModelConnectionBinding struct {
@@ -93,6 +99,12 @@ type ModelConnectionBinding struct {
 	// only with the credential material (armed store) — never in
 	// metadata-only responses and never persisted into core state.
 	ExtraHeaders map[string]string `json:"extra_headers,omitempty"`
+	// AccountID binds Core continuation to the subscription account. The API
+	// alone sends the account header and credentials to the upstream.
+	AccountID string `json:"account_id,omitempty"`
+	// ReasoningEffort is the connection's requested effort (subscription
+	// connections); empty = adapter default.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // modelBinding resolves the persona's human's explicit model selection.
@@ -104,6 +116,10 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.writeModelBinding(w, r, personaID)
+}
+
+func (s *Server) writeModelBinding(w http.ResponseWriter, r *http.Request, personaID string) {
 	persona, err := s.store.persona(r.Context(), personaID)
 	if err != nil {
 		storeError(w, err)
@@ -186,7 +202,12 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 				Model:           meta.Connection.Model,
 				Version:         meta.Version,
 				MaxOutputTokens: meta.Connection.MaxOutputTokens,
+				ReasoningEffort: meta.Connection.ReasoningEffort,
 			},
+		}
+		if meta.Connection.Preset == modelconnections.ChatGPTPreset {
+			s.writeChatGPTBinding(w, r, human, binding)
+			return
 		}
 		if s.conns.CredentialsAvailable() {
 			access, err := s.conns.Resolve(r.Context(), human, sel.ConnectionID)
@@ -204,4 +225,38 @@ func (s *Server) modelBinding(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, ModelBinding{Selection: sel.Kind, Reason: "unknown selection kind"})
 	}
+}
+
+// writeChatGPTBinding resolves a subscription connection's access token,
+// refreshing under the connection's row lock when needed. A grant that can
+// no longer be refreshed is a definite, user-fixable unavailability
+// (reconnect), never a fallback; a transient refresh failure is a 503 the
+// core retries like a provider outage.
+func (s *Server) writeChatGPTBinding(w http.ResponseWriter, r *http.Request, human string, binding ModelBinding) {
+	access, err := s.conns.ResolveChatGPT(r.Context(), human, binding.Connection.ID, "")
+	switch {
+	case err == nil:
+		// Subscription credentials stay on the API; Core receives only metadata.
+		binding.Connection.Model = access.Connection.Model
+		binding.Connection.ReasoningEffort = access.Connection.ReasoningEffort
+		binding.Connection.AccountID = access.AccountID
+		binding.Connection.Version = access.Version
+		binding.CredentialAvailable = true
+	case errors.Is(err, modelconnections.ErrReconnectRequired):
+		binding.CredentialState = "reconnect_required"
+		binding.Reason = "the ChatGPT sign-in for this connection has expired or was revoked; reconnect ChatGPT in AI connection settings"
+	case errors.Is(err, modelconnections.ErrChatGPTDisabled):
+		binding.CredentialState = "disabled"
+		binding.Reason = "ChatGPT subscription connections are not enabled on this server"
+	case errors.Is(err, modelconnections.ErrNotFound):
+		binding.Connection = nil
+		binding.Reason = "selected API connection no longer exists"
+	case errors.Is(err, modelconnections.ErrRefreshFailed):
+		writeError(w, http.StatusServiceUnavailable, "ChatGPT credential refresh failed; retry")
+		return
+	default:
+		storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, binding)
 }

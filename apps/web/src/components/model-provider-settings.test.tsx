@@ -18,6 +18,10 @@ it("offers API connections and explains that subscription sign-in is unavailable
     save: vi.fn(),
     remove: vi.fn(),
     select: vi.fn(),
+    beginChatGPTLogin: vi.fn(),
+    chatGPTLogin: vi.fn(),
+    cancelChatGPTLogin: vi.fn(),
+    saveChatGPTSettings: vi.fn(),
   };
   const usageAPI = {
     overview: async () => ({ sources: [], waits: [] }),
@@ -36,7 +40,7 @@ it("offers API connections and explains that subscription sign-in is unavailable
     await screen.findByText("現在はサーバーの既定設定を使っています。"),
   ).toBeInTheDocument();
   expect(
-    screen.getByText(/ChatGPTのサブスクリプション接続には対応していません/),
+    screen.getByText(/サーバーが対応していればChatGPTのサブスクリプション/),
   ).toBeInTheDocument();
   expect(
     screen.queryByRole("button", { name: /ChatGPT/ }),

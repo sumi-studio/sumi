@@ -40,6 +40,16 @@ var ErrProcessInputUnsupported = errors.New("process input attach unsupported by
 // self-heal — so callers should fail the owning job rather than requeue it.
 var ErrProcessWorkspace = errors.New("process workspace unavailable")
 
+// ProcessNotStartedError is a launch refused before any container create
+// was issued: no container exists and nothing executed, so the operation
+// ends as a definite failure instead of an indeterminate one.
+type ProcessNotStartedError struct{ Err error }
+
+func (e *ProcessNotStartedError) Error() string { return e.Err.Error() }
+func (e *ProcessNotStartedError) Unwrap() error { return e.Err }
+
+func processNotStarted(err error) error { return &ProcessNotStartedError{Err: err} }
+
 type ProcessState string
 
 const (
@@ -327,6 +337,10 @@ type ProcessOperation struct {
 	// "fenced before it existed"; a replayed StartProcess returns this
 	// record instead of launching.
 	Tombstone bool `json:"tombstone,omitempty"`
+	// NotStarted marks a failed operation whose launch was refused before
+	// any container create (e.g. an unusable job image pin): nothing ran,
+	// and Error says why.
+	NotStarted bool `json:"not_started,omitempty"`
 	// Quiesced is computed evidence filled at read time, never journalled:
 	// the operation is terminal AND the runtime proves no physical writer
 	// remains — nothing ever launched, or the operation container was

@@ -189,8 +189,9 @@ them yourself, then delete the prefix directory by hand.
   optional `SUMI_MODEL_HEADERS_JSON`, `SUMI_MODEL_EXTRA_JSON`,
   `SUMI_MODEL_TIMEOUT_MS`.
 
-A ChatGPT/Codex subscription has **no built-in OAuth flow** — manual
-human OAuth/subscription integration is not yet implemented. To use a
+The Local host has **no ChatGPT/Codex subscription sign-in** yet. The main
+API's device-code flow ([ChatGPT subscription connections](agent/chatgpt-subscription.md))
+is not wired into `sumi-local`. To use a
 subscription-backed endpoint you must point `SUMI_MODEL_BASE_URL`/`_API_KEY`
 at a bridge/proxy you run yourself that accepts your subscription
 credential.
