@@ -79,6 +79,12 @@ type DurableGateway struct {
 	// browserSessionLockAttemptHook is test-only synchronization invoked
 	// immediately before attempting the shared lifecycle lock.
 	browserSessionLockAttemptHook func()
+	// eventStatFastPath records that the runtime directory's filesystem meets
+	// the event-log metadata fast path contract (see eventStatTrustAge).
+	eventStatFastPath bool
+	// nowHook is test-only: it moves the wall clock the fast path compares
+	// against file change times, without sleeping.
+	nowHook func() time.Time
 
 	// stateMu protects run-in-flight and pending-approval state derived from
 	// durable events. Readers also take mu first so they cannot observe the
@@ -93,6 +99,14 @@ type personalityAgentLogState struct {
 	eventSeq  uint64
 	eventSize int64
 	eventCRC  uint32
+	// eventStat fingerprints the event file as of the last refresh that
+	// verified this tail against its full content under the exclusive lock,
+	// at wall time eventStatVerifiedNS. eventStatTrusted lets a later refresh
+	// skip re-reading the log while the fingerprint is unchanged — see
+	// eventStatTrustAge for the contract.
+	eventStat           eventFileStat
+	eventStatVerifiedNS int64
+	eventStatTrusted    bool
 	// tailObserved records that a refresh under the event-file lock has
 	// folded this persona's committed log into the session guards — the
 	// diagnostic distinction between "verified idle" and "never looked".
@@ -186,6 +200,83 @@ func crc32OfFilePrefix(file io.ReadSeeker, size int64) (uint32, error) {
 
 func updateCRC(crc uint32, data []byte) uint32 {
 	return crc32.Update(crc, crc32.IEEETable, data)
+}
+
+// Event-log metadata fast path.
+//
+// refreshEventTailLocked folds the committed event log into this process's
+// tail: seq, size, CRC, run markers, and the run-in-flight and pending-approval
+// guards that admission and run closure act on. It may skip re-reading the log
+// only when the tail was folded from exactly the bytes the file holds now. The
+// fast path is taken only when all of these hold:
+//
+//  1. The runtime directory is on a local filesystem whose inode change time
+//     (ctime) this kernel stamps from its realtime clock on every write and
+//     truncate, at a granularity of at most one second (ext2/3/4, XFS, Btrfs,
+//     tmpfs, overlayfs). Network, FUSE, and other filesystems — whose ctime may
+//     come from another host's clock or be coarse — always re-verify in full.
+//  2. The file's device, inode, size, and ctime equal the fingerprint recorded
+//     right after its content was last fully verified under the exclusive
+//     event-file lock.
+//  3. That verified ctime was already more than eventStatTrustAge older than
+//     this process's wall clock at verification, and the wall clock has not
+//     since gone back before the verification instant.
+//
+// Every writer takes the exclusive lock and appends, truncates (torn-tail
+// repair, rollback), or replaces the file; each changes the inode, the size,
+// or the ctime. A change after verification happens at a later wall time, so
+// under (1) its ctime exceeds the verified ctime by more than eventStatTrustAge
+// minus one timestamp tick, and (2) no longer matches. It could reproduce the
+// verified ctime only if the realtime clock stepped back by more than
+// eventStatTrustAge; (3) turns any such step, observed at the next refresh,
+// into a full verification. A recently written file therefore stays on the
+// full CRC path until it has been quiet for eventStatTrustAge.
+//
+// Not covered: a privileged actor forging ctime (it cannot be set from
+// userspace), and a same-size rewrite landing on the exact verified ctime
+// while the clock steps back and forward again between two refreshes.
+const eventStatTrustAge = 2 * time.Second
+
+type eventFileStat struct {
+	device  uint64
+	inode   uint64
+	size    int64
+	ctimeNS int64
+}
+
+func statEventFile(file durableFileHandle) (eventFileStat, bool) {
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(int(file.Fd()), &stat); err != nil {
+		return eventFileStat{}, false
+	}
+	return eventFileStat{
+		device:  uint64(stat.Dev),
+		inode:   uint64(stat.Ino),
+		size:    stat.Size,
+		ctimeNS: stat.Ctim.Nano(),
+	}, true
+}
+
+// localChangeTimeFilesystem reports whether a filesystem meets condition (1)
+// of the event-log metadata fast path.
+func localChangeTimeFilesystem(fs *syscall.Statfs_t) bool {
+	switch uint32(fs.Type) {
+	case 0xEF53, // ext2/3/4
+		0x58465342, // XFS
+		0x9123683E, // Btrfs
+		0x01021994, // tmpfs
+		0x794C7630: // overlayfs
+		return true
+	default:
+		return false
+	}
+}
+
+func (g *DurableGateway) now() time.Time {
+	if g.nowHook != nil {
+		return g.nowHook()
+	}
+	return time.Now()
 }
 
 type runtimeState struct {
@@ -323,6 +414,8 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		_ = runtimeDir.Close()
 		return nil, err
 	}
+	var fs syscall.Statfs_t
+	eventStatFastPath := syscall.Fstatfs(dirFD, &fs) == nil && localChangeTimeFilesystem(&fs)
 	return &DurableGateway{
 		dir:                          abs,
 		commands:                     commands,
@@ -337,6 +430,7 @@ func OpenDurableGateway(dir string, commands *CommandStore) (*DurableGateway, er
 		browserSubscribers:           make(map[string]map[uint64]chan browserVolatileBatch),
 		runInFlight:                  make(map[string]bool),
 		pendingApprovals:             make(map[string]map[string]bool),
+		eventStatFastPath:            eventStatFastPath,
 		newFile: func(name string, flag int, perm os.FileMode) (durableFileHandle, error) {
 			return os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
 		},
@@ -2740,6 +2834,9 @@ func (g *DurableGateway) resetEventTailLocked(st *personalityAgentLogState, pers
 	// minted by the old history must not outlive it.
 	st.commandKeys = nil
 	st.commandKeysOK = false
+	st.eventStat = eventFileStat{}
+	st.eventStatVerifiedNS = 0
+	st.eventStatTrusted = false
 	g.stateMu.Lock()
 	delete(g.pendingApprovals, personalityAgentID)
 	delete(g.runInFlight, personalityAgentID)
@@ -2747,6 +2844,16 @@ func (g *DurableGateway) resetEventTailLocked(st *personalityAgentLogState, pers
 }
 
 func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *personalityAgentLogState, personalityAgentID string) error {
+	// An idle log is the common case — the direct-chat projector checks it
+	// every sweep. Under the metadata fast path contract (eventStatTrustAge)
+	// a trusted, unchanged fingerprint proves the tail was folded from the
+	// file's current bytes, so re-reading the whole lifetime log is skipped.
+	if st.eventStatTrusted && g.now().UnixNano() >= st.eventStatVerifiedNS {
+		if current, ok := statEventFile(file); ok && current == st.eventStat && current.size == st.eventSize {
+			return nil
+		}
+	}
+	st.eventStatTrusted = false
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return fmt.Errorf("seek durable event log: %w", err)
@@ -2760,6 +2867,7 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 			return fmt.Errorf("checksum durable event log prefix: %w", err)
 		}
 		if crc == st.eventCRC {
+			g.noteVerifiedEventFileLocked(file, st)
 			return nil
 		}
 		g.resetEventTailLocked(st, personalityAgentID)
@@ -2870,7 +2978,28 @@ func (g *DurableGateway) refreshEventTailLocked(file durableFileHandle, st *pers
 	st.eventSize = offset
 	st.eventCRC = crc
 	st.tailObserved = true
+	g.noteVerifiedEventFileLocked(file, st)
 	return nil
+}
+
+// noteVerifiedEventFileLocked records the fingerprint of an event file whose
+// content st has just verified in full under the exclusive lock. It is
+// trusted only under the metadata fast path contract (eventStatTrustAge):
+// a supported filesystem, exactly the verified length, and a change time
+// already older than eventStatTrustAge.
+func (g *DurableGateway) noteVerifiedEventFileLocked(file durableFileHandle, st *personalityAgentLogState) {
+	st.eventStatTrusted = false
+	if !g.eventStatFastPath {
+		return
+	}
+	fingerprint, ok := statEventFile(file)
+	if !ok || fingerprint.size != st.eventSize {
+		return
+	}
+	now := g.now().UnixNano()
+	st.eventStat = fingerprint
+	st.eventStatVerifiedNS = now
+	st.eventStatTrusted = now-fingerprint.ctimeNS > int64(eventStatTrustAge)
 }
 
 func (g *DurableGateway) refreshAckTailLocked(file durableFileHandle, st *personalityAgentLogState) error {
