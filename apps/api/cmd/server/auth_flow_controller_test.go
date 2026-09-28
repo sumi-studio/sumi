@@ -27,6 +27,21 @@ type fakeFirebaseProviderLifecycle struct {
 	deleteCalls   int
 }
 
+func TestEnrollmentEmailErrorsSurviveFlowBoundary(t *testing.T) {
+	for _, tt := range []struct {
+		input error
+		want  error
+	}{
+		{koseki.ErrEnrollmentInvite, agentevents.ErrBrowserEnrollmentInvite},
+		{koseki.ErrEnrollmentEmailUnverified, agentevents.ErrBrowserEnrollmentEmailUnverified},
+		{koseki.ErrEnrollmentEmailMismatch, agentevents.ErrBrowserEnrollmentEmailMismatch},
+	} {
+		if got := mapFlowError(tt.input); !errors.Is(got, tt.want) {
+			t.Fatalf("%v mapped to %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
 func (f *fakeFirebaseProviderLifecycle) ProviderAccount(_ context.Context, uid string) (firebaseProviderAccount, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

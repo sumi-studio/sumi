@@ -84,6 +84,32 @@ func TestBootstrapInviteRejectsMisuse(t *testing.T) {
 	}
 }
 
+// PendingEnrollmentEmail tells only the nonce holder of a still-unproved flow
+// which address its invitation demands.
+func TestPendingEnrollmentEmailIsScopedToTheUnprovedFlow(t *testing.T) {
+	s, ctx := bootstrapStore(t)
+	_, token, err := s.IssueBootstrapEnrollmentInvite(ctx, "first@example.com", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := testNonce(t)
+	f := inviteFlow(t, ctx, s, token, n, IntentSignUp)
+	if got, err := s.PendingEnrollmentEmail(ctx, f.FlowID, n); err != nil || got != "first@example.com" {
+		t.Fatalf("pending invitation email %q %v", got, err)
+	}
+	for _, probe := range [][2]string{{f.FlowID, testNonce(t)}, {"not-a-flow", n}, {f.FlowID, "not-a-nonce"}} {
+		if got, err := s.PendingEnrollmentEmail(ctx, probe[0], probe[1]); err != nil || got != "" {
+			t.Fatalf("foreign probe %v read %q %v", probe, got, err)
+		}
+	}
+	if _, err := s.ResolveAuthProof(ctx, f.FlowID, n, inviteProof("first-uid", "first@example.com", true)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.PendingEnrollmentEmail(ctx, f.FlowID, n); err != nil || got != "" {
+		t.Fatalf("completed flow still demands %q %v", got, err)
+	}
+}
+
 // The bootstrap invitation behaves like any email-bound invitation: the
 // wrong or unverified email is refused, the right one registers exactly one
 // Human, and from then on the bootstrap is closed while ordinary
@@ -96,12 +122,18 @@ func TestBootstrapInviteAdmitsOnlyBoundEmailThenCloses(t *testing.T) {
 	}
 	n := testNonce(t)
 	f := inviteFlow(t, ctx, s, token, n, IntentSignUp)
-	for _, proof := range []VerifiedIdentity{
-		inviteProof("first-uid", "first@example.com", false),
-		inviteProof("first-uid", "other@example.com", true),
+	for _, tt := range []struct {
+		proof VerifiedIdentity
+		want  error
+	}{
+		{inviteProof("first-uid", "first@example.com", false), ErrEnrollmentEmailUnverified},
+		{inviteProof("first-uid", "other@example.com", true), ErrEnrollmentEmailMismatch},
 	} {
-		if _, err := s.ResolveAuthProof(ctx, f.FlowID, n, proof); !errors.Is(err, ErrEnrollmentInvite) {
+		if _, err := s.ResolveAuthProof(ctx, f.FlowID, n, tt.proof); !errors.Is(err, tt.want) || !errors.Is(err, ErrEnrollmentInvite) {
 			t.Fatalf("mismatched proof accepted: %v", err)
+		}
+		if _, err := s.InspectEnrollmentInvite(ctx, token); err != nil {
+			t.Fatalf("refused proof consumed the invitation: %v", err)
 		}
 	}
 	assertRegistryCounts(t, ctx, s, 0, 0)

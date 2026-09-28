@@ -120,17 +120,39 @@ export function takePendingRedirectSignIn(): PendingRedirectAuthFlow | null {
   return takePendingRedirectFlow();
 }
 
-export async function resolveRedirectSignInUser(): Promise<User> {
-  const credential = await getRedirectResult(getFirebaseAuth());
-  if (!credential) throw new RedirectSignInAbandonedError();
-  return credential.user;
+export interface RedirectSignInProof {
+  user: User;
+  /**
+   * GitHub's OAuth access token from this return. When Firebase does not prove
+   * the invited address, Sumi asks GitHub through this token. It lives only
+   * in memory for this return and is never stored.
+   */
+  providerAccessToken?: string;
+}
+
+export async function resolveRedirectSignIn(): Promise<RedirectSignInProof> {
+  const result = await getRedirectResult(getFirebaseAuth());
+  if (!result) throw new RedirectSignInAbandonedError();
+  // credentialFromResult does not check which provider issued the token, so
+  // only a GitHub result's token is ever read.
+  const providerAccessToken =
+    result.providerId === "github.com"
+      ? GithubAuthProvider.credentialFromResult(result)?.accessToken
+      : undefined;
+  return providerAccessToken
+    ? { user: result.user, providerAccessToken }
+    : { user: result.user };
 }
 
 function createRedirectProvider(
   provider: RecoverableProvider,
 ): FirebaseAuthProvider {
   if (provider === "github.com") {
-    return new GithubAuthProvider();
+    const github = new GithubAuthProvider();
+    // Lets Sumi read which addresses GitHub itself verified when an
+    // invitation is bound to one.
+    github.addScope("user:email");
+    return github;
   }
   const google = new GoogleAuthProvider();
   google.setCustomParameters({ prompt: "select_account" });

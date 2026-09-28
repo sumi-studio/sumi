@@ -13,6 +13,7 @@ import (
 type fakeAuthFlowController struct {
 	startResult           BrowserAuthFlowResult
 	resolveResult         BrowserAuthFlowResult
+	resolveRequest        ResolveBrowserAuthFlowRequest
 	confirmResult         BrowserAuthFlowResult
 	providerStatusResult  ProviderOperationStatusResult
 	providerStatusErr     error
@@ -36,7 +37,8 @@ type fakeAuthFlowController struct {
 func (f *fakeAuthFlowController) Start(context.Context, StartBrowserAuthFlowRequest) (BrowserAuthFlowResult, error) {
 	return f.startResult, nil
 }
-func (f *fakeAuthFlowController) Resolve(context.Context, ResolveBrowserAuthFlowRequest, FirebaseIdentity) (BrowserAuthFlowResult, error) {
+func (f *fakeAuthFlowController) Resolve(_ context.Context, request ResolveBrowserAuthFlowRequest, _ FirebaseIdentity) (BrowserAuthFlowResult, error) {
+	f.resolveRequest = request
 	return f.resolveResult, nil
 }
 func (f *fakeAuthFlowController) Confirm(context.Context, ConfirmBrowserAuthFlowRequest) (BrowserAuthFlowResult, error) {
@@ -469,6 +471,60 @@ func TestProviderOperationSagaErrorsExposeRetryableSemanticCodes(t *testing.T) {
 		if recorder.Code != test.wantStatus || !strings.Contains(recorder.Body.String(), `"error":"`+test.wantCode+`"`) {
 			t.Fatalf("error %v: status=%d body=%s", test.err, recorder.Code, recorder.Body.String())
 		}
+	}
+}
+
+func TestEnrollmentErrorsKeepForbiddenStatusAndDistinctRecoveryCodes(t *testing.T) {
+	for _, tt := range []struct {
+		err  error
+		code string
+	}{
+		{ErrBrowserEnrollmentInvite, "invitation_required"},
+		{ErrBrowserEnrollmentEmailUnverified, "invitation_email_unverified"},
+		{ErrBrowserEnrollmentEmailMismatch, "invitation_email_mismatch"},
+		{ErrBrowserEnrollmentEmailProofRequired, "invitation_email_proof_required"},
+	} {
+		r := httptest.NewRecorder()
+		writeFlowError(r, tt.err)
+		if r.Code != http.StatusForbidden || !strings.Contains(r.Body.String(), `"error":"`+tt.code+`"`) {
+			t.Fatalf("%v: status=%d body=%s", tt.err, r.Code, r.Body.String())
+		}
+	}
+	// A provider that could not be asked decided nothing: retryable, not a refusal.
+	r := httptest.NewRecorder()
+	writeFlowError(r, ErrBrowserEnrollmentEmailProofUnavailable)
+	if r.Code != http.StatusServiceUnavailable || !strings.Contains(r.Body.String(), `"error":"invitation_email_proof_unavailable"`) {
+		t.Fatalf("proof unavailable: status=%d body=%s", r.Code, r.Body.String())
+	}
+}
+
+func TestResolveForwardsOnlyWellFormedProviderAccessToken(t *testing.T) {
+	firebase := &fakeFirebaseVerifier{identity: FirebaseIdentity{
+		UID: "firebase-user", SignInProvider: "github.com", AuthTime: time.Now(),
+	}}
+	server, _ := newTestBrowserAuthServer(t, firebase, &fakeBindingResolver{})
+	controller := &fakeAuthFlowController{resolveResult: BrowserAuthFlowResult{
+		FlowID: "0198f0f4-9b72-7000-8000-0000000000f1", Outcome: "confirmation_required", NextAction: "create_account",
+	}}
+	server.Flows = controller
+	resolved := postFlowJSON(t, server, "/auth/flows/resolve",
+		`{"flow_id":"0198f0f4-9b72-7000-8000-0000000000f1","nonce":"abc","id_token":"token","provider_access_token":"gho_Abc123"}`)
+	if resolved.Code != http.StatusOK || controller.resolveRequest.ProviderAccessToken != "gho_Abc123" {
+		t.Fatalf("resolve: %d %s %+v", resolved.Code, resolved.Body.String(), controller.resolveRequest)
+	}
+	if strings.Contains(resolved.Body.String(), "gho_Abc123") {
+		t.Fatal("the provider token was echoed back")
+	}
+	calls := firebase.calls
+	for _, token := range []string{"gho abc", `gho\u0000abc`, strings.Repeat("a", maxProviderAccessTokenBytes+1)} {
+		refused := postFlowJSON(t, server, "/auth/flows/resolve",
+			`{"flow_id":"0198f0f4-9b72-7000-8000-0000000000f1","nonce":"abc","id_token":"token","provider_access_token":"`+token+`"}`)
+		if refused.Code != http.StatusBadRequest {
+			t.Fatalf("malformed provider token %q: %d %s", token, refused.Code, refused.Body.String())
+		}
+	}
+	if firebase.calls != calls {
+		t.Fatal("a malformed provider token reached ID-token verification")
 	}
 }
 

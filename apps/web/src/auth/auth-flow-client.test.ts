@@ -62,6 +62,30 @@ describe("Koseki browser auth-flow client", () => {
     });
   });
 
+  it("sends a GitHub access token only alongside the proof it belongs to", async () => {
+    const fetchMock = mockAuthPost({
+      flow_id: "flow-1",
+      outcome: "confirmation_required",
+      next_action: "create_account",
+      continuation: "/",
+      expires_at: "2026-08-01T01:00:00Z",
+    });
+
+    await resolveAuthFlow({
+      flowId: "flow-1",
+      nonce,
+      idToken: "id-token",
+      providerAccessToken: "gho_token",
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      flow_id: "flow-1",
+      nonce,
+      id_token: "id-token",
+      provider_access_token: "gho_token",
+    });
+  });
+
   it("sends only the server-requested action to explicit confirmation", async () => {
     const fetchMock = mockAuthPost({
       flow_id: "flow-1",

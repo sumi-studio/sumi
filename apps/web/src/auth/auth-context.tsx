@@ -86,7 +86,7 @@ import {
   hasPendingRedirectSignIn,
   RedirectSignInAbandonedError,
   RedirectSignInExpiredError,
-  resolveRedirectSignInUser,
+  resolveRedirectSignIn,
   takePendingRedirectSignIn,
 } from "./redirect-sign-in";
 import {
@@ -599,11 +599,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       generation,
       flow,
       user,
+      providerAccessToken,
       switchFromUserId,
     }: {
       generation: number;
       flow: PendingRedirectAuthFlow;
       user: User;
+      /** In-memory GitHub evidence from this same return; never persisted. */
+      providerAccessToken?: string;
       switchFromUserId?: string;
     }): Promise<boolean> => {
       let confirmationRequired = false;
@@ -615,6 +618,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           flowId: flow.flowId,
           nonce: flow.nonce,
           idToken,
+          ...(providerAccessToken ? { providerAccessToken } : {}),
           switchFromUserId,
         });
         if (resolved.outcome === "confirmation_required") {
@@ -688,6 +692,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     let firebaseSignInCompleted = false;
     let confirmationRequired = false;
     let user: User | null = null;
+    let providerAccessToken: string | undefined;
     let flow: PendingRedirectAuthFlow | null = null;
     try {
       flow = takePendingRedirectSignIn();
@@ -698,7 +703,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         throw new RedirectSignInAbandonedError();
       }
       try {
-        user = await resolveRedirectSignInUser();
+        const proof = await resolveRedirectSignIn();
+        user = proof.user;
+        providerAccessToken = proof.providerAccessToken;
       } catch (error) {
         if (
           isSameEmailCredentialCollision(error) &&
@@ -736,6 +743,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         generation,
         flow,
         user,
+        providerAccessToken,
       });
       if (!isCurrentGeneration(generation) && !confirmationRequired) {
         await signOutFirebaseBestEffort();
@@ -753,6 +761,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // discards the flow.
         const resolvedUser = user;
         const resolvedFlow = flow;
+        const resolvedProviderAccessToken = providerAccessToken;
         const target =
           resolvedUser.displayName ??
           resolvedUser.email ??
@@ -762,6 +771,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             generation: nextGeneration(),
             flow: resolvedFlow,
             user: resolvedUser,
+            providerAccessToken: resolvedProviderAccessToken,
             switchFromUserId: switchFromUserId || undefined,
           });
         };
