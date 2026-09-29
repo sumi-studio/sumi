@@ -489,16 +489,13 @@ func (s *Service) sealInTx(ctx context.Context, tx pgx.Tx, personaID, transferID
 		personaID, transferID); err != nil {
 		return Receipt{}, err
 	}
-	// A 'preparing' chunk is a claim by the writer generation the seal just
-	// fenced: the branch can never record an outcome, so its claim is dead
-	// placement-local execution state. The cut carries the durable memory
-	// — verdicts, replacement text, ranges, attempt history — but never a
-	// live claim: the row returns to 'sealed' so the destination can claim
-	// it under its own writer. Attempts and interruptions are judgments and
-	// history, not claims; they carry unchanged.
+	// Release placement-local execution claims, preserving any durable branch's
+	// exact snapshot, candidate and review so the destination resumes it.
+	// Unsnapshotted fixture/import preparation returns to sealed instead.
+
 	if _, err := tx.Exec(ctx, `
 		UPDATE core_memory_chunks
-		SET status = 'sealed', claimed_generation = NULL, claimed_at = NULL, not_before = NULL
+		SET status = CASE WHEN EXISTS(SELECT 1 FROM core_memory_branches b WHERE b.persona_id=core_memory_chunks.persona_id AND b.chunk_seq=core_memory_chunks.chunk_seq) THEN 'preparing' ELSE 'sealed' END, claimed_generation = NULL, claimed_at = NULL, not_before = NULL
 		WHERE persona_id = $1 AND status = 'preparing'`, personaID); err != nil {
 		return Receipt{}, err
 	}

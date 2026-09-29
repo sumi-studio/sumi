@@ -60,6 +60,15 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
+/** Non-secret identity of the model configuration used by a saved branch. */
+export interface ModelBindingSnapshot {
+  version: 1;
+  fingerprint: string;
+  provider: string;
+  model?: string;
+  reasoningEffort?: string;
+}
+
 export type ModelEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; call: ToolCall }
@@ -95,11 +104,21 @@ export interface ModelRequest {
   round: number;
   messages: ChatMessage[];
   tools: ToolSpec[];
+  /** Refuse a saved branch if its selected connection/configuration changed. */
+  bindingSnapshot?: ModelBindingSnapshot;
+  /**
+   * Append an Astra configuration update after this many original messages.
+   * The original top-level effort and message/tool prefix stay unchanged.
+   */
+  reasoningEffort?: "medium";
+  reasoningEffortAfter?: number;
   signal?: AbortSignal;
 }
 
 export interface ModelProvider {
   readonly name: string;
+  /** Capture configuration identity without persisting credentials. */
+  snapshotBinding?(): Promise<ModelBindingSnapshot>;
   /** Streaming contract: text deltas, tool calls, then exactly one done. */
   stream(request: ModelRequest): AsyncIterable<ModelEvent>;
   /**
@@ -156,6 +175,7 @@ export type ModelFailureCause =
   | "model_reconnect_required"
   | "model_auth_rejected"
   | "model_connection_disabled"
+  | "model_binding_changed"
   | "model_usage_limit";
 
 export class ModelError extends Error {

@@ -1,10 +1,12 @@
 import {
+  type ModelBindingSnapshot,
   ModelError,
   type ModelEvent,
   type ModelProvider,
   type ModelRequest,
   type ToolCall,
 } from "../provider.ts";
+import { assertBindingSnapshot, snapshotFor } from "./binding-snapshot.ts";
 import {
   assertExtraHeaders,
   encodeCallArguments,
@@ -83,7 +85,26 @@ export class OpenAIProvider implements ModelProvider {
     return overridden ?? this.cfg.maxOutputTokens;
   }
 
+  async snapshotBinding(): Promise<ModelBindingSnapshot> {
+    return snapshotFor(this.name, this.cfg, this.cfg.model);
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
+    if (request.bindingSnapshot) {
+      assertBindingSnapshot(
+        request.bindingSnapshot,
+        await this.snapshotBinding(),
+      );
+    }
+    if (request.reasoningEffort !== undefined) {
+      throw new ModelError(
+        "memory reasoning updates require the Astra Responses connection",
+        {
+          retryable: false,
+          unavailable: true,
+        },
+      );
+    }
     assertExtraHeaders(this.cfg.headers);
     // Chat-completions function names must match ^[a-zA-Z][a-zA-Z0-9_-]*$ —
     // canonical tool names like "journal.note" are rejected outright by some

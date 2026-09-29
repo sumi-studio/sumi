@@ -896,7 +896,7 @@ const inputCols = `persona_id, input_id, kind, payload, actor_kind, actor_id,
 const previousReceiptCol = `(SELECT prev.created_at FROM core_inputs prev
 		WHERE prev.persona_id = core_inputs.persona_id
 			AND prev.admission_seq < core_inputs.admission_seq
-			AND prev.actor_kind NOT IN ('schedule', 'job', 'terminal')
+			AND prev.actor_kind NOT IN ('schedule', 'job', 'terminal', 'memory')
 		ORDER BY prev.admission_seq DESC LIMIT 1)`
 
 type inputScanner interface {
@@ -1985,13 +1985,6 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	}
 	sRows.Close()
 	if err := sRows.Err(); err != nil {
-		return res, err
-	}
-	// Return memory chunks a fenced generation was preparing to the shelf
-	// so the live generation can reprepare them — the originals never left
-	// the context while preparation ran. The lost claim counts as an
-	// interruption, not a failed attempt.
-	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
 		return res, err
 	}
 	// Held usage reservations a dead generation admitted but never

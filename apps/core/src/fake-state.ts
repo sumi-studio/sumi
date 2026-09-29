@@ -1,3 +1,10 @@
+import {
+  sha256,
+  type MemoryBranch,
+  type MemoryBranchState,
+  type MemorySnapshot,
+  type MemoryPolicy,
+} from "./memory-branch.ts";
 import { jsonEqual } from "./json.ts";
 import {
   FencedError,
@@ -10,7 +17,6 @@ import { isInternalActor } from "./memory.ts";
 import type {
   Approval,
   ApprovalDecision,
-  ClaimedMemoryChunk,
   CommitRequest,
   Decision,
   Event,
@@ -20,12 +26,10 @@ import type {
   JobTerminalReport,
   Json,
   LoadResult,
-  MemoryBlock,
   MemoryChunk,
   MemoryStatus,
   ModelBinding,
   NextWork,
-  OmittedMemory,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -111,13 +115,9 @@ const L0_CHUNK_MIN_TOKENS = 10_000;
 const L0_FORCED_SEAL_LIMIT_TOKENS = L0_CHUNK_MIN_TOKENS * 2;
 const L0_LIVE_LIMIT_TOKENS = 40_000;
 /** Recorded preparation failures a chunk may spend. */
-const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 /** Claims ending without a recorded outcome before a chunk is marked failed. */
-const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
 /** Go memoryReshelvePacing: shelf delay after an unavailable model layer. */
-const MEMORY_RESHELVE_PACING_MS = 200;
 /** Estimated tokens of applied memory blocks admitted into one context. */
-const MEMORY_SEND_CAP_TOKENS = 25_000;
 /** Applied L1 beyond this triggers an L1→L2 consolidation target. */
 const L1_LIMIT_TOKENS = 15_000;
 /** One L1→L2 target consumes until at most this much applied L1 remains. */
@@ -127,8 +127,6 @@ const L2_LIMIT_TOKENS = 10_000;
 /** Journal records one conversation_history search call scans. */
 const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
-const L0_SEND_CAP_TOKENS = 60_000;
-const CONTEXT_MAX_EVENTS = 5_000;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
 function estEventTokens(
@@ -164,38 +162,6 @@ function journalEventJson(e: Event): string {
           )
         : v,
   );
-}
-
-/** Go admitApplied: newest blocks first while they fit the memory cap; the
- * older remainder is left out as one explicit range. */
-function admitApplied(
-  blocks: MemoryBlock[],
-): [MemoryBlock[], OmittedMemory | null] {
-  let used = 0;
-  let cut = blocks.length;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const b = blocks[i] as MemoryBlock;
-    if (used + b.est_tokens > MEMORY_SEND_CAP_TOKENS) break;
-    used += b.est_tokens;
-    cut = i;
-  }
-  if (cut === 0) return [blocks, null];
-  const older = blocks.slice(0, cut);
-  const first = older[0] as MemoryBlock;
-  const last = older[older.length - 1] as MemoryBlock;
-  return [
-    blocks.slice(cut),
-    {
-      count: older.length,
-      first_chunk_seq: first.chunk_seq,
-      last_chunk_seq: last.chunk_seq,
-      first_seq: first.first_seq,
-      last_seq: last.last_seq,
-      first_time: first.first_time,
-      last_time: last.last_time,
-      est_tokens: older.reduce((n, b) => n + b.est_tokens, 0),
-    },
-  ];
 }
 
 /**
@@ -294,8 +260,10 @@ function validateToolRequest(
         return `bad request: ${tool} requires a UUIDv7 session_id`;
       }
       if (tool === "terminal.write") {
-        if (request.eof !== true &&
-          (typeof request.data !== "string" || request.data === "")) {
+        if (
+          request.eof !== true &&
+          (typeof request.data !== "string" || request.data === "")
+        ) {
           return "bad request: terminal.write requires data or eof";
         }
         if (typeof request.data === "string" && request.data.length > 65536) {
@@ -306,17 +274,31 @@ function validateToolRequest(
         const cols = request.cols;
         const rows = request.rows;
         if (
-          typeof cols !== "number" || typeof rows !== "number" ||
-          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+          typeof cols !== "number" ||
+          typeof rows !== "number" ||
+          cols < 2 ||
+          cols > 1000 ||
+          rows < 2 ||
+          rows > 500
         ) {
           return "bad request: terminal.resize requires cols 2..1000 and rows 2..500";
         }
       }
       if (tool === "terminal.signal") {
         const allowed = new Set([
-          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+          "INT",
+          "TERM",
+          "HUP",
+          "QUIT",
+          "KILL",
+          "TSTP",
+          "USR1",
+          "USR2",
         ]);
-        if (typeof request.signal !== "string" || !allowed.has(request.signal)) {
+        if (
+          typeof request.signal !== "string" ||
+          !allowed.has(request.signal)
+        ) {
           return "bad request: terminal.signal not permitted";
         }
       }
@@ -362,10 +344,13 @@ const UUIDV7_RE =
  * the same session, never a second one.
  */
 function fakeUuidV7(seed: string): string {
-  const h = `${fakeDigest(`${seed}:a`)}${fakeDigest(`${seed}:b`)}` +
+  const h =
+    `${fakeDigest(`${seed}:a`)}${fakeDigest(`${seed}:b`)}` +
     `${fakeDigest(`${seed}:c`)}${fakeDigest(`${seed}:d`)}`;
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7${h.slice(13, 16)}-` +
-    `${"89ab"[parseInt(h[16] ?? "0", 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+  return (
+    `${h.slice(0, 8)}-${h.slice(8, 12)}-7${h.slice(13, 16)}-` +
+    `${"89ab"[parseInt(h[16] ?? "0", 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`
+  );
 }
 
 function actionDigest(tool: string, route: string, request: Json): string {
@@ -432,6 +417,8 @@ export class FakeState implements StateClient {
   outboxEntries: OutboxEntry[] = [];
   /** Sealed journal ranges and their L1 replacement lifecycle. */
   memoryChunks: MemoryChunk[] = [];
+  memoryBranches = new Map<string, MemoryBranch>();
+  memoryBranchAttempts = new Map<string, MemoryBranch[]>();
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
   /** Durable approval records — key: approval_id. */
@@ -744,7 +731,6 @@ export class FakeState implements StateClient {
       }
     }
     // Memory chunks a fenced generation was preparing count an interruption.
-    this.interruptPreparing(persona, generation);
     // Held reservations from dead generations reconcile the same way Go
     // Recover does: the fact landed → settled; it never did → an
     // inspectable 'unrecorded' fact carrying the estimate, not a release.
@@ -1387,7 +1373,7 @@ export class FakeState implements StateClient {
    */
   private renderedContext(
     persona: string,
-    limit: number,
+    _limit: number,
     excludeInputId = "",
   ): RenderedContext {
     // Applied and superseded chunks both cover their ranges: a superseded
@@ -1408,38 +1394,8 @@ export class FakeState implements StateClient {
           this.turns.get(e.turn_id)?.input_id === excludeInputId
         ),
     );
-    const rowCap =
-      limit <= 0 ? CONTEXT_MAX_EVENTS : Math.min(limit, CONTEXT_MAX_EVENTS);
-    const picked: Event[] = [];
-    let budget = 0;
-    for (let i = uncovered.length - 1; i >= 0; i--) {
-      const e = uncovered[i];
-      if (!e) break;
-      const est = estEventTokens(e.kind, e.payload);
-      if (
-        picked.length >= rowCap ||
-        (picked.length > 0 && budget + est > L0_SEND_CAP_TOKENS)
-      ) {
-        break;
-      }
-      budget += est;
-      picked.push(e);
-    }
-    const events = picked.reverse();
-    const firstShown = events[0]?.seq ?? 0;
-    const older = uncovered.filter((e) => e.seq < firstShown);
-    const oldest = older[0];
-    const newestOmitted = older[older.length - 1];
-    const omitted =
-      oldest && newestOmitted
-        ? {
-            count: older.length,
-            first_seq: oldest.seq,
-            last_seq: newestOmitted.seq,
-            first_time: oldest.created_at,
-            last_time: newestOmitted.created_at,
-          }
-        : null;
+    const events = uncovered;
+    const omitted = null;
     const at = (seq: number) =>
       this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
         ?.created_at ?? "";
@@ -1455,7 +1411,8 @@ export class FakeState implements StateClient {
         text: c.replacement ?? "",
         est_tokens: c.replacement_est_tokens ?? 0,
       }));
-    const [memory, memoryOmitted] = admitApplied(blocks);
+    const memory = blocks,
+      memoryOmitted = null;
     return { events, memory, omitted, memory_omitted: memoryOmitted };
   }
 
@@ -2742,7 +2699,6 @@ export class FakeState implements StateClient {
     generation: number,
   ): Promise<MemoryStatus> {
     this.mustHold(persona, generation);
-    this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
     const covered = Math.max(0, ...mine().map((c) => c.last_seq));
@@ -2968,20 +2924,31 @@ export class FakeState implements StateClient {
     const count = (s: MemoryChunk["status"]) =>
       mine.filter((c) => c.status === s).length;
     const now = Date.now();
-    const readyAt = (c: MemoryChunk): number | null =>
-      c.status === "preparing"
+    const readyAt = (c: MemoryChunk): number | null => {
+      if (c.status === "sealed") return null; // needs an actual main snapshot, not an alarm
+      if (c.status !== "preparing") return null;
+      const b = this.memoryBranches.get(`${persona}|${c.chunk_seq}`);
+      return !b?.state || b.state.status === "running"
         ? now
-        : c.status === "sealed"
-          ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
+        : b.state.retry_at
+          ? Date.parse(b.state.retry_at)
           : null;
+    };
     const ready = mine.map(readyAt).filter((t): t is number => t !== null);
-    const appliedBlocks = mine
-      .filter((c) => c.status === "applied")
-      .sort((a, b) => a.first_seq - b.first_seq)
-      .map(
-        (c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock,
-      );
     return {
+      branches: [...this.memoryBranches.values()]
+        .filter(
+          (b) =>
+            b.chunk.persona_id === persona && b.chunk.status === "preparing",
+        )
+        .map((b) => ({
+          chunk_seq: b.chunk.chunk_seq,
+          status: b.state?.status ?? "running",
+          revision: b.revision,
+          retry_at: b.state?.retry_at ?? null,
+          issue: b.state?.issue ?? null,
+          pause_reason: b.state?.pause_reason ?? null,
+        })),
       live_raw_tokens:
         mine
           .filter(
@@ -3005,270 +2972,243 @@ export class FakeState implements StateClient {
       next_claimable_at: ready.length
         ? new Date(Math.min(...ready)).toISOString()
         : null,
-      applied_omitted: admitApplied(appliedBlocks)[1]?.count ?? 0,
+      applied_omitted: 0,
       covered_seq: covered,
       latest_seq: Math.max(0, ...events.map((e) => e.seq)),
       chunk_min_tokens: L0_CHUNK_MIN_TOKENS,
       live_limit_tokens: L0_LIVE_LIMIT_TOKENS,
-      memory_send_cap_tokens: MEMORY_SEND_CAP_TOKENS,
+      memory_send_cap_tokens: 0,
     };
   }
 
-  async claimMemoryChunk(
+  async claimMemoryBranch(
     persona: string,
     generation: number,
-    contextLimit: number,
-  ): Promise<ClaimedMemoryChunk> {
+    snapshot?: MemorySnapshot,
+    policy?: MemoryPolicy,
+  ): Promise<MemoryBranch | null> {
     this.mustHold(persona, generation);
-    const mine = this.memoryChunks.filter((c) => c.persona_id === persona);
-    const empty = () => ({
-      chunk: null,
-      target_events: [],
-      target_fragments: [],
-      context: this.renderedContext(persona, contextLimit),
-    });
-    // Every 'preparing' chunk is an orphan from the caller's view: its claim
-    // ended without an outcome, so it counts an interruption — not an
-    // attempt — and waits out a short pacing. (FakeState is single-threaded;
-    // the real store relies on pacing and generation fencing to converge
-    // concurrent claims, not on strict single-flight.)
-    this.interruptPreparing(persona, null);
-    const c = mine
+    if (Date.parse(this.leases.get(persona)!.expires_at) <= Date.now())
+      throw new FencedError();
+    const active = [...this.memoryBranches.values()].find(
+      (b) =>
+        b.chunk.persona_id === persona &&
+        b.chunk.status === "preparing" &&
+        (!b.state ||
+          b.state.status === "running" ||
+          (b.state.retry_at !== null &&
+            Date.parse(b.state.retry_at) <= Date.now()) ||
+          (b.state.pause_reason === "configured_budget" &&
+            policy &&
+            !jsonEqual(policy, b.state.policy)) ||
+          (snapshot?.binding &&
+            (b.state.effective_binding ?? b.snapshot.binding)?.fingerprint !==
+              snapshot.binding.fingerprint)),
+    );
+    if (active) {
+      active.chunk.claimed_generation = generation;
+      return structuredClone(active);
+    }
+    if (!snapshot) return null;
+    const covers = (first: number, last: number) => {
+      let next = first;
+      for (const r of [...snapshot.ranges].sort(
+        (a, b) => a.first_seq - b.first_seq,
+      )) {
+        if (r.last_seq < first || r.first_seq > last) continue;
+        if (r.first_seq < first || r.last_seq > last || r.first_seq > next)
+          return false;
+        next = Math.max(next, r.last_seq + 1);
+      }
+      return next === last + 1;
+    };
+    const matches = (c: MemoryChunk) =>
+      covers(c.first_seq, c.last_seq) &&
+      (c.layer === 1
+        ? !snapshot.ranges.some(
+            (r) =>
+              r.first_seq >= c.first_seq &&
+              r.last_seq <= c.last_seq &&
+              (r.layer !== undefined || r.chunk_seq !== undefined),
+          )
+        : (c.sources ?? []).length > 0 &&
+          (c.sources ?? []).every((seq) => {
+            const source = this.memoryChunks.find(
+              (s) => s.persona_id === persona && s.chunk_seq === seq,
+            );
+            return (
+              source?.status === "applied" &&
+              snapshot.ranges.some(
+                (r) =>
+                  r.chunk_seq === seq &&
+                  r.layer === source.layer &&
+                  r.first_seq === source.first_seq &&
+                  r.last_seq === source.last_seq &&
+                  r.message_index !== undefined,
+              )
+            );
+          }));
+    const pressure = [0, 0, 0];
+    const counted = new Set<number>();
+    for (const r of snapshot.ranges) {
+      if (r.message_index !== undefined && !counted.has(r.message_index)) {
+        counted.add(r.message_index);
+        pressure[r.layer ?? 0]! += estTextTokens(
+          JSON.stringify(snapshot.messages[r.message_index]),
+        );
+      }
+    }
+    if (
+      pressure[0]! > L0_LIVE_LIMIT_TOKENS ||
+      pressure[1]! > L1_LIMIT_TOKENS ||
+      pressure[2]! > L2_LIMIT_TOKENS
+    ) {
+      for (const b of this.memoryBranches.values()) {
+        if (
+          b.chunk.persona_id !== persona ||
+          b.chunk.status !== "kept" ||
+          !matches(b.chunk)
+        )
+          continue;
+        const last = Math.max(...b.snapshot.ranges.map((r) => r.last_seq));
+        const fresh = new Set<number>();
+        let added = 0;
+        for (const r of snapshot.ranges) {
+          if (
+            r.first_seq > last &&
+            r.message_index !== undefined &&
+            !fresh.has(r.message_index)
+          ) {
+            fresh.add(r.message_index);
+            added += estTextTokens(
+              JSON.stringify(snapshot.messages[r.message_index]),
+            );
+          }
+        }
+        if (added < L0_CHUNK_MIN_TOKENS) continue;
+        const key = `${persona}|${b.chunk.chunk_seq}`;
+        const history = this.memoryBranchAttempts.get(key) ?? [];
+        history.push(structuredClone(b));
+        this.memoryBranchAttempts.set(key, history);
+        b.chunk.status = "sealed";
+        b.chunk.prepared_at = null;
+        break;
+      }
+    }
+    const c = this.memoryChunks
       .filter(
-        (x) =>
-          x.status === "sealed" &&
-          (x.not_before === null || Date.parse(x.not_before) <= Date.now()),
+        (c) =>
+          c.persona_id === persona &&
+          c.status === "sealed" &&
+          (!c.not_before || Date.parse(c.not_before) <= Date.now()),
       )
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)[0];
-    if (!c) return empty();
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .find(matches);
+    if (!c) return null;
     c.status = "preparing";
     c.claimed_generation = generation;
     c.claimed_at = new Date().toISOString();
-    c.not_before = null;
-    if (c.layer >= 2) {
-      // An upper-layer target prepares from its selected sources' accepted
-      // texts, not raw events. A stale target (a source no longer applied)
-      // is marked failed without spending attempts — the honest answer for
-      // a carried row or one whose sources another target consumed.
-      const at = (seq: number) =>
-        this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
-          ?.created_at ?? "";
-      const srcs = (c.sources ?? []).map((seq) =>
-        this.memoryChunks.find(
-          (s) => s.persona_id === persona && s.chunk_seq === seq,
-        ),
-      );
-      const stale =
-        srcs.length !== (c.sources ?? []).length ||
-        srcs.some((s) => s?.status !== "applied");
-      if (stale) {
-        c.status = "failed";
-        c.claimed_generation = null;
-        c.claimed_at = null;
-        c.last_error =
-          "upper-layer target is stale: its selected sources are no longer applied";
-        return empty();
-      }
-      const fragments = (srcs as MemoryChunk[]).map((s) => ({
-        chunk_seq: s.chunk_seq,
-        layer: s.layer,
-        first_seq: s.first_seq,
-        last_seq: s.last_seq,
-        first_time: at(s.first_seq),
-        last_time: at(s.last_seq),
-        text: s.replacement ?? "",
-        est_tokens: s.replacement_est_tokens ?? 0,
-      }));
-      return {
-        chunk: c,
-        target_events: [],
-        target_fragments: fragments,
-        context: this.renderedContext(persona, contextLimit),
-      };
-    }
-    return {
+    const prior = this.memoryBranches.get(`${persona}|${c.chunk_seq}`);
+    const b: MemoryBranch = {
       chunk: c,
-      target_events: this.eventLog.filter(
-        (e) =>
-          e.persona_id === persona &&
-          e.seq >= c.first_seq &&
-          e.seq <= c.last_seq,
-      ),
-      target_fragments: [],
-      context: this.renderedContext(persona, contextLimit),
+      snapshot: structuredClone(snapshot),
+      state: null,
+      revision: prior ? prior.revision + 1 : 0,
     };
+    this.memoryBranches.set(`${persona}|${c.chunk_seq}`, b);
+    return structuredClone(b);
   }
-
-  async completeMemoryChunk(
+  async saveMemoryBranch(
     persona: string,
     generation: number,
     chunkSeq: number,
-    result: { replacement?: string; keepUnchanged?: boolean },
-  ): Promise<MemoryChunk> {
+    revision: number,
+    state: MemoryBranchState,
+  ): Promise<MemoryBranch> {
     this.mustHold(persona, generation);
-    const replacement = result.replacement ?? "";
-    const keepUnchanged = result.keepUnchanged ?? false;
-    if (keepUnchanged === (replacement !== "")) {
-      throw new StateError(
-        400,
-        "bad request: exactly one of replacement text or keep_unchanged is required",
-      );
-    }
-    if (replacement.includes("\u0000")) {
-      throw new StateError(400, "bad request: replacement contains a NUL byte");
-    }
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status === "preparing") {
-      if (c.claimed_generation !== generation) throw new FencedError();
-      const rest = estTextTokens(replacement);
-      if (keepUnchanged) {
-        c.status = "kept";
-      } else if (rest >= c.est_tokens) {
-        // A replacement that does not shrink the range is kept visible but
-        // never applied: the originals stay in context.
-        c.status = "kept";
-        c.replacement = replacement;
-        c.replacement_est_tokens = rest;
-        c.last_error = `replacement did not shrink the range (${rest} >= ${c.est_tokens} estimated tokens); originals kept`;
-      } else {
-        c.status = "prepared";
-        c.replacement = replacement;
-        c.replacement_est_tokens = rest;
-      }
-      c.claimed_generation = null;
-      c.claimed_at = null;
-      c.prepared_at = new Date().toISOString();
-      return c;
-    }
+    if (Date.parse(this.leases.get(persona)!.expires_at) <= Date.now())
+      throw new FencedError();
+    const b = this.memoryBranches.get(`${persona}|${chunkSeq}`);
+    if (!b) throw new StateError(404, "branch not found");
+    if (b.revision === revision + 1 && jsonEqual(b.state, state))
+      return structuredClone(b);
+    if (b.revision !== revision)
+      throw new StateError(409, "stale branch revision");
+    if (b.chunk.status !== "preparing")
+      throw new StateError(409, "branch already settled");
     if (
-      c.status === "prepared" ||
-      c.status === "kept" ||
-      c.status === "applied"
-    ) {
-      const same =
-        (keepUnchanged && c.status === "kept" && c.replacement === null) ||
-        (!keepUnchanged && c.replacement === replacement);
-      if (!same) {
+      state.candidate &&
+      state.candidate.sha256 !== (await sha256(state.candidate.text))
+    )
+      throw new StateError(400, "candidate hash mismatch");
+    b.chunk = this.memoryChunks.find(
+      (c) => c.persona_id === persona && c.chunk_seq === chunkSeq,
+    )!;
+    const old = b.state;
+    if (
+      old &&
+      (state.rounds < old.rounds ||
+        state.tokens < old.tokens ||
+        old.messages.some((m, i) => !jsonEqual(m, state.messages[i])))
+    )
+      throw new StateError(409, "branch transcript is append-only");
+    if (state.status === "prepared" || state.status === "kept") {
+      if (
+        !state.final ||
+        !old?.review ||
+        !jsonEqual(state.final, old.review) ||
+        state.rounds <= old.review.opened_round
+      )
         throw new StateError(
           409,
-          `chunk ${chunkSeq} already completed with different content`,
+          "completion requires previously opened confirmation",
         );
-      }
-      return c;
+      if (state.status === "prepared") {
+        if (
+          !state.candidate ||
+          !jsonEqual(old.candidate, state.candidate) ||
+          state.final.kind !== "replace" ||
+          state.final.sha256 !== state.candidate.sha256 ||
+          state.final.version !== state.candidate.version
+        )
+          throw new StateError(409, "confirmed candidate changed");
+        if (estTextTokens(state.candidate.text) >= b.chunk.est_tokens)
+          throw new StateError(400, "candidate does not reduce target");
+        b.chunk.replacement = state.candidate.text;
+        b.chunk.replacement_est_tokens = estTextTokens(state.candidate.text);
+      } else if (state.final.kind !== "keep")
+        throw new StateError(409, "keep confirmation required");
+      b.chunk.status = state.status;
+      b.chunk.prepared_at = new Date().toISOString();
+      b.chunk.claimed_generation = null;
+      b.chunk.claimed_at = null;
     }
-    throw new StateError(
-      409,
-      `chunk ${chunkSeq} is ${c.status}, not preparing`,
-    );
-  }
-
-  async failMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    failure: { error: string; retryable: boolean },
-  ): Promise<MemoryChunk> {
-    this.mustHold(persona, generation);
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status !== "preparing" || c.claimed_generation !== generation) {
-      throw new StateError(
-        409,
-        `chunk ${chunkSeq} is not preparing under this generation`,
-      );
-    }
-    // A recorded failure is the only thing that spends attempts.
-    c.attempts += 1;
-    c.claimed_generation = null;
-    c.claimed_at = null;
-    c.last_error = failure.error;
-    if (failure.retryable && c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) {
-      c.status = "sealed";
-      c.not_before = new Date(
-        Date.now() + retryBackoffMs(c.attempts),
-      ).toISOString();
-    } else {
-      c.status = "failed";
-      c.not_before = null;
-    }
-    return c;
-  }
-
-  /**
-   * Go ReshelveMemoryChunk: no model request could be evaluated — the
-   * binding was unavailable or budget admission denied the call — so the
-   * claim records no verdict and spends neither attempts nor
-   * interruptions; a short pacing keeps a persistent condition from
-   * claiming every tick, and a 'budget-wait:' reason is cleared early by
-   * a funding change.
-   */
-  async reshelveMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    pause: { reason: string; delayMs?: number },
-  ): Promise<MemoryChunk> {
-    this.mustHold(persona, generation);
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status !== "preparing" || c.claimed_generation !== generation) {
-      throw new StateError(
-        409,
-        `chunk ${chunkSeq} is not preparing under this generation`,
-      );
-    }
-    c.status = "sealed";
-    c.claimed_generation = null;
-    c.claimed_at = null;
-    c.last_error = pause.reason;
-    c.not_before = new Date(
-      Date.now() + (pause.delayMs ?? MEMORY_RESHELVE_PACING_MS),
-    ).toISOString();
-    return c;
-  }
-
-  /**
-   * Go interruptPreparing: a 'preparing' claim that ended without an
-   * outcome (host stopped, fence lost, lost response) counts one
-   * interruption and returns to the shelf after a short pacing; too many
-   * mark the chunk failed, visible with its originals kept.
-   */
-  private interruptPreparing(persona: string, exceptGeneration: number | null) {
-    for (const c of this.memoryChunks) {
-      if (
-        c.persona_id !== persona ||
-        c.status !== "preparing" ||
-        (exceptGeneration !== null && c.claimed_generation === exceptGeneration)
-      ) {
-        continue;
-      }
-      const prior = c.interruptions;
-      c.interruptions += 1;
-      c.claimed_generation = null;
-      c.claimed_at = null;
-      if (c.interruptions >= MEMORY_CHUNK_MAX_INTERRUPTIONS) {
-        c.status = "failed";
-        c.not_before = null;
-        c.last_error = [
-          c.last_error,
-          `preparation was interrupted ${MEMORY_CHUNK_MAX_INTERRUPTIONS} times without a recorded outcome`,
-        ]
-          .filter(Boolean)
-          .join("; ");
-      } else {
-        c.status = "sealed";
-        c.not_before = new Date(
-          Date.now() + Math.min(200 * 2 ** Math.min(prior, 8), 30_000),
-        ).toISOString();
+    if (!jsonEqual(old?.issue ?? null, state.issue)) {
+      const transition = state.issue ? "occurred" : "recovered",
+        issue = state.issue ?? old?.issue;
+      if (issue) {
+        const id = `memory:${chunkSeq}:${revision + 1}:${transition}`;
+        if (
+          !this.inputs.some(
+            (i) => i.persona_id === persona && i.input_id === id,
+          )
+        ) {
+          this.addInput(
+            persona,
+            id,
+            `[Memory mechanism ${transition}] ${issue.message}`,
+            "memory_status",
+          );
+          const input = this.inputs[this.inputs.length - 1]!;
+          input.actor_kind = "memory";
+          input.source_surface = "core_memory";
+          input.attention = "observe";
+        }
       }
     }
+    b.state = structuredClone(state);
+    b.revision++;
+    return structuredClone(b);
   }
 
   /** Go ensureInputReceived: journal the turn's input once, before a note. */
@@ -3656,9 +3596,7 @@ export class FakeState implements StateClient {
         if (name.length > 80) {
           throw new StateError(400, "terminal name too long");
         }
-        const sessionId = fakeUuidV7(
-          `terminal:${inputIdCtx}:${callIndexCtx}`,
-        );
+        const sessionId = fakeUuidV7(`terminal:${inputIdCtx}:${callIndexCtx}`);
         const existing = this.terminalSessions.get(key(sessionId));
         if (existing) {
           if (existing.name !== name) {
@@ -3672,9 +3610,13 @@ export class FakeState implements StateClient {
         const live = [...this.terminalSessions.values()].filter(
           (t) =>
             t.persona_id === persona &&
-            ["requested", "claimed", "active", "ending", "interrupted"].includes(
-              t.status,
-            ),
+            [
+              "requested",
+              "claimed",
+              "active",
+              "ending",
+              "interrupted",
+            ].includes(t.status),
         ).length;
         // Same live-session bound as the Go store (terminalMaxSessions).
         if (live >= 4) {
@@ -3744,7 +3686,9 @@ export class FakeState implements StateClient {
       case "terminal.write": {
         const t = mustSession(op.session_id);
         if (op.eof === true) {
-          return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+          return {
+            input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`),
+          };
         }
         const data = op.data;
         if (typeof data !== "string" || data === "") {
@@ -3753,36 +3697,55 @@ export class FakeState implements StateClient {
         if (data.length > 65536) {
           throw new StateError(400, "terminal.write data exceeds 64 KiB");
         }
-        return { input: submitInput(t, "stdin", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "stdin", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.resize": {
         const t = mustSession(op.session_id);
         const cols = op.cols;
         const rows = op.rows;
         if (
-          typeof cols !== "number" || typeof rows !== "number" ||
-          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+          typeof cols !== "number" ||
+          typeof rows !== "number" ||
+          cols < 2 ||
+          cols > 1000 ||
+          rows < 2 ||
+          rows > 500
         ) {
           throw new StateError(
             400,
             "resize requires cols 2..1000 and rows 2..500",
           );
         }
-        return { input: submitInput(t, "resize", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "resize", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.signal": {
         const t = mustSession(op.session_id);
         const allowed = new Set([
-          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+          "INT",
+          "TERM",
+          "HUP",
+          "QUIT",
+          "KILL",
+          "TSTP",
+          "USR1",
+          "USR2",
         ]);
         if (typeof op.signal !== "string" || !allowed.has(op.signal)) {
           throw new StateError(400, "signal not permitted");
         }
-        return { input: submitInput(t, "signal", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "signal", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.eof": {
         const t = mustSession(op.session_id);
-        return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.close": {
         const t = mustSession(op.session_id);

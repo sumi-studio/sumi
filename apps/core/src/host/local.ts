@@ -63,6 +63,11 @@ async function main() {
     providerRetryBudgetMs: process.env.SUMI_PROVIDER_RETRY_BUDGET_MS
       ? Number(process.env.SUMI_PROVIDER_RETRY_BUDGET_MS)
       : undefined,
+    memoryPolicy: {
+      maxRounds: Number(process.env.SUMI_MEMORY_MAX_ROUNDS ?? 32),
+      maxTokens: Number(process.env.SUMI_MEMORY_MAX_TOKENS ?? 0),
+      maxConsecutiveFailures: Number(process.env.SUMI_MEMORY_MAX_FAILURES ?? 3),
+    },
     memoryPreparationTimeoutMs: process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS
       ? Number(process.env.SUMI_MEMORY_PREPARATION_TIMEOUT_MS)
       : undefined,

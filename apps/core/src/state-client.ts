@@ -1,8 +1,13 @@
+import type {
+  MemoryBranch,
+  MemoryBranchState,
+  MemorySnapshot,
+  MemoryPolicy,
+} from "./memory-branch.ts";
 import { ModelError } from "./provider.ts";
 import type {
   Approval,
   ApprovalDecision,
-  ClaimedMemoryChunk,
   CommitRequest,
   Decision,
   Event,
@@ -10,7 +15,6 @@ import type {
   Job,
   JobTerminalReport,
   LoadResult,
-  MemoryChunk,
   MemoryStatus,
   ModelBinding,
   NextWork,
@@ -274,56 +278,20 @@ export interface StateClient {
    */
   memoryMaintain(persona: string, generation: number): Promise<MemoryStatus>;
   memoryStatus(persona: string): Promise<MemoryStatus>;
-  /**
-   * Claim the oldest sealable chunk for asynchronous L1 preparation — one
-   * branch at a time. `chunk` is null when nothing is claimable right now
-   * (nothing sealed, another branch preparing, or backoff pending). The
-   * returned context is the rendered parent context at claim time.
-   */
-  claimMemoryChunk(
+  claimMemoryBranch(
     persona: string,
     generation: number,
-    contextLimit: number,
-  ): Promise<ClaimedMemoryChunk>;
-  /**
-   * Shelve the finished replacement candidate. Completion alone never
-   * changes the sent context — application is a separate threshold-gated
-   * step in memoryMaintain. keepUnchanged is the model's KEEP_UNCHANGED
-   * decision: the originals stay and the chunk is never reprepared.
-   */
-  completeMemoryChunk(
+    snapshot?: MemorySnapshot,
+    policy?: MemoryPolicy,
+  ): Promise<MemoryBranch | null>;
+  saveMemoryBranch(
     persona: string,
     generation: number,
     chunkSeq: number,
-    result: { replacement?: string; keepUnchanged?: boolean },
-  ): Promise<MemoryChunk>;
-  /**
-   * Record a failed preparation attempt. Retryable failures return the
-   * chunk to the shelf with backoff while attempts remain; an exhausted
-   * or non-retryable failure is terminal ('failed') — visible, originals
-   * kept, never silently skipped.
-   */
-  failMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    failure: { error: string; retryable: boolean },
-  ): Promise<MemoryChunk>;
-  /**
-   * Return a claimed chunk to the shelf when no model request could be
-   * evaluated — an unbound selection, a missing credential, a
-   * binding-lookup outage, or a denied budget admission. Records no
-   * verdict and spends no attempts or interruptions; the chunk waits out
-   * a short pacing (delayMs, or the service default), then proceeds once
-   * a usable binding exists. A funding or model-selection change clears
-   * budget pacing early.
-   */
-  reshelveMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    pause: { reason: string; delayMs?: number },
-  ): Promise<MemoryChunk>;
+    revision: number,
+    state: MemoryBranchState,
+  ): Promise<MemoryBranch>;
+
   outbox(
     persona: string,
     afterSeq: number,
@@ -865,7 +833,7 @@ export class HttpStateClient implements StateClient {
         // may continue with a smaller working view like any size refusal.
         throw new ModelError(
           "ChatGPT transport: request exceeds the transport size limit; it was not sent",
-          { retryable: false, refusal: "context_length" },
+          { retryable: false, refusal: "context_length", unavailable: true },
         );
       }
       const cause =
@@ -935,55 +903,30 @@ export class HttpStateClient implements StateClient {
       `/internal/core/personas/${persona}/memory`,
     );
   }
-  claimMemoryChunk(persona: string, generation: number, contextLimit: number) {
-    return this.call<ClaimedMemoryChunk>(
+  claimMemoryBranch(
+    persona: string,
+    generation: number,
+    snapshot?: MemorySnapshot,
+    policy?: MemoryPolicy,
+  ) {
+    return this.call<MemoryBranch | null>(
       "POST",
-      `/internal/core/personas/${persona}/memory/chunks/claim`,
-      { generation, context_limit: contextLimit },
+      `/internal/core/personas/${persona}/memory/branches/claim`,
+      { generation, snapshot, policy },
     );
   }
-  async completeMemoryChunk(
+  saveMemoryBranch(
     persona: string,
     generation: number,
     chunkSeq: number,
-    result: { replacement?: string; keepUnchanged?: boolean },
+    revision: number,
+    state: MemoryBranchState,
   ) {
-    const res = await this.call<{ chunk: MemoryChunk }>(
+    return this.call<MemoryBranch>(
       "POST",
-      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/complete`,
-      {
-        generation,
-        replacement: result.replacement ?? "",
-        keep_unchanged: result.keepUnchanged ?? false,
-      },
+      `/internal/core/personas/${persona}/memory/branches/${chunkSeq}/checkpoint`,
+      { generation, revision, state },
     );
-    return res.chunk;
-  }
-  async failMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    failure: { error: string; retryable: boolean },
-  ) {
-    const res = await this.call<{ chunk: MemoryChunk }>(
-      "POST",
-      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/fail`,
-      { generation, error: failure.error, retryable: failure.retryable },
-    );
-    return res.chunk;
-  }
-  async reshelveMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    pause: { reason: string; delayMs?: number },
-  ) {
-    const res = await this.call<{ chunk: MemoryChunk }>(
-      "POST",
-      `/internal/core/personas/${persona}/memory/chunks/${chunkSeq}/reshelve`,
-      { generation, reason: pause.reason, delay_ms: pause.delayMs },
-    );
-    return res.chunk;
   }
   async outbox(persona: string, afterSeq: number, limit = 200) {
     const res = await this.call<{ outbox: OutboxEntry[] }>(

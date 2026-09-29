@@ -26,7 +26,7 @@ func TestCoreFoundationFromEmptyDatabase(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM humans), (SELECT count(*) FROM schema_migrations), (SELECT count(*) FROM app_catalog), to_regclass('public.agent_secrets')::text`).Scan(&humans, &migrations, &catalog, &retired); err != nil {
 		t.Fatal(err)
 	}
-	if humans != 0 || migrations != 2 || catalog == 0 || retired != nil {
+	if humans != 0 || migrations != 3 || catalog == 0 || retired != nil {
 		t.Fatalf("foundation humans=%d migrations=%d catalog=%d retired=%v", humans, migrations, catalog, retired)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET checksum='unrelated-schema'`); err != nil {

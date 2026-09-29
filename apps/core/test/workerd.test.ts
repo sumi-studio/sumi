@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
-import { SelectedModelProvider } from "../src/host/provider-env.ts";
 import {
   MissingPersonaTokenError,
   SecretaryObject,
@@ -238,20 +237,16 @@ test("missing persona token re-arms on the dormant cadence and recovers (F5)", a
   assert.equal(ctx.alarmAt(), null, "recovered and idle: asleep again");
 });
 
-/** ~11k estimated tokens per message: each exchange clears the 10k seal. */
 const PAD = "x".repeat(44 * 1024);
-
-/**
- * Turns answer at once. A memory branch answers after `branchDelayMs`, or
- * never (ignoring cancellation) when `branchHangs` is set.
- */
 class BranchProvider implements ModelProvider {
   readonly name = "branch-scripted";
   branchRequests = 0;
-  branchDelayMs = 0;
+  requests: ModelRequest[] = [];
   branchHangs = false;
+  branchDelayMs = 0;
   async *stream(req: ModelRequest): AsyncIterable<ModelEvent> {
-    if (!req.turnId.startsWith("memory-l1-")) {
+    this.requests.push(req);
+    if (req.phase !== "memory") {
       yield { type: "text", delta: "ok" };
       yield { type: "done", usage: { finish_reason: "stop" } };
       return;
@@ -259,159 +254,164 @@ class BranchProvider implements ModelProvider {
     this.branchRequests++;
     if (this.branchHangs) await new Promise(() => {});
     await sleep(this.branchDelayMs);
-    yield { type: "text", delta: "organized memory of the first exchange" };
-    yield { type: "done", usage: { finish_reason: "stop" } };
+    const paths = {
+      candidate: "memory/1/candidate.md",
+      source: "memory/1/source.json",
+    };
+    const tool = (name: string, args: Record<string, unknown>) => ({
+      type: "tool_call" as const,
+      call: {
+        id: crypto.randomUUID(),
+        route: "normal" as const,
+        name,
+        arguments: args,
+      },
+    });
+    if (req.round === 0)
+      yield tool("file.write", {
+        path: paths.candidate,
+        content_text: "organized first exchange",
+        expect_version: "none",
+      });
+    else if (req.round === 1) {
+      yield tool("file.read", { path: paths.source, len: 1048576 });
+      yield tool("file.read", { path: paths.candidate });
+    } else if (req.round === 2) {
+      const written = req.messages
+        .filter((m) => m.role === "tool")
+        .map((m) => JSON.parse(m.content))
+        .find((v) => v.path === paths.candidate);
+      yield {
+        type: "text",
+        delta: JSON.stringify({
+          action: "review",
+          version: written.version,
+          sha256: written.sha256,
+        }),
+      };
+    } else {
+      const frame = JSON.parse(
+        req.messages.at(-1)!.content,
+      ).memory_confirmation;
+      yield {
+        type: "text",
+        delta: JSON.stringify({
+          action: "confirm",
+          version: frame.version,
+          sha256: frame.sha256,
+          token: frame.token,
+          checks: {
+            source_and_speakers: true,
+            sequence_and_changes: true,
+            uncertainty_and_relationship: true,
+            no_new_conclusions: true,
+            satisfied_with_this_version: true,
+          },
+        }),
+      };
+    }
+    yield {
+      type: "done",
+      usage: { finish_reason: req.round < 2 ? "tool_calls" : "stop" },
+    };
   }
 }
-
-/** Two padded exchanges through fetch wakes: chunk 1 is sealable after. */
 async function twoExchanges(
   state: FakeState,
   obj: TestObject,
   ctx: ReturnType<typeof fakeCtx>,
 ) {
+  state.registerEffect("file.read", () => {
+    throw new Error("memory branch must not reach ordinary files");
+  });
+  state.registerEffect("file.write", () => {
+    throw new Error("memory branch must not reach ordinary files");
+  });
   state.addInput(PERSONA, "pad-1", `first ${PAD}`);
   state.addInput(PERSONA, "pad-2", `second ${PAD}`);
   await obj.fetch(wakeReq());
   await settle(ctx);
-  assert.equal((await state.outbox(PERSONA, 0)).length, 2);
 }
-
-test("fetch drain never starts memory preparation and arms the alarm to start it", async () => {
+test("fetch saves the actual live snapshot; a reconstructed DO runs its private branch on alarm", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const provider = new BranchProvider();
   const ctx = fakeCtx();
-  const obj = new TestObject(ctx as never, fakeEnv as never, state, provider);
-  await twoExchanges(state, obj, ctx);
-  // A second fetch drain seals chunk 1 but must not claim it.
-  await obj.fetch(wakeReq());
-  await settle(ctx);
-  const c = state.memoryChunks[0];
-  assert.ok(c, "chunk 1 sealed");
-  assert.equal(c.status, "sealed");
-  assert.equal(c.interruptions, 0);
-  assert.equal(provider.branchRequests, 0, "no model call from a fetch drain");
-  const armedIn = ctx.alarmAt()! - Date.now();
-  assert.ok(armedIn <= 1_500, `alarm armed soon for preparation: ${armedIn}ms`);
+  await twoExchanges(
+    state,
+    new TestObject(ctx as never, fakeEnv as never, state, provider),
+    ctx,
+  );
+  const b = state.memoryBranches.get(`${PERSONA}|1`);
+  assert.ok(b, "trigger snapshot saved in fetch drain");
+  assert.equal(b.chunk.status, "preparing");
+  assert.equal(provider.branchRequests, 0);
+  const frozen = JSON.stringify(b.snapshot);
+  await fire(
+    ctx,
+    new TestObject(ctx as never, fakeEnv as never, state, provider),
+  );
+  assert.equal(state.memoryChunks[0]!.status, "prepared");
+  assert.equal(provider.branchRequests, 4);
+  assert.equal(JSON.stringify(b.snapshot), frozen);
+  for (const req of provider.requests.filter((r) => r.phase === "memory")) {
+    assert.equal(
+      JSON.stringify(req.messages.slice(0, b.snapshot.messages.length)),
+      JSON.stringify(b.snapshot.messages),
+    );
+    assert.equal(JSON.stringify(req.tools), JSON.stringify(b.snapshot.tools));
+  }
 });
-
-test("memory-only work survives a transfer round trip: the rescue wake re-plans it", async () => {
-  // A chunk waits for preparation; the persona moves away before the alarm
-  // runs, so the object disarms (persona_inactive). Reactivated with no
-  // input or schedule, only the sweep's memory rescue wakes it. That fetch
-  // drain may not prepare, but it plans the alarm that does.
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new BranchProvider();
-  const ctx = fakeCtx();
-  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
-  const obj = new TestObject(ctx as never, env as never, state, provider);
-  await twoExchanges(state, obj, ctx);
-  await obj.fetch(wakeReq()); // seals chunk 1
-  await settle(ctx);
-  assert.equal(state.memoryChunks[0]?.status, "sealed");
-  assert.ok(ctx.alarmAt() !== null, "preparation planned");
-
-  state.setPersonaAuthority(PERSONA, "transferred");
-  await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
-  assert.equal(ctx.alarmAt(), null, "inactive: disarmed");
-  assert.equal(state.memoryChunks[0]?.status, "sealed");
-
-  // Reactivated; the missed activation signal leaves it asleep until the
-  // sweep's rescue wake (an ordinary fetch) arrives.
-  state.setPersonaAuthority(PERSONA, "active");
-  const revived = new TestObject(ctx as never, env as never, state, provider);
-  const r = await revived.fetch(wakeReq());
-  assert.equal(r.status, 200);
-  await settle(ctx);
-  assert.equal(provider.branchRequests, 0, "no model call from a fetch drain");
-  const armedIn = ctx.alarmAt()! - Date.now();
-  assert.ok(armedIn <= 1_500, `rescue planned the preparation: ${armedIn}ms`);
-  await fire(ctx, revived);
-  assert.equal(state.memoryChunks[0]?.status, "prepared");
-  assert.equal(provider.branchRequests, 1);
-});
-
-test("a planned memory wake lost in an outage is recovered by the rescue wake", async () => {
+test("a state outage and lost alarm recover the saved branch without rebuilding its prefix", async () => {
   const state = new FailingAcquireState();
   state.addPersona(PERSONA);
   const provider = new BranchProvider();
   const ctx = fakeCtx();
   const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
-  const obj = new TestObject(ctx as never, env as never, state, provider);
-  await twoExchanges(state, obj, ctx);
-  await obj.fetch(wakeReq());
-  await settle(ctx);
-  assert.ok(ctx.alarmAt() !== null, "preparation planned");
-
-  // State outage: every alarm re-arms the retry — the plan is never dropped.
-  state.failWith = () => new StateError(503, "state service 503");
-  for (let i = 0; i < 3; i++) {
-    await fire(ctx, obj);
-    assert.ok(ctx.alarmAt()! - Date.now() > 50_000, "retry armed");
-  }
-  // Storage fails too: the alarm handler throws (the platform retries it a
-  // bounded number of times, then gives up) and no alarm remains.
-  const { setAlarm } = ctx.storage;
-  ctx.storage.setAlarm = async () => {
-    throw new Error("storage unavailable");
-  };
-  await assert.rejects(fire(ctx, obj));
-  assert.equal(ctx.alarmAt(), null, "the planned wake is gone");
-
-  // Everything resumes. The sweep rescues the overdue chunk with a wake;
-  // the plan it arms prepares the memory.
-  ctx.storage.setAlarm = setAlarm;
-  state.failWith = null;
-  const r = await new TestObject(
-    ctx as never,
-    env as never,
+  await twoExchanges(
     state,
-    provider,
-  ).fetch(wakeReq());
-  assert.equal(r.status, 200);
-  await settle(ctx);
-  assert.ok(ctx.alarmAt()! - Date.now() <= 1_500, "preparation re-planned");
+    new TestObject(ctx as never, env as never, state, provider),
+    ctx,
+  );
+  const frozen = JSON.stringify(
+    state.memoryBranches.get(`${PERSONA}|1`)!.snapshot,
+  );
+  state.failWith = () => new StateError(503, "temporary outage");
   await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
-  assert.equal(state.memoryChunks[0]?.status, "prepared");
+  assert.ok(ctx.alarmAt());
+  state.failWith = null;
+  const resumed = new TestObject(ctx as never, env as never, state, provider);
+  await resumed.fetch(wakeReq());
+  await settle(ctx);
+  assert.equal(provider.branchRequests, 0);
+  await fire(ctx, resumed);
+  assert.equal(state.memoryChunks[0]!.status, "prepared");
+  assert.equal(
+    JSON.stringify(state.memoryBranches.get(`${PERSONA}|1`)!.snapshot),
+    frozen,
+  );
 });
-
-test("alarm drain keeps a branch alive past the turn budget and shelves its result", async () => {
+test("alarm execution holds a reviewed multi-round branch beyond the normal turn budget", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const provider = new BranchProvider();
-  provider.branchDelayMs = 1_500;
+  provider.branchDelayMs = 100;
   const ctx = fakeCtx();
   const env = {
     ...fakeEnv,
-    SUMI_DRAIN_TURN_BUDGET_MS: "300",
-    SUMI_ALARM_DRAIN_LIFETIME_MS: "20000",
-    SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "5000",
+    SUMI_DRAIN_TURN_BUDGET_MS: "100",
+    SUMI_ALARM_DRAIN_LIFETIME_MS: "10000",
   };
-  const obj = new TestObject(ctx as never, env as never, state, provider);
-  await twoExchanges(state, obj, ctx);
-
-  const t0 = performance.now(); // monotonic — the host clock may step
-  await obj.alarm();
-  const took = performance.now() - t0;
-  const c = state.memoryChunks[0]!;
-  assert.equal(c.status, "prepared", JSON.stringify(c));
-  assert.equal(c.attempts, 0);
-  assert.equal(c.interruptions, 0);
-  assert.equal(provider.branchRequests, 1);
-  assert.ok(
-    took >= 1_500,
-    `the alarm held the branch to completion: ${took}ms`,
+  await twoExchanges(
+    state,
+    new TestObject(ctx as never, env as never, state, provider),
+    ctx,
   );
-  assert.equal(
-    state.leases.get(PERSONA)!.expires_at < new Date().toISOString(),
-    true,
-    "lease released after the drain",
-  );
+  await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
+  assert.equal(state.memoryChunks[0]!.status, "prepared");
+  assert.equal(provider.branchRequests, 4);
 });
-
-test("alarm drain records a hanging branch as a retryable timeout and re-arms for the retry", async () => {
+test("interrupted alarm leaves durable progress and later alarm resumes the same source", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const provider = new BranchProvider();
@@ -419,180 +419,29 @@ test("alarm drain records a hanging branch as a retryable timeout and re-arms fo
   const ctx = fakeCtx();
   const env = {
     ...fakeEnv,
-    // One attempt per drain, deterministically: the drain starts a
-    // branch only when timeout+margin still fits the remaining lifetime
-    // (margin = lifetime/10), and a recorded timeout reshelves with a
-    // ~200ms backoff. 2000ms lifetime leaves no room for a second
-    // attempt — after the ~1000ms timeout, startMemory can never hold
-    // again — so attempts===1 is a real guarantee here, not a timing
-    // accident (a 3000ms lifetime legitimately admits a second attempt
-    // at ~1.2s, which is valid product behavior, not a defect).
-    SUMI_ALARM_DRAIN_LIFETIME_MS: "2000",
     SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "1000",
+    SUMI_ALARM_DRAIN_LIFETIME_MS: "2000",
   };
-  const obj = new TestObject(ctx as never, env as never, state, provider);
-  await twoExchanges(state, obj, ctx);
-
-  await obj.alarm();
-  const c = state.memoryChunks[0]!;
-  assert.equal(c.status, "sealed", JSON.stringify(c));
-  assert.equal(c.attempts, 1, "a timeout is a recorded failure");
-  assert.equal(c.interruptions, 0);
-  assert.match(c.last_error ?? "", /did not finish within 1000ms/);
-  const armedIn = ctx.alarmAt()! - Date.now();
-  assert.ok(
-    armedIn > 0 && armedIn <= 1_500,
-    `re-armed for the retry, not the 30s heartbeat: ${armedIn}ms`,
+  await twoExchanges(
+    state,
+    new TestObject(ctx as never, env as never, state, provider),
+    ctx,
   );
-
-  // The retry the alarm was armed for: once the reshelve backoff has
-  // passed and the provider stops hanging, the next alarm claims the
-  // same chunk and completes it — attempts stays at the one recorded
-  // failure (success does not spend attempts).
+  await fire(ctx, new TestObject(ctx as never, env as never, state, provider));
+  assert.ok(state.memoryBranches.get(`${PERSONA}|1`)!.state!.in_flight);
   provider.branchHangs = false;
-  await sleep(1_400); // past not_before (~timeout + 200ms backoff)
-  await obj.alarm();
-  const retried = state.memoryChunks[0]!;
-  assert.equal(retried.status, "prepared", JSON.stringify(retried));
-  assert.equal(retried.attempts, 1);
-  assert.equal(retried.interruptions, 0);
-  assert.equal(provider.branchRequests, 2, "the retry ran exactly once");
+  await fire(
+    ctx,
+    new TestObject(
+      ctx as never,
+      { ...fakeEnv, SUMI_MEMORY_PREPARATION_TIMEOUT_MS: "5000" } as never,
+      state,
+      provider,
+    ),
+  );
+  assert.equal(state.memoryChunks[0]!.status, "prepared");
 });
 
-/**
- * An unbound selection with pending memory must not keep the DO on the 1s
- * memory-wake floor: the branch pauses and the alarm rests on the shelf
- * cadence until a usable binding exists, then the same chunk proceeds.
- */
-test("unbound binding shelves memory work; a repaired binding resumes it", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  let bindingLookups = 0;
-  const realBinding = state.modelBinding.bind(state);
-  state.modelBinding = (p) => {
-    bindingLookups++;
-    return realBinding(p);
-  };
-  const provider = new SelectedModelProvider({
-    state,
-    persona: PERSONA,
-    fallback: new MockProvider(),
-    timeoutMs: 5_000,
-  });
-  const ctx = fakeCtx();
-  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
-  const obj = new TestObject(ctx as never, env as never, state, provider, {
-    memoryUnavailablePauseMs: 2_000,
-  });
-
-  // Bound while the exchanges land and the chunk seals.
-  await twoExchanges(state, obj, ctx);
-  await obj.fetch(wakeReq());
-  await settle(ctx);
-  const c = state.memoryChunks[0]!;
-  assert.equal(c.status, "sealed");
-
-  // Now the destination-window state: the selection cannot produce a call.
-  state.setModelBinding(PERSONA, {
-    selection: "needs_rebinding",
-    intent: { kind: "api", model: "m" },
-    reason: "carried model intent needs a destination selection",
-  } as never);
-
-  const probesBefore = bindingLookups;
-  const alarmStart = Date.now();
-  await obj.alarm();
-  assert.equal(bindingLookups, probesBefore + 1, "one probe, not a claim");
-  const after = state.memoryChunks[0]!;
-  assert.equal(after.status, "sealed", "the pause records no verdict");
-  assert.equal(after.attempts, 0);
-  assert.equal(after.interruptions, 0);
-  // Measured from before the drain: the alarm fired at start+shelf, not
-  // the 1s memory-wake floor.
-  const armedIn = ctx.alarmAt()! - alarmStart;
-  assert.ok(
-    armedIn > 1_500,
-    `unbound memory re-arms on the shelf cadence, not the 1s floor: ${armedIn}ms`,
-  );
-
-  // A second alarm inside the shelf runs an ordinary drain — no probe,
-  // no claim — and ordinary work still wakes promptly.
-  await obj.alarm();
-  assert.equal(bindingLookups, probesBefore + 1, "shelved: no re-probe");
-  assert.equal(state.memoryChunks[0]!.status, "sealed");
-  state.addInput(PERSONA, "in-while-paused", "hello while unbound");
-  await obj.fetch(wakeReq());
-  await settle(ctx);
-  assert.notEqual(
-    state.inputs.find((i) => i.input_id === "in-while-paused")!.status,
-    "queued",
-    "the drain still processed the input (its own binding verdict is separate)",
-  );
-
-  // The human binds a usable selection; once the shelf expires the next
-  // ordinary wake re-probes and the same chunk prepares.
-  state.setModelBinding(PERSONA, { selection: "unset" });
-  await sleep(2_100); // past the shelf — monotonic in-process deadline
-  await obj.alarm();
-  await settle(ctx);
-  const done = state.memoryChunks[0]!;
-  assert.ok(
-    done.status === "prepared" || done.status === "kept",
-    `the same chunk was worked, not burned: ${JSON.stringify(done)}`,
-  );
-  assert.equal(done.attempts, 0, "the pause never spent an attempt");
-  assert.equal(done.interruptions, 0);
-});
-
-/**
- * A binding that dies between the preflight probe and the call resolves
- * the same `unavailable` error at stream time: the claimed chunk is
- * reshelved with its budgets intact and the wake rests on the shelf —
- * not paced to the reshelve's 200ms.
- */
-test("binding dying mid-call reshelves and shelves the wake", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const realBinding = state.modelBinding.bind(state);
-  let lookups = 0;
-  const provider = new SelectedModelProvider({
-    state,
-    persona: PERSONA,
-    fallback: new MockProvider(),
-    timeoutMs: 5_000,
-  });
-  const ctx = fakeCtx();
-  const env = { ...fakeEnv, SUMI_HEARTBEAT_MS: "60000" };
-  const obj = new TestObject(ctx as never, env as never, state, provider, {
-    memoryUnavailablePauseMs: 2_000,
-  });
-  await twoExchanges(state, obj, ctx);
-  await obj.fetch(wakeReq());
-  await settle(ctx);
-  assert.equal(state.memoryChunks[0]!.status, "sealed");
-
-  // Arm the dying binding only now: the probe sees it usable, the stream's
-  // own resolve then gets the outage — the call-time race.
-  state.modelBinding = (p) => {
-    lookups++;
-    if (lookups === 1) return realBinding(p);
-    return Promise.reject(new StateError(503, "state service restarting"));
-  };
-  const alarmStart = Date.now();
-  await obj.alarm();
-  const c = state.memoryChunks[0]!;
-  assert.equal(c.status, "sealed", "reshelved, not failed");
-  assert.equal(c.attempts, 0, "the mid-call outage spent no attempt");
-  assert.equal(c.interruptions, 0);
-  assert.match(c.last_error ?? "", /selection lookup failed/);
-  const armedIn = ctx.alarmAt()! - alarmStart;
-  assert.ok(
-    armedIn > 1_500,
-    `reshelve's short pacing does not re-arm the alarm: ${armedIn}ms`,
-  );
-});
-
-/** The DO-storage routing key (workerd.ts PERSONA_KEY). */
 const PERSONA_KEY_FOR_TEST = "sumi/persona_id";
 
 /** Counts storage writes and can fail the next get/put once. */
@@ -993,5 +842,34 @@ test("PersonaNotFoundError is what the fake raises for an unknown persona", asyn
   await assert.rejects(
     state.acquireWriter(PERSONA, "h", 1_000),
     PersonaNotFoundError,
+  );
+});
+
+test("a branch paused without a retry deadline does not keep an idle alarm alive", {
+  timeout: 3000,
+}, async () => {
+  const state = new FakeState();
+  state.addPersona(PERSONA);
+  state.listTools = async () => ["journal.note"];
+  const provider = new BranchProvider();
+  const ctx = fakeCtx();
+  await twoExchanges(
+    state,
+    new TestObject(ctx as never, fakeEnv as never, state, provider),
+    ctx,
+  );
+  await fire(
+    ctx,
+    new TestObject(ctx as never, fakeEnv as never, state, provider),
+  );
+  assert.equal(provider.branchRequests, 0);
+  assert.equal(
+    state.memoryBranches.get(`${PERSONA}|1`)!.state!.pause_reason,
+    "private_tools_missing",
+  );
+  assert.equal(ctx.alarmAt(), null);
+  assert.equal(
+    state.inputs.filter((i) => i.kind === "memory_status").length,
+    1,
   );
 });

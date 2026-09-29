@@ -14,12 +14,11 @@
 // corrections and new experiences that arrived during preparation — are
 // outside the sealed range and are never touched by application.
 //
-// Thresholds follow docs/agent/memory-preparation-and-replacement-2026-09-08:
+// Current preparation thresholds:
 // seal at >=10k estimated tokens, replace when live raw exceeds 40k. The
 // estimate is an internal capacity heuristic, not provider billing.
 //
-// Upper layers share the same pipeline (docs/agent/memory.md steps 4–5,
-// memory-boundaries-2026-09-08). When applied L1 replacements exceed
+// Upper layers share the same pipeline. When applied L1 replacements exceed
 // L1LimitTokens, the writer creates a sealed layer-2 target over the oldest
 // contiguous applied L1 fragments; a branch replaces their combined text
 // with one smaller L2 fragment, and the sources become 'superseded' — the
@@ -36,7 +35,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -58,24 +56,8 @@ const (
 	// L0LiveLimitTokens: prepared replacements apply only while the live raw
 	// estimate (unapplied chunks + unsealed tail) exceeds this.
 	L0LiveLimitTokens int64 = 40_000
-	// L0SendCapTokens bounds the raw records rendered into one sent context.
-	// Raw records stay in the context by capacity, not by record count: with
-	// nothing prepared, originals keep rendering past L0LiveLimitTokens (the
-	// conversation never waits for preparation), and only beyond this cap do
-	// the oldest raw records leave the sent context — reported as an omitted
-	// range, never deleted or summarized. The headroom over the live limit
-	// absorbs preparation lag; with applied blocks and the system prompt it
-	// keeps a normal context near the ~80k design target.
-	L0SendCapTokens int64 = 60_000
-	// MemorySendCapTokens bounds the applied replacement text admitted into
-	// one sent context: the design's L1 (15k) + L2 (10k) allotment, held by
-	// L1 alone until L1→L2 consolidation exists. The newest applied blocks
-	// are admitted; older ones beyond the cap are reported as an omitted
-	// memory range — stored, not summarized, originals readable — instead
-	// of silently growing (or one huge replacement poisoning) every turn.
-	MemorySendCapTokens int64 = 25_000
 	// L1LimitTokens: applied L1 replacement text beyond this triggers an
-	// L1→L2 consolidation target (docs/agent/memory.md: L1 holds ~15k).
+	// L1→L2 consolidation target.
 	L1LimitTokens int64 = 15_000
 	// L1DropToTokens: one L1→L2 target consumes the oldest contiguous
 	// applied L1 fragments until at most this much applied L1 remains
@@ -84,27 +66,6 @@ const (
 	// L2LimitTokens: applied L2 beyond this triggers L2-internal
 	// reintegration over the whole contiguous applied L2 run.
 	L2LimitTokens int64 = 10_000
-	// contextMaxEvents is a defensive row bound on the rendered raw window;
-	// the token cap is the normal bound.
-	contextMaxEvents = 5_000
-	// memoryChunkMaxAttempts bounds recorded preparation failures per chunk
-	// (provider errors, incomplete or truncated output, timeouts). A chunk
-	// that exhausts them becomes 'failed' — visible in status, its originals
-	// still live — rather than silently skipped or retried forever.
-	memoryChunkMaxAttempts = 3
-	// memoryChunkMaxInterruptions bounds claims that ended with no recorded
-	// outcome (host stopped or evicted, writer fenced, claim response lost).
-	// Interruptions are not failures of the preparation itself, so they do
-	// not spend attempts; they are paced by backoff and bounded separately
-	// so a host that dies on every claim cannot loop model calls forever.
-	memoryChunkMaxInterruptions = 8
-	// memoryReshelvePacing delays a chunk returned to the shelf because the
-	// model layer could not produce a request — an unusable binding or a
-	// budget-denied admission. The claim reached no model, so nothing is
-	// counted; the delay keeps a persistent block from spinning the
-	// claim/reshelve pair inside one host tick. Callers pass a longer pace
-	// for a budget wait, which clears on the next funding change.
-	memoryReshelvePacing = 200 * time.Millisecond
 )
 
 // ErrMemoryConflict marks a memory-state contract violation (HTTP 409).
@@ -213,6 +174,7 @@ type OmittedMemory struct {
 // MemoryStatus reports the memory layer's current shape for observability
 // and for the writer's preparation scheduling.
 type MemoryStatus struct {
+	Branches []MemoryBranchStatus `json:"branches"`
 	// LiveRawTokens estimates the raw records still in the sent context:
 	// unapplied chunks (sealed through failed/kept) plus the unsealed tail.
 	LiveRawTokens int64 `json:"live_raw_tokens"`
@@ -241,21 +203,6 @@ type MemoryStatus struct {
 	ChunkMinTokens      int64 `json:"chunk_min_tokens"`
 	LiveLimitTokens     int64 `json:"live_limit_tokens"`
 	MemorySendCapTokens int64 `json:"memory_send_cap_tokens"`
-}
-
-// ClaimedMemoryChunk is a chunk plus everything the preparation branch needs:
-// the covered events verbatim (layer-1 target) or the selected source
-// fragments verbatim (upper-layer target), and the rendered parent context
-// at claim time.
-type ClaimedMemoryChunk struct {
-	Chunk *MemoryChunk `json:"chunk"`
-	// TargetEvents is the sealed journal range's stored events — set for a
-	// layer-1 target, empty for an upper-layer one.
-	TargetEvents []Event `json:"target_events"`
-	// TargetFragments is the selected source fragments' accepted texts with
-	// their locators — set for an upper-layer target, empty for layer 1.
-	TargetFragments []MemoryBlock   `json:"target_fragments"`
-	Context         RenderedContext `json:"context"`
 }
 
 var chunkCols = `persona_id, chunk_seq, layer, sources, first_seq, last_seq, est_tokens,
@@ -313,89 +260,37 @@ func (s *Store) eventsInRange(ctx context.Context, db interface {
 	return out, rows.Err()
 }
 
-// renderedContext returns the journal as the model sees it: the newest raw
-// events not covered by an applied chunk (or by a superseded source — its
-// records are represented by the applied upper-layer block that consumed
-// it), up to L0SendCapTokens (and the caller's row bound), plus the newest
-// applied blocks up to MemorySendCapTokens. Applied blocks are admitted
-// regardless of the raw window — compacted memory stays in the context
-// even when its original range is older than the raw window. The newest
-// record is always included, even alone over the cap.
-//
-// excludeInputID names the input a turn is about to present itself: records
-// its earlier attempts already journaled mid-turn (its input_received and a
-// journal.note effect) are re-presented by the turn and its recorded plan,
-// so they are left out here instead of appearing twice. Empty excludes none.
-func (s *Store) renderedContext(ctx context.Context, db contextQuerier, personaID string, limit int, excludeInputID string) (RenderedContext, error) {
+// renderedContext returns every unrepresented event and every applied block.
+// Only an explicitly confirmed and applied replacement can remove an original
+// from this view. Row/token budgets do not silently discard kept/failed work.
+func (s *Store) renderedContext(ctx context.Context, db contextQuerier, personaID string, _ int, excludeInputID string) (RenderedContext, error) {
 	var rc RenderedContext
-	limit = clampLimit(limit, contextMaxEvents, contextMaxEvents)
 	rows, err := db.Query(ctx, `
-		SELECT persona_id, seq, turn_id, kind, payload, created_at
-		FROM core_events e
-		WHERE e.persona_id = $1
-			AND NOT EXISTS (
-				SELECT 1 FROM core_memory_chunks c
-				WHERE c.persona_id = e.persona_id AND c.status IN ('applied','superseded')
-					AND e.seq BETWEEN c.first_seq AND c.last_seq)
-			AND NOT EXISTS (
-				SELECT 1 FROM core_turns t
-				WHERE t.persona_id = e.persona_id AND t.turn_id = e.turn_id
-					AND t.input_id = $3)
-		ORDER BY seq DESC LIMIT $2`, personaID, limit+1, excludeInputID)
+ SELECT persona_id,seq,turn_id,kind,payload,created_at FROM core_events e
+ WHERE e.persona_id=$1 AND NOT EXISTS (
+  SELECT 1 FROM core_memory_chunks c WHERE c.persona_id=e.persona_id
+   AND c.status IN ('applied','superseded') AND e.seq BETWEEN c.first_seq AND c.last_seq)
+ AND NOT EXISTS (SELECT 1 FROM core_turns t WHERE t.persona_id=e.persona_id
+  AND t.turn_id=e.turn_id AND t.input_id=$2)
+ ORDER BY seq`, personaID, excludeInputID)
 	if err != nil {
 		return rc, err
 	}
-	var newestFirst []Event
-	var budget int64
-	truncated := false
+	rc.Events = []Event{}
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
+		if err = rows.Scan(&e.PersonaID, &e.Seq, &e.TurnID, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
 			rows.Close()
 			return rc, err
 		}
-		est := estPayloadTokens(e.Kind, e.Payload)
-		if len(newestFirst) >= limit || (len(newestFirst) > 0 && budget+est > L0SendCapTokens) {
-			truncated = true
-			break
-		}
-		budget += est
-		newestFirst = append(newestFirst, e)
+		rc.Events = append(rc.Events, e)
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil {
+	if err = rows.Err(); err != nil {
 		return rc, err
 	}
-	rc.Events = make([]Event, len(newestFirst))
-	for i, e := range newestFirst {
-		rc.Events[len(newestFirst)-1-i] = e
-	}
-	if truncated && len(rc.Events) > 0 {
-		var om OmittedRange
-		if err := db.QueryRow(ctx, `
-			SELECT COUNT(*), MIN(seq), MAX(seq), MIN(created_at), MAX(created_at)
-			FROM core_events e
-			WHERE e.persona_id = $1 AND e.seq < $2
-				AND NOT EXISTS (
-					SELECT 1 FROM core_memory_chunks c
-					WHERE c.persona_id = e.persona_id AND c.status IN ('applied','superseded')
-						AND e.seq BETWEEN c.first_seq AND c.last_seq)
-				AND NOT EXISTS (
-					SELECT 1 FROM core_turns t
-					WHERE t.persona_id = e.persona_id AND t.turn_id = e.turn_id
-						AND t.input_id = $3)`,
-			personaID, rc.Events[0].Seq, excludeInputID).Scan(&om.Count, &om.FirstSeq, &om.LastSeq,
-			&om.FirstTime, &om.LastTime); err != nil {
-			return rc, err
-		}
-		rc.Omitted = &om
-	}
-	blocks, err := s.appliedBlocks(ctx, db, personaID)
-	if err != nil {
-		return rc, err
-	}
-	rc.Memory, rc.MemoryOmitted = admitApplied(blocks)
-	return rc, nil
+	rc.Memory, err = s.appliedBlocks(ctx, db, personaID)
+	return rc, err
 }
 
 // appliedBlocks returns every applied chunk in journal position order —
@@ -429,70 +324,6 @@ func (s *Store) appliedBlocks(ctx context.Context, db interface {
 	return out, rows.Err()
 }
 
-// admitApplied admits the newest applied blocks whose estimates fit
-// MemorySendCapTokens, stopping at the first block that does not fit; that
-// block and every older one form the omitted memory range. The cut is
-// contiguous, so the notice names one journal range, and nothing is dropped
-// silently or summarized in its place.
-func admitApplied(blocks []MemoryBlock) ([]MemoryBlock, *OmittedMemory) {
-	var used int64
-	cut := len(blocks)
-	for i := len(blocks) - 1; i >= 0; i-- {
-		if used+blocks[i].EstTokens > MemorySendCapTokens {
-			break
-		}
-		used += blocks[i].EstTokens
-		cut = i
-	}
-	if cut == 0 {
-		return blocks, nil
-	}
-	older := blocks[:cut]
-	first, last := older[0], older[len(older)-1]
-	om := &OmittedMemory{
-		Count:         len(older),
-		FirstChunkSeq: first.ChunkSeq,
-		LastChunkSeq:  last.ChunkSeq,
-		FirstSeq:      first.FirstSeq,
-		LastSeq:       last.LastSeq,
-		FirstTime:     first.FirstTime,
-		LastTime:      last.LastTime,
-	}
-	for _, b := range older {
-		om.EstTokens += b.EstTokens
-	}
-	return blocks[cut:], om
-}
-
-// interruptPreparing returns 'preparing' chunks whose claim ended without a
-// recorded outcome to the shelf. The originals never left the context while
-// preparation ran, so nothing is lost; the interruption is counted apart
-// from attempts and paced by backoff (200ms doubling, capped at 30s). Once
-// memoryChunkMaxInterruptions is reached the chunk becomes 'failed' —
-// visible, originals kept. exceptGeneration, when set, leaves that
-// generation's claims alone (the live writer's own branch).
-func interruptPreparing(ctx context.Context, tx pgx.Tx, personaID string, exceptGeneration *int64) error {
-	args := []any{personaID, memoryChunkMaxInterruptions,
-		fmt.Sprintf("preparation was interrupted %d times without a recorded outcome", memoryChunkMaxInterruptions)}
-	scope := ""
-	if exceptGeneration != nil {
-		scope = " AND claimed_generation <> $4"
-		args = append(args, *exceptGeneration)
-	}
-	_, err := tx.Exec(ctx, `
-		UPDATE core_memory_chunks SET
-			interruptions = interruptions + 1,
-			claimed_generation = NULL,
-			claimed_at = NULL,
-			status = CASE WHEN interruptions + 1 >= $2 THEN 'failed' ELSE 'sealed' END,
-			not_before = CASE WHEN interruptions + 1 >= $2 THEN NULL
-				ELSE now() + LEAST(200 * power(2, LEAST(interruptions, 8)), 30000) * interval '1 millisecond' END,
-			last_error = CASE WHEN interruptions + 1 >= $2
-				THEN concat_ws('; ', last_error, $3::text) ELSE last_error END
-		WHERE persona_id = $1 AND status = 'preparing'`+scope, args...)
-	return err
-}
-
 // MemoryMaintain is the writer's memory housekeeping step: seal newly safe
 // journal ranges, then apply prepared replacements while the live raw
 // estimate exceeds the limit. It runs between turns under the writer
@@ -505,12 +336,6 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return st, err
-	}
-
-	// A 'preparing' chunk claimed by a fenced generation belonged to a dead
-	// writer — return it to the shelf so the live generation can reprepare.
-	if err := interruptPreparing(ctx, tx, personaID, &generation); err != nil {
 		return st, err
 	}
 
@@ -939,7 +764,7 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 	st := MemoryStatus{
 		ChunkMinTokens:      L0ChunkMinTokens,
 		LiveLimitTokens:     L0LiveLimitTokens,
-		MemorySendCapTokens: MemorySendCapTokens,
+		MemorySendCapTokens: 0,
 	}
 	err := s.pool.QueryRow(ctx, `
 		SELECT
@@ -953,10 +778,8 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			COUNT(*) FILTER (WHERE status = 'kept'),
 			COUNT(*) FILTER (WHERE status = 'failed'),
 			COUNT(*) FILTER (WHERE status = 'superseded'),
-			COUNT(*) FILTER (WHERE status = 'preparing'
-				OR (status = 'sealed' AND (not_before IS NULL OR not_before <= statement_timestamp()))),
-			MIN(CASE WHEN status = 'preparing' THEN statement_timestamp()
-				WHEN status = 'sealed' THEN GREATEST(COALESCE(not_before, statement_timestamp()), statement_timestamp()) END),
+			COUNT(*) FILTER (WHERE (status = 'preparing' AND EXISTS(SELECT 1 FROM core_memory_branches b WHERE b.persona_id=core_memory_chunks.persona_id AND b.chunk_seq=core_memory_chunks.chunk_seq AND (b.status='running' OR b.retry_at<=statement_timestamp())))),
+			MIN(CASE WHEN status = 'preparing' THEN (SELECT CASE WHEN b.status='running' THEN statement_timestamp() ELSE b.retry_at END FROM core_memory_branches b WHERE b.persona_id=core_memory_chunks.persona_id AND b.chunk_seq=core_memory_chunks.chunk_seq) END),
 			COALESCE(MAX(last_seq), 0)
 		FROM core_memory_chunks WHERE persona_id = $1`, personaID).
 		Scan(&st.LiveRawTokens, &st.AppliedTokens, &st.Sealed, &st.Preparing,
@@ -964,30 +787,6 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 			&st.Claimable, &st.NextClaimableAt, &st.CoveredSeq)
 	if err != nil {
 		return st, err
-	}
-	if st.Applied > 0 {
-		rows, err := s.pool.Query(ctx, `
-			SELECT COALESCE(replacement_est_tokens, 0) FROM core_memory_chunks
-			WHERE persona_id = $1 AND status = 'applied' ORDER BY first_seq`, personaID)
-		if err != nil {
-			return st, err
-		}
-		var blocks []MemoryBlock
-		for rows.Next() {
-			var b MemoryBlock
-			if err := rows.Scan(&b.EstTokens); err != nil {
-				rows.Close()
-				return st, err
-			}
-			blocks = append(blocks, b)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return st, err
-		}
-		if _, om := admitApplied(blocks); om != nil {
-			st.AppliedOmitted = om.Count
-		}
 	}
 	var tail int64
 	if err := s.pool.QueryRow(ctx, `
@@ -1015,299 +814,19 @@ func (s *Store) MemoryStatus(ctx context.Context, personaID string) (MemoryStatu
 		return st, err
 	}
 	st.LiveRawTokens += tail
-	return st, nil
-}
-
-// ClaimMemoryChunk claims the oldest sealable chunk for preparation — one
-// branch at a time. The returned context is the rendered parent context at
-// claim time (the same view a turn would see), so the branch inherits the
-// parent's context rather than a target-only summary input. A claim spends
-// nothing: attempts count recorded failures only.
-func (s *Store) ClaimMemoryChunk(ctx context.Context, personaID string, generation int64, contextLimit int) (*ClaimedMemoryChunk, error) {
-	tx, err := s.pool.Begin(ctx)
+	rows, err = s.pool.Query(ctx, `SELECT b.chunk_seq,b.status,b.revision,b.retry_at,b.issue,b.state::jsonb->>'pause_reason' FROM core_memory_branches b JOIN core_memory_chunks c USING(persona_id,chunk_seq) WHERE b.persona_id=$1 AND c.status='preparing' ORDER BY b.chunk_seq`, personaID)
 	if err != nil {
-		return nil, err
+		return st, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return nil, err
-	}
-	// The caller holds the live generation and claims only while it runs no
-	// branch of its own, so any 'preparing' row is orphaned: a dead
-	// generation's claim, a lost claim response, or a branch stopped before
-	// it recorded an outcome. It is counted as an interruption and paced —
-	// never as a failed attempt. This is convergence, not serialization:
-	// the scan and the claim are separate statements, so concurrent
-	// same-generation callers can both see an empty shelf and both claim —
-	// transiently two 'preparing' rows, never the same target. The pacing
-	// and generation fencing, not single-flight, are what the lifecycle
-	// relies on.
-	if err := interruptPreparing(ctx, tx, personaID, nil); err != nil {
-		return nil, err
-	}
-	c, err := scanChunk(tx.QueryRow(ctx, `
-		UPDATE core_memory_chunks
-		SET status = 'preparing', claimed_generation = $2, claimed_at = now(), not_before = NULL
-		WHERE (persona_id, chunk_seq) = (
-			SELECT persona_id, chunk_seq FROM core_memory_chunks
-			WHERE persona_id = $1 AND status = 'sealed'
-				AND (not_before IS NULL OR not_before <= statement_timestamp())
-			ORDER BY chunk_seq LIMIT 1 FOR UPDATE)
-		RETURNING `+chunkCols, personaID, generation))
-	if errors.Is(err, ErrChunkNotFound) {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, err
+	st.Branches = []MemoryBranchStatus{}
+	for rows.Next() {
+		var b MemoryBranchStatus
+		if err = rows.Scan(&b.ChunkSeq, &b.Status, &b.Revision, &b.RetryAt, &b.Issue, &b.PauseReason); err != nil {
+			rows.Close()
+			return st, err
 		}
-		return &ClaimedMemoryChunk{}, nil
+		st.Branches = append(st.Branches, b)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("claim memory chunk: %w", dataErr(err))
-	}
-	claimed := &ClaimedMemoryChunk{Chunk: &c}
-	if c.Layer >= 2 {
-		// An upper-layer target's input is its selected sources' accepted
-		// texts with their locators — not raw events. The sources must all
-		// still be applied: a stale target — a crafted or carried row, or a
-		// target whose sources a different applied target consumed while it
-		// waited — is marked failed without spending attempts rather than
-		// prepared from a different source set.
-		frows, err := tx.Query(ctx, `
-			SELECT s.chunk_seq, s.layer, s.first_seq, s.last_seq,
-				f.created_at, l.created_at, s.replacement, s.replacement_est_tokens, s.status
-			FROM core_memory_chunks s
-			JOIN core_events f ON f.persona_id = s.persona_id AND f.seq = s.first_seq
-			JOIN core_events l ON l.persona_id = s.persona_id AND l.seq = s.last_seq
-			WHERE s.persona_id = $1 AND s.chunk_seq = ANY($2)
-			ORDER BY s.first_seq`, personaID, c.Sources)
-		if err != nil {
-			return nil, err
-		}
-		stale := false
-		var frags []MemoryBlock
-		for frows.Next() {
-			var b MemoryBlock
-			var status string
-			if err := frows.Scan(&b.ChunkSeq, &b.Layer, &b.FirstSeq, &b.LastSeq,
-				&b.FirstTime, &b.LastTime, &b.Text, &b.EstTokens, &status); err != nil {
-				frows.Close()
-				return nil, err
-			}
-			if status != "applied" {
-				stale = true
-			}
-			frags = append(frags, b)
-		}
-		frows.Close()
-		if err := frows.Err(); err != nil {
-			return nil, err
-		}
-		if stale || len(frags) != len(c.Sources) {
-			if _, err := tx.Exec(ctx, `
-				UPDATE core_memory_chunks SET status = 'failed', claimed_generation = NULL,
-					claimed_at = NULL,
-					last_error = 'upper-layer target is stale: its selected sources are no longer applied'
-				WHERE persona_id = $1 AND chunk_seq = $2`,
-				personaID, c.ChunkSeq); err != nil {
-				return nil, err
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return nil, err
-			}
-			return &ClaimedMemoryChunk{}, nil
-		}
-		claimed.TargetFragments = frags
-	} else {
-		events, err := s.eventsInRange(ctx, tx, personaID, c.FirstSeq, c.LastSeq)
-		if err != nil {
-			return nil, err
-		}
-		claimed.TargetEvents = events
-	}
-	rc, err := s.renderedContext(ctx, tx, personaID, contextLimit, "")
-	if err != nil {
-		return nil, err
-	}
-	claimed.Context = rc
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return claimed, nil
-}
-
-// CompleteMemoryChunk shelves the finished replacement candidate. The result
-// is stored and waits — completion alone never inserts it into the sent
-// context or removes the originals. keep_unchanged is the model's
-// KEEP_UNCHANGED decision: the originals are kept and the chunk is never
-// reprepared. A replacement that does not shrink the range is kept the same
-// way (design: KEEP_UNCHANGED, a non-shrinking result, or failure keep the
-// originals), with the text stored for inspection. A replayed identical
-// complete returns the stored row.
-func (s *Store) CompleteMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, replacement string, keepUnchanged bool) (*MemoryChunk, error) {
-	if keepUnchanged == (replacement != "") {
-		return nil, fmt.Errorf("%w: exactly one of replacement text or keep_unchanged is required", ErrBadRequest)
-	}
-	if hasNUL(replacement) {
-		return nil, fmt.Errorf("%w: replacement contains a NUL byte the store cannot hold", ErrBadRequest)
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return nil, err
-	}
-	c, err := scanChunk(tx.QueryRow(ctx,
-		`SELECT `+chunkCols+` FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2 FOR UPDATE`,
-		personaID, chunkSeq))
-	if err != nil {
-		return nil, err
-	}
-	switch {
-	case c.Status == "preparing":
-		if c.ClaimedGeneration == nil || *c.ClaimedGeneration != generation {
-			return nil, ErrGenerationFence
-		}
-		rest := estTextTokens(replacement)
-		switch {
-		case keepUnchanged:
-			err = tx.QueryRow(ctx, `
-				UPDATE core_memory_chunks SET status = 'kept', claimed_generation = NULL,
-					claimed_at = NULL, prepared_at = now()
-				WHERE persona_id = $1 AND chunk_seq = $2 RETURNING chunk_seq`,
-				personaID, chunkSeq).Scan(&c.ChunkSeq)
-		case rest >= c.EstTokens:
-			err = tx.QueryRow(ctx, `
-				UPDATE core_memory_chunks SET status = 'kept', replacement = $3,
-					replacement_est_tokens = $4, claimed_generation = NULL, claimed_at = NULL,
-					prepared_at = now(), last_error = $5
-				WHERE persona_id = $1 AND chunk_seq = $2 RETURNING chunk_seq`,
-				personaID, chunkSeq, replacement, rest,
-				fmt.Sprintf("replacement did not shrink the range (%d >= %d estimated tokens); originals kept", rest, c.EstTokens)).
-				Scan(&c.ChunkSeq)
-		default:
-			err = tx.QueryRow(ctx, `
-				UPDATE core_memory_chunks SET status = 'prepared', replacement = $3,
-					replacement_est_tokens = $4, claimed_generation = NULL, claimed_at = NULL,
-					prepared_at = now()
-				WHERE persona_id = $1 AND chunk_seq = $2 RETURNING chunk_seq`,
-				personaID, chunkSeq, replacement, rest).Scan(&c.ChunkSeq)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("complete memory chunk: %w", dataErr(err))
-		}
-	case c.Status == "prepared", c.Status == "kept", c.Status == "applied":
-		// Lost-response replay: identical content returns the stored row; a
-		// different answer for an already-resolved chunk conflicts. A kept
-		// chunk that stored a non-shrinking replacement replays that text.
-		same := (keepUnchanged && c.Status == "kept" && c.Replacement == nil) ||
-			(!keepUnchanged && c.Replacement != nil && *c.Replacement == replacement)
-		if !same {
-			return nil, fmt.Errorf("%w: chunk %d already completed with different content", ErrMemoryConflict, chunkSeq)
-		}
-	default:
-		return nil, fmt.Errorf("%w: chunk %d is %s, not preparing", ErrMemoryConflict, chunkSeq, c.Status)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return s.chunk(ctx, s.pool, personaID, chunkSeq)
-}
-
-// FailMemoryChunk records a failed preparation attempt — the only thing that
-// spends attempts. A retryable failure returns the chunk to 'sealed' with a
-// backoff while attempts remain; a non-retryable failure or an exhausted
-// budget marks it 'failed' — visible, originals kept — rather than silently
-// skipped.
-func (s *Store) FailMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, errText string, retryable bool) (*MemoryChunk, error) {
-	errText = strings.ReplaceAll(errText, "\x00", "")
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return nil, err
-	}
-	c, err := scanChunk(tx.QueryRow(ctx,
-		`SELECT `+chunkCols+` FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2 FOR UPDATE`,
-		personaID, chunkSeq))
-	if err != nil {
-		return nil, err
-	}
-	if c.Status != "preparing" || c.ClaimedGeneration == nil || *c.ClaimedGeneration != generation {
-		return nil, fmt.Errorf("%w: chunk %d is not preparing under this generation", ErrMemoryConflict, chunkSeq)
-	}
-	attempts := c.Attempts + 1
-	if retryable && attempts < memoryChunkMaxAttempts {
-		delay := retryBackoff(attempts)
-		if _, err := tx.Exec(ctx, `
-			UPDATE core_memory_chunks SET status = 'sealed', attempts = $5,
-				claimed_generation = NULL, claimed_at = NULL,
-				last_error = $3, not_before = now() + $4 * interval '1 millisecond'
-			WHERE persona_id = $1 AND chunk_seq = $2`,
-			personaID, chunkSeq, errText, delay.Milliseconds(), attempts); err != nil {
-			return nil, err
-		}
-	} else {
-		if _, err := tx.Exec(ctx, `
-			UPDATE core_memory_chunks SET status = 'failed', attempts = $4,
-				claimed_generation = NULL, claimed_at = NULL,
-				last_error = $3, not_before = NULL
-			WHERE persona_id = $1 AND chunk_seq = $2`,
-			personaID, chunkSeq, errText, attempts); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return s.chunk(ctx, s.pool, personaID, chunkSeq)
-}
-
-// ReshelveMemoryChunk returns a claimed chunk to the shelf when no model
-// request could be evaluated — an unbound or deleted selection, a missing
-// credential, a binding-lookup outage, or a budget-denied admission. No
-// verdict was evaluated, so the claim spends neither an attempt nor an
-// interruption; the reason is kept on last_error for visibility. delayMs
-// paces the next claim beyond the default tick — a budget wait uses a
-// slower cadence because only a funding change can unblock it.
-func (s *Store) ReshelveMemoryChunk(ctx context.Context, personaID string, generation int64, chunkSeq int64, reason string, delayMs int64) (*MemoryChunk, error) {
-	reason = strings.ReplaceAll(reason, "\x00", "")
-	delay := time.Duration(delayMs) * time.Millisecond
-	if delay <= 0 {
-		delay = memoryReshelvePacing
-	}
-	if delay > 10*time.Minute {
-		delay = 10 * time.Minute
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := requireGeneration(ctx, tx, personaID, generation); err != nil {
-		return nil, err
-	}
-	c, err := scanChunk(tx.QueryRow(ctx,
-		`SELECT `+chunkCols+` FROM core_memory_chunks WHERE persona_id = $1 AND chunk_seq = $2 FOR UPDATE`,
-		personaID, chunkSeq))
-	if err != nil {
-		return nil, err
-	}
-	if c.Status != "preparing" || c.ClaimedGeneration == nil || *c.ClaimedGeneration != generation {
-		return nil, fmt.Errorf("%w: chunk %d is not preparing under this generation", ErrMemoryConflict, chunkSeq)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE core_memory_chunks SET status = 'sealed',
-			claimed_generation = NULL, claimed_at = NULL,
-			last_error = $3, not_before = now() + $4 * interval '1 millisecond'
-		WHERE persona_id = $1 AND chunk_seq = $2`,
-		personaID, chunkSeq, reason, delay.Milliseconds()); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return s.chunk(ctx, s.pool, personaID, chunkSeq)
+	rows.Close()
+	return st, rows.Err()
 }

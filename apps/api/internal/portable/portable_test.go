@@ -522,7 +522,7 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 // claim order agree.
 func claimSeq(t *testing.T, p placement, personaID string, generation, wantSeq int64) {
 	t.Helper()
-	claimed := must(p.state.ClaimMemoryChunk(context.Background(), personaID, generation, 50))
+	claimed := must(claimMemoryFixture(t, p, context.Background(), personaID, generation, 50))
 	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != wantSeq {
 		t.Fatalf("claimed chunk %+v, want chunk_seq %d", claimed.Chunk, wantSeq)
 	}
@@ -649,18 +649,18 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatalf("maintain sealed %d chunks, want 6 (status %+v)", st.Sealed, st)
 	}
 
-	// Drive each lifecycle state through the real service.
+	// Prepare chunk lifecycle fixtures; branch execution has dedicated tests.
 	claimSeq(t, local, pid, gen, 1)
-	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 1, "Day one, compressed.", false))
+	must(completeMemoryFixture(t, local, ctx, pid, gen, 1, "Day one, compressed.", false))
 	if st = must(local.state.MemoryMaintain(ctx, pid, gen)); st.Applied != 1 {
 		t.Fatalf("chunk 1 did not apply: %+v", st)
 	}
 	claimSeq(t, local, pid, gen, 2)
-	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 2, "", true)) // kept
+	must(completeMemoryFixture(t, local, ctx, pid, gen, 2, "", true)) // kept
 	claimSeq(t, local, pid, gen, 3)
-	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "provider timeout", true))
+	must(failMemoryFixture(t, local, ctx, pid, gen, 3, "provider timeout", true))
 	claimSeq(t, local, pid, gen, 4) // chunk 3 is backed off; 4 is next
-	must(local.state.CompleteMemoryChunk(ctx, pid, gen, 4, "Day four, compressed.", false))
+	must(completeMemoryFixture(t, local, ctx, pid, gen, 4, "Day four, compressed.", false))
 	// Chunk 3's backoff must be on the row; then push its deadline into
 	// the past directly — not_before is wall-clock and a host clock step
 	// (observed on this WSL2 host) can regress now() below a recorded
@@ -674,7 +674,7 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimSeq(t, local, pid, gen, 3)
-	must(local.state.FailMemoryChunk(ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
+	must(failMemoryFixture(t, local, ctx, pid, gen, 3, "replacement rejected: factually wrong", false))
 	// Chunk 5's claim is orphaned once (an interruption), then reclaimed —
 	// its history crosses the transfer. Chunk 6 is still claimed when the
 	// seal lands: the cut normalizes that dead claim back to 'sealed'.
@@ -772,13 +772,13 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimSeq(t, cloud, pid, dgen, 5)
-	must(cloud.state.CompleteMemoryChunk(ctx, pid, dgen, 5, "Day five, compressed.", false))
+	must(completeMemoryFixture(t, cloud, ctx, pid, dgen, 5, "Day five, compressed.", false))
 	if c := chunkRow(t, cloud, pid, 5); c.Status != "prepared" || c.Interruptions != 1 {
 		t.Fatalf("chunk 5 after destination preparation: %+v", c)
 	}
 	// The normalized chunk 6 is ordinary sealed work for the destination.
 	claimSeq(t, cloud, pid, dgen, 6)
-	must(cloud.state.FailMemoryChunk(ctx, pid, dgen, 6, "cloud provider timeout", true))
+	must(failMemoryFixture(t, cloud, ctx, pid, dgen, 6, "cloud provider timeout", true))
 	if c := chunkRow(t, cloud, pid, 6); c.Status != "sealed" || c.Attempts != 1 || c.Interruptions != 0 {
 		t.Fatalf("normalized chunk 6 resumed with wrong history: %+v", c)
 	}
@@ -788,7 +788,7 @@ func TestTransferCarriesSecretaryMemory(t *testing.T) {
 	if a := authority(t, local, pid); a != "sealed" {
 		t.Fatalf("source authority %s", a)
 	}
-	if _, err := local.state.ClaimMemoryChunk(ctx, pid, gen, 50); !errors.Is(err, agentstate.ErrGenerationFence) {
+	if _, err := claimMemoryFixture(t, local, ctx, pid, gen, 50); !errors.Is(err, agentstate.ErrGenerationFence) {
 		t.Fatalf("source memory claim after seal: %v, want fenced", err)
 	}
 	must(local.svc.Complete(ctx, pid, "move-mem",
@@ -891,7 +891,7 @@ func TestTransferCarriesUpperMemory(t *testing.T) {
 
 	// The carried sealed L2 target is ordinary work for the destination's
 	// writer: claiming it resolves the carried sources to their fragments.
-	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	claimed := must(claimMemoryFixture(t, cloud, ctx, pid, dgen, 50))
 	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 6 || claimed.Chunk.Layer != 2 {
 		t.Fatalf("destination upper claim: %+v", claimed.Chunk)
 	}
@@ -1039,7 +1039,7 @@ func TestImportRefusesContradictoryUpperMemory(t *testing.T) {
 	}
 	// The sealed reintegration target is claimable at the destination and
 	// resolves its still-applied source fragment.
-	claimed := must(cloud.state.ClaimMemoryChunk(ctx, pid, dgen, 50))
+	claimed := must(claimMemoryFixture(t, cloud, ctx, pid, dgen, 50))
 	if claimed.Chunk == nil || claimed.Chunk.ChunkSeq != 7 ||
 		len(claimed.TargetFragments) != 1 || claimed.TargetFragments[0].Text != "L1 of days four" {
 		t.Fatalf("destination claim on carried sealed target: %+v", claimed.Chunk)

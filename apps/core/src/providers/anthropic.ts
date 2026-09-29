@@ -1,11 +1,13 @@
 import {
   type ChatMessage,
+  type ModelBindingSnapshot,
   ModelError,
   type ModelEvent,
   type ModelProvider,
   type ModelRequest,
   type ToolCall,
 } from "../provider.ts";
+import { assertBindingSnapshot, snapshotFor } from "./binding-snapshot.ts";
 import {
   assertExtraHeaders,
   httpError,
@@ -87,7 +89,26 @@ export class AnthropicProvider implements ModelProvider {
     return overridden ?? this.cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
   }
 
+  async snapshotBinding(): Promise<ModelBindingSnapshot> {
+    return snapshotFor(this.name, this.cfg, this.cfg.model);
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
+    if (request.bindingSnapshot) {
+      assertBindingSnapshot(
+        request.bindingSnapshot,
+        await this.snapshotBinding(),
+      );
+    }
+    if (request.reasoningEffort !== undefined) {
+      throw new ModelError(
+        "memory reasoning updates require the Astra Responses connection",
+        {
+          retryable: false,
+          unavailable: true,
+        },
+      );
+    }
     assertExtraHeaders(this.cfg.headers);
     const tools = wireTools(request.tools);
     const toWire = new Map(tools.map((t) => [t.spec.name, t.wire]));

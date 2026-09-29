@@ -2,24 +2,21 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { FakeState } from "../src/fake-state.ts";
 import {
-  evictToBudget,
-  renderedViewTokens,
-  renderJournalContext,
-} from "../src/memory.ts";
-import {
   ModelError,
   type ModelEvent,
   type ModelProvider,
   type ModelRequest,
 } from "../src/provider.ts";
 import { Secretary, type SecretaryConfig } from "../src/secretary.ts";
-import type { Event } from "../src/types.ts";
 
 // Incoming messages open with a receipt line (conversation-continuity
 // tests); these assertions are about what follows it.
-const afterReceipt = (c: string | undefined) =>
-  c?.replace(/^\[(?:Received|Recorded) [^\]]*\]\n/, "");
 
+const BULK = "y".repeat(2000);
+const noticeOf = (req: ModelRequest) =>
+  req.messages.find((m) =>
+    m.content.includes("Working-context capacity notice"),
+  );
 const PERSONA = "01930e00-0000-7000-8000-0000000000b2";
 
 /** A provider scripted per call: call number → its event stream. */
@@ -78,224 +75,26 @@ async function turn(s: Secretary, state: FakeState, id: string, text: string) {
   assert.equal(await s.step(), "turn");
 }
 
-const noticeOf = (req: ModelRequest) =>
-  req.messages.find((m) =>
-    m.content.includes("Working-context capacity notice"),
-  );
-
-// Old exchanges carry real bulk so that halving the working view saves more
-// than the capacity notice costs — below that margin a resend is correctly
-// not attempted (the notice itself would make the send larger).
-const BULK = "y".repeat(2_000);
-
-test("recovery: a refused request retries on a reduced working view and completes", async () => {
+test("capacity refusal preserves the full context without a reduced-view retry", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
   const provider = new ScriptedProvider();
   const s = new Secretary(cfg(state, provider));
   await s.start();
-  // Four completed exchanges = eight older journal records.
-  for (let i = 0; i < 4; i++) {
-    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
-  }
-  provider.script = (call) =>
-    call === 5 ? refuseContext() : answer("still here");
-  await turn(s, state, "live", "the live request");
-  assert.equal(provider.requests.length, 6);
-
-  const recovered = provider.requests[5]!;
-  assert.equal(recovered.messages[0]!.role, "system");
-  // The capacity notice names exactly the records left out and how to
-  // reread them — the oldest records, dropped whole. The first receipt has
-  // no previous receipt time, so its record is slightly smaller than the
-  // later ones and halving the view reaches one record further.
-  const notice = noticeOf(recovered);
-  assert.ok(notice, "capacity notice present");
-  assert.match(notice!.content, /journal seq 1 through 5/);
-  assert.match(notice!.content, /conversation_history/);
-  // The evicted text is gone from this send; the retained tail and the
-  // current input are not.
-  const bodies = recovered.messages.map((m) => m.content);
-  assert.ok(!bodies.some((c) => c.includes("old-0")), "evicted records absent");
-  assert.ok(
-    bodies.some((c) => c.includes("old-3")),
-    "retained tail present",
-  );
-  assert.equal(afterReceipt(recovered.messages.at(-1)!.content), "[human] the live request");
-  assert.equal(recovered.messages.at(-1)!.role, "user");
-
-  // The journal itself was never touched: every record — including the
-  // evicted ones — is still there, and the turn completed once.
-  const evs = await state.events(PERSONA, 0);
-  assert.equal(evs.filter((e) => e.kind === "input_received").length, 5);
-  const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(input.status, "done");
-  await s.stop();
-});
-
-test("recovery: the in-turn assistant/tool suffix rides along; effects are not replayed", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new ScriptedProvider();
-  const s = new Secretary(cfg(state, provider));
-  await s.start();
-  for (let i = 0; i < 4; i++) {
-    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
-  }
-  provider.script = (call) => {
-    if (call === 5) {
-      // Round 0 decides one internal tool call.
-      return (async function* () {
-        yield {
-          type: "tool_call" as const,
-          call: {
-            id: "c1",
-            name: "journal.note",
-            route: "normal",
-            arguments: { text: "remembered" },
-          },
-        };
-        yield { type: "done" as const, usage: {} };
-      })();
-    }
-    if (call === 6) return refuseContext(); // round 1 first attempt
-    return answer("answer after the note");
-  };
-  await turn(s, state, "live", "please remember this");
-  assert.equal(provider.requests.length, 7);
-
-  const recovered = provider.requests[6]!;
-  assert.ok(noticeOf(recovered), "capacity notice present");
-  const suffix = recovered.messages.slice(-3);
-  assert.equal(afterReceipt(suffix[0]!.content), "[human] please remember this");
-  assert.equal(suffix[1]!.role, "assistant");
-  assert.equal(suffix[1]!.toolCalls?.length, 1);
-  assert.equal(suffix[1]!.toolCalls![0]!.name, "journal.note");
-  assert.equal(suffix[2]!.role, "tool");
-  assert.equal(suffix[2]!.toolCallId, "c1");
-
-  // The note's effect committed once — recovery never replays side effects.
-  const evs = await state.events(PERSONA, 0);
-  assert.equal(evs.filter((e) => e.kind === "note").length, 1);
-  assert.equal(
-    evs.filter((e) => e.kind === "tool_result" && e.payload.call_id === "c1")
-      .length,
-    1,
-  );
-  const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(input.status, "done");
-  await s.stop();
-});
-
-test("recovery: persistent refusals end in a bounded, honest failure", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new ScriptedProvider();
+  await turn(s, state, "one", "remember this original");
+  provider.requests = [];
   provider.script = () => refuseContext();
-  const s = new Secretary(cfg(state, provider));
-  await s.start();
-  for (let i = 0; i < 4; i++) {
-    provider.script = () => answer("ok");
-    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
-  }
-  provider.script = () => refuseContext();
-  await turn(s, state, "live", "too big");
-  // 1 initial + 2 recoveries = 3 sends, then a recorded failure.
-  assert.equal(provider.requests.length, 7);
-  // Each recovery evicts more of the oldest records.
-  assert.match(noticeOf(provider.requests[5]!)!.content, /seq 1 through 5/);
-  assert.match(noticeOf(provider.requests[6]!)!.content, /seq 1 through 7/);
-
-  const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(
-    input.status,
-    "done",
-    "a capacity failure is terminal, not requeued",
-  );
-  const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
-  assert.match(
-    String(failed.payload.error),
-    /refused the request for context size/,
-  );
-  assert.match(String(failed.payload.error), /2 reduced working-view attempt/);
-  await s.stop();
-});
-
-test("recovery: a refusal framed as retryable is still terminal", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new ScriptedProvider();
-  const s = new Secretary(cfg(state, provider));
-  await s.start();
-  for (let i = 0; i < 4; i++) {
-    provider.script = () => answer("ok");
-    await turn(s, state, `old-${i}`, `old-${i} ${BULK}`);
-  }
-  // A provider can report a capacity refusal inside an otherwise
-  // transient-looking error (e.g. an in-band stream error with a 5xx code).
-  // The refusal still wins: bounded recoveries, then a terminal failure —
-  // never a requeue onto the transient budget.
-  provider.script = () =>
-    (async function* () {
-      yield { type: "text" as const, delta: "partial " };
-      throw new ModelError("provider stream error: context_length_exceeded", {
-        retryable: true,
-        refusal: "context_length",
-      });
-    })();
-  await turn(s, state, "live", "too big");
-  assert.equal(provider.requests.length, 7); // 1 + 2 recoveries
-  const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(input.status, "done", "capacity failure stays terminal");
-  const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
-  assert.match(
-    String(failed.payload.error),
-    /refused the request for context size/,
-  );
-  await s.stop();
-});
-
-test("recovery: nothing reducible fails at once, without burning recoveries", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new ScriptedProvider();
-  provider.script = () => refuseContext();
-  const s = new Secretary(cfg(state, provider));
-  await s.start();
-  // No prior journal records — only the protected suffix remains.
-  await turn(s, state, "live", "unrecoverable");
+  await turn(s, state, "two", "next request");
   assert.equal(provider.requests.length, 1);
-  const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
-  assert.match(String(failed.payload.error), /no reducible records/);
-  await s.stop();
-});
-
-test("recovery: a resend that the notice would not make smaller is not attempted", async () => {
-  const state = new FakeState();
-  state.addPersona(PERSONA);
-  const provider = new ScriptedProvider();
-  const s = new Secretary(cfg(state, provider));
-  await s.start();
-  // One small exchange: evicting it saves less than the notice costs, so
-  // the reduced view would be larger than the one just refused.
-  provider.script = () => answer("ok");
-  await turn(s, state, "old-0", "old-0");
-  provider.script = () => refuseContext();
-  await turn(s, state, "live", "too big");
-  // No second send: dropping the one reducible unit and paying the notice
-  // would not shrink the view.
-  assert.equal(provider.requests.length, 2);
-  const input = state.inputs.find((i) => i.input_id === "live")!;
-  assert.equal(input.status, "done", "terminal — not requeued");
-  const failed = state.outboxEntries.find((e) => e.kind === "turn_failed")!;
   assert.match(
-    String(failed.payload.error),
-    /refused the request for context size/,
+    JSON.stringify(provider.requests[0]!.messages),
+    /remember this original/,
   );
-  assert.match(String(failed.payload.error), /would not have been smaller/);
+  const last = Array.from(state.turns.values()).at(-1)!;
+  assert.equal(last.status, "failed");
+  assert.match(last.error!, /preserved without deleting records/);
   await s.stop();
 });
-
 test("recovery: a transient provider failure keeps its own retry semantics", async () => {
   const state = new FakeState();
   state.addPersona(PERSONA);
@@ -317,78 +116,6 @@ test("recovery: a transient provider failure keeps its own retry semantics", asy
   assert.equal(input.status, "queued");
   assert.ok(input.not_before, "retry is paced");
   await s.stop();
-});
-
-test("recovery: eviction drops whole decision/call/result units and shrinks the real send", () => {
-  // A mixed journal: small exchanges, then a tool flow whose deciding text,
-  // call and result are one unit, then the newest records.
-  const mk = (
-    seq: number,
-    kind: string,
-    payload: Record<string, unknown>,
-  ): Event => ({
-    persona_id: PERSONA,
-    seq,
-    turn_id: "t",
-    kind,
-    payload,
-    created_at: "2026-09-15T00:00:00.000Z",
-  });
-  const big = "x".repeat(12_000);
-  const evs = [
-    mk(1, "input_received", { text: "first", actor_kind: "human" }),
-    mk(2, "assistant_message", { text: "I will look that up." }),
-    mk(3, "tool_call", {
-      call_id: "c1",
-      tool: "conversation_history",
-      request: { operation: "read", args: big }, // large invisible args
-    }),
-    mk(4, "tool_result", {
-      call_id: "c1",
-      tool: "conversation_history",
-      response: { data: big },
-    }),
-    mk(5, "assistant_message", { text: `It says ${big}` }),
-    mk(6, "input_received", { text: "second", actor_kind: "human" }),
-    mk(7, "assistant_message", { text: "recent tail" }),
-  ];
-  const fullWire = JSON.stringify(renderJournalContext(evs)).length;
-
-  // Budget that keeps the newest records but forces the oldest units out.
-  const { kept, evicted } = evictToBudget(evs, 4_000);
-  assert.ok(evicted.length > 0 && kept.length > 0);
-
-  // Unit atomicity: a kept tool_result always has its call and deciding
-  // text; an evicted call takes its result and deciding text with it.
-  const keptSeqs = new Set(kept.map((e) => e.seq));
-  const evictedSeqs = new Set(evicted.map((e) => e.seq));
-  for (const e of evs) {
-    if (e.kind === "tool_result") {
-      const call = evs.find(
-        (x) =>
-          x.kind === "tool_call" && x.payload.call_id === e.payload.call_id,
-      );
-      assert.ok(call, "result has a call");
-      assert.equal(
-        keptSeqs.has(e.seq),
-        keptSeqs.has(call.seq),
-        `call/result pairing preserved for ${String(e.payload.call_id)}`,
-      );
-    }
-  }
-  // No rendered `[tool ...]` result floats in the kept view without the
-  // text that decided it — the deciding message and its flow are one unit.
-  if (keptSeqs.has(4)) assert.ok(keptSeqs.has(2) && keptSeqs.has(3));
-  if (evictedSeqs.has(2)) assert.ok(evictedSeqs.has(3) && evictedSeqs.has(4));
-
-  // The rendered send actually shrinks — eviction is measured on what the
-  // provider would receive, not on invisible raw records.
-  const keptWire = JSON.stringify(renderJournalContext(kept)).length;
-  assert.ok(
-    keptWire < fullWire * 0.6,
-    `rendered send should shrink meaningfully (${keptWire} vs ${fullWire})`,
-  );
-  assert.ok(renderedViewTokens(kept) <= 4_000);
 });
 
 test("memory: the fake seal walk keeps an oversized committed turn whole", async () => {

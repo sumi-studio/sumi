@@ -1,5 +1,6 @@
 import {
   type ChatMessage,
+  type ModelBindingSnapshot,
   ModelError,
   type ModelEvent,
   type ModelProvider,
@@ -7,6 +8,7 @@ import {
   type ProviderContinuation,
   type ToolCall,
 } from "../provider.ts";
+import { assertBindingSnapshot, snapshotFor } from "./binding-snapshot.ts";
 import {
   CHATGPT_MAX_REQUEST_BYTES,
   CHATGPT_REJECTED_HEADER,
@@ -108,7 +110,52 @@ export class OpenAIResponsesProvider implements ModelProvider {
     return overridden ?? this.cfg.maxOutputTokens;
   }
 
+  async snapshotBinding(): Promise<ModelBindingSnapshot> {
+    const { chatgpt, ...settings } = this.cfg;
+    const effort =
+      chatgpt?.reasoningEffort ??
+      (this.cfg.extra?.reasoning as { effort?: string } | undefined)?.effort;
+    return snapshotFor(
+      this.name,
+      {
+        ...settings,
+        ...(chatgpt
+          ? {
+              accountId: chatgpt.accountId,
+              reasoningEffort: chatgpt.reasoningEffort,
+            }
+          : {}),
+      },
+      this.cfg.model,
+      effort,
+    );
+  }
+
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
+    const preservePrefix =
+      request.phase === "memory" || !!request.bindingSnapshot;
+    if (request.bindingSnapshot) {
+      assertBindingSnapshot(
+        request.bindingSnapshot,
+        await this.snapshotBinding(),
+      );
+    }
+    if (request.reasoningEffort !== undefined) {
+      if (
+        request.phase !== "memory" ||
+        this.cfg.model !== "gpt-6-astra" ||
+        request.reasoningEffort !== "medium" ||
+        typeof request.reasoningEffortAfter !== "number" ||
+        !Number.isSafeInteger(request.reasoningEffortAfter) ||
+        request.reasoningEffortAfter < 0 ||
+        request.reasoningEffortAfter > request.messages.length
+      ) {
+        throw new ModelError("invalid memory reasoning configuration update", {
+          retryable: false,
+          unavailable: true,
+        });
+      }
+    }
     assertExtraHeaders(this.cfg.headers);
     const tools = wireTools(request.tools);
     const toWire = new Map(tools.map((t) => [t.spec.name, t.wire]));
@@ -149,7 +196,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
             ...(this.cfg.maxOutputTokens
               ? { max_output_tokens: this.cfg.maxOutputTokens }
               : {}),
-            ...standardInput(request.messages, toWire),
+            ...standardInput(request.messages, toWire, request),
             ...(tools.length
               ? {
                   // `strict: false` is explicit: when it is omitted,
@@ -167,11 +214,14 @@ export class OpenAIResponsesProvider implements ModelProvider {
             ...this.cfg.extra,
           });
       if (chatgpt) {
-        // An oversized request is refused before sending, with a size
-        // cause. Recorded continuation is an optimization, so it is dropped
-        // first; a request still too large without it is a size refusal the
-        // turn can answer with a smaller working view.
-        if (replaying && utf8Length(body) > CHATGPT_MAX_REQUEST_BYTES) {
+        // A saved branch must keep its exact inherited prefix. Only an
+        // unpinned ordinary turn may omit optional continuation. Requests
+        // still above the transport cap are refused before any send.
+        if (
+          !preservePrefix &&
+          replaying &&
+          utf8Length(body) > CHATGPT_MAX_REQUEST_BYTES
+        ) {
           body = (
             await chatGPTBody(
               this.cfg.model,
@@ -189,7 +239,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
         if (bytes > CHATGPT_MAX_REQUEST_BYTES) {
           throw new ModelError(
             `ChatGPT request is ${bytes} bytes, above the ${CHATGPT_MAX_REQUEST_BYTES}-byte transport limit; it was not sent`,
-            { retryable: false, refusal: "context_length" },
+            { retryable: false, refusal: "context_length", unavailable: true },
           );
         }
       }
@@ -256,12 +306,10 @@ export class OpenAIResponsesProvider implements ModelProvider {
           refreshed = true;
           continue;
         }
-        // A request carrying recorded continuation that the backend
-        // refuses (400) is resent once without it. The continuation is an
-        // optimization, never a precondition: a stored round whose
-        // encrypted reasoning can no longer be used must not wedge the
-        // turn on every retry.
-        if (res.status === 400 && chatgpt && replaying) {
+        // Ordinary unpinned turns can retry a rejected optional continuation.
+        // For pinned/memory calls, return the refusal without changing the
+        // inherited context; the durable branch owns recovery.
+        if (res.status === 400 && chatgpt && replaying && !preservePrefix) {
           await res.body?.cancel().catch(() => {});
           body = (
             await chatGPTBody(
@@ -641,6 +689,10 @@ function toInput(
   /** Continuation scope to replay; unset = replay none. */
   replayScope?: string,
   omitReasoning = false,
+  configuration?: Pick<
+    ModelRequest,
+    "reasoningEffort" | "reasoningEffortAfter"
+  >,
 ): {
   instructions?: string;
   input: Record<string, unknown>[];
@@ -650,7 +702,19 @@ function toInput(
   let replaying = false;
   const system: string[] = [];
   const input: Record<string, unknown>[] = [];
-  for (const m of messages) {
+  const appendConfiguration = (index: number) => {
+    if (
+      configuration?.reasoningEffort &&
+      configuration.reasoningEffortAfter === index
+    ) {
+      input.push({
+        type: "configuration_update",
+        reasoning: { effort: configuration.reasoningEffort },
+      });
+    }
+  };
+  for (const [index, m] of messages.entries()) {
+    appendConfiguration(index);
     switch (m.role) {
       case "system":
         system.push(m.content);
@@ -744,6 +808,7 @@ function toInput(
         break;
     }
   }
+  appendConfiguration(messages.length);
   return {
     ...(system.length ? { instructions: system.join("\n\n") } : {}),
     input,
@@ -755,8 +820,19 @@ function toInput(
 function standardInput(
   messages: ChatMessage[],
   toWire: Map<string, string>,
+  configuration?: Pick<
+    ModelRequest,
+    "reasoningEffort" | "reasoningEffortAfter"
+  >,
 ): { instructions?: string; input: Record<string, unknown>[] } {
-  const { replaying: _, ...rest } = toInput(messages, toWire);
+  const { replaying: _, ...rest } = toInput(
+    messages,
+    toWire,
+    "standard",
+    undefined,
+    false,
+    configuration,
+  );
   return rest;
 }
 
@@ -799,6 +875,7 @@ async function chatGPTBody(
     lite ? "chatgpt-lite" : "chatgpt",
     replayScope,
     omitReasoning,
+    request,
   );
   const functions = tools.map((t) => functionTool(t));
   // The Codex client's reasoning parameters: the requested effort, and on

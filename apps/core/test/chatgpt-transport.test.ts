@@ -469,7 +469,7 @@ test("a request above the transport limit is a size refusal that sends nothing",
   );
   assert.equal(api.refusal, "context_length");
   assert.equal(api.retryable, false);
-  assert.equal(api.unavailable, undefined);
+  assert.equal(api.unavailable, true);
 });
 
 test("the transport carries the remaining configured model budget, including settings above 120 s", async () => {

@@ -1,16 +1,20 @@
+import {
+  runMemoryPreparation,
+  DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
+} from "./memory-compaction.ts";
+import {
+  DEFAULT_MEMORY_POLICY,
+  type MemoryPolicy,
+  type MemorySnapshot,
+  type MemorySourceRange,
+} from "./memory-branch.ts";
 import { jsonEqual } from "./json.ts";
 import {
-  capacityNoticeMessage,
-  DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS,
-  estTextTokens,
-  evictToBudget,
   inputBodyText,
   inputMarker,
   isInternalActor,
   receiptLine,
-  renderedViewTokens,
   renderJournalContext,
-  runMemoryPreparation,
 } from "./memory.ts";
 import {
   type ChatMessage,
@@ -96,6 +100,7 @@ export interface SecretaryConfig {
    * once it starts one. Default 10 minutes.
    */
   memoryPreparationTimeoutMs?: number;
+  memoryPolicy?: Partial<MemoryPolicy>;
   /**
    * How long pending memory work is shelved after the model layer reports
    * itself unavailable (no usable binding, missing credential, a selection
@@ -141,15 +146,6 @@ function activeAgeMs(input: Input): number {
   }
   return active;
 }
-
-/**
- * Bounded working-view recoveries after a provider context-capacity refusal,
- * per model consultation. Each recovery drops more of the oldest raw journal
- * records from the sent view only; the durable journal, the current input,
- * and the in-turn suffix are never touched. 2 recoveries mean at most three
- * provider calls for one decision before the honest recorded failure.
- */
-const MAX_SEND_VIEW_RECOVERIES = 2;
 
 /**
  * Default shelf for pending memory work while the model layer is
@@ -216,9 +212,11 @@ export class Secretary {
    * branch exists at a time (the state service also enforces this).
    */
   private memoryTask: Promise<void> | null = null;
+  private memoryAllowed = true;
   private memoryAbort: AbortController | null = null;
   /** The memory shape seen by the latest maintenance step. */
   private memoryShape: MemoryStatus | null = null;
+  private lastLiveSnapshot: MemorySnapshot | null = null;
   /**
    * performance.now() deadline until which memory preparation is shelved
    * after the model layer reported itself unavailable. In-process only:
@@ -275,6 +273,7 @@ export class Secretary {
   async step(opts: StepOptions = {}): Promise<StepResult> {
     if (!this.running || !this.lease) return "stopped";
     const gen = this.lease.generation;
+    this.memoryAllowed = opts.startMemory !== false;
     const { state, personaId } = this.cfg;
     try {
       const now = Date.now();
@@ -294,29 +293,13 @@ export class Secretary {
       // a claimed chunk's originals stay in the context while the branch
       // runs, so corrections and new experiences during preparation are
       // never overwritten.
-      // A 'preparing' chunk while this process runs no branch is orphaned
-      // (lost claim response, stopped branch); the claim counts it as an
-      // interruption and prepares it again once its short pacing passes.
       const mem = await state.memoryMaintain(personaId, gen);
       this.memoryShape = mem;
-      // While the model layer is shelved as unavailable, pending chunks
-      // wait untouched: no claim, no probe — the host rests on its
-      // ordinary cadence until the shelf expires and a step re-probes.
-      if (
-        opts.startMemory !== false &&
-        !this.memoryTask &&
-        mem.claimable > 0 &&
-        performance.now() >= this.memoryModelPausedUntil
-      ) {
-        this.memoryAbort = new AbortController();
-        this.memoryTask = this.prepareMemory(
-          gen,
-          this.memoryAbort.signal,
-        ).finally(() => {
-          this.memoryTask = null;
-          this.memoryAbort = null;
-        });
-      }
+      // Only an already frozen branch may resume while idle. New branches
+      // start at the actual model boundary below, never by rebuilding history.
+      if (mem.sealed > 0 && this.lastLiveSnapshot && !this.memoryTask)
+        await this.captureMemory(gen, this.lastLiveSnapshot);
+      if (mem.preparing > 0) this.startMemory(gen);
       const turnId = this.cfg.idgen();
       const { turn, input, context, memory, omitted, memory_omitted, plan } =
         await state.loadTurn(personaId, gen, turnId, this.cfg.contextLimit);
@@ -695,16 +678,67 @@ export class Secretary {
     return () => clearInterval(t);
   }
 
-  /**
-   * One asynchronous L1 preparation branch. The state service seals the
-   * chunk and hands back the parent's rendered context at claim time; the
-   * branch consults the same provider with the parent's tools offered (never
-   * executed) and records its verdict (prepared / kept / failed). The claim
-   * is generation-fenced: losing the writer fence mid-preparation aborts the
-   * branch with no further model call, and the next generation counts the
-   * claim as an interruption.
-   */
-  private async prepareMemory(gen: number, signal: AbortSignal): Promise<void> {
+  /** Freeze the exact live model boundary before asynchronous execution.
+   * An idle alarm may resume this durable branch, never rebuild its prefix. */
+  private async captureMemory(
+    gen: number,
+    snapshot: MemorySnapshot,
+  ): Promise<void> {
+    const shape = this.memoryShape;
+    if (
+      this.memoryTask ||
+      !shape ||
+      (shape.sealed === 0 && shape.preparing === 0 && shape.kept === 0)
+    )
+      return;
+    try {
+      const b = await this.cfg.state.claimMemoryBranch(
+        this.cfg.personaId,
+        gen,
+        snapshot,
+        { ...DEFAULT_MEMORY_POLICY, ...this.cfg.memoryPolicy },
+      );
+      if (b) {
+        this.memoryShape = {
+          ...shape,
+          preparing: Math.max(shape.preparing, 1),
+          claimable: 1,
+        };
+        this.startMemory(gen, snapshot);
+      }
+    } catch (error) {
+      if (error instanceof FencedError) throw error;
+      this.log("memory snapshot could not be saved; original context remains", {
+        error: String(error),
+      });
+    }
+  }
+
+  private startMemory(gen: number, snapshot?: MemorySnapshot): void {
+    if (
+      !this.memoryAllowed ||
+      this.memoryTask ||
+      performance.now() < this.memoryModelPausedUntil ||
+      !this.memoryShape ||
+      this.memoryShape.claimable === 0
+    )
+      return;
+    this.memoryAbort = new AbortController();
+    this.memoryTask = this.prepareMemory(
+      gen,
+      this.memoryAbort.signal,
+      snapshot,
+    ).finally(() => {
+      this.memoryTask = null;
+      this.memoryAbort = null;
+    });
+  }
+
+  private async prepareMemory(
+    gen: number,
+    signal: AbortSignal,
+    snapshot?: MemorySnapshot,
+  ): Promise<void> {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       const result = await runMemoryPreparation({
@@ -712,9 +746,8 @@ export class Secretary {
         generation: gen,
         state: this.cfg.state,
         provider: this.cfg.provider,
-        contextLimit: this.cfg.contextLimit,
-        system: SYSTEM,
-        tools: await this.advertisedSpecs(),
+        snapshot,
+        policy: this.cfg.memoryPolicy,
         signal,
         timeoutMs: this.memoryTimeoutMs,
         log: (msg, fields) => this.log(msg, fields),
@@ -729,9 +762,8 @@ export class Secretary {
         this.memoryModelPausedUntil = 0;
       }
     } catch (e) {
-      // A fenced branch stops silently — the next generation's recovery
-      // reseals its chunk. Other errors inside preparation are already
-      // recorded on the chunk by runMemoryPreparation; anything that
+      // A fenced branch stops; a later generation resumes its saved state.
+      // Mechanism faults are recorded by runMemoryPreparation; anything that
       // escaped that is a defect worth surfacing, not a loop-killer.
       if (!(e instanceof FencedError)) {
         this.log("memory preparation error", { error: String(e) });
@@ -765,7 +797,30 @@ export class Secretary {
     const stopRenewal = this.renewDuringTurn(gen);
     try {
       const events: EventInput[] = [inputReceivedEvent(input, turn)];
-      const messages = assemble(context, input, memory, omitted, memoryOmitted);
+      const ranges: MemorySourceRange[] = [];
+      const messages = assemble(
+        context,
+        input,
+        memory,
+        omitted,
+        memoryOmitted,
+        ranges,
+      );
+      const unresolved = (this.memoryShape?.branches ?? [])
+        .filter((b) => b.issue)
+        .map((b) => ({
+          chunk_seq: b.chunk_seq,
+          status: b.status,
+          pause_reason: b.pause_reason,
+          issue: b.issue,
+        }));
+      if (unresolved.length)
+        messages.splice(messages.length - 1, 0, {
+          role: "user",
+          content:
+            "[Current memory mechanism status; operational information, not a message from your person] " +
+            JSON.stringify(unresolved),
+        });
       // The stored plan is the authority — re-sync on every savePlan so a
       // plan that grew further in a lost prior attempt is executed as
       // recorded, never as this attempt would have decided it.
@@ -786,6 +841,7 @@ export class Secretary {
             memory,
             omitted,
             memoryOmitted,
+            ranges,
           });
           // Failure committed inside decide(); a retryable one is paced
           // durably by the requeue's not_before backoff, so the loop is
@@ -1084,34 +1140,13 @@ export class Secretary {
       memory: MemoryBlock[];
       omitted: OmittedRange | null;
       memoryOmitted: OmittedMemory | null;
+      ranges: MemorySourceRange[];
     },
   ): Promise<{ rounds: Decision[] } | { failed: true; retryable: boolean }> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
 
-    // The protected suffix: the current input's user message plus everything
-    // this turn appended so far — assistant text carrying its decided calls,
-    // then one role:"tool" message per committed result. The request itself
-    // and its in-turn flow are never evicted; only older raw journal
-    // records are.
-    const suffixStart = messages.reduce(
-      (last, m, i) => (m.role === "user" ? i : last),
-      messages.length - 1,
-    );
-    const suffix = messages.slice(suffixStart);
-    const system = messages[0] ?? { role: "system" as const, content: SYSTEM };
-
     let sendMessages = messages;
-    let keptEvents = view.events;
-    const evicted: Event[] = [];
-    let sendRecoveries = 0;
-    // The journal portion of the current send's estimate — raw records plus
-    // any capacity notice already in the view. A recovery only resends when
-    // the next view is strictly smaller than what the provider refused.
-    let lastViewEst = renderedViewTokens(keptEvents);
-    // Set when records could be dropped but the notice's own cost meant the
-    // resend would not have been smaller — reported honestly at the end.
-    let refusalNotSmaller = false;
 
     let text = "";
     let calls: ToolCall[] = [];
@@ -1136,6 +1171,15 @@ export class Secretary {
       usage = {};
       continuation = undefined;
       try {
+        const tools = await this.advertisedSpecs();
+        const bindingSnapshot = await this.cfg.provider.snapshotBinding?.();
+        const liveSnapshot = structuredClone({
+          messages: sendMessages,
+          tools,
+          ranges: view.ranges,
+          ...(bindingSnapshot ? { binding: bindingSnapshot } : {}),
+        });
+        await this.captureMemory(gen, liveSnapshot);
         for await (const ev of this.cfg.provider.stream({
           personaId,
           turnId: turn.turn_id,
@@ -1144,7 +1188,8 @@ export class Secretary {
           inputId: input.input_id,
           round,
           messages: sendMessages,
-          tools: await this.advertisedSpecs(),
+          tools,
+          bindingSnapshot,
           signal: this.inFlight?.signal,
         })) {
           if (ev.type === "text") text += ev.delta;
@@ -1154,6 +1199,27 @@ export class Secretary {
             continuation = ev.continuation;
           }
         }
+        // An unanswered native call is not a valid model input boundary.
+        // If execution ends before another consultation, wait for a real
+        // boundary containing its results rather than synthesizing one.
+        this.lastLiveSnapshot = calls.length
+          ? null
+          : {
+              ...liveSnapshot,
+              messages: [
+                ...liveSnapshot.messages,
+                {
+                  role: "assistant",
+                  content: text,
+                  ...(calls.length
+                    ? { toolCalls: structuredClone(calls) }
+                    : {}),
+                  ...(continuation
+                    ? { continuation: structuredClone(continuation) }
+                    : {}),
+                },
+              ],
+            };
       } catch (e) {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
         if (e instanceof BudgetWaitError) {
@@ -1185,71 +1251,6 @@ export class Secretary {
         // one containing NUL) must not make the failure itself unpersistable.
         const msg = stripNul(e instanceof Error ? e.message : String(e));
         const mErr = e instanceof ModelError ? e : null;
-        if (
-          mErr?.refusal === "context_length" &&
-          sendRecoveries < MAX_SEND_VIEW_RECOVERIES
-        ) {
-          // A deterministic capacity refusal can never succeed with the
-          // identical send. Continue the same request on a smaller
-          // temporary working view: the oldest eviction units — deciding
-          // text together with the call/result records it started — drop
-          // first; applied memory blocks, standing notices, the current
-          // input and the in-turn suffix all stay. There is no configured
-          // provider window, so each recovery halves the remaining
-          // rendered tail. The journal is never touched — the capacity
-          // notice names exactly which records left this send and how to
-          // reread them, and the next turn assembles the full context again.
-          const keptEst = renderedViewTokens(keptEvents);
-          const { kept, evicted: dropped } = evictToBudget(
-            keptEvents,
-            Math.floor(keptEst / 2),
-          );
-          if (dropped.length > 0) {
-            // The notice itself occupies the view: a resend is only worth
-            // making when the reduced journal portion plus the notice is
-            // actually smaller than what just failed — for a tiny history
-            // the notice can cost more than the evicted records saved.
-            const candidate = [...evicted, ...dropped];
-            const notice = capacityNoticeMessage(candidate);
-            const nextViewEst =
-              renderedViewTokens(kept) + estTextTokens(notice.content);
-            if (nextViewEst < lastViewEst) {
-              lastViewEst = nextViewEst;
-              keptEvents = kept;
-              evicted.push(...dropped);
-              sendRecoveries += 1;
-              sendMessages = [
-                system,
-                ...renderJournalContext(
-                  kept,
-                  view.memory,
-                  view.omitted,
-                  view.memoryOmitted,
-                  [
-                    {
-                      seq: (evicted[evicted.length - 1]?.seq ?? 0) + 0.5,
-                      message: notice,
-                    },
-                  ],
-                ),
-                ...suffix,
-              ];
-              this.log(
-                "provider refused context; retrying with a reduced working view",
-                {
-                  turn_id: turn.turn_id,
-                  round,
-                  recovery: sendRecoveries,
-                  excluded_records: evicted.length,
-                  excluded_first_seq: evicted[0]?.seq,
-                  excluded_last_seq: evicted[evicted.length - 1]?.seq,
-                },
-              );
-              continue;
-            }
-            refusalNotSmaller = true;
-          }
-        }
         // Deterministic provider rejections cannot be fixed by retrying —
         // they fail the input outright. Transient failures (5xx/429,
         // network, timeout, an incomplete stream) stay retryable for a
@@ -1268,18 +1269,13 @@ export class Secretary {
         // it as a retryable error — the identical send can never succeed.
         const retryable =
           mErr !== null &&
+          mErr.cause !== "model_binding_changed" &&
           (!mErr.retryable || mErr.refusal === "context_length")
             ? false
             : withinBudget;
         const detail =
           mErr?.refusal === "context_length"
-            ? `provider refused the request for context size` +
-              (sendRecoveries > 0
-                ? `; ${sendRecoveries} reduced working-view attempt(s) were also refused`
-                : refusalNotSmaller
-                  ? "; the reduced view would not have been smaller"
-                  : "; the working view had no reducible records") +
-              `: ${msg}`
+            ? `provider refused the request for context size; the context and pending memory work were preserved without deleting records: ${msg}`
             : msg;
         await this.commitTurnFinal(turn, {
           outcome: "fail",
@@ -1724,10 +1720,18 @@ export function assemble(
   memory: MemoryBlock[] = [],
   omitted: OmittedRange | null = null,
   memoryOmitted: OmittedMemory | null = null,
+  sourceRanges?: MemorySourceRange[],
 ): ChatMessage[] {
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM },
-    ...renderJournalContext(context, memory, omitted, memoryOmitted),
+    ...renderJournalContext(
+      context,
+      memory,
+      omitted,
+      memoryOmitted,
+      [],
+      sourceRanges,
+    ),
   ];
   const p = input.payload as Record<string, unknown>;
   const body = inputBodyText(p);
