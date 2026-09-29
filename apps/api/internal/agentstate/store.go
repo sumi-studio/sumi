@@ -2139,6 +2139,11 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 		"attachments":          list(in.Payload["attachments"]),
 		"attempt":              attempt,
 	}
+	if in.ActorKind == "memory" && in.SourceSurface == "core_memory" {
+		payload["chunk_seq"] = integer(in.Payload["chunk_seq"])
+		payload["transition"] = str(in.Payload["transition"])
+		payload["code"] = str(in.Payload["code"])
+	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO core_events (persona_id, seq, turn_id, kind, payload)
@@ -2267,6 +2272,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		return resp, resp != nil, err
 	}
 	switch tool {
+	case "skill.read":
+		response, err := readSkill(request)
+		return response, true, err
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
 		if scheduleID == "" {

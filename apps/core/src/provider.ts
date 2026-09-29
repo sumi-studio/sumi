@@ -181,7 +181,7 @@ export type ModelFailureCause =
 export class ModelError extends Error {
   readonly retryable: boolean;
   readonly retryAfterMs?: number;
-  readonly refusal?: "context_length";
+  readonly refusal?: "context_length" | "spend_limit";
   readonly unavailable?: boolean;
   readonly cause?: ModelFailureCause;
   constructor(
@@ -189,7 +189,7 @@ export class ModelError extends Error {
     opts: {
       retryable: boolean;
       retryAfterMs?: number;
-      refusal?: "context_length";
+      refusal?: "context_length" | "spend_limit";
       unavailable?: boolean;
       cause?: ModelFailureCause;
     },

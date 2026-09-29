@@ -163,6 +163,16 @@ func TestMemoryBranchFaultTransitionsAndPausedScheduling(t *testing.T) {
 	if notices != 2 || posts != 0 {
 		t.Fatalf("want occurrence/recovery only and no publication, notices=%d posts=%d", notices, posts)
 	}
+	var recovered map[string]any
+	if e = s.pool.QueryRow(ctx, `SELECT payload FROM core_inputs WHERE persona_id=$1 AND payload->>'transition'='recovered'`, p).Scan(&recovered); e != nil {
+		t.Fatal(e)
+	}
+	if recovered["chunk_seq"] != float64(b.Chunk.ChunkSeq) || recovered["code"] != "memory_context_capacity" {
+		t.Fatal("recovery lost the issue identity", recovered)
+	}
+	if text, _ := recovered["text"].(string); strings.Contains(text, "capacity rejected") || !strings.Contains(text, "previously reported") {
+		t.Fatal("recovery repeats an old failure as current", recovered)
+	}
 }
 
 func TestMemoryBranchKeepReconsiderationNeedsNewLiveMaterial(t *testing.T) {

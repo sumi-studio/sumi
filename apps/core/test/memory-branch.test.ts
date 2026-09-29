@@ -935,3 +935,152 @@ test("a control protocol fault recovers on a successful review, after source rea
     2,
   );
 });
+
+for (const mode of ["resume", "rebranch"] as const) {
+  test(`enforced spend limit preserves the draft until explicit ${mode}`, async () => {
+    const { state, g } = await fixture();
+    const requests: ModelRequest[] = [];
+    const writer = scripted(state, requests);
+    let attempts = 0;
+    const refusing: ModelProvider = {
+      name: "project-spend-limit",
+      async *stream(request) {
+        attempts++;
+        if (attempts === 2) {
+          throw new ModelError(
+            "OpenAI error: project_spend_limit_exceeded; sk-private-fixture https://example.invalid/private-account",
+            {
+              retryable: false,
+              refusal: "spend_limit",
+              cause: "model_usage_limit",
+            },
+          );
+        }
+        yield* writer.stream(request);
+      },
+    };
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider: refusing,
+      snapshot: snapshot(),
+    });
+    let b = state.memoryBranches.get(`${p}|1`)!;
+    const savedDraft = structuredClone(b.state!.candidate);
+    const savedPrefix = structuredClone(b.snapshot);
+    assert.ok(savedDraft, "the refusal happened after a draft was saved");
+    assert.equal(b.state!.status, "paused");
+    assert.equal(b.state!.pause_reason, "spend_limit");
+    assert.equal(b.state!.retry_at, null);
+    assert.equal(b.state!.in_flight, null);
+    assert.equal(b.state!.model_calls, 2);
+    assert.match(b.state!.issue!.message, /enforced spending limit/);
+    assert.doesNotMatch(
+      b.state!.issue!.message,
+      /sk-private|https?:|private-account/,
+    );
+    assert.equal(b.state!.issue!.code, "memory_spend_limit");
+    assert.equal(b.chunk.replacement, null);
+
+    // Simulate restoring the saved branch after a process restart. Both
+    // idle ticks and fresh parent consultations must leave the refused
+    // request alone; a larger execution budget does not fix provider denial.
+    state.memoryBranches.set(`${p}|1`, JSON.parse(JSON.stringify(b)));
+    for (const snap of [undefined, snapshot(), snapshot()]) {
+      assert.equal(
+        await runMemoryPreparation({
+          personaId: p,
+          generation: g,
+          state,
+          provider: refusing,
+          snapshot: snap,
+          policy: { maxRounds: 64 },
+        }),
+        "idle",
+      );
+    }
+    assert.equal(attempts, 2);
+    assert.deepEqual(
+      state.memoryBranches.get(`${p}|1`)!.state!.candidate,
+      savedDraft,
+    );
+    const notices = () =>
+      state.inputs.filter((i) => i.kind === "memory_status");
+    assert.equal(notices().length, 1, "idle ticks must not repeat the issue");
+    assert.equal(notices()[0]!.payload.code, "memory_spend_limit");
+    assert.match(String(notices()[0]!.payload.text), /enforced spending limit/);
+    assert.equal(state.outboxEntries.length, 0);
+    const status = await state.memoryStatus(p);
+    assert.equal(status.claimable, 0);
+    assert.equal(status.next_claimable_at, null);
+
+    await requestResume(state, g, mode, 8);
+    const recoveryRequests: ModelRequest[] = [];
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider: scripted(state, recoveryRequests),
+      ...(mode === "rebranch" ? { snapshot: snapshot() } : {}),
+    });
+    b = state.memoryBranches.get(`${p}|1`)!;
+    assert.equal(b.state!.status, "prepared");
+    assert.equal(b.state!.issue, null);
+    assert.deepEqual(
+      b.state!.candidate,
+      savedDraft,
+      "recovery must not rewrite the saved draft",
+    );
+    assert.deepEqual(b.snapshot, savedPrefix);
+    assert.equal(
+      recoveryRequests.length,
+      3,
+      "read, review, then confirm the saved draft",
+    );
+    assert.deepEqual(
+      notices().map((i) => i.payload.transition),
+      ["occurred", "recovered"],
+    );
+  });
+}
+
+for (const disposition of [
+  { retryable: true },
+  { retryable: false, unavailable: true },
+  { retryable: false },
+  { retryable: false, cause: "model_usage_limit" as const },
+]) {
+  test(`failure without an explicit spending refusal keeps paced retries: ${JSON.stringify(disposition)}`, async () => {
+    const { state, g } = await fixture();
+    let attempts = 0;
+    const provider: ModelProvider = {
+      name: "temporarily-unavailable",
+      async *stream() {
+        attempts++;
+        throw new ModelError("temporarily unavailable", disposition);
+      },
+    };
+    const deps = {
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+      snapshot: snapshot(),
+    };
+    await runMemoryPreparation(deps);
+    const b = state.memoryBranches.get(`${p}|1`)!;
+    assert.ok(b.state!.retry_at);
+    assert.equal(b.state!.issue, null);
+    assert.equal(await runMemoryPreparation(deps), "idle");
+    assert.equal(attempts, 1);
+    b.state!.retry_at = new Date(0).toISOString();
+    await runMemoryPreparation(deps);
+    assert.equal(attempts, 2);
+    assert.ok(state.memoryBranches.get(`${p}|1`)!.state!.retry_at);
+    assert.equal(
+      state.inputs.filter((i) => i.kind === "memory_status").length,
+      0,
+    );
+  });
+}

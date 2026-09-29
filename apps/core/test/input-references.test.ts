@@ -194,6 +194,9 @@ test("reference metadata is scoped to its actual input surface", () => {
       session_id: "not-a-terminal-event",
       status: "closed",
       exit_code: 0,
+      chunk_seq: 7319,
+      transition: "occurred",
+      code: "memory_budget_exhausted",
     },
   });
   assert.equal(afterReceipt(assemble([], input).at(-1)!.content), "[human] Hello");

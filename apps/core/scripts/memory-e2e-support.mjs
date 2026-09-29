@@ -26,8 +26,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, openSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { memoryTaskFromInstruction } from "../src/memory-instructions/task.ts";
 
-export const MEMORY_INSTRUCTION_PREFIX = "ここからは非同期の記憶整理の分岐";
 const RESUMED_NOTE = "[Memory execution resumed after a model/connection change]";
 
 /** Stable short digest of one provider message, for prefix comparisons. */
@@ -55,16 +55,15 @@ export function memoryBranchView(messages) {
     (m) =>
       m.role === "user" &&
       typeof m.content === "string" &&
-      m.content.startsWith(MEMORY_INSTRUCTION_PREFIX),
+      memoryTaskFromInstruction(m.content) !== null,
   );
   if (start < 0) return null;
-  const instruction = messages[start].content;
-  const chunk = Number(/memory\/(\d+)\/source\.json/.exec(instruction)?.[1]);
-  const seq = /journal seq (\d+)〜(\d+)/.exec(instruction);
+  const task = memoryTaskFromInstruction(messages[start].content);
   return {
-    chunk,
-    first_seq: Number(seq?.[1]),
-    last_seq: Number(seq?.[2]),
+    chunk: task.chunk_seq,
+    first_seq: task.first_seq,
+    last_seq: task.last_seq,
+    transition: task.transition,
     prefix: messages.slice(0, start),
     own: messages.slice(start + 1),
   };

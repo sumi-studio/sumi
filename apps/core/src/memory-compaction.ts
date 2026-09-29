@@ -353,6 +353,20 @@ export async function runMemoryPreparation(
         const unavailable =
           e instanceof BudgetWaitError ||
           (e instanceof ModelError && e.unavailable);
+        // A non-retryable turn error can also mean uncertain subscription
+        // delivery or a quota window that will reset. Only an explicit
+        // enforced spend limit changes memory's existing recovery policy.
+        if (e instanceof ModelError && e.refusal === "spend_limit") {
+          paused.pause_reason = "spend_limit";
+          paused.retry_at = null;
+          paused.issue = {
+            code: "memory_spend_limit",
+            message:
+              "The selected model connection reached its enforced spending limit. Memory preparation will not retry automatically. The frozen context and draft remain saved; memory.resume can continue after the spending limit has been addressed.",
+          };
+          await checkpoint(deps, branch, paused, signal);
+          return "worked";
+        }
         paused.pause_reason = unavailable
           ? "model_unavailable"
           : "provider_error";

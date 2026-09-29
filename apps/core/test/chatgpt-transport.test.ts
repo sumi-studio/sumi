@@ -220,6 +220,10 @@ test("subscription stream failures never copy raw upstream error text into recor
     },
     { type: "error", message: "private-token", code: "permission_denied" },
     {
+      type: "error",
+      error: { message: "private-token", code: "permission_denied" },
+    },
+    {
       type: "response.incomplete",
       response: { incomplete_details: { reason: "private-token" } },
     },

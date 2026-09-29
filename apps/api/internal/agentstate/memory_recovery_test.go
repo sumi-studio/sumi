@@ -151,3 +151,71 @@ func TestMemoryResumeCannotSilentlyRemoveAnExhaustedTokenCap(t *testing.T) {
 		}
 	}
 }
+
+// The first tool claim journals its input before Core commits the turn. That
+// receipt must retain exactly the recovery references from the delivered event.
+func TestMemoryNoticeRecoveryJournalsReferencesAtFirstToolClaim(t *testing.T) {
+	s, p, g, b := branchFixture(t)
+	ctx := context.Background()
+	n := branchState("saved draft")
+	n["status"] = "paused"
+	n["pause_reason"] = "configured_budget"
+	n["model_calls"] = 32
+	n["issue"] = map[string]string{"code": "memory_budget_exhausted", "message": "Preparation reached its configured execution budget."}
+	if _, err := s.SaveMemoryBranch(ctx, p, g, b.Chunk.ChunkSeq, b.Revision, checkpointRaw(t, n)); err != nil {
+		t.Fatal(err)
+	}
+	load, err := s.LoadTurn(ctx, p, g, "notice-recovery", 5000)
+	if err != nil || load.Input == nil || load.Input.Kind != "memory_status" {
+		t.Fatalf("notice did not reach intake: %+v %v", load, err)
+	}
+	// The caller learns the target from the delivered input, not fixture state.
+	req := map[string]any{"chunk_seq": load.Input.Payload["chunk_seq"], "mode": "resume", "additional_rounds": 4}
+	c := PlanCall{CallID: "resume-from-notice", Tool: "memory.resume", Route: "normal", Request: req}
+	mustPlan(t, s, p, load.Turn.TurnID, g, c)
+	op, _, fresh, err := s.ClaimOperation(ctx, p, load.Turn.TurnID, g, "notice-op", c.Tool, 0, req)
+	if err != nil || !fresh || op.Status != "done" {
+		t.Fatalf("recovery from delivered notice: %+v %v", op, err)
+	}
+	var received map[string]any
+	if err := s.pool.QueryRow(ctx, `SELECT payload FROM core_events WHERE persona_id=$1 AND kind='input_received' AND payload->>'input_id'=$2`, p, load.Input.InputID).Scan(&received); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"chunk_seq", "transition", "code", "text"} {
+		if received[key] != load.Input.Payload[key] {
+			t.Fatalf("first-claim receipt lost %s: %v vs %v", key, received[key], load.Input.Payload[key])
+		}
+	}
+	if received["actor_kind"] != "memory" || received["source_surface"] != "core_memory" || received["attention"] != "observe" {
+		t.Fatal("notice became an external message", received)
+	}
+
+	// A new state-service instance receives a retry after the receipt was lost.
+	// It replays the result and cannot grant the same execution budget twice.
+	restarted := NewStore(s.pool)
+	replay, _, fresh, err := restarted.ClaimOperation(ctx, p, load.Turn.TurnID, g, "notice-op-replay", c.Tool, 0, req)
+	if err != nil || fresh || replay.OperationID != op.OperationID {
+		t.Fatalf("lost receipt replay: %+v %v", replay, err)
+	}
+	resumed, err := restarted.ClaimMemoryBranch(ctx, p, g, nil)
+	if err != nil || resumed == nil {
+		t.Fatalf("resumed branch unavailable: %+v %v", resumed, err)
+	}
+	var st map[string]any
+	if err := json.Unmarshal(resumed.State, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st["budget_extension"].(map[string]any)["rounds"] != float64(4) {
+		t.Fatal("replayed recovery granted duplicate budget", st)
+	}
+	var notices, posts int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM core_inputs WHERE persona_id=$1 AND kind='memory_status'`, p).Scan(&notices); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM core_outbox WHERE persona_id=$1`, p).Scan(&posts); err != nil {
+		t.Fatal(err)
+	}
+	if notices != 1 || posts != 0 {
+		t.Fatalf("recovery duplicated or published a notice: notices=%d posts=%d", notices, posts)
+	}
+}

@@ -498,6 +498,81 @@ test("response.failed and mid-stream error events fail honestly", async () => {
   );
 });
 
+test("nested and top-level SSE errors keep their diagnostics and classification without account links or keys", async () => {
+  const quota = {
+    type: "insufficient_quota",
+    code: "project_spend_limit_exceeded",
+    message:
+      "Your project has reached its configured enforced spend limit. Update your limit at https://platform.openai.com/settings/proj_private/limits. test-key sk-private-example Bearer private-token",
+    param: null,
+  };
+  for (const { event, code, retryable, refusal } of [
+    {
+      event: { type: "error", error: quota },
+      code: quota.code,
+      retryable: false,
+      refusal: "spend_limit",
+    },
+    {
+      event: { type: "error", code: quota.code, message: quota.message },
+      code: quota.code,
+      retryable: false,
+      refusal: "spend_limit",
+    },
+    {
+      event: {
+        type: "error",
+        error: {
+          type: "authentication_error",
+          message: "authentication failed",
+        },
+      },
+      code: "authentication_error",
+      retryable: false,
+      refusal: undefined,
+    },
+    {
+      event: {
+        type: "error",
+        error: { code: "context_length_exceeded", message: "input too long" },
+      },
+      code: "context_length_exceeded",
+      retryable: true,
+      refusal: "context_length",
+    },
+    ...["rate_limit_exceeded", "server_error"].map((code) => ({
+      event: { type: "error", error: { code, message: "try again later" } },
+      code,
+      retryable: true,
+      refusal: undefined,
+    })),
+  ]) {
+    await withServer(
+      (_req, res) => sse([ev(event)])(res),
+      async (base) => {
+        await assert.rejects(collect(provider(base)), (error: unknown) => {
+          assert.ok(error instanceof ModelError);
+          assert.ok(error.message.includes(code));
+          assert.equal(error.retryable, retryable);
+          assert.equal(error.refusal, refusal);
+          assert.equal(
+            error.cause,
+            code === quota.code ? "model_usage_limit" : undefined,
+          );
+          assert.doesNotMatch(
+            error.message,
+            /https?:|proj_private|test-key|sk-private|private-token/,
+          );
+          if (code === quota.code) {
+            assert.match(error.message, /configured enforced spend limit/);
+          }
+          return true;
+        });
+      },
+    );
+  }
+});
+
 test("a stream that ends without response.completed is not a reply", async () => {
   await withServer(
     (_req, res) => sse([textDelta("cut off")])(res),

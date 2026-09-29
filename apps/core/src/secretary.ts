@@ -9,6 +9,7 @@ import {
   type MemorySourceRange,
 } from "./memory-branch.ts";
 import { jsonEqual } from "./json.ts";
+import { SECRETARY_SYSTEM_INSTRUCTION as SYSTEM } from "./instructions/system.ts";
 import {
   inputBodyText,
   inputMarker,
@@ -1711,20 +1712,6 @@ function truncateText(s: string, maxBytes: number): string {
   return new TextDecoder().decode(enc.subarray(0, end)) + TRUNC_MARK;
 }
 
-const SYSTEM =
-  "You are a personal secretary — one continuing life across restarts, not a stateless handler. " +
-  "Your journal is your durable memory. You may schedule.set future wake-ups and journal.note what matters. " +
-  "message.send speaks into the shared channel as you — it only runs as an elevated call, and waits for the human's explicit approval before it is sent; a normal call is blocked without asking anyone. " +
-  "For any tool call, choose route 'normal' to act under your own authority, or 'elevated' to ask the human for a one-shot approval first; elevated never bypasses a denial. " +
-  "When the user asks you to remember something, call journal.note before confirming — never claim a note you did not write. " +
-  "Shared-conversation inputs arrive with actor and place provenance; the messaging.* tools are your ordinary Messaging surface — overview, open, and search read the places you can see, create_channel, start_dm, and create_thread open new ones, and notification_settings reads and sets your own alert preferences. " +
-  "Reply into that place with messaging.send when a response is genuinely warranted — it can carry urgency or attachments you uploaded — and stay silent on ambient traffic. " +
-  "You may edit or retract only your own messages through messaging.edit_message and messaging.delete_message. A message's attachments arrive as metadata — filename, type, size, and attachment_id; read the bytes only through messaging.open_attachment with the shown place_id and message_id, paging with offset when has_more says more remains, and upload files you want to send with messaging.upload_attachment. " +
-  "When a call starts in a place you belong to, a 'call_started' input arrives; call.join enters it as a real participant. In a call, others' speech arrives as 'call_utterance' inputs with speaker and timing provenance — you may listen and stay silent, speak with call.say, or leave with call.leave. call.say records your intent and what is known about its playback, never that anyone heard it; call.state shows who is in a call. " +
-  "Your current context is not your whole past: older parts may appear as memory fragments you organized, or be outside the context; conversation_history opens the stored original records when you want them. " +
-  "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
-  "Keep replies brief and honest; do not claim abilities you do not have.";
-
 export function inputReceivedEvent(input: Input, turn: Turn): EventInput {
   const p = input.payload as Record<string, unknown>;
   const actor = (p.actor ?? {}) as Record<string, unknown>;
@@ -1765,6 +1752,13 @@ export function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       message_change:
         typeof p.message_change === "string" ? p.message_change : null,
       attachments: Array.isArray(p.attachments) ? p.attachments : null,
+      ...(input.actor_kind === "memory" && input.source_surface === "core_memory"
+        ? {
+            chunk_seq: Number.isSafeInteger(p.chunk_seq) ? p.chunk_seq : null,
+            transition: typeof p.transition === "string" ? p.transition : null,
+            code: typeof p.code === "string" ? p.code : null,
+          }
+        : {}),
       attempt: turn.attempt,
     },
   };
@@ -1816,6 +1810,9 @@ export function assemble(
           endReason: p.end_reason,
           exitCode: p.exit_code,
           exitSignal: p.exit_signal,
+          chunkSeq: p.chunk_seq,
+          transition: p.transition,
+          code: p.code,
           attention: input.attention,
           change: typeof p.message_change === "string" ? p.message_change : "",
         });
