@@ -27,6 +27,7 @@ import {
   assertExtraHeaders,
   disambiguateCallIds,
   encodeCallArguments,
+  errorBodyFields,
   httpError,
   isContextLengthRefusal,
   networkError,
@@ -591,23 +592,26 @@ export class OpenAIResponsesProvider implements ModelProvider {
             });
           }
           case "error": {
+            const err = errorBodyFields(data) ?? {
+              code: json.code,
+              message: json.message,
+            };
             const message = chatgpt
               ? "ChatGPT stream error"
-              : (json.message ?? "stream error");
+              : streamErrorMessage(err.message, this.cfg.apiKey);
             const code =
-              (chatgpt
-                ? safeDiagnosticCode(
-                    JSON.stringify({ error: { code: json.code } }),
-                  )
-                : typeof json.code === "string"
-                  ? json.code
-                  : "") ?? "";
-            throw new ModelError(`provider stream error: ${message}`, {
-              retryable: !/invalid|authentication|permission/i.test(code),
-              refusal: isContextLengthRefusal(null, code, message)
-                ? "context_length"
-                : undefined,
-            });
+              safeDiagnosticCode(JSON.stringify({ error: err })) ?? "";
+            throw new ModelError(
+              `provider stream error${code ? ` (${code})` : ""}: ${message}`,
+              {
+                retryable:
+                  code !== "project_spend_limit_exceeded" &&
+                  !/invalid|authentication|permission/i.test(code),
+                refusal: isContextLengthRefusal(null, code, message)
+                  ? "context_length"
+                  : undefined,
+              },
+            );
           }
           default:
             // response.created / .in_progress / content_part.* / reasoning /
@@ -675,6 +679,16 @@ export class OpenAIResponsesProvider implements ModelProvider {
       await events?.return(undefined).catch(() => {});
     }
   }
+}
+
+/** Provider diagnostics can contain account links or echoed credentials. */
+function streamErrorMessage(message: unknown, apiKey: string): string {
+  if (typeof message !== "string" || !message) return "stream error";
+  return (apiKey ? message.replaceAll(apiKey, "[redacted key]") : message)
+    .replace(/https?:\/\/\S+/gi, "[redacted URL]")
+    .replace(/\bsk-[\w-]+/g, "[redacted key]")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .slice(0, 1024);
 }
 
 /**
