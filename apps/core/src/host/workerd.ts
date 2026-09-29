@@ -80,7 +80,7 @@
  * own secret store, never in DO storage.
  */
 
-import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory.ts";
+import { DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS } from "../memory-compaction.ts";
 import { Secretary } from "../secretary.ts";
 import {
   HttpStateClient,
@@ -269,6 +269,11 @@ export class SecretaryObject {
       pollIntervalMs: 0,
       scheduleEveryMs: 1_000,
       memoryPreparationTimeoutMs: this.memoryPreparationTimeoutMs(),
+      memoryPolicy: {
+        maxRounds: this.envMs("SUMI_MEMORY_MAX_ROUNDS", 1, 32),
+        maxTokens: this.envMs("SUMI_MEMORY_MAX_TOKENS", 0, 0),
+        maxConsecutiveFailures: this.envMs("SUMI_MEMORY_MAX_FAILURES", 1, 3),
+      },
       memoryUnavailablePauseMs: this.envMs(
         "SUMI_MEMORY_UNAVAILABLE_PAUSE_MS",
         1_000,

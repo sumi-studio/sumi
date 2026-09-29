@@ -1,3 +1,10 @@
+import {
+  sha256,
+  type MemoryBranch,
+  type MemoryBranchState,
+  type MemorySnapshot,
+  type MemoryPolicy,
+} from "./memory-branch.ts";
 import { jsonEqual } from "./json.ts";
 import {
   FencedError,
@@ -7,25 +14,24 @@ import {
   StateError,
 } from "./state-client.ts";
 import { isInternalActor } from "./memory.ts";
+import { inputReceivedEvent } from "./secretary.ts";
 import type {
   Approval,
   ApprovalDecision,
-  ClaimedMemoryChunk,
   CommitRequest,
   Decision,
   Event,
+  EventInput,
   FundingRef,
   Input,
   Job,
   JobTerminalReport,
   Json,
   LoadResult,
-  MemoryBlock,
   MemoryChunk,
   MemoryStatus,
   ModelBinding,
   NextWork,
-  OmittedMemory,
   Operation,
   OutboxEntry,
   PersonaState,
@@ -111,13 +117,9 @@ const L0_CHUNK_MIN_TOKENS = 10_000;
 const L0_FORCED_SEAL_LIMIT_TOKENS = L0_CHUNK_MIN_TOKENS * 2;
 const L0_LIVE_LIMIT_TOKENS = 40_000;
 /** Recorded preparation failures a chunk may spend. */
-const MEMORY_CHUNK_MAX_ATTEMPTS = 3;
 /** Claims ending without a recorded outcome before a chunk is marked failed. */
-const MEMORY_CHUNK_MAX_INTERRUPTIONS = 8;
 /** Go memoryReshelvePacing: shelf delay after an unavailable model layer. */
-const MEMORY_RESHELVE_PACING_MS = 200;
 /** Estimated tokens of applied memory blocks admitted into one context. */
-const MEMORY_SEND_CAP_TOKENS = 25_000;
 /** Applied L1 beyond this triggers an L1→L2 consolidation target. */
 const L1_LIMIT_TOKENS = 15_000;
 /** One L1→L2 target consumes until at most this much applied L1 remains. */
@@ -127,8 +129,6 @@ const L2_LIMIT_TOKENS = 10_000;
 /** Journal records one conversation_history search call scans. */
 const HISTORY_SEARCH_SCAN_RECORDS = 2_000;
 const HISTORY_READ_CHAR_BUDGET = 16 * 1024;
-const L0_SEND_CAP_TOKENS = 60_000;
-const CONTEXT_MAX_EVENTS = 5_000;
 
 /** Matches Go estPayloadTokens: ~4 bytes/token over stored JSON + overhead. */
 function estEventTokens(
@@ -166,38 +166,6 @@ function journalEventJson(e: Event): string {
   );
 }
 
-/** Go admitApplied: newest blocks first while they fit the memory cap; the
- * older remainder is left out as one explicit range. */
-function admitApplied(
-  blocks: MemoryBlock[],
-): [MemoryBlock[], OmittedMemory | null] {
-  let used = 0;
-  let cut = blocks.length;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const b = blocks[i] as MemoryBlock;
-    if (used + b.est_tokens > MEMORY_SEND_CAP_TOKENS) break;
-    used += b.est_tokens;
-    cut = i;
-  }
-  if (cut === 0) return [blocks, null];
-  const older = blocks.slice(0, cut);
-  const first = older[0] as MemoryBlock;
-  const last = older[older.length - 1] as MemoryBlock;
-  return [
-    blocks.slice(cut),
-    {
-      count: older.length,
-      first_chunk_seq: first.chunk_seq,
-      last_chunk_seq: last.chunk_seq,
-      first_seq: first.first_seq,
-      last_seq: last.last_seq,
-      first_time: first.first_time,
-      last_time: last.last_time,
-      est_tokens: older.reduce((n, b) => n + b.est_tokens, 0),
-    },
-  ];
-}
-
 /**
  * Mirror of the Go tool registry (approvals.go): which tools exist and
  * the authority each may act under. message.send may only run through an
@@ -213,6 +181,7 @@ export const TOOL_AUTHORITY: Record<
 > = {
   "schedule.set": { requiresApproval: false, elevatedOnly: false },
   "journal.note": { requiresApproval: false, elevatedOnly: false },
+  "memory.resume": { requiresApproval: false, elevatedOnly: false },
   "job.start": { requiresApproval: false, elevatedOnly: false },
   "job.status": { requiresApproval: false, elevatedOnly: false },
   "job.cancel": { requiresApproval: false, elevatedOnly: false },
@@ -228,6 +197,120 @@ export const TOOL_AUTHORITY: Record<
   "message.send": { requiresApproval: false, elevatedOnly: true },
   conversation_history: { requiresApproval: false, elevatedOnly: false },
 };
+
+/**
+ * The identity of a journaled experience within one input's resolution
+ * lineage (Go experienceKey): a round's deciding text by round, a call and
+ * its result by the call's flat plan index, an approval request by its
+ * approval. null for records that carry no such identity.
+ */
+export function experienceKey(
+  kind: string,
+  payload: Record<string, unknown>,
+): string | null {
+  const n = (v: unknown) => (Number.isSafeInteger(v) ? String(v) : null);
+  switch (kind) {
+    case "assistant_message": {
+      const r = n(payload.round);
+      return r === null ? null : `${kind}:${r}`;
+    }
+    case "tool_call":
+    case "tool_result": {
+      const i = n(payload.call_index);
+      return i === null ? null : `${kind}:${i}`;
+    }
+    case "approval_requested":
+      return typeof payload.approval_id === "string" && payload.approval_id
+        ? `${kind}:${payload.approval_id}`
+        : null;
+    default:
+      return null;
+  }
+}
+
+/** One planned call's place in its input's plan (Go callExperience). */
+type CallPosition = {
+  round: number;
+  text: string;
+  call: PlanCall;
+  index: number;
+};
+
+/** The round's deciding text (if any) and the call as decided — what the
+ * Core journals for it (secretary.ts executeCall), keyed the same way. */
+function decidedEvents(pos: CallPosition): EventInput[] {
+  return [
+    ...(pos.text !== ""
+      ? [
+          {
+            kind: "assistant_message",
+            payload: { text: pos.text, round: pos.round },
+          },
+        ]
+      : []),
+    {
+      kind: "tool_call",
+      payload: {
+        tool: pos.call.tool,
+        call_id: pos.call.call_id ?? "",
+        request: pos.call.request,
+        route: pos.call.route,
+        round: pos.round,
+        call_index: pos.index,
+      },
+    },
+  ];
+}
+
+/** A finalized operation's result as the model is fed it; null while it
+ * has none (running, parked) — no outcome is invented. */
+function resultEvent(
+  pos: CallPosition,
+  op: Operation,
+  approval: Approval | null,
+): EventInput | null {
+  const p: Record<string, unknown> = {
+    tool: pos.call.tool,
+    call_id: pos.call.call_id ?? "",
+    call_index: pos.index,
+  };
+  if (op.status === "done") {
+    p.response = op.response;
+  } else if (op.status === "failed") {
+    const r = op.response as Record<string, unknown> | null;
+    p.error =
+      r !== null && typeof r === "object" && "error" in r
+        ? String(r.error)
+        : "operation failed";
+    if (approval?.status === "denied") p.denied = true;
+  } else {
+    return null;
+  }
+  return { kind: "tool_result", payload: p as Json };
+}
+
+/** A parked call: decided, planned, waiting on a human, not run. */
+function awaitingEvents(pos: CallPosition, a: Approval): EventInput[] {
+  const [text] = decidedEvents(pos).filter(
+    (e) => e.kind === "assistant_message",
+  );
+  return [
+    ...(text ? [text] : []),
+    {
+      kind: "approval_requested",
+      payload: {
+        tool: pos.call.tool,
+        call_id: pos.call.call_id ?? "",
+        route: pos.call.route,
+        round: pos.round,
+        call_index: pos.index,
+        approval_id: a.approval_id,
+        required_by: a.required_by,
+        request: pos.call.request,
+      },
+    },
+  ];
+}
 
 // Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
 // or any non-RFC3339 shape is rejected even though new Date() would parse
@@ -270,6 +353,27 @@ function validateToolRequest(
       }
       return null;
     }
+    case "memory.resume":
+      return Number.isSafeInteger(request.chunk_seq) &&
+        Number(request.chunk_seq) > 0 &&
+        ["resume", "rebranch"].includes(String(request.mode)) &&
+        Number.isSafeInteger(request.additional_rounds) &&
+        Number(request.additional_rounds) > 0 &&
+        Number(request.additional_rounds) <= 128 &&
+        (request.additional_tokens === undefined ||
+          (Number.isSafeInteger(request.additional_tokens) &&
+            Number(request.additional_tokens) >= 0 &&
+            Number(request.additional_tokens) <= 100000000)) &&
+        Object.keys(request).every((k) =>
+          [
+            "chunk_seq",
+            "mode",
+            "additional_rounds",
+            "additional_tokens",
+          ].includes(k),
+        )
+        ? null
+        : "bad request: invalid memory.resume request";
     case "journal.note":
       return typeof request.text === "string" && request.text !== ""
         ? null
@@ -294,8 +398,10 @@ function validateToolRequest(
         return `bad request: ${tool} requires a UUIDv7 session_id`;
       }
       if (tool === "terminal.write") {
-        if (request.eof !== true &&
-          (typeof request.data !== "string" || request.data === "")) {
+        if (
+          request.eof !== true &&
+          (typeof request.data !== "string" || request.data === "")
+        ) {
           return "bad request: terminal.write requires data or eof";
         }
         if (typeof request.data === "string" && request.data.length > 65536) {
@@ -306,17 +412,31 @@ function validateToolRequest(
         const cols = request.cols;
         const rows = request.rows;
         if (
-          typeof cols !== "number" || typeof rows !== "number" ||
-          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+          typeof cols !== "number" ||
+          typeof rows !== "number" ||
+          cols < 2 ||
+          cols > 1000 ||
+          rows < 2 ||
+          rows > 500
         ) {
           return "bad request: terminal.resize requires cols 2..1000 and rows 2..500";
         }
       }
       if (tool === "terminal.signal") {
         const allowed = new Set([
-          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+          "INT",
+          "TERM",
+          "HUP",
+          "QUIT",
+          "KILL",
+          "TSTP",
+          "USR1",
+          "USR2",
         ]);
-        if (typeof request.signal !== "string" || !allowed.has(request.signal)) {
+        if (
+          typeof request.signal !== "string" ||
+          !allowed.has(request.signal)
+        ) {
           return "bad request: terminal.signal not permitted";
         }
       }
@@ -362,10 +482,13 @@ const UUIDV7_RE =
  * the same session, never a second one.
  */
 function fakeUuidV7(seed: string): string {
-  const h = `${fakeDigest(`${seed}:a`)}${fakeDigest(`${seed}:b`)}` +
+  const h =
+    `${fakeDigest(`${seed}:a`)}${fakeDigest(`${seed}:b`)}` +
     `${fakeDigest(`${seed}:c`)}${fakeDigest(`${seed}:d`)}`;
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7${h.slice(13, 16)}-` +
-    `${"89ab"[parseInt(h[16] ?? "0", 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+  return (
+    `${h.slice(0, 8)}-${h.slice(8, 12)}-7${h.slice(13, 16)}-` +
+    `${"89ab"[parseInt(h[16] ?? "0", 16) % 4]}${h.slice(17, 20)}-${h.slice(20, 32)}`
+  );
 }
 
 function actionDigest(tool: string, route: string, request: Json): string {
@@ -432,6 +555,8 @@ export class FakeState implements StateClient {
   outboxEntries: OutboxEntry[] = [];
   /** Sealed journal ranges and their L1 replacement lifecycle. */
   memoryChunks: MemoryChunk[] = [];
+  memoryBranches = new Map<string, MemoryBranch>();
+  memoryBranchAttempts = new Map<string, MemoryBranch[]>();
   /** First commit request per turn — replay comparison (commit_request). */
   private commits = new Map<string, CommitRequest>();
   /** Durable approval records — key: approval_id. */
@@ -727,6 +852,27 @@ export class FakeState implements StateClient {
         t.status = "interrupted";
         t.finished_at = new Date().toISOString();
         interrupted.push(t.turn_id);
+        // Go markInterruptedTx: a turn that already journaled experience
+        // says its request stopped there and resumes.
+        const received = this.receivedSeq.get(`${persona}|${t.input_id}`);
+        if (
+          received !== undefined &&
+          this.eventLog.some(
+            (e) =>
+              e.persona_id === persona &&
+              e.seq >= received &&
+              e.turn_id === t.turn_id,
+          )
+        ) {
+          this.eventLog.push({
+            persona_id: persona,
+            seq: this.nextSeq(this.seq, persona),
+            turn_id: t.turn_id,
+            kind: "turn_paused",
+            payload: { reason: "interrupted" },
+            created_at: new Date().toISOString(),
+          });
+        }
       }
     }
     for (const i of this.inputs) {
@@ -744,7 +890,6 @@ export class FakeState implements StateClient {
       }
     }
     // Memory chunks a fenced generation was preparing count an interruption.
-    this.interruptPreparing(persona, generation);
     // Held reservations from dead generations reconcile the same way Go
     // Recover does: the fact landed → settled; it never did → an
     // inspectable 'unrecorded' fact carrying the estimate, not a release.
@@ -1387,7 +1532,7 @@ export class FakeState implements StateClient {
    */
   private renderedContext(
     persona: string,
-    limit: number,
+    _limit: number,
     excludeInputId = "",
   ): RenderedContext {
     // Applied and superseded chunks both cover their ranges: a superseded
@@ -1408,38 +1553,8 @@ export class FakeState implements StateClient {
           this.turns.get(e.turn_id)?.input_id === excludeInputId
         ),
     );
-    const rowCap =
-      limit <= 0 ? CONTEXT_MAX_EVENTS : Math.min(limit, CONTEXT_MAX_EVENTS);
-    const picked: Event[] = [];
-    let budget = 0;
-    for (let i = uncovered.length - 1; i >= 0; i--) {
-      const e = uncovered[i];
-      if (!e) break;
-      const est = estEventTokens(e.kind, e.payload);
-      if (
-        picked.length >= rowCap ||
-        (picked.length > 0 && budget + est > L0_SEND_CAP_TOKENS)
-      ) {
-        break;
-      }
-      budget += est;
-      picked.push(e);
-    }
-    const events = picked.reverse();
-    const firstShown = events[0]?.seq ?? 0;
-    const older = uncovered.filter((e) => e.seq < firstShown);
-    const oldest = older[0];
-    const newestOmitted = older[older.length - 1];
-    const omitted =
-      oldest && newestOmitted
-        ? {
-            count: older.length,
-            first_seq: oldest.seq,
-            last_seq: newestOmitted.seq,
-            first_time: oldest.created_at,
-            last_time: newestOmitted.created_at,
-          }
-        : null;
+    const events = uncovered;
+    const omitted = null;
     const at = (seq: number) =>
       this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
         ?.created_at ?? "";
@@ -1455,7 +1570,8 @@ export class FakeState implements StateClient {
         text: c.replacement ?? "",
         est_tokens: c.replacement_est_tokens ?? 0,
       }));
-    const [memory, memoryOmitted] = admitApplied(blocks);
+    const memory = blocks,
+      memoryOmitted = null;
     return { events, memory, omitted, memory_omitted: memoryOmitted };
   }
 
@@ -1606,6 +1722,12 @@ export class FakeState implements StateClient {
         throw new StateError(400, `input_received names absent input ${id}`);
       }
     }
+    // An experience an earlier attempt of this input already journaled —
+    // a round's text, a call and its result, an approval request, recorded
+    // when that attempt parked or requeued — is the same fact again when
+    // the resumed attempt re-presents its plan: the first record stays
+    // (Go withoutJournaledExperience).
+    const experienced = this.lineageExperience(persona, turn.input_id);
     const emitted = new Set<string>();
     for (const ev of req.events) {
       if (ev.kind === "input_received") {
@@ -1614,6 +1736,11 @@ export class FakeState implements StateClient {
           continue;
         }
         emitted.add(key);
+      }
+      const exp = experienceKey(ev.kind, ev.payload);
+      if (exp !== null) {
+        if (experienced.has(exp)) continue;
+        experienced.add(exp);
       }
       const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
@@ -1848,6 +1975,14 @@ export class FakeState implements StateClient {
       .slice(0, limit);
   }
 
+  /**
+   * Go ClaimOperation: the claim and its journaling are one transaction.
+   * The call is journaled with its outcome — a receipt, a stored failure,
+   * a parked approval request — at the claim itself (Go experience.go), so
+   * an effect is never known only to the operation ledger; an execution
+   * error rolls the journal back with the claim, and a deterministic
+   * rejection is journaled as the call's result, fenced like the claim.
+   */
   async claimOperation(
     persona: string,
     generation: number,
@@ -1863,6 +1998,167 @@ export class FakeState implements StateClient {
     approval: Approval | null;
     fresh: boolean;
   }> {
+    const mark = {
+      events: this.eventLog.length,
+      seq: this.seq.get(persona),
+      received: new Map(this.receivedSeq),
+    };
+    try {
+      const res = this.claim(persona, generation, op);
+      const turn = this.turns.get(op.turnId)!;
+      const pos = this.planPosition(persona, turn.input_id, op.callIndex)!;
+      const { operation, approval } = res;
+      if (
+        operation.status === "awaiting_approval" &&
+        approval?.status === "pending"
+      ) {
+        this.journalExperience(persona, turn, awaitingEvents(pos, approval));
+      } else {
+        this.journalOutcome(persona, turn, pos, operation, approval);
+      }
+      return res;
+    } catch (e) {
+      this.eventLog.length = mark.events;
+      if (mark.seq === undefined) this.seq.delete(persona);
+      else this.seq.set(persona, mark.seq);
+      this.receivedSeq = mark.received;
+      if (e instanceof StateError && e.status === 400) {
+        this.journalRejectedClaim(persona, generation, op, e.message);
+      }
+      throw e;
+    }
+  }
+
+  /** Go journalRejectedClaim: only the live turn's recorded plan position. */
+  private journalRejectedClaim(
+    persona: string,
+    generation: number,
+    op: {
+      turnId: string;
+      tool: string;
+      callIndex: number;
+      request: Record<string, unknown>;
+    },
+    cause: string,
+  ) {
+    const lease = this.leases.get(persona);
+    const turn = this.turns.get(op.turnId);
+    if (
+      !lease ||
+      lease.generation !== generation ||
+      !turn ||
+      turn.persona_id !== persona ||
+      turn.generation !== generation ||
+      turn.status !== "running"
+    ) {
+      return;
+    }
+    const pos = this.planPosition(persona, turn.input_id, op.callIndex);
+    if (
+      !pos ||
+      pos.call.tool !== op.tool ||
+      !jsonEqual(pos.call.request, op.request ?? {})
+    ) {
+      return;
+    }
+    this.journalExperience(persona, turn, [
+      ...decidedEvents(pos),
+      {
+        kind: "tool_result",
+        payload: {
+          tool: op.tool,
+          call_id: pos.call.call_id ?? "",
+          call_index: op.callIndex,
+          error: cause.replaceAll("\0", ""),
+        },
+      },
+    ]);
+  }
+
+  /** A flat call index's place in the input's recorded plan. */
+  private planPosition(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+  ): CallPosition | null {
+    const plan = this.plans.get(`${persona}|${inputId}`);
+    if (!plan || callIndex < 0) return null;
+    let n = callIndex;
+    for (const [round, d] of plan.plan.entries()) {
+      if (n < d.calls.length) {
+        return { round, text: d.text, call: d.calls[n]!, index: callIndex };
+      }
+      n -= d.calls.length;
+    }
+    return null;
+  }
+
+  /** Go journalExperienceTx: the input once, then each record the input's
+   * lineage has not journaled yet (experienceKey), attributed to turn. */
+  private journalExperience(persona: string, turn: Turn, events: EventInput[]) {
+    this.ensureInputReceived(persona, turn);
+    const experienced = this.lineageExperience(persona, turn.input_id);
+    for (const ev of events) {
+      const exp = experienceKey(ev.kind, ev.payload);
+      if (exp !== null) {
+        if (experienced.has(exp)) continue;
+        experienced.add(exp);
+      }
+      this.eventLog.push({
+        persona_id: persona,
+        seq: this.nextSeq(this.seq, persona),
+        turn_id: turn.turn_id,
+        kind: ev.kind,
+        payload: ev.payload,
+        created_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  /** Go journalOutcomeTx: the call with its finalized outcome, if any. */
+  private journalOutcome(
+    persona: string,
+    turn: Turn,
+    pos: CallPosition,
+    op: Operation,
+    approval: Approval | null,
+  ) {
+    const res = resultEvent(pos, op, approval);
+    if (res) {
+      this.journalExperience(persona, turn, [...decidedEvents(pos), res]);
+    }
+  }
+
+  /** Keys of the experience every turn serving the input journaled. */
+  private lineageExperience(persona: string, inputId: string): Set<string> {
+    const lineage = new Set(
+      [...this.turns.values()]
+        .filter((t) => t.persona_id === persona && t.input_id === inputId)
+        .map((t) => t.turn_id),
+    );
+    return new Set(
+      this.eventLog
+        .filter((e) => e.persona_id === persona && lineage.has(e.turn_id))
+        .map((e) => experienceKey(e.kind, e.payload))
+        .filter((k) => k !== null),
+    );
+  }
+
+  private claim(
+    persona: string,
+    generation: number,
+    op: {
+      operationId: string;
+      turnId: string;
+      tool: string;
+      callIndex: number;
+      request: Record<string, unknown>;
+    },
+  ): {
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  } {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish. Go's claimableTool is
@@ -1930,13 +2226,7 @@ export class FakeState implements StateClient {
         return { operation: existing, approval: null, fresh: true };
       }
       if (existing.status === "awaiting_approval") {
-        return this.claimGated(
-          persona,
-          turn.input_id,
-          op.callIndex,
-          existing,
-          false,
-        );
+        return this.claimGated(persona, turn, op.callIndex, existing, false);
       }
       // A replayed job.* receipt carries the job's state now next to the
       // original result (Go withCurrentJobTx); the stored receipt stays.
@@ -2041,6 +2331,13 @@ export class FakeState implements StateClient {
       };
       return { operation, approval: null, fresh: true };
     }
+    // The call is journaled before its effect runs, so anything the effect
+    // records follows its cause (Go claimOperation).
+    this.journalExperience(
+      persona,
+      turn,
+      decidedEvents(this.planPosition(persona, turn.input_id, op.callIndex)!),
+    );
     try {
       this.applyInternal(
         persona,
@@ -2111,11 +2408,12 @@ export class FakeState implements StateClient {
    */
   private claimGated(
     persona: string,
-    inputId: string,
+    claiming: Turn,
     callIndex: number,
     op: Operation,
     freshInsert: boolean,
   ): { operation: Operation; approval: Approval | null; fresh: boolean } {
+    const inputId = claiming.input_id;
     const appr = this.approvalFor(persona, inputId, callIndex);
     if (!appr) {
       throw new StateError(
@@ -2134,6 +2432,11 @@ export class FakeState implements StateClient {
     // approved, unconsumed: the one-shot grant is consumed and the effect
     // applied in the same step — exactly-once under the granted provenance.
     appr.consumed_at = new Date().toISOString();
+    this.journalExperience(
+      persona,
+      claiming,
+      decidedEvents(this.planPosition(persona, inputId, callIndex)!),
+    );
     try {
       this.applyInternal(persona, inputId, callIndex, op.turn_id, op);
     } catch (e) {
@@ -2237,6 +2540,83 @@ export class FakeState implements StateClient {
       operation.response = {
         seq,
         kind: "secretary_message",
+      };
+    } else if (operation.tool === "memory.resume") {
+      const error = validateToolRequest(operation.tool, op);
+      if (error) throw new StateError(400, error);
+      const b = this.memoryBranches.get(`${persona}|${op.chunk_seq}`);
+      if (
+        !b?.state ||
+        b.state.status !== "paused" ||
+        b.chunk.status !== "preparing"
+      )
+        throw new StateError(
+          400,
+          "memory.resume requires a paused unfinished branch",
+        );
+      if (
+        op.mode === "resume" &&
+        b.state.pause_reason === "private_tools_missing"
+      )
+        throw new StateError(400, "frozen tools cannot change; use rebranch");
+      const st = structuredClone(b.state);
+      st.review = null;
+      st.final = null;
+      st.source_read = [];
+      st.candidate_read = [];
+      st.in_flight = null;
+      st.failures = 0;
+      st.interruptions = 0;
+      const rounds = Number(op.additional_rounds),
+        tokens = Number(op.additional_tokens ?? 0);
+      if (op.mode === "rebranch") {
+        const limit = st.execution_budget?.tokens ?? st.policy.maxTokens;
+        const restartTokens =
+          limit > 0
+            ? Math.max(
+                0,
+                limit + (st.budget_extension?.tokens ?? 0) - st.tokens,
+              ) + tokens
+            : tokens;
+        if (limit > 0 && restartTokens === 0)
+          throw new StateError(
+            400,
+            "exhausted token cap requires additional_tokens",
+          );
+        st.rebranch_requested = true;
+        st.restart_budget = { rounds, tokens: restartTokens };
+        st.pause_reason = "rebranch_requested";
+        st.retry_at = null;
+      } else {
+        const limit = st.execution_budget?.tokens ?? st.policy.maxTokens;
+        if (
+          limit > 0 &&
+          limit + (st.budget_extension?.tokens ?? 0) + tokens <= st.tokens
+        )
+          throw new StateError(
+            400,
+            "exhausted token cap requires additional_tokens",
+          );
+        st.budget_extension = {
+          rounds: (st.budget_extension?.rounds ?? 0) + rounds,
+          tokens: (st.budget_extension?.tokens ?? 0) + tokens,
+        };
+        st.rebranch_requested = false;
+        st.pause_reason = "resume_requested";
+        st.retry_at = new Date().toISOString();
+      }
+      st.messages.push({
+        role: "user",
+        content: `[Memory recovery selected by the main secretary] mode=${op.mode}, additional_rounds=${rounds}, additional_tokens=${tokens}. This is a finite execution grant, not a change to your draft. Read source and candidate again and open a new confirmation.`,
+      });
+      b.state = st;
+      b.revision++;
+      operation.response = {
+        chunk_seq: op.chunk_seq,
+        mode: op.mode,
+        additional_rounds: rounds,
+        additional_tokens: tokens,
+        waiting_for_parent_snapshot: op.mode === "rebranch",
       };
     } else if (operation.tool === "journal.note") {
       const text = op.text;
@@ -2742,7 +3122,6 @@ export class FakeState implements StateClient {
     generation: number,
   ): Promise<MemoryStatus> {
     this.mustHold(persona, generation);
-    this.interruptPreparing(persona, generation);
     const mine = () =>
       this.memoryChunks.filter((c) => c.persona_id === persona);
     const covered = Math.max(0, ...mine().map((c) => c.last_seq));
@@ -2757,6 +3136,17 @@ export class FakeState implements StateClient {
     const tail = this.eventLog.filter(
       (e) => e.persona_id === persona && e.seq > covered,
     );
+    const roundKey = (e: Event) =>
+      ["assistant_message", "tool_call", "tool_result"].includes(e.kind) &&
+      e.payload.round !== undefined
+        ? `${e.turn_id}:${JSON.stringify(e.payload.round)}`
+        : null;
+    const roundEnds = new Map<string, number>();
+    for (const e of tail) {
+      const key = roundKey(e);
+      if (key !== null) roundEnds.set(key, e.seq);
+    }
+    let activeRoundEnd = -1;
     const pending = new Set<string>();
     let windowEst = 0;
     let windowStart = -1;
@@ -2764,7 +3154,7 @@ export class FakeState implements StateClient {
     let prevKind = "";
     for (const e of tail) {
       let cut = false;
-      if (windowStart >= 0 && pending.size === 0) {
+      if (windowStart >= 0 && pending.size === 0 && e.seq > activeRoundEnd) {
         switch (e.kind) {
           case "input_received":
             cut = windowEst >= L0_CHUNK_MIN_TOKENS;
@@ -2812,6 +3202,9 @@ export class FakeState implements StateClient {
       } else if (e.kind === "tool_result" && typeof callId === "string") {
         pending.delete(callId);
       }
+      const key = roundKey(e);
+      if (key !== null)
+        activeRoundEnd = Math.max(activeRoundEnd, roundEnds.get(key)!);
       prevKind = e.kind;
     }
     // Live raw = every not-yet-applied layer-1 chunk plus the unsealed
@@ -2968,20 +3361,31 @@ export class FakeState implements StateClient {
     const count = (s: MemoryChunk["status"]) =>
       mine.filter((c) => c.status === s).length;
     const now = Date.now();
-    const readyAt = (c: MemoryChunk): number | null =>
-      c.status === "preparing"
+    const readyAt = (c: MemoryChunk): number | null => {
+      if (c.status === "sealed") return null; // needs an actual main snapshot, not an alarm
+      if (c.status !== "preparing") return null;
+      const b = this.memoryBranches.get(`${persona}|${c.chunk_seq}`);
+      return !b?.state || b.state.status === "running"
         ? now
-        : c.status === "sealed"
-          ? Math.max(c.not_before ? Date.parse(c.not_before) : now, now)
+        : b.state.retry_at
+          ? Date.parse(b.state.retry_at)
           : null;
+    };
     const ready = mine.map(readyAt).filter((t): t is number => t !== null);
-    const appliedBlocks = mine
-      .filter((c) => c.status === "applied")
-      .sort((a, b) => a.first_seq - b.first_seq)
-      .map(
-        (c) => ({ est_tokens: c.replacement_est_tokens ?? 0 }) as MemoryBlock,
-      );
     return {
+      branches: [...this.memoryBranches.values()]
+        .filter(
+          (b) =>
+            b.chunk.persona_id === persona && b.chunk.status === "preparing",
+        )
+        .map((b) => ({
+          chunk_seq: b.chunk.chunk_seq,
+          status: b.state?.status ?? "running",
+          revision: b.revision,
+          retry_at: b.state?.retry_at ?? null,
+          issue: b.state?.issue ?? null,
+          pause_reason: b.state?.pause_reason ?? null,
+        })),
       live_raw_tokens:
         mine
           .filter(
@@ -3005,273 +3409,304 @@ export class FakeState implements StateClient {
       next_claimable_at: ready.length
         ? new Date(Math.min(...ready)).toISOString()
         : null,
-      applied_omitted: admitApplied(appliedBlocks)[1]?.count ?? 0,
+      applied_omitted: 0,
       covered_seq: covered,
       latest_seq: Math.max(0, ...events.map((e) => e.seq)),
       chunk_min_tokens: L0_CHUNK_MIN_TOKENS,
       live_limit_tokens: L0_LIVE_LIMIT_TOKENS,
-      memory_send_cap_tokens: MEMORY_SEND_CAP_TOKENS,
+      memory_send_cap_tokens: 0,
     };
   }
 
-  async claimMemoryChunk(
+  async claimMemoryBranch(
     persona: string,
     generation: number,
-    contextLimit: number,
-  ): Promise<ClaimedMemoryChunk> {
+    snapshot?: MemorySnapshot,
+    policy?: MemoryPolicy,
+  ): Promise<MemoryBranch | null> {
     this.mustHold(persona, generation);
-    const mine = this.memoryChunks.filter((c) => c.persona_id === persona);
-    const empty = () => ({
-      chunk: null,
-      target_events: [],
-      target_fragments: [],
-      context: this.renderedContext(persona, contextLimit),
-    });
-    // Every 'preparing' chunk is an orphan from the caller's view: its claim
-    // ended without an outcome, so it counts an interruption — not an
-    // attempt — and waits out a short pacing. (FakeState is single-threaded;
-    // the real store relies on pacing and generation fencing to converge
-    // concurrent claims, not on strict single-flight.)
-    this.interruptPreparing(persona, null);
-    const c = mine
-      .filter(
-        (x) =>
-          x.status === "sealed" &&
-          (x.not_before === null || Date.parse(x.not_before) <= Date.now()),
+    if (Date.parse(this.leases.get(persona)!.expires_at) <= Date.now())
+      throw new FencedError();
+    const covers = (first: number, last: number) => {
+      if (!snapshot) return false;
+      const selected = new Set(
+        snapshot.ranges
+          .filter(
+            (r) =>
+              r.first_seq >= first &&
+              r.last_seq <= last &&
+              r.message_index !== undefined,
+          )
+          .map((r) => r.message_index),
+      );
+      if (
+        snapshot.ranges.some(
+          (r) =>
+            r.message_index !== undefined &&
+            selected.has(r.message_index) &&
+            (r.first_seq < first || r.last_seq > last),
+        )
       )
-      .sort((a, b) => a.chunk_seq - b.chunk_seq)[0];
-    if (!c) return empty();
+        return false;
+      let next = first;
+      for (const r of [...snapshot.ranges].sort(
+        (a, b) => a.first_seq - b.first_seq,
+      )) {
+        if (r.last_seq < first || r.first_seq > last) continue;
+        if (r.first_seq < first || r.last_seq > last || r.first_seq > next)
+          return false;
+        next = Math.max(next, r.last_seq + 1);
+      }
+      return next === last + 1;
+    };
+    const matches = (c: MemoryChunk) =>
+      !!snapshot &&
+      covers(c.first_seq, c.last_seq) &&
+      (c.layer === 1
+        ? !snapshot.ranges.some(
+            (r) =>
+              r.first_seq >= c.first_seq &&
+              r.last_seq <= c.last_seq &&
+              (r.layer !== undefined || r.chunk_seq !== undefined),
+          )
+        : (c.sources ?? []).length > 0 &&
+          (c.sources ?? []).every((seq) => {
+            const source = this.memoryChunks.find(
+              (s) => s.persona_id === persona && s.chunk_seq === seq,
+            );
+            return (
+              source?.status === "applied" &&
+              snapshot.ranges.some(
+                (r) =>
+                  r.chunk_seq === seq &&
+                  r.layer === source.layer &&
+                  r.first_seq === source.first_seq &&
+                  r.last_seq === source.last_seq &&
+                  r.message_index !== undefined,
+              )
+            );
+          }));
+    if (
+      snapshot &&
+      ["file.read", "file.write"].every((name) =>
+        snapshot!.tools.some((t) => t.name === name),
+      )
+    ) {
+      const waiting = [...this.memoryBranches.values()].find(
+        (b) =>
+          b.chunk.persona_id === persona &&
+          b.chunk.status === "preparing" &&
+          b.state?.rebranch_requested &&
+          matches(b.chunk),
+      );
+      if (waiting) {
+        const key = `${persona}|${waiting.chunk.chunk_seq}`;
+        const prior = structuredClone(waiting);
+        delete prior.previous_attempt;
+        const history = this.memoryBranchAttempts.get(key) ?? [];
+        history.push(prior);
+        this.memoryBranchAttempts.set(key, history);
+        waiting.previous_attempt = structuredClone(waiting.state!);
+        waiting.state = null;
+        waiting.snapshot = structuredClone(snapshot);
+        waiting.revision++;
+      }
+    }
+    const active = [...this.memoryBranches.values()].find(
+      (b) =>
+        b.chunk.persona_id === persona &&
+        b.chunk.status === "preparing" &&
+        !b.state?.rebranch_requested &&
+        (!b.state ||
+          b.state.status === "running" ||
+          (b.state.retry_at !== null &&
+            Date.parse(b.state.retry_at) <= Date.now()) ||
+          (b.state.pause_reason === "configured_budget" &&
+            policy &&
+            !jsonEqual(policy, b.state.policy)) ||
+          (snapshot?.binding &&
+            (b.state.effective_binding ?? b.snapshot.binding)?.fingerprint !==
+              snapshot.binding.fingerprint)),
+    );
+    if (active) {
+      active.chunk.claimed_generation = generation;
+      return structuredClone(active);
+    }
+    if (
+      [...this.memoryBranches.values()].some(
+        (b) => b.chunk.persona_id === persona && b.chunk.status === "preparing",
+      )
+    )
+      return null;
+    if (!snapshot) return null;
+    const pressure = [0, 0, 0];
+    const counted = new Set<number>();
+    for (const r of snapshot.ranges) {
+      if (r.message_index !== undefined && !counted.has(r.message_index)) {
+        counted.add(r.message_index);
+        pressure[r.layer ?? 0]! += estTextTokens(
+          JSON.stringify(snapshot.messages[r.message_index]),
+        );
+      }
+    }
+    if (
+      pressure[0]! > L0_LIVE_LIMIT_TOKENS ||
+      pressure[1]! > L1_LIMIT_TOKENS ||
+      pressure[2]! > L2_LIMIT_TOKENS
+    ) {
+      for (const b of this.memoryBranches.values()) {
+        if (
+          b.chunk.persona_id !== persona ||
+          b.chunk.status !== "kept" ||
+          !matches(b.chunk)
+        )
+          continue;
+        const last = Math.max(...b.snapshot.ranges.map((r) => r.last_seq));
+        const fresh = new Set<number>();
+        let added = 0;
+        for (const r of snapshot.ranges) {
+          if (
+            r.first_seq > last &&
+            r.message_index !== undefined &&
+            !fresh.has(r.message_index)
+          ) {
+            fresh.add(r.message_index);
+            added += estTextTokens(
+              JSON.stringify(snapshot.messages[r.message_index]),
+            );
+          }
+        }
+        if (added < L0_CHUNK_MIN_TOKENS) continue;
+        const key = `${persona}|${b.chunk.chunk_seq}`;
+        const history = this.memoryBranchAttempts.get(key) ?? [];
+        history.push(structuredClone(b));
+        this.memoryBranchAttempts.set(key, history);
+        b.chunk.status = "sealed";
+        b.chunk.prepared_at = null;
+        break;
+      }
+    }
+    const c = this.memoryChunks
+      .filter(
+        (c) =>
+          c.persona_id === persona &&
+          c.status === "sealed" &&
+          (!c.not_before || Date.parse(c.not_before) <= Date.now()),
+      )
+      .sort((a, b) => a.chunk_seq - b.chunk_seq)
+      .find(matches);
+    if (!c) return null;
     c.status = "preparing";
     c.claimed_generation = generation;
     c.claimed_at = new Date().toISOString();
-    c.not_before = null;
-    if (c.layer >= 2) {
-      // An upper-layer target prepares from its selected sources' accepted
-      // texts, not raw events. A stale target (a source no longer applied)
-      // is marked failed without spending attempts — the honest answer for
-      // a carried row or one whose sources another target consumed.
-      const at = (seq: number) =>
-        this.eventLog.find((e) => e.persona_id === persona && e.seq === seq)
-          ?.created_at ?? "";
-      const srcs = (c.sources ?? []).map((seq) =>
-        this.memoryChunks.find(
-          (s) => s.persona_id === persona && s.chunk_seq === seq,
-        ),
-      );
-      const stale =
-        srcs.length !== (c.sources ?? []).length ||
-        srcs.some((s) => s?.status !== "applied");
-      if (stale) {
-        c.status = "failed";
-        c.claimed_generation = null;
-        c.claimed_at = null;
-        c.last_error =
-          "upper-layer target is stale: its selected sources are no longer applied";
-        return empty();
-      }
-      const fragments = (srcs as MemoryChunk[]).map((s) => ({
-        chunk_seq: s.chunk_seq,
-        layer: s.layer,
-        first_seq: s.first_seq,
-        last_seq: s.last_seq,
-        first_time: at(s.first_seq),
-        last_time: at(s.last_seq),
-        text: s.replacement ?? "",
-        est_tokens: s.replacement_est_tokens ?? 0,
-      }));
-      return {
-        chunk: c,
-        target_events: [],
-        target_fragments: fragments,
-        context: this.renderedContext(persona, contextLimit),
-      };
-    }
-    return {
+    const prior = this.memoryBranches.get(`${persona}|${c.chunk_seq}`);
+    const b: MemoryBranch = {
       chunk: c,
-      target_events: this.eventLog.filter(
-        (e) =>
-          e.persona_id === persona &&
-          e.seq >= c.first_seq &&
-          e.seq <= c.last_seq,
-      ),
-      target_fragments: [],
-      context: this.renderedContext(persona, contextLimit),
+      snapshot: structuredClone(snapshot),
+      state: null,
+      revision: prior ? prior.revision + 1 : 0,
     };
+    this.memoryBranches.set(`${persona}|${c.chunk_seq}`, b);
+    return structuredClone(b);
   }
-
-  async completeMemoryChunk(
+  async saveMemoryBranch(
     persona: string,
     generation: number,
     chunkSeq: number,
-    result: { replacement?: string; keepUnchanged?: boolean },
-  ): Promise<MemoryChunk> {
+    revision: number,
+    state: MemoryBranchState,
+  ): Promise<MemoryBranch> {
     this.mustHold(persona, generation);
-    const replacement = result.replacement ?? "";
-    const keepUnchanged = result.keepUnchanged ?? false;
-    if (keepUnchanged === (replacement !== "")) {
-      throw new StateError(
-        400,
-        "bad request: exactly one of replacement text or keep_unchanged is required",
-      );
-    }
-    if (replacement.includes("\u0000")) {
-      throw new StateError(400, "bad request: replacement contains a NUL byte");
-    }
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status === "preparing") {
-      if (c.claimed_generation !== generation) throw new FencedError();
-      const rest = estTextTokens(replacement);
-      if (keepUnchanged) {
-        c.status = "kept";
-      } else if (rest >= c.est_tokens) {
-        // A replacement that does not shrink the range is kept visible but
-        // never applied: the originals stay in context.
-        c.status = "kept";
-        c.replacement = replacement;
-        c.replacement_est_tokens = rest;
-        c.last_error = `replacement did not shrink the range (${rest} >= ${c.est_tokens} estimated tokens); originals kept`;
-      } else {
-        c.status = "prepared";
-        c.replacement = replacement;
-        c.replacement_est_tokens = rest;
-      }
-      c.claimed_generation = null;
-      c.claimed_at = null;
-      c.prepared_at = new Date().toISOString();
-      return c;
-    }
+    if (Date.parse(this.leases.get(persona)!.expires_at) <= Date.now())
+      throw new FencedError();
+    const b = this.memoryBranches.get(`${persona}|${chunkSeq}`);
+    if (!b) throw new StateError(404, "branch not found");
+    if (b.revision === revision + 1 && jsonEqual(b.state, state))
+      return structuredClone(b);
+    if (b.revision !== revision)
+      throw new StateError(409, "stale branch revision");
+    if (b.chunk.status !== "preparing")
+      throw new StateError(409, "branch already settled");
     if (
-      c.status === "prepared" ||
-      c.status === "kept" ||
-      c.status === "applied"
-    ) {
-      const same =
-        (keepUnchanged && c.status === "kept" && c.replacement === null) ||
-        (!keepUnchanged && c.replacement === replacement);
-      if (!same) {
+      state.candidate &&
+      state.candidate.sha256 !== (await sha256(state.candidate.text))
+    )
+      throw new StateError(400, "candidate hash mismatch");
+    b.chunk = this.memoryChunks.find(
+      (c) => c.persona_id === persona && c.chunk_seq === chunkSeq,
+    )!;
+    const old = b.state;
+    if (
+      old &&
+      ((state.model_calls ?? 0) < (old.model_calls ?? 0) ||
+        state.rounds < old.rounds ||
+        state.tokens < old.tokens ||
+        old.messages.some((m, i) => !jsonEqual(m, state.messages[i])))
+    )
+      throw new StateError(409, "branch transcript is append-only");
+    if (state.status === "prepared" || state.status === "kept") {
+      if (
+        !state.final ||
+        !old?.review ||
+        !jsonEqual(state.final, old.review) ||
+        state.rounds <= old.review.opened_round
+      )
         throw new StateError(
           409,
-          `chunk ${chunkSeq} already completed with different content`,
+          "completion requires previously opened confirmation",
         );
-      }
-      return c;
+      if (state.status === "prepared") {
+        if (
+          !state.candidate ||
+          !jsonEqual(old.candidate, state.candidate) ||
+          state.final.kind !== "replace" ||
+          state.final.sha256 !== state.candidate.sha256 ||
+          state.final.version !== state.candidate.version
+        )
+          throw new StateError(409, "confirmed candidate changed");
+        if (estTextTokens(state.candidate.text) >= b.chunk.est_tokens)
+          throw new StateError(400, "candidate does not reduce target");
+        b.chunk.replacement = state.candidate.text;
+        b.chunk.replacement_est_tokens = estTextTokens(state.candidate.text);
+      } else if (state.final.kind !== "keep")
+        throw new StateError(409, "keep confirmation required");
+      b.chunk.status = state.status;
+      b.chunk.prepared_at = new Date().toISOString();
+      b.chunk.claimed_generation = null;
+      b.chunk.claimed_at = null;
     }
-    throw new StateError(
-      409,
-      `chunk ${chunkSeq} is ${c.status}, not preparing`,
-    );
-  }
-
-  async failMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    failure: { error: string; retryable: boolean },
-  ): Promise<MemoryChunk> {
-    this.mustHold(persona, generation);
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status !== "preparing" || c.claimed_generation !== generation) {
-      throw new StateError(
-        409,
-        `chunk ${chunkSeq} is not preparing under this generation`,
-      );
-    }
-    // A recorded failure is the only thing that spends attempts.
-    c.attempts += 1;
-    c.claimed_generation = null;
-    c.claimed_at = null;
-    c.last_error = failure.error;
-    if (failure.retryable && c.attempts < MEMORY_CHUNK_MAX_ATTEMPTS) {
-      c.status = "sealed";
-      c.not_before = new Date(
-        Date.now() + retryBackoffMs(c.attempts),
-      ).toISOString();
-    } else {
-      c.status = "failed";
-      c.not_before = null;
-    }
-    return c;
-  }
-
-  /**
-   * Go ReshelveMemoryChunk: no model request could be evaluated — the
-   * binding was unavailable or budget admission denied the call — so the
-   * claim records no verdict and spends neither attempts nor
-   * interruptions; a short pacing keeps a persistent condition from
-   * claiming every tick, and a 'budget-wait:' reason is cleared early by
-   * a funding change.
-   */
-  async reshelveMemoryChunk(
-    persona: string,
-    generation: number,
-    chunkSeq: number,
-    pause: { reason: string; delayMs?: number },
-  ): Promise<MemoryChunk> {
-    this.mustHold(persona, generation);
-    const c = this.memoryChunks.find(
-      (x) => x.persona_id === persona && x.chunk_seq === chunkSeq,
-    );
-    if (!c) throw new StateError(404, "memory chunk not found");
-    if (c.status !== "preparing" || c.claimed_generation !== generation) {
-      throw new StateError(
-        409,
-        `chunk ${chunkSeq} is not preparing under this generation`,
-      );
-    }
-    c.status = "sealed";
-    c.claimed_generation = null;
-    c.claimed_at = null;
-    c.last_error = pause.reason;
-    c.not_before = new Date(
-      Date.now() + (pause.delayMs ?? MEMORY_RESHELVE_PACING_MS),
-    ).toISOString();
-    return c;
-  }
-
-  /**
-   * Go interruptPreparing: a 'preparing' claim that ended without an
-   * outcome (host stopped, fence lost, lost response) counts one
-   * interruption and returns to the shelf after a short pacing; too many
-   * mark the chunk failed, visible with its originals kept.
-   */
-  private interruptPreparing(persona: string, exceptGeneration: number | null) {
-    for (const c of this.memoryChunks) {
-      if (
-        c.persona_id !== persona ||
-        c.status !== "preparing" ||
-        (exceptGeneration !== null && c.claimed_generation === exceptGeneration)
-      ) {
-        continue;
-      }
-      const prior = c.interruptions;
-      c.interruptions += 1;
-      c.claimed_generation = null;
-      c.claimed_at = null;
-      if (c.interruptions >= MEMORY_CHUNK_MAX_INTERRUPTIONS) {
-        c.status = "failed";
-        c.not_before = null;
-        c.last_error = [
-          c.last_error,
-          `preparation was interrupted ${MEMORY_CHUNK_MAX_INTERRUPTIONS} times without a recorded outcome`,
-        ]
-          .filter(Boolean)
-          .join("; ");
-      } else {
-        c.status = "sealed";
-        c.not_before = new Date(
-          Date.now() + Math.min(200 * 2 ** Math.min(prior, 8), 30_000),
-        ).toISOString();
+    const oldIssue =
+      old?.issue ?? (!old ? b.previous_attempt?.issue : null) ?? null;
+    if (!jsonEqual(oldIssue, state.issue)) {
+      const transition = state.issue ? "occurred" : "recovered",
+        issue = state.issue ?? oldIssue;
+      if (issue) {
+        const id = `memory:${chunkSeq}:${revision + 1}:${transition}`;
+        if (
+          !this.inputs.some(
+            (i) => i.persona_id === persona && i.input_id === id,
+          )
+        ) {
+          this.addInput(
+            persona,
+            id,
+            `[Memory mechanism ${transition}] ${issue.message}`,
+            "memory_status",
+          );
+          const input = this.inputs[this.inputs.length - 1]!;
+          input.actor_kind = "memory";
+          input.source_surface = "core_memory";
+          input.attention = "observe";
+        }
       }
     }
+    b.state = structuredClone(state);
+    b.revision++;
+    return structuredClone(b);
   }
 
-  /** Go ensureInputReceived: journal the turn's input once, before a note. */
+  /** Go ensureInputReceived: journal the turn's input once, before the
+   * first record of its experience a claim journals. */
   private ensureInputReceived(persona: string, turn: Turn) {
     const key = `${persona}|${turn.input_id}`;
     if (this.receivedSeq.has(key)) return;
@@ -3285,17 +3720,9 @@ export class FakeState implements StateClient {
       seq,
       turn_id: turn.turn_id,
       kind: "input_received",
-      payload: {
-        input_id: input.input_id,
-        kind: input.kind,
-        text:
-          typeof input.payload.text === "string" ? input.payload.text : null,
-        actor_kind: input.actor_kind,
-        source_surface: input.source_surface,
-        received_at: input.created_at,
-        previous_received_at: input.previous_received_at ?? null,
-        attempt: turn.attempt,
-      },
+      // The receipt the Core would commit for the same input (Go builds
+      // the same fields): whichever lands first is the one that stands.
+      payload: inputReceivedEvent(input, turn).payload,
       created_at: new Date().toISOString(),
     });
     this.receivedSeq.set(key, seq);
@@ -3318,6 +3745,17 @@ export class FakeState implements StateClient {
         op.status = failed ? "failed" : "done";
         op.response = response;
         op.completed_at = new Date().toISOString();
+        // Go journalCompletedTx: the call and the receipt it was given,
+        // attributed to the finalizing turn.
+        const turn = this.turns.get(op.turn_id);
+        const index = Number(op.idempotency_key.split(":tool:").pop());
+        const pos =
+          turn && Number.isSafeInteger(index)
+            ? this.planPosition(persona, turn.input_id, index)
+            : null;
+        if (turn && pos && pos.call.tool === op.tool) {
+          this.journalOutcome(persona, turn, pos, op, null);
+        }
         return op;
       }
     }
@@ -3656,9 +4094,7 @@ export class FakeState implements StateClient {
         if (name.length > 80) {
           throw new StateError(400, "terminal name too long");
         }
-        const sessionId = fakeUuidV7(
-          `terminal:${inputIdCtx}:${callIndexCtx}`,
-        );
+        const sessionId = fakeUuidV7(`terminal:${inputIdCtx}:${callIndexCtx}`);
         const existing = this.terminalSessions.get(key(sessionId));
         if (existing) {
           if (existing.name !== name) {
@@ -3672,9 +4108,13 @@ export class FakeState implements StateClient {
         const live = [...this.terminalSessions.values()].filter(
           (t) =>
             t.persona_id === persona &&
-            ["requested", "claimed", "active", "ending", "interrupted"].includes(
-              t.status,
-            ),
+            [
+              "requested",
+              "claimed",
+              "active",
+              "ending",
+              "interrupted",
+            ].includes(t.status),
         ).length;
         // Same live-session bound as the Go store (terminalMaxSessions).
         if (live >= 4) {
@@ -3744,7 +4184,9 @@ export class FakeState implements StateClient {
       case "terminal.write": {
         const t = mustSession(op.session_id);
         if (op.eof === true) {
-          return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+          return {
+            input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`),
+          };
         }
         const data = op.data;
         if (typeof data !== "string" || data === "") {
@@ -3753,36 +4195,55 @@ export class FakeState implements StateClient {
         if (data.length > 65536) {
           throw new StateError(400, "terminal.write data exceeds 64 KiB");
         }
-        return { input: submitInput(t, "stdin", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "stdin", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.resize": {
         const t = mustSession(op.session_id);
         const cols = op.cols;
         const rows = op.rows;
         if (
-          typeof cols !== "number" || typeof rows !== "number" ||
-          cols < 2 || cols > 1000 || rows < 2 || rows > 500
+          typeof cols !== "number" ||
+          typeof rows !== "number" ||
+          cols < 2 ||
+          cols > 1000 ||
+          rows < 2 ||
+          rows > 500
         ) {
           throw new StateError(
             400,
             "resize requires cols 2..1000 and rows 2..500",
           );
         }
-        return { input: submitInput(t, "resize", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "resize", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.signal": {
         const t = mustSession(op.session_id);
         const allowed = new Set([
-          "INT", "TERM", "HUP", "QUIT", "KILL", "TSTP", "USR1", "USR2",
+          "INT",
+          "TERM",
+          "HUP",
+          "QUIT",
+          "KILL",
+          "TSTP",
+          "USR1",
+          "USR2",
         ]);
         if (typeof op.signal !== "string" || !allowed.has(op.signal)) {
           throw new StateError(400, "signal not permitted");
         }
-        return { input: submitInput(t, "signal", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "signal", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.eof": {
         const t = mustSession(op.session_id);
-        return { input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`) };
+        return {
+          input: submitInput(t, "eof", `in:${inputIdCtx}:${callIndexCtx}`),
+        };
       }
       case "terminal.close": {
         const t = mustSession(op.session_id);

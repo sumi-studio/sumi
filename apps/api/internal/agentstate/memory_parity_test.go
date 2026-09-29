@@ -53,8 +53,7 @@ func TestMemoryNonShrinkingReplacementKept(t *testing.T) {
 	if err != nil || after.Status != "kept" {
 		t.Fatalf("chunk after maintain: %+v err=%v", after, err)
 	}
-	// Only the raw send cap may leave the originals out — never the kept
-	// replacement.
+	// KEEP leaves originals visible; it never replaces them with a rejected draft.
 	if res := loadContext(t, s, pa, gen); len(res.Memory) != 0 || res.MemoryOmitted != nil {
 		t.Fatalf("kept replacement reached the context: %+v %+v", res.Memory, res.MemoryOmitted)
 	}
@@ -77,9 +76,9 @@ func prepareOldest(t *testing.T, s *Store, pa string, gen int64, estTokens int) 
 	return *c
 }
 
-// Applied fragments are admitted newest-first under the memory cap; the
-// older ones leave the context as one explicit, time-anchored range.
-func TestMemoryAppliedAdmissionCap(t *testing.T) {
+// Every applied fragment remains visible until an upper-layer replacement
+// covers it; size alone does not erase a secretary's context.
+func TestMemoryAppliedFragmentsRemainVisible(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
@@ -95,11 +94,11 @@ func TestMemoryAppliedAdmissionCap(t *testing.T) {
 		prepareOldest(t, s, pa, gen, 10_000)
 	}
 	st, err := s.MemoryMaintain(ctx, pa, gen)
-	if err != nil || st.Applied != 4 || st.AppliedOmitted != 2 || st.MemorySendCapTokens != MemorySendCapTokens {
+	if err != nil || st.Applied != 4 || st.AppliedOmitted != 0 || st.MemorySendCapTokens != 0 {
 		t.Fatalf("apply: %+v err=%v", st, err)
 	}
 	res := loadContext(t, s, pa, gen)
-	if len(res.Memory) != 2 || res.Memory[0].ChunkSeq != 3 || res.Memory[1].ChunkSeq != 4 {
+	if len(res.Memory) != 4 || res.Memory[0].ChunkSeq != 1 || res.Memory[3].ChunkSeq != 4 {
 		t.Fatalf("admitted blocks: %+v", res.Memory)
 	}
 	evs, err := s.Events(ctx, pa, 0, 100)
@@ -113,22 +112,19 @@ func TestMemoryAppliedAdmissionCap(t *testing.T) {
 	if b := res.Memory[0]; !b.FirstTime.Equal(at[b.FirstSeq]) || !b.LastTime.Equal(at[b.LastSeq]) {
 		t.Fatalf("block times %v..%v, events %v..%v", b.FirstTime, b.LastTime, at[b.FirstSeq], at[b.LastSeq])
 	}
-	om := res.MemoryOmitted
-	if om == nil || om.Count != 2 || om.FirstChunkSeq != 1 || om.LastChunkSeq != 2 ||
-		om.FirstSeq != 1 || om.LastSeq != 4 || om.EstTokens != 20_000 ||
-		!om.FirstTime.Equal(at[1]) || !om.LastTime.Equal(at[4]) {
-		t.Fatalf("memory omitted: %+v", om)
+	if res.MemoryOmitted != nil {
+		t.Fatalf("applied fragments omitted: %+v", res.MemoryOmitted)
 	}
-	// Originals of the left-out fragments stay readable.
+	// The source remains durable as well as its active replacement.
 	chunk1, err := s.chunk(ctx, s.pool, pa, 1)
 	if err != nil || chunk1.Status != "applied" || chunk1.Replacement == nil {
 		t.Fatalf("chunk 1: %+v err=%v", chunk1, err)
 	}
 }
 
-// One enormous newest fragment is left out whole with its locator, never
-// sent over the cap.
-func TestMemoryOversizedFragmentIsOmittedExplicitly(t *testing.T) {
+// An unusually large fragment remains visible rather than being silently
+// removed by a separate send cap.
+func TestMemoryOversizedFragmentRemainsVisible(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
 	pa := pid(t)
@@ -142,12 +138,11 @@ func TestMemoryOversizedFragmentIsOmittedExplicitly(t *testing.T) {
 	}
 	prepareOldest(t, s, pa, gen, 26_000)
 	st, err := s.MemoryMaintain(ctx, pa, gen)
-	if err != nil || st.Applied != 1 || st.AppliedOmitted != 1 {
+	if err != nil || st.Applied != 1 || st.AppliedOmitted != 0 {
 		t.Fatalf("apply: %+v err=%v", st, err)
 	}
 	res := loadContext(t, s, pa, gen)
-	if len(res.Memory) != 0 || res.MemoryOmitted == nil || res.MemoryOmitted.Count != 1 ||
-		res.MemoryOmitted.EstTokens != 26_000 || res.MemoryOmitted.FirstSeq != 1 || res.MemoryOmitted.LastSeq != 2 {
+	if len(res.Memory) != 1 || res.MemoryOmitted != nil || res.Memory[0].EstTokens != 26_000 {
 		t.Fatalf("oversized fragment: memory=%+v omitted=%+v", res.Memory, res.MemoryOmitted)
 	}
 }
@@ -228,9 +223,12 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 	}
 	commit := CommitRequest{Outcome: "complete",
 		Events: []EventInput{received("in-1", 2),
-			{Kind: "tool_call", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "request": noteReq}},
-			{Kind: "tool_result", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "response": op2.Response}},
-			{Kind: "assistant_message", Payload: map[string]any{"text": "noted"}}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "reply", "round": 0}},
+			{Kind: "tool_call", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "request": noteReq,
+				"route": "normal", "round": 0, "call_index": 0}},
+			{Kind: "tool_result", Payload: map[string]any{"call_id": "c1", "tool": "journal.note",
+				"call_index": 0, "response": op2.Response}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "noted", "round": 1}}},
 		Output: map[string]any{"text": "noted"}}
 	if _, err := s.CommitTurn(ctx, pa, "t-1b", l2.Generation, commit); err != nil {
 		t.Fatalf("commit t-1b: %v", err)
@@ -259,7 +257,11 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 			noteSeq = e.Seq
 		}
 	}
-	want := "input_received,note,tool_call,tool_result,assistant_message"
+	// The call and its result were journaled by the claim that ran the
+	// note (the note between them, as the effect's own record), the
+	// interrupted attempt is marked, and the retried commit adds only its
+	// final reply.
+	want := "input_received,assistant_message,tool_call,note,tool_result,turn_paused,assistant_message"
 	if count != 1 || strings.Join(kinds, ",") != want || receivedSeq >= noteSeq {
 		t.Fatalf("in-1 records: %v (input_received x%d)", kinds, count)
 	}

@@ -1,107 +1,14 @@
-/**
- * Memory layer: asynchronous L1 preparation on the same journal the Go
- * agentstate service seals into chunks (docs/agent/memory.md,
- * memory-preparation-and-replacement-2026-09-08).
- *
- * Sealing, preparation, and application are separate durable states owned by
- * the state service. This module carries the core-side half: rendering the
- * sent context (raw tail + applied replacement blocks interleaved at their
- * original positions) and running the one-at-a-time preparation branch.
- *
- * The branch keeps the parent's prefix — system prompt, tool definitions,
- * rendered context — and the parent's model: it is the same individual
- * organizing its own memory, not a separate reviewer. Its tools are offered
- * but never executed. A finished candidate is shelved ('prepared');
- * only the state service applies it, and only while the live raw estimate
- * exceeds the 40k threshold. Events that arrived after a chunk was sealed —
- * corrections, new experiences — are outside its range and are never
- * touched by application.
- *
- * Lifecycle: a branch that ends with an answer or a genuine failure records
- * it (failures spend the chunk's attempts). A branch stopped by its host or
- * by losing the writer fence records nothing and makes no further model
- * call; the state service counts that claim as an interruption instead.
- */
-
-import {
-  type ChatMessage,
-  ModelError,
-  type ModelEvent,
-  type ModelProvider,
-  type ToolSpec,
-} from "./provider.ts";
-import { FencedError, type StateClient, StateError } from "./state-client.ts";
+import type { MemorySourceRange } from "./memory-branch.ts";
+import type { ChatMessage } from "./provider.ts";
 import type {
-  ClaimedMemoryChunk,
   Event,
   MemoryBlock,
-  MemoryChunk,
   OmittedMemory,
   OmittedRange,
 } from "./types.ts";
-import { BudgetWaitError } from "./usage.ts";
-
-/** A sealed L0 chunk cuts at a safe boundary once it reaches this estimate. */
+/** Journal rendering only. Compaction runs in the durable memory branch. */
 export const L0_CHUNK_MIN_TOKENS = 10_000;
-/** Prepared replacements apply only while live raw estimate exceeds this. */
 export const L0_LIVE_LIMIT_TOKENS = 40_000;
-/**
- * Default wall-clock bound on one preparation branch. A real-model
- * preparation has been observed at ~104s; the bound only catches a stream
- * that never ends, and it is recorded as a retryable failure.
- */
-export const DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS = 10 * 60_000;
-
-/**
- * Re-admission pacing for a chunk reshelved on a budget denial — a slow
- * heartbeat, not a poll loop: a budget or funding change clears
- * not_before early, so this only bounds the self-healing fallback.
- */
-const BUDGET_WAIT_RESHELVE_MS = 30_000;
-
-/**
- * The L1 preparation instruction — carried over from the previous runtime's
- * compact-l0-to-l1 prompt, with locators adapted to the journal: chunk_seq
- * names the sealed range, seq names one stored record, and both open the
- * originals through conversation_history read. Same branch principle: the
- * fork inherits the parent's context, keeps events to the target's range,
- * distinguishes who said/did/observed what, and answers KEEP_UNCHANGED when
- * nothing can shrink without losing meaning or experience.
- */
-export const COMPACT_L1_PROMPT =
-  "今のあなたの文脈を引き継いだ分岐で、自分の記憶を整理する。後続の `compact_target` が今回置き換える対象を示す。各 `event` は親の送信文脈にある対象記録のコピーで、`seq` がその記録を識別する。\n\n" +
-  "前後の文脈は対象部分を読み解くために使い、置換文に残す出来事や認識は対象の範囲に保つ。他のチャンクの出来事を取り込んだり、後から知ったことで当時の理解を書き換えたりしない。\n\n" +
-  "まず、繰り返されるツール呼び出しの外枠や、ツール結果中の同じ本文の再掲を減らす。同じ発言や観測が再び起きた事実は残し、誰の言葉・行為・観測だったか、出来事の順序や時刻、呼び出しと結果の対応、途中で変わった理解が辿れるようにする。相手が言ったこと、自分が見聞きしたこと、自分の解釈や未確認のことは区別したまま残す。意味を担う言葉や数値についての経験を、単なる「資料を見た」「作業した」に置き換えない。\n\n" +
-  "会話や共に過ごした出来事は、当面の仕事への有用性だけで選ばない。課題一覧、人物の固定した属性、教訓へ一律にまとめる必要はない。必要な内容は長く残してよく、決まった圧縮率・文字数・見出しはない。反省やメモを新たに作る手順でもない。\n\n" +
-  "詳細を外部の記録へ預けると判断するなら、何をどこから読み返せるかが自分に分かる手掛かりを残す。対象の `chunk_seq` や各 `seq` は、通常の会話で `conversation_history` の `read` に指定して会話記録の保存済み原文を開ける。IDだけで内容を代用せず、取り戻せる内容と、今ここに残す理解を結び付ける。外部の資料を改めて開く場合は、当時見た内容へ戻ることと、更新後の内容を読むことを区別する。\n\n" +
-  "出力は対象を置き換える文章だけとする。この分岐ではツールは実行されない。整理によって意味や経験を損なわずに減らせるものがなければ、`KEEP_UNCHANGED` だけを出力する。その場合は元の対象がそのまま保持される。";
-
-/**
- * The L1→L2 consolidation instruction — carried over from the previous
- * runtime's compact-l1-to-l2 prompt, with locators adapted to the journal:
- * each fragment's chunk_seq opens its covered originals through
- * conversation_history read. Same branch principle, and the boundary is
- * the accepted one: the selected fragments supply the replacement; later
- * corrections and fragments outside the selection are never folded in.
- */
-export const COMPACT_L1_TO_L2_PROMPT =
-  "You are organizing a selected part of your own memory. The conversation above is your unchanged current context. The compact_target below identifies the only fragments this replacement will consume.\n\n" +
-  "Write a smaller replacement for those fragments, integrating their meaning while preserving the order of what happened, who said or did what, uncertainty, and changes of understanding within that period. Everything outside the target remains in place. Do not bring later events, corrections, or details from other fragments into this earlier memory. Do not add conclusions or lessons that the selected material does not contain.\n\n" +
-  "Each fragment's chunk_seq and seq range open its original records: in an ordinary conversation, conversation_history read with that chunk_seq returns the stored journal events it covered. Use the locator to connect what you keep with what remains recoverable.\n\n" +
-  "Return only the replacement text, which will occupy the selected fragments' original position. If a faithful smaller replacement is not useful, return KEEP_UNCHANGED. Do not call tools.";
-
-/**
- * The L2-internal reintegration instruction — carried over from the
- * previous runtime's compact-l2-reintegration prompt. Rearrangement is
- * allowed within the selected L2 fragments only; nothing is imported from
- * retained L1 or L0 (memory-boundaries-2026-09-08).
- */
-export const COMPACT_L2_REINTEGRATION_PROMPT =
-  "You are reorganizing a selected part of your own established memory. The conversation above is your unchanged current context. Only the existing L2 fragments identified in compact_target will be replaced.\n\n" +
-  "You may integrate and rearrange what is already in those fragments to make a smaller, coherent memory. Preserve distinctions, uncertainty, attribution, and changes that matter. The remaining L2, L1, and L0 stay as they are: do not import their events, corrections, or details into this replacement. Do not invent lessons or conclusions.\n\n" +
-  "Each fragment's chunk_seq and seq range open its original records: in an ordinary conversation, conversation_history read with that chunk_seq returns the stored journal events it covered.\n\n" +
-  "Return only replacement text for the selected fragments' position. If a faithful smaller replacement is not useful, return KEEP_UNCHANGED. Do not call tools.";
-
 /** Render one applied memory block the way the previous runtime did: a
  * synthetic context note at the chunk's original position — not a
  * fabricated received message — carrying when its records were made (the
@@ -303,7 +210,10 @@ export function receiptLine(
  * receipt line and never serve as the previous receipt (Go
  * previousReceiptCol). */
 export const isInternalActor = (actorKind: unknown): boolean =>
-  actorKind === "schedule" || actorKind === "job" || actorKind === "terminal";
+  actorKind === "schedule" ||
+  actorKind === "job" ||
+  actorKind === "terminal" ||
+  actorKind === "memory";
 
 const FAILURE_REASONS: Record<string, string> = {
   no_model_connection: "no model connection was selected",
@@ -317,8 +227,36 @@ const FAILURE_REASONS: Record<string, string> = {
   model_usage_limit: "the selected subscription's usage limit was reached",
 };
 
-/** Map one journal event to the model-visible message, or null for kinds
- * with no context rendering (e.g. internal bookkeeping). */
+/**
+ * How a terminal failure reads in later context. It never claims that
+ * nothing was said or done: a request can fail after its tool calls took
+ * effect (a Messaging send, an edit), and those stay true. Each call is
+ * journaled with its result at the claim that ran it, so they appear above
+ * the marker even when the failing attempt's own records are not in hand;
+ * when the closing commit could not be stored, what is missing is only
+ * what the turn had not journaled yet — its closing reply.
+ */
+function turnFailedText(p: Record<string, unknown>): string {
+  const why = FAILURE_REASONS[str(p.error_kind)];
+  const head = `[turn failed${why ? `: ${why}` : ""} — `;
+  if (p.record_lost === true) {
+    return (
+      head +
+      "this turn's closing records could not be stored. Tool calls it ran are recorded above with their results as they happened " +
+      "— for example, a message you sent stays sent — but any reply it ended with is not shown here]"
+    );
+  }
+  return (
+    head +
+    "this request stopped here without finishing normally. " +
+    "What is recorded above for it happened as shown — for example, a message you sent stays sent; nothing further runs for it]"
+  );
+}
+
+/** Map one standalone journal event to the model-visible message, or null
+ * for kinds with no standalone rendering. tool_call and tool_result are not
+ * standalone: renderJournalContext renders them as the provider-native
+ * pairs they were when the model decided them. */
 export function eventMessage(ev: Event): ChatMessage | null {
   const p = ev.payload;
   switch (ev.kind) {
@@ -352,36 +290,274 @@ export function eventMessage(ev: Event): ChatMessage | null {
         content: `${receipt ? `${receipt}\n` : ""}${who} ${inputBodyText(p)}`,
       };
     }
-    case "turn_failed": {
+    case "turn_failed":
       // The requester was told; the secretary must be too, or an
       // unanswered input reads as a request still waiting for it.
-      const why = FAILURE_REASONS[str(p.error_kind)];
-      const lost = p.record_lost === true
-        ? "; its record could not be stored"
-        : "";
-      return {
-        role: "user",
-        content: `[turn failed${why ? `: ${why}` : ""} — this turn ended without a completed reply${lost}]`,
-      };
-    }
+      return { role: "user", content: turnFailedText(p) };
     case "assistant_message":
       return { role: "assistant", content: String(p.text ?? "") };
     case "note":
       return { role: "assistant", content: `[note] ${String(p.text ?? "")}` };
-    case "tool_result":
-      // Flattened to assistant text: a bare role:"tool" message with no
-      // preceding assistant tool_calls is rejected by chat-completions
-      // providers. The journal keeps the structured record; the model gets
-      // the result inline.
+    case "turn_paused":
+      // An attempt that parked on usage budget, requeued after a transient
+      // model error, or stopped with its host (recovery marks it) leaves
+      // what it did so far in the journal; the request is not over, and its
+      // resuming attempt continues from there without running those calls
+      // again.
       return {
-        role: "assistant",
-        content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
-          p.response ?? (p.error ? { error: p.error } : {}),
-        )}`,
+        role: "user",
+        content:
+          p.reason === "budget"
+            ? "[This request paused here: its next model call is waiting for usage budget. " +
+              "What is recorded above for it happened as shown; it continues when budget allows, " +
+              "and the calls above are not run again.]"
+            : p.reason === "interrupted"
+              ? "[This request stopped here when its run was interrupted. " +
+                "What is recorded above for it happened as shown; it resumes later, " +
+                "and the calls above are not run again.]"
+              : "[This request paused here after a temporary model error. " +
+                "What is recorded above for it happened as shown; it is retried later, " +
+                "and the calls above are not run again.]",
       };
+    case "approval_requested": {
+      // A parked call: decided, durably planned, and not run. Its outcome
+      // (or denial) is journaled as an ordinary call/result pair by the
+      // attempt that resumes it, so this is a status note, not a call.
+      const approval = str(p.approval_id);
+      return {
+        role: "user",
+        content:
+          `[Approval requested: your ${str(p.route) || "elevated"} call ${str(p.tool) || "?"}` +
+          `${str(p.call_id) ? ` (call_id ${str(p.call_id)})` : ""} is waiting for a human decision` +
+          `${approval ? ` (approval_id ${approval})` : ""}; it has not run at this point. ` +
+          `Requested input: ${JSON.stringify(p.request ?? {})}]`,
+      };
+    }
+    case "approval_decided": {
+      const by = str(p.decided_by_kind);
+      return {
+        role: "user",
+        content:
+          `[Approval decided: ${str(p.decision) || "?"}${by ? ` by ${by}` : ""} for your ` +
+          `${str(p.route) || "elevated"} call ${str(p.tool) || "?"}` +
+          `${str(p.approval_id) ? ` (approval_id ${str(p.approval_id)})` : ""}. ` +
+          "What the call then did is recorded when its request resumes.]",
+      };
+    }
     default:
       return null;
   }
+}
+
+/**
+ * The model-facing content of one recorded tool result — the same bytes
+ * the model received live when the round's results were fed back in the
+ * turn (secretary.ts feeds `response`, or `{error}` for a failed call), so
+ * a later turn or a restart reads the same result.
+ */
+export function toolResultContent(p: Record<string, unknown>): string {
+  return JSON.stringify(
+    p.response ?? (p.error !== undefined ? { error: p.error } : {}),
+  );
+}
+
+type RenderItem = {
+  seq: number;
+  message: ChatMessage;
+  sources?: MemorySourceRange[];
+};
+
+/**
+ * One model round as the journal recorded it: the round's deciding text
+ * and the calls it decided, each with the result the model was fed.
+ */
+type RoundGroup = {
+  seq: number;
+  turnId: string;
+  round: unknown;
+  text: string | null;
+  calls: { ev: Event; result: Event | null }[];
+  /** Records journaled while a call awaited its result — what the call's
+   * own effect recorded (a note) — rendered after the round's results. */
+  after: RenderItem[];
+};
+
+/**
+ * Render the journal records themselves, in seq order. A round's
+ * assistant_message and the tool_call/tool_result records of the same
+ * turn and round become the provider-native pair the model produced and
+ * received live: one assistant message carrying the text and the decided
+ * calls, then one tool message per result, in call order. The call's
+ * arguments are what the secretary chose to do (the sent message body, the
+ * edit); the result is what the effect actually returned (a receipt, or an
+ * error). Neither is rewritten as the other's speech.
+ *
+ * Representing a call re-executes nothing: only calls streamed by the
+ * current consultation are ever planned and claimed.
+ *
+ * Every assistant tool call is followed by its result, as every provider
+ * wire requires. A record whose partner is outside the rendered view — the
+ * raw window can begin between a call and its result — renders as an
+ * explicit note instead of an unpaired native call or result.
+ *
+ * Call ids stay as recorded (a missing one is named after the call's
+ * journal seq). They came from whichever provider decided them and can
+ * repeat across turns; each provider adapter makes them valid and unique
+ * for its own wire at serialization (disambiguateCallIds), where the
+ * current turn's calls and opaque continuations are also in view.
+ */
+function renderEvents(events: Event[]): RenderItem[] {
+  const out: RenderItem[] = [];
+  let group: RoundGroup | null = null;
+
+  const wireId = (ev: Event): string =>
+    str(ev.payload.call_id) || `sumi_call_${ev.seq}`;
+  const callLabel = (p: Record<string, unknown>) =>
+    `${str(p.tool) || "?"}${str(p.call_id) ? ` (call_id ${str(p.call_id)})` : ""}`;
+
+  const flush = () => {
+    const g = group;
+    group = null;
+    if (!g) return;
+    const paired = g.calls.filter((c) => c.result !== null);
+    const ids = paired.map((c) => wireId(c.ev));
+    if (g.text !== null || paired.length > 0) {
+      out.push({
+        seq: g.seq,
+        sources: [
+          ...(g.text !== null ? [g.seq] : []),
+          ...paired.map((c) => c.ev.seq),
+        ].map((seq) => ({ first_seq: seq, last_seq: seq })),
+        message: {
+          role: "assistant",
+          content: g.text ?? "",
+          ...(paired.length > 0
+            ? {
+                toolCalls: paired.map((c, i) => ({
+                  id: ids[i]!,
+                  name: str(c.ev.payload.tool),
+                  route:
+                    c.ev.payload.route === "elevated" ? "elevated" : "normal",
+                  arguments: (c.ev.payload.request ?? {}) as Record<
+                    string,
+                    unknown
+                  >,
+                })),
+              }
+            : {}),
+        },
+      });
+    }
+    paired.forEach((c, i) => {
+      out.push({
+        seq: g.seq,
+        sources: [{ first_seq: c.result!.seq, last_seq: c.result!.seq }],
+        message: {
+          role: "tool",
+          toolCallId: ids[i]!,
+          name: str(c.ev.payload.tool),
+          content: toolResultContent(c.result!.payload),
+        },
+      });
+    });
+    for (const c of g.calls) {
+      if (c.result !== null) continue;
+      out.push({
+        seq: g.seq,
+        sources: [{ first_seq: c.ev.seq, last_seq: c.ev.seq }],
+        message: {
+          role: "user",
+          content:
+            `[Your ${c.ev.payload.route === "elevated" ? "elevated " : ""}call ${callLabel(c.ev.payload)} ` +
+            `(journal seq ${c.ev.seq}) with input ${JSON.stringify(c.ev.payload.request ?? {})} ` +
+            "has no recorded result in this context.]",
+        },
+      });
+    }
+    out.push(...g.after);
+  };
+
+  for (const ev of events) {
+    const p = ev.payload;
+    if (ev.kind === "assistant_message") {
+      flush();
+      group = {
+        seq: ev.seq,
+        turnId: ev.turn_id,
+        round: p.round,
+        text: String(p.text ?? ""),
+        calls: [],
+        after: [],
+      };
+      continue;
+    }
+    if (ev.kind === "tool_call") {
+      const open = group as RoundGroup | null;
+      if (!open || open.turnId !== ev.turn_id || open.round !== p.round) {
+        flush();
+        group = {
+          seq: ev.seq,
+          turnId: ev.turn_id,
+          round: p.round,
+          text: null,
+          calls: [],
+          after: [],
+        };
+      }
+      group!.calls.push({ ev, result: null });
+      continue;
+    }
+    if (ev.kind === "tool_result") {
+      // The flat plan position identifies the call exactly; the model's
+      // call_id is only unique when the provider made it so.
+      const call = (group as RoundGroup | null)?.calls.find(
+        (c) =>
+          c.result === null &&
+          (Number.isSafeInteger(p.call_index)
+            ? c.ev.payload.call_index === p.call_index
+            : c.ev.payload.call_id === p.call_id),
+      );
+      if (call) {
+        call.result = ev;
+        continue;
+      }
+      flush();
+      out.push({
+        seq: ev.seq,
+        sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+        message: {
+          role: "user",
+          content:
+            `[Result of your earlier call ${callLabel(p)} (journal seq ${ev.seq}); ` +
+            `the call itself is outside this context]\n${toolResultContent(p)}`,
+        },
+      });
+      continue;
+    }
+    const m = eventMessage(ev);
+    const open = group as RoundGroup | null;
+    if (open?.calls.some((c) => c.result === null)) {
+      // An effect records inside its claim, between its call and its
+      // result (a journal.note): it follows the round's results rather
+      // than splitting a call from its result.
+      if (m)
+        open.after.push({
+          seq: ev.seq,
+          message: m,
+          sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+        });
+      continue;
+    }
+    flush();
+    if (m)
+      out.push({
+        seq: ev.seq,
+        message: m,
+        sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+      });
+  }
+  flush();
+  return out;
 }
 
 /** A temporary notice that older raw records are outside the sent context —
@@ -433,8 +609,13 @@ export function renderJournalContext(
   omitted: OmittedRange | null = null,
   memoryOmitted: OmittedMemory | null = null,
   extras: { seq: number; message: ChatMessage }[] = [],
+  sourceRanges?: MemorySourceRange[],
 ): ChatMessage[] {
-  const items: { seq: number; message: ChatMessage }[] = [];
+  const items: {
+    seq: number;
+    message: ChatMessage;
+    sources?: MemorySourceRange[];
+  }[] = [];
   if (memoryOmitted) {
     items.push({
       seq: memoryOmitted.first_seq,
@@ -448,604 +629,59 @@ export function renderJournalContext(
     });
   }
   for (const b of memory) {
-    items.push({ seq: b.first_seq, message: memoryBlockMessage(b) });
+    items.push({
+      seq: b.first_seq,
+      message: memoryBlockMessage(b),
+      sources: [
+        {
+          first_seq: b.first_seq,
+          last_seq: b.last_seq,
+          layer: b.layer,
+          chunk_seq: b.chunk_seq,
+        },
+      ],
+    });
   }
   for (const x of extras) {
     items.push(x);
   }
-  for (const ev of events) {
-    const m = eventMessage(ev);
-    if (m) items.push({ seq: ev.seq, message: m });
-  }
-  // Array sort is stable: ties keep the order pushed above.
-  return items.sort((a, b) => a.seq - b.seq).map((i) => i.message);
+  const rendered = renderEvents(events);
+  items.push(...rendered);
+  const mapped = new Set(
+    rendered.flatMap((i) => (i.sources ?? []).map((r) => r.first_seq)),
+  );
+  for (const ev of events)
+    if (!mapped.has(ev.seq))
+      sourceRanges?.push({ first_seq: ev.seq, last_seq: ev.seq });
+  // Stable order keeps each native assistant call followed by its results.
+  return items
+    .sort((a, b) => a.seq - b.seq)
+    .map((item, index) => {
+      for (const source of item.sources ?? [])
+        sourceRanges?.push({ ...source, message_index: index + 1 });
+      return item.message;
+    });
 }
 
 /**
  * Estimated tokens of one journal record — the same ~4-bytes-per-token
- * accounting the state service uses (estPayloadTokens). Used here only to
- * size the temporary working view after a provider capacity refusal; it is
- * not provider billing and never writes durable state.
+ * accounting the state service uses (estPayloadTokens). Includes serialized tool arguments and results; this is a capacity
+ * heuristic, not provider billing.
  */
 export function estEventTokens(
   kind: string,
   payload: Record<string, unknown>,
 ): number {
-  return Math.ceil((kind.length + 16 + JSON.stringify(payload).length) / 4);
+  return Math.ceil(
+    (kind.length +
+      16 +
+      new TextEncoder().encode(JSON.stringify(payload)).length) /
+      4,
+  );
 }
 
 /** Estimated tokens of a stored or rendered text — same ~4-bytes-per-token
  * family as estEventTokens. */
 export function estTextTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
-/**
- * Eviction units over the journal view — the port of the reference's
- * replay_units onto journal kinds. The deciding assistant_message and the
- * tool_call/tool_result records its calls produced form one indivisible
- * unit: eviction can never keep a result while dropping its call or the
- * text that decided it, and never drops an invisible tool_call for no wire
- * gain. Every other record is its own unit. A unit boundary opens only
- * before a record that is not part of an open tool flow — never before a
- * tool_call or tool_result, and never while a call in the unit is still
- * waiting for its result.
- */
-function evictionUnits(events: Event[]): Event[][] {
-  const units: Event[][] = [];
-  let open: Event[] = [];
-  const pending = new Set<string>();
-  for (const e of events) {
-    if (
-      open.length > 0 &&
-      pending.size === 0 &&
-      e.kind !== "tool_call" &&
-      e.kind !== "tool_result"
-    ) {
-      units.push(open);
-      open = [];
-    }
-    open.push(e);
-    const callId = e.payload.call_id;
-    if (e.kind === "tool_call" && typeof callId === "string") {
-      pending.add(callId);
-    } else if (e.kind === "tool_result" && typeof callId === "string") {
-      pending.delete(callId);
-    }
-  }
-  if (open.length > 0) units.push(open);
-  return units;
-}
-
-/** Estimated tokens a journal record contributes to the actual send;
- * records that render nothing (e.g. tool_call) cost nothing on the wire. */
-function estRenderedTokens(e: Event): number {
-  return eventMessage(e) === null ? 0 : estEventTokens(e.kind, e.payload);
-}
-
-/**
- * Estimated rendered tokens of a journal view — what the send actually
- * carries for these records.
- */
-export function renderedViewTokens(events: Event[]): number {
-  let total = 0;
-  for (const e of events) total += estRenderedTokens(e);
-  return total;
-}
-
-/**
- * Drop the oldest eviction units from a working view until the retained
- * rendered estimate fits `budget`. Units are indivisible: an oversized unit
- * drops whole or stays whole — nothing is split or truncated to satisfy the
- * number, and a flow's deciding text, calls and results leave or stay
- * together. Newest units are preferred, but a large enough view can lose
- * all of them — the live request and in-turn suffix are not part of this
- * view at all and are protected separately.
- */
-export function evictToBudget(
-  events: Event[],
-  budget: number,
-): { kept: Event[]; evicted: Event[] } {
-  const units = evictionUnits(events);
-  const costs = units.map((u) => {
-    let c = 0;
-    for (const e of u) c += estRenderedTokens(e);
-    return c;
-  });
-  let total = 0;
-  for (const c of costs) total += c;
-  let cut = 0;
-  while (cut < units.length && total > budget) {
-    total -= costs[cut] ?? 0;
-    cut += 1;
-  }
-  return {
-    kept: units.slice(cut).flat(),
-    evicted: units.slice(0, cut).flat(),
-  };
-}
-
-/**
- * The provider-capacity notice carried in a recovered working view: it names
- * exactly which raw journal records are out of this send — count, seq range
- * and recorded times — and how to reread them. It is not a summary, and it
- * is never written to the journal: the records stay in the canonical
- * history, and accepted memory notes elsewhere in the view may still
- * represent parts of the named range — the range bounds where the omitted
- * raw records sit, not what the view still knows.
- */
-export function capacityNoticeMessage(evicted: Event[]): ChatMessage {
-  const first = evicted[0];
-  const last = evicted[evicted.length - 1];
-  if (!first || !last) {
-    throw new Error("capacity notice requires evicted records");
-  }
-  const source = JSON.stringify({
-    operation: "read",
-    from_seq: first.seq,
-    limit: 5,
-  });
-  return {
-    role: "user",
-    content:
-      "[Working-context capacity notice; not a new user message]\n" +
-      `${evicted.length} earlier raw records from your private history — journal seq ${first.seq} through ${last.seq}, recorded ${first.created_at} through ${last.created_at} — ` +
-      "are not in this working view because the provider rejected its size. Their raw records have not been summarized or deleted; " +
-      "accepted memory notes in this view may still cover parts of that range. " +
-      `Reread the originals with conversation_history(${source}), following next_after_seq while needed through sequence ${last.seq}. ` +
-      "Do not treat this omission as evidence that those experiences were unimportant.",
-  };
-}
-
-/** The compact_target user message: the sealed range's stored events,
- * verbatim, as journal records with their seq identities. */
-export function compactTargetMessage(
-  chunk: MemoryChunk,
-  target: Event[],
-): ChatMessage {
-  return {
-    role: "user",
-    content:
-      "compact_target\n" +
-      JSON.stringify({
-        chunk_seq: chunk.chunk_seq,
-        layer: chunk.layer,
-        range: { first_seq: chunk.first_seq, last_seq: chunk.last_seq },
-        est_tokens: chunk.est_tokens,
-        events: target.map((e) => ({
-          seq: e.seq,
-          kind: e.kind,
-          created_at: e.created_at,
-          payload: e.payload,
-        })),
-      }),
-  };
-}
-
-/** The compact_target user message for an upper-layer target: the selected
- * source fragments' accepted texts, verbatim, with the chunk_seq and seq
- * locators that open their original records through conversation_history. */
-export function compactUpperTargetMessage(
-  chunk: MemoryChunk,
-  fragments: MemoryBlock[],
-): ChatMessage {
-  const kind = fragments[0]?.layer === 1 ? "compact_l1" : "consolidate_l2";
-  return {
-    role: "user",
-    content:
-      "compact_target\n" +
-      JSON.stringify({
-        kind,
-        chunk_seq: chunk.chunk_seq,
-        layer: chunk.layer,
-        range: { first_seq: chunk.first_seq, last_seq: chunk.last_seq },
-        est_tokens: chunk.est_tokens,
-        fragments: fragments.map((f) => ({
-          chunk_seq: f.chunk_seq,
-          layer: f.layer,
-          first_seq: f.first_seq,
-          last_seq: f.last_seq,
-          first_time: f.first_time,
-          last_time: f.last_time,
-          est_tokens: f.est_tokens,
-          text: f.text,
-        })),
-      }),
-  };
-}
-
-/**
- * The branch's full request: the parent's own prefix kept as-is — the same
- * system prompt and the rendered journal context at claim time — with the
- * preparation instruction and the compact target appended at the end. The
- * branch is the same individual in the same context, not a target-only
- * summarizer. An upper-layer target carries its selected fragments'
- * accepted texts; a layer-1 target carries its range's stored events.
- */
-export function branchMessages(
-  claimed: ClaimedMemoryChunk,
-  system: string,
-): ChatMessage[] {
-  const messages: ChatMessage[] = [
-    { role: "system", content: system },
-    ...renderJournalContext(
-      claimed.context.events ?? [],
-      claimed.context.memory ?? [],
-      claimed.context.omitted ?? null,
-      claimed.context.memory_omitted ?? null,
-    ),
-  ];
-  const chunk = claimed.chunk;
-  if (chunk) {
-    if (chunk.layer >= 2) {
-      const fragments = claimed.target_fragments ?? [];
-      const reintegrating = fragments[0]?.layer === 2;
-      const target = compactUpperTargetMessage(chunk, fragments);
-      messages.push({
-        role: "user",
-        content: `${reintegrating ? COMPACT_L2_REINTEGRATION_PROMPT : COMPACT_L1_TO_L2_PROMPT}\n\n${target.content}`,
-      });
-    } else {
-      const target = compactTargetMessage(chunk, claimed.target_events);
-      messages.push({
-        role: "user",
-        content: `${COMPACT_L1_PROMPT}\n\n${target.content}`,
-      });
-    }
-  }
-  return messages;
-}
-
-export interface MemoryPreparationDeps {
-  personaId: string;
-  generation: number;
-  state: StateClient;
-  provider: ModelProvider;
-  contextLimit: number;
-  /** The parent's system prompt — the branch keeps the parent prefix. */
-  system: string;
-  /** The parent's tool definitions; offered unchanged, never executed. */
-  tools: ToolSpec[];
-  /**
-   * Aborted when the host stops or the writer fence is lost: the branch
-   * ends at once, records nothing and makes no further model call.
-   */
-  signal?: AbortSignal;
-  /** Wall-clock bound on the model call; exceeding it is a recorded failure. */
-  timeoutMs?: number;
-  log?: (msg: string, fields?: Record<string, unknown>) => void;
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(t);
-      reject(new DOMException("aborted", "AbortError"));
-    });
-  });
-}
-
-/** The model's preparation verdict for one claimed chunk. */
-type PreparationOutcome =
-  | { kind: "prepared"; replacement: string }
-  | { kind: "kept" }
-  | { kind: "unavailable"; reason: string; delayMs?: number }
-  | { kind: "failed"; error: string; retryable: boolean };
-
-/**
- * Persist the branch's verdict. A claimed chunk must never be orphaned in
- * 'preparing' under a still-live generation — a transient failure to record
- * the outcome is retried with backoff until it lands, the process is
- * stopping, or the fence is lost (a later generation's recovery reseals it).
- */
-async function recordMemoryOutcome(
-  deps: MemoryPreparationDeps,
-  chunkSeq: number,
-  outcome: PreparationOutcome,
-): Promise<void> {
-  const { personaId, generation, state } = deps;
-  const log = deps.log ?? (() => {});
-  for (let attempt = 0; ; attempt++) {
-    if (deps.signal?.aborted) return;
-    try {
-      if (outcome.kind === "prepared") {
-        await state.completeMemoryChunk(personaId, generation, chunkSeq, {
-          replacement: outcome.replacement,
-        });
-        log("memory candidate prepared", { chunk_seq: chunkSeq });
-      } else if (outcome.kind === "kept") {
-        await state.completeMemoryChunk(personaId, generation, chunkSeq, {
-          keepUnchanged: true,
-        });
-        log("memory preparation kept originals", { chunk_seq: chunkSeq });
-      } else if (outcome.kind === "unavailable") {
-        await state.reshelveMemoryChunk(personaId, generation, chunkSeq, {
-          reason: outcome.reason,
-          delayMs: outcome.delayMs,
-        });
-        log("memory preparation paused: no model request could be made", {
-          chunk_seq: chunkSeq,
-          reason: outcome.reason,
-        });
-      } else {
-        await state.failMemoryChunk(personaId, generation, chunkSeq, {
-          error: outcome.error,
-          retryable: outcome.retryable,
-        });
-        log("memory preparation failed", {
-          chunk_seq: chunkSeq,
-          retryable: outcome.retryable,
-          error: outcome.error,
-        });
-      }
-      return;
-    } catch (e) {
-      if (e instanceof FencedError) throw e;
-      // A deterministic 400 completing 'prepared' means the text itself
-      // cannot be stored — convert to a terminal fail so the chunk's real
-      // state is recorded instead of looping on an impossible write.
-      if (
-        outcome.kind === "prepared" &&
-        e instanceof StateError &&
-        e.status === 400
-      ) {
-        outcome = {
-          kind: "failed",
-          error: `replacement rejected: ${e.message.slice(0, 1024)}`,
-          retryable: false,
-        };
-        continue;
-      }
-      // Any other deterministic rejection (a conflicting stored state) can
-      // never land by retrying: leave the chunk to the state service's
-      // interruption accounting instead of holding the host in a loop.
-      if (e instanceof StateError && e.status < 500 && e.status !== 429) {
-        log("memory outcome rejected; not retried", {
-          chunk_seq: chunkSeq,
-          status: e.status,
-          error: e.message.slice(0, 1024),
-        });
-        return;
-      }
-      const wait = Math.min(500 * 2 ** Math.min(attempt, 5), 10_000);
-      try {
-        await sleep(wait, deps.signal);
-      } catch {
-        return; // aborted
-      }
-    }
-  }
-}
-
-/**
- * Iterate a provider stream, but stop waiting the moment `signal` aborts —
- * a provider that ignores cancellation must not hold the host's lifetime.
- */
-async function* untilAborted(
-  stream: AsyncIterable<ModelEvent>,
-  signal: AbortSignal,
-): AsyncGenerator<ModelEvent> {
-  const it = stream[Symbol.asyncIterator]();
-  let onAbort = () => {};
-  const aborted = new Promise<never>((_, reject) => {
-    onAbort = () => reject(new DOMException("aborted", "AbortError"));
-    if (signal.aborted) onAbort();
-    else signal.addEventListener("abort", onAbort, { once: true });
-  });
-  aborted.catch(() => {});
-  try {
-    for (;;) {
-      const next = await Promise.race([it.next(), aborted]);
-      if (next.done) return;
-      yield next.value;
-    }
-  } catch (e) {
-    // Let an abandoned provider finish on its own; nothing awaits it.
-    void Promise.resolve(it.return?.()).catch(() => {});
-    throw e;
-  } finally {
-    signal.removeEventListener("abort", onAbort);
-  }
-}
-
-/**
- * How one preparation pass ended for scheduling purposes: "unavailable" when
- * the model layer could not produce a request at all (a pause, not a
- * verdict — the host should re-check on an ordinary cadence, not spin),
- * "worked" when a chunk was claimed and its outcome recorded either way,
- * "idle" when nothing was claimed or the run was interrupted first.
- */
-export type MemoryPreparationResult = "idle" | "unavailable" | "worked";
-
-/**
- * One preparation branch: claim the oldest sealable chunk, consult the model
- * with the parent's context, then record the verdict. Completing never
- * changes the sent context — application is the state service's separate,
- * threshold-gated step.
- *
- * Never throws except FencedError: every answer or genuine failure is
- * recorded on the chunk (retryable failures — provider errors, a stream that
- * ends incomplete, truncated or empty output, the timeout — return it to the
- * shelf with backoff; a spent budget marks it 'failed', visible rather than
- * silently skipped). A model layer that cannot produce a request at all —
- * an unbound selection, a missing credential — is a pause, not a verdict:
- * the work waits, unclaimed or reshelved with its budgets intact, until a
- * usable binding exists. A stop or fence loss records nothing.
- */
-export async function runMemoryPreparation(
-  deps: MemoryPreparationDeps,
-): Promise<MemoryPreparationResult> {
-  const { personaId, generation, state, provider } = deps;
-  const log = deps.log ?? (() => {});
-  // A stopped or fenced writer claims nothing and spends no model call.
-  if (deps.signal?.aborted) return "idle";
-  // Binding preflight: an unusable selection (post-transfer
-  // needs_rebinding, "none", a missing credential, a selection lookup
-  // outage) pauses the work instead of letting a claim reach the model
-  // layer's refusal. Anything not marked unavailable falls through and
-  // the real call classifies it — the binding can die between this check
-  // and the stream.
-  if (provider.probe) {
-    try {
-      await provider.probe();
-    } catch (e) {
-      if (e instanceof ModelError && e.unavailable) {
-        log("memory preparation paused: model unavailable", {
-          reason: e.message.slice(0, 4 * 1024),
-        });
-        return "unavailable";
-      }
-    }
-  }
-  const claimed = await state.claimMemoryChunk(
-    personaId,
-    generation,
-    deps.contextLimit,
-  );
-  const chunk = claimed.chunk;
-  if (!chunk) return "idle";
-  if (deps.signal?.aborted) return "idle";
-
-  const timeoutMs = deps.timeoutMs ?? DEFAULT_MEMORY_PREPARATION_TIMEOUT_MS;
-  const call = new AbortController();
-  let timedOut = false;
-  const onStop = () => call.abort();
-  deps.signal?.addEventListener("abort", onStop, { once: true });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    call.abort();
-  }, timeoutMs);
-  let text = "";
-  let toolCalls = 0;
-  let usage: Record<string, unknown> | null = null;
-  let streamError: unknown = null;
-  try {
-    const stream = provider.stream({
-      personaId,
-      turnId: `memory-l${chunk.layer}-${chunk.chunk_seq}`,
-      generation,
-      phase: "memory",
-      round: 0,
-      messages: branchMessages(claimed, deps.system),
-      tools: deps.tools,
-      signal: call.signal,
-    });
-    for await (const ev of untilAborted(stream, call.signal)) {
-      if (ev.type === "text") text += ev.delta;
-      else if (ev.type === "tool_call") toolCalls++;
-      else usage = ev.usage;
-    }
-  } catch (e) {
-    streamError = e;
-  } finally {
-    clearTimeout(timer);
-    deps.signal?.removeEventListener("abort", onStop);
-  }
-
-  if (deps.signal?.aborted) {
-    // Host stop or fence loss: not a model failure. The claim stays
-    // unresolved and the next claim or generation counts an interruption.
-    log("memory preparation interrupted", { chunk_seq: chunk.chunk_seq });
-    return "idle";
-  }
-  const fail = (error: string, retryable: boolean) =>
-    recordMemoryOutcome(deps, chunk.chunk_seq, {
-      kind: "failed",
-      error,
-      retryable,
-    });
-  if (timedOut) {
-    await fail(`preparation did not finish within ${timeoutMs}ms`, true);
-    return "worked";
-  }
-  if (streamError !== null) {
-    const e = streamError;
-    // Budget admission denied the call before any request was sent — a
-    // placement condition, not a verdict on the chunk. The 'budget-wait:'
-    // reason marks it so a later budget or funding change clears the
-    // pacing early; between changes a slow re-admit heartbeat keeps the
-    // wait self-healing.
-    if (e instanceof BudgetWaitError) {
-      await recordMemoryOutcome(deps, chunk.chunk_seq, {
-        kind: "unavailable",
-        reason: `budget-wait: ${e.message.slice(0, 4 * 1024)}`,
-        delayMs: BUDGET_WAIT_RESHELVE_MS,
-      });
-      // Budget retry timing belongs to the durable shelf, so do not add
-      // the separate model-unavailable in-process pause.
-      return "idle";
-    }
-    // An unusable binding refused before any request was evaluated — a
-    // placement condition, not a verdict on the chunk (a transferred
-    // secretary is needs_rebinding until its human binds a connection).
-    // The claim returns to the shelf with its attempt budget intact so
-    // the same work proceeds once a usable binding exists.
-    if (e instanceof ModelError && e.unavailable) {
-      await recordMemoryOutcome(deps, chunk.chunk_seq, {
-        kind: "unavailable",
-        reason: `model: ${e.message.slice(0, 4 * 1024)}`,
-      });
-      return "unavailable";
-    }
-    // A capacity refusal is deterministic even when the provider framed it
-    // retryable: the preparation sends the identical target again, which
-    // can never succeed — the chunk records a terminal failure (its
-    // originals stay live) instead of spending attempts on the impossible.
-    const retryable =
-      !(e instanceof ModelError) ||
-      (e.retryable && e.refusal !== "context_length");
-    await fail(
-      `model: ${(e instanceof Error ? e.message : String(e)).slice(0, 4 * 1024)}`,
-      retryable,
-    );
-    return "worked";
-  }
-  if (toolCalls > 0) {
-    // Tools are offered for an identical prefix but never run here; an
-    // output that tried to act instead of replacing is not adopted.
-    await fail(
-      `preparation output attempted ${toolCalls} tool call(s); tools are not executed in memory preparation`,
-      true,
-    );
-    return "worked";
-  }
-  // Same classification as the previous runtime's compactor: a response
-  // that did not finish normally, or finished empty, is incomplete and
-  // retried within the budget — never adopted, never terminal at once.
-  if (usage === null) {
-    await fail(
-      "incomplete preparation response: stream ended without completion",
-      true,
-    );
-    return "worked";
-  }
-  const finish = usage.finish_reason;
-  if (typeof finish === "string" && finish !== "stop") {
-    await fail(
-      `incomplete preparation response: finish_reason=${finish}`,
-      true,
-    );
-    return "worked";
-  }
-  const trimmed = text.trim();
-  if (trimmed === "KEEP_UNCHANGED") {
-    await recordMemoryOutcome(deps, chunk.chunk_seq, { kind: "kept" });
-    return "worked";
-  }
-  if (!trimmed) {
-    await fail(
-      "incomplete preparation response: empty replacement output",
-      true,
-    );
-    return "worked";
-  }
-  // PG text cannot hold NUL — strip it rather than let an un-storable
-  // candidate loop at the persistence boundary.
-  const replacement = trimmed.replaceAll("\u0000", "");
-  await recordMemoryOutcome(deps, chunk.chunk_seq, {
-    kind: "prepared",
-    replacement,
-  });
-  return "worked";
+  return Math.ceil(new TextEncoder().encode(text).length / 4);
 }

@@ -97,6 +97,7 @@ var toolAuthority = map[string]struct {
 }{
 	"schedule.set":         {internal: true},
 	"journal.note":         {internal: true},
+	"memory.resume":        {internal: true},
 	"conversation_history": {internal: true, readOnly: true},
 	// Jobs (merged slice): ordinary internal effects under the secretary's
 	// own authority — no human decision on either route.
@@ -183,6 +184,9 @@ func validateToolRequest(tool string, request map[string]any) error {
 		default:
 			return fmt.Errorf("%w: schedule.set miss_policy must be fire_late, coalesce, expire, or report_missed", ErrBadRequest)
 		}
+	case "memory.resume":
+		_, err := parseMemoryResumeRequest(request)
+		return err
 	case "journal.note":
 		if text, _ := request["text"].(string); text == "" {
 			return fmt.Errorf("%w: journal.note requires text", ErrBadRequest)

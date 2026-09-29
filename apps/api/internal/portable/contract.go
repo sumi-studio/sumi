@@ -351,6 +351,11 @@ var coreTables = []table{
 		{"claimed_generation", colBigint}, {"claimed_at", colTime}, {"not_before", colTime},
 		{"created_at", colTime}, {"prepared_at", colTime}, {"applied_at", colTime},
 	}},
+	{name: "core_memory_branches", orderBy: `chunk_seq`, cols: []column{
+		{"persona_id", colUUID}, {"chunk_seq", colBigint}, {"snapshot", colText}, {"previous_attempts", colText}, {"state", colText},
+		{"revision", colBigint}, {"checkpoint_hash", colText}, {"status", colText}, {"retry_at", colTime},
+		{"issue", colJSON}, {"updated_at", colTime},
+	}},
 }
 
 // placementLocalTables reference core_personas but are never carried: the

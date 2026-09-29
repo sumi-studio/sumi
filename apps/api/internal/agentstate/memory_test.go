@@ -339,7 +339,7 @@ func TestMemorySealClaimComplete(t *testing.T) {
 		c1.NotBefore == nil || !c1.NotBefore.After(time.Now()) {
 		t.Fatalf("interrupted claim: %+v %v", c1, err)
 	}
-	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Claimable != 0 || st.NextClaimableAt == nil {
+	if st, err := s.MemoryStatus(ctx, pa); err != nil || st.Claimable != 0 || st.NextClaimableAt != nil {
 		t.Fatalf("status while paced: %+v %v", st, err)
 	}
 	// The recorded deadline is wall-clock; a host clock step can regress
@@ -490,61 +490,6 @@ func TestMemoryEventsDuringPreparationSurvive(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("correction committed during preparation is missing from context")
-	}
-}
-
-func TestMemoryRecoverResealsStalePreparing(t *testing.T) {
-	s, _ := newStore(t)
-	ctx := context.Background()
-	pa := pid(t)
-	mustPersona(t, s, pa)
-	gen1 := acquireWriter(t, s, pa, 50*time.Millisecond)
-
-	seedSealed(t, s, pa, gen1, 2)
-	claimed, err := s.ClaimMemoryChunk(ctx, pa, gen1, 50)
-	if err != nil || claimed.Chunk == nil {
-		t.Fatalf("claim: %v", err)
-	}
-	// Writer crashes mid-preparation: its lease expires, a new generation
-	// acquires, and recovery returns the orphaned claim to the shelf.
-	time.Sleep(100 * time.Millisecond)
-	gen2 := acquireWriter(t, s, pa, time.Minute)
-	if gen2 == gen1 {
-		t.Fatal("expected a new generation")
-	}
-	if _, err := s.Recover(ctx, pa, gen2); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-	c, err := s.chunk(ctx, s.pool, pa, 1)
-	if err != nil {
-		t.Fatalf("chunk: %v", err)
-	}
-	// The lost claim is an interruption, not a failed attempt.
-	if c.Status != "sealed" || c.Interruptions != 1 || c.Attempts != 0 || c.ClaimedGeneration != nil {
-		t.Fatalf("stale preparing chunk not resealed as an interruption: %+v", c)
-	}
-	// The dead generation's outcome can no longer land.
-	if _, err := s.CompleteMemoryChunk(ctx, pa, gen1, 1, "late", false); !errors.Is(err, ErrGenerationFence) {
-		t.Fatalf("fenced complete: %v", err)
-	}
-	// The new generation prepares it instead, once the short pacing passes.
-	// The recorded deadline is wall-clock; a host clock step can regress
-	// now() below it (observed on this WSL2 host), so push it into the past
-	// directly rather than sleeping on a margin.
-	if c.NotBefore == nil {
-		t.Fatalf("interrupted chunk lost its pacing deadline: %+v", c)
-	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
-		 WHERE persona_id = $1 AND chunk_seq = 1`, pa); err != nil {
-		t.Fatal(err)
-	}
-	re, err := s.ClaimMemoryChunk(ctx, pa, gen2, 50)
-	if err != nil || re.Chunk == nil {
-		t.Fatalf("reclaim: %v", err)
-	}
-	if _, err := s.CompleteMemoryChunk(ctx, pa, gen2, 1, "gen2 replacement", false); err != nil {
-		t.Fatalf("gen2 complete: %v", err)
 	}
 }
 
@@ -977,9 +922,8 @@ func TestConversationHistoryOversizedRecord(t *testing.T) {
 }
 
 // Raw records stay in the sent context by capacity, not by a record count:
-// a long run of small messages renders whole, and only past the send cap do
-// the oldest raw records leave — reported as an omitted range that excludes
-// applied memory, while every row stays in the journal.
+// Original events stay in the sent context until a reviewed replacement
+// covers them, even past the previous raw send window.
 func TestMemoryRenderedContextByCapacity(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
@@ -1010,11 +954,10 @@ func TestMemoryRenderedContextByCapacity(t *testing.T) {
 		est += estPayloadTokens(e.Kind, e.Payload)
 	}
 	first, last := res.Context[0].Seq, res.Context[len(res.Context)-1].Seq
-	if est > L0SendCapTokens || last != 114 {
+	if est <= 60_000 || first != 1 || last != 114 || len(res.Context) != 114 {
 		t.Fatalf("raw window est=%d last=%d", est, last)
 	}
-	if res.Omitted == nil || res.Omitted.FirstSeq != 1 || res.Omitted.LastSeq != first-1 ||
-		res.Omitted.Count != first-1 {
+	if res.Omitted != nil {
 		t.Fatalf("omitted range: %+v (first rendered %d)", res.Omitted, first)
 	}
 
@@ -1029,8 +972,7 @@ func TestMemoryRenderedContextByCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load 3: %v", err)
 	}
-	if len(res.Memory) != 1 || res.Omitted == nil || res.Omitted.FirstSeq != 11 ||
-		res.Omitted.Count != res.Context[0].Seq-11 {
+	if len(res.Memory) != 1 || res.Omitted != nil || res.Context[0].Seq != 11 || len(res.Context) != 104 {
 		t.Fatalf("omitted with applied memory: %+v memory=%d", res.Omitted, len(res.Memory))
 	}
 }
@@ -1577,62 +1519,5 @@ func TestMemoryUpperStaleTargetFailsHonestly(t *testing.T) {
 	c1, _ := s.chunk(ctx, s.pool, pa, 1)
 	if c1.Status != "superseded" {
 		t.Fatalf("source row touched by the honest failure: %+v", c1)
-	}
-}
-
-// Upper-layer claims fence and interrupt like layer-1 ones: a dead
-// generation's preparing target returns to the shelf as an interruption,
-// its outcome can never land, and the live generation reprepares it.
-func TestMemoryUpperClaimFencingAndInterruption(t *testing.T) {
-	s, _ := newStore(t)
-	ctx := context.Background()
-	pa := pid(t)
-	mustPersona(t, s, pa)
-	gen1 := acquireWriter(t, s, pa, 50*time.Millisecond)
-
-	seedSealed(t, s, pa, gen1, 8)
-	for seq := int64(1); seq <= 7; seq++ {
-		prepareChunk(t, s, pa, gen1, seq, l1Replacement())
-	}
-	if _, err := s.MemoryMaintain(ctx, pa, gen1); err != nil {
-		t.Fatalf("maintain: %v", err)
-	}
-	cl, err := s.ClaimMemoryChunk(ctx, pa, gen1, 50)
-	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
-		t.Fatalf("claim 8: %v %+v", err, cl.Chunk)
-	}
-	// The writer dies mid-preparation; a new generation recovers.
-	time.Sleep(100 * time.Millisecond)
-	gen2 := acquireWriter(t, s, pa, time.Minute)
-	if _, err := s.Recover(ctx, pa, gen2); err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-	c8, err := s.chunk(ctx, s.pool, pa, 8)
-	if err != nil || c8.Status != "sealed" || c8.Interruptions != 1 || c8.Attempts != 0 {
-		t.Fatalf("interrupted upper claim: %+v %v", c8, err)
-	}
-	if _, err := s.CompleteMemoryChunk(ctx, pa, gen1, 8, "late answer", false); !errors.Is(err, ErrGenerationFence) {
-		t.Fatalf("fenced upper complete: %v", err)
-	}
-	// The interruption's deadline is wall-clock; a host clock step can
-	// regress now() below it (observed on this WSL2 host), so push it into
-	// the past directly rather than sleeping on a margin.
-	if c8.NotBefore == nil {
-		t.Fatalf("interrupted upper chunk lost its pacing deadline: %+v", c8)
-	}
-	if _, err := s.pool.Exec(ctx,
-		`UPDATE core_memory_chunks SET not_before = '2000-01-01'::timestamptz
-		 WHERE persona_id = $1 AND chunk_seq = 8`, pa); err != nil {
-		t.Fatal(err)
-	}
-	cl, err = s.ClaimMemoryChunk(ctx, pa, gen2, 50)
-	if err != nil || cl.Chunk == nil || cl.Chunk.ChunkSeq != 8 {
-		t.Fatalf("reclaim 8: %v %+v", err, cl.Chunk)
-	}
-	if len(cl.TargetFragments) != 2 {
-		t.Fatalf("reclaimed fragments: %+v", cl.TargetFragments)
-	}
-	if _, err := s.CompleteMemoryChunk(ctx, pa, gen2, 8, "gen2 L2 text", false); err != nil {
-		t.Fatalf("gen2 complete: %v", err)
 	}
 }

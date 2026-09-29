@@ -228,6 +228,7 @@ export type FailureKind =
   | "oversize_plan"
   | "model_reconnect_required"
   | "model_auth_rejected"
+  | "model_binding_changed"
   | "model_connection_disabled"
   | "model_usage_limit";
 
@@ -415,6 +416,14 @@ export interface RenderedContext {
 
 /** The memory layer's current shape (read-only observability). */
 export interface MemoryStatus {
+  branches?: {
+    chunk_seq: number;
+    status: string;
+    revision: number;
+    retry_at: string | null;
+    issue: { code: string; message: string } | null;
+    pause_reason: string | null;
+  }[];
   live_raw_tokens: number;
   applied_tokens: number;
   sealed: number;
@@ -425,7 +434,7 @@ export interface MemoryStatus {
   failed: number;
   /** Sources replaced by an applied upper-layer block (kept durable). */
   superseded: number;
-  /** Chunks a claim could take now (sealed past backoff, or orphaned). */
+  /** Saved branches that can execute now without a new parent snapshot. */
   claimable: number;
   /** Earliest time a chunk becomes claimable; null when none waits. */
   next_claimable_at: string | null;
@@ -436,19 +445,6 @@ export interface MemoryStatus {
   chunk_min_tokens: number;
   live_limit_tokens: number;
   memory_send_cap_tokens: number;
-}
-
-/**
- * A chunk claimed for asynchronous preparation, with everything the branch
- * needs: for a layer-1 target the covered events verbatim, for an
- * upper-layer target the selected source fragments' accepted texts with
- * their locators — plus the rendered parent context at claim time.
- */
-export interface ClaimedMemoryChunk {
-  chunk: MemoryChunk | null;
-  target_events: Event[];
-  target_fragments: MemoryBlock[];
-  context: RenderedContext;
 }
 
 export interface RecoverResult {

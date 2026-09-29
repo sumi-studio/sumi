@@ -265,7 +265,7 @@ func TestEntrypointFileSliceE2E(t *testing.T) {
 	}
 	// A full claim executes the real file.write effect against filesvc.
 	code, out = core(http.MethodPost, "/"+reg.AgentID+"/writer/acquire",
-		`{"holder_id":"e2e","ttl_ms":60000}`)
+		`{"protocol":"agentic-memory-v1","holder_id":"e2e","ttl_ms":60000}`)
 	if code != 200 {
 		t.Fatalf("acquire writer: %d %v", code, out)
 	}

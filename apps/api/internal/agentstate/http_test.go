@@ -109,6 +109,31 @@ func TestScopedCapabilityAuth(t *testing.T) {
 	}
 }
 
+func TestHTTPWriterRequiresCurrentRuntimeProtocol(t *testing.T) {
+	srv, mux := newHTTPServer(t)
+	pa := pid(t)
+	do(t, mux, "POST", "/internal/core/personas", testAdminSecret, `{"persona_id":"`+pa+`"}`)
+	path := "/internal/core/personas/" + pa + "/writer/acquire"
+	for _, body := range []string{
+		`{"holder_id":"old-core","ttl_ms":60000}`,
+		`{"protocol":"one-shot","holder_id":"old-core","ttl_ms":60000}`,
+	} {
+		rec := do(t, mux, "POST", path, testAdminSecret, body)
+		if rec.Code != http.StatusUpgradeRequired || !strings.Contains(rec.Body.String(), `"code":"runtime_protocol_mismatch"`) {
+			t.Fatalf("outdated runtime acquired a writer: %d %s", rec.Code, rec.Body)
+		}
+	}
+	var leases int
+	if err := srv.store.pool.QueryRow(context.Background(), "SELECT count(*) FROM core_writer_leases WHERE persona_id=$1", pa).Scan(&leases); err != nil || leases != 0 {
+		t.Fatalf("rejected runtimes must leave no writer: count=%d err=%v", leases, err)
+	}
+	rec := do(t, mux, "POST", path, testAdminSecret,
+		`{"protocol":"agentic-memory-v1","holder_id":"current-core","ttl_ms":60000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("current runtime cannot acquire: %d %s", rec.Code, rec.Body)
+	}
+}
+
 func TestHTTPInputToCommitFlow(t *testing.T) {
 	_, mux := newHTTPServer(t)
 	pa := pid(t)
@@ -120,7 +145,7 @@ func TestHTTPInputToCommitFlow(t *testing.T) {
 	tok := created.PersonaToken
 
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
-		`{"holder_id":"h1","ttl_ms":60000}`)
+		`{"protocol":"agentic-memory-v1","holder_id":"h1","ttl_ms":60000}`)
 	if rec.Code != 200 {
 		t.Fatalf("acquire: %d %s", rec.Code, rec.Body)
 	}
@@ -226,7 +251,7 @@ func TestHTTPPlanAndClaimBoundary(t *testing.T) {
 	tok := created.PersonaToken
 
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
-		`{"holder_id":"h1","ttl_ms":60000}`)
+		`{"protocol":"agentic-memory-v1","holder_id":"h1","ttl_ms":60000}`)
 	var lease WriterLease
 	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
 	gen := itoa(lease.Generation)
@@ -334,7 +359,7 @@ func TestHTTPDeterministicToolData400(t *testing.T) {
 	tok := created.PersonaToken
 
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
-		`{"holder_id":"h1","ttl_ms":60000}`)
+		`{"protocol":"agentic-memory-v1","holder_id":"h1","ttl_ms":60000}`)
 	var lease WriterLease
 	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
 	gen := itoa(lease.Generation)
@@ -385,7 +410,7 @@ func TestHTTPCommitOverBodyLimit(t *testing.T) {
 	tok := created.PersonaToken
 
 	rec = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", tok,
-		`{"holder_id":"h1","ttl_ms":60000}`)
+		`{"protocol":"agentic-memory-v1","holder_id":"h1","ttl_ms":60000}`)
 	var lease WriterLease
 	_ = json.Unmarshal(rec.Body.Bytes(), &lease)
 	gen := itoa(lease.Generation)
@@ -813,7 +838,7 @@ func TestHTTPPersonaNotFoundCode(t *testing.T) {
 		_ = json.Unmarshal(rec.Body.Bytes(), &body)
 		return body.Code
 	}
-	acquire := `{"holder_id":"h1","ttl_ms":30000}`
+	acquire := `{"protocol":"agentic-memory-v1","holder_id":"h1","ttl_ms":30000}`
 
 	missing := pid(t)
 	for _, path := range []string{"/writer/acquire", "/state"} {
@@ -837,7 +862,7 @@ func TestHTTPPersonaNotFoundCode(t *testing.T) {
 	if rec := do(t, mux, "POST", "/internal/core/personas/"+live+"/writer/acquire", testAdminSecret, acquire); rec.Code != 200 {
 		t.Fatalf("acquire: %d %s", rec.Code, rec.Body)
 	}
-	rec := do(t, mux, "POST", "/internal/core/personas/"+live+"/writer/acquire", testAdminSecret, `{"holder_id":"h2","ttl_ms":30000}`)
+	rec := do(t, mux, "POST", "/internal/core/personas/"+live+"/writer/acquire", testAdminSecret, `{"protocol":"agentic-memory-v1","holder_id":"h2","ttl_ms":30000}`)
 	if rec.Code != 409 || code(rec) != "" {
 		t.Fatalf("held writer: %d %s", rec.Code, rec.Body)
 	}

@@ -174,13 +174,12 @@ var cutChecks = []struct{ name, sql string }{
 			OR NOT EXISTS (SELECT 1 FROM core_inputs i
 				WHERE i.persona_id = o.persona_id AND i.input_id = o.payload->>'input_id'))`},
 	// A memory chunk's claim is execution authority of a placement-bound
-	// writer; the seal normalizes live 'preparing' rows back to 'sealed'
-	// before the cut, so a bundle carrying a claim is malformed, not a
-	// transfer of in-flight work.
+	// writer; the seal clears the claim before the cut. A preparing row
+	// may carry a durable branch, but never source execution authority.
 	{"memory_chunk_claim_carried", `
 		SELECT count(*) FROM core_memory_chunks c
 		WHERE c.persona_id = $1 AND (
-			c.status = 'preparing' OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
+			(c.status = 'preparing' AND NOT EXISTS(SELECT 1 FROM core_memory_branches b WHERE b.persona_id=c.persona_id AND b.chunk_seq=c.chunk_seq)) OR c.claimed_generation IS NOT NULL OR c.claimed_at IS NOT NULL)`},
 	// Upper-layer targets carry their provenance: every source must resolve
 	// to a distinct carried same-persona chunk, all in one layer, and the
 	// target's journal range must be exactly its sources' span — anchored at

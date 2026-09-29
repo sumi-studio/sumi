@@ -18,9 +18,19 @@
  *      parked input without duplicating work.
  *   4. A call whose provider never reported usage is recorded 'unknown'
  *      and inspectable — never silently zero.
- *   5. Memory preparation calls are metered too (phase 'memory').
+ *   5. Memory branch rounds are metered too (phase 'memory'): chunk 1's
+ *      branch runs the private-workspace protocol (memoryAgentRound in
+ *      memory-e2e-support.mjs) to its confirmation, one fact per round.
+ *      Later chunks' branch calls are held open by the stub so they cannot
+ *      interleave facts with the checks below.
  *
- * The provider and rates are labelled fixtures — not provider prices.
+ * The provider and rates are labelled fixtures — not provider prices. The
+ * real workspace file service is configured so the state service
+ * advertises file.read/file.write, which a memory branch requires.
+ *
+ * The run creates its own database next to SUMI_TEST_DB_URL's and leaves it
+ * for inspection: the operator budget and rate card it sets apply to every
+ * persona in a database, so they must not meter other runs sharing one.
  *
  *   SUMI_TEST_DB_URL=postgres://… [SUMI_E2E_DIR=<artifacts>] \
  *   [SUMI_E2E_PORT=9541] node scripts/e2e-usage.mjs
@@ -42,6 +52,13 @@ import {
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  chatCompletionsSSE,
+  fromChatCompletions,
+  memoryAgentRound,
+  memoryBranchView,
+  startFileService,
+} from "./memory-e2e-support.mjs";
 
 const CHILD = process.argv.includes("--child");
 if (CHILD) {
@@ -92,11 +109,15 @@ async function childMain() {
 
 // --------------------------------------------------------------- parent ---
 async function main() {
-  const DB_URL = process.env.SUMI_TEST_DB_URL ?? process.env.SUMI_DB_URL;
-  if (!DB_URL) {
+  const BASE_DB_URL = process.env.SUMI_TEST_DB_URL ?? process.env.SUMI_DB_URL;
+  if (!BASE_DB_URL) {
     console.error("e2e-usage: SUMI_TEST_DB_URL required — real PostgreSQL");
     process.exit(2);
   }
+  // Its own database: the operator budget and fixture rate card set below
+  // are global to a database, and would meter other runs sharing it.
+  const dbName = `sumi_e2e_usage_${randomUUID().replaceAll("-", "").slice(0, 10)}`;
+  const DB_URL = BASE_DB_URL.replace(/\/[^/?]*(\?|$)/, `/${dbName}$1`);
   const DIR =
     process.env.SUMI_E2E_DIR ??
     mkdtempSync(join(tmpdir(), "sumi-e2e-usage-run-"));
@@ -159,6 +180,7 @@ async function main() {
   // the fact then records 'unknown'. A `partial-usage` file sends a usage
   // chunk without completion_tokens.
   const providerLog = join(DIR, "provider-requests.jsonl");
+  const memoryLog = join(DIR, "memory-requests.jsonl");
   const stub = createServer((reqIn, res) => {
     if (reqIn.method !== "POST" || !reqIn.url.endsWith("/chat/completions")) {
       res.writeHead(404).end();
@@ -168,6 +190,27 @@ async function main() {
     reqIn.on("data", (d) => (body += d));
     reqIn.on("end", () => {
       const parsed = JSON.parse(body);
+      const view = memoryBranchView(fromChatCompletions(parsed.messages));
+      if (view) {
+        const decision =
+          view.chunk === 1
+            ? memoryAgentRound(view, { label: "usage stub" })
+            : null;
+        appendFileSync(
+          memoryLog,
+          `${JSON.stringify({ chunk: view.chunk, stage: decision?.stage ?? "held" })}\n`,
+        );
+        if (!decision) return; // held open until the run ends
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          chatCompletionsSSE(decision, {
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            prompt_tokens_details: { cached_tokens: 400 },
+          }),
+        );
+        return;
+      }
       const last = parsed.messages.at(-1)?.content ?? "";
       appendFileSync(
         providerLog,
@@ -177,8 +220,7 @@ async function main() {
           last: last.slice(0, 60),
         })}\n`,
       );
-      const isMemory = last.includes("compact_target");
-      const text = isMemory ? "KEEP_UNCHANGED" : `ack ${last.slice(0, 40)}`;
+      const text = `ack ${last.slice(0, 40)}`;
       const usage = existsSync(join(DIR, "drop-usage"))
         ? null
         : existsSync(join(DIR, "partial-usage"))
@@ -222,12 +264,18 @@ async function main() {
   );
   if (build.status !== 0) fail("go build failed");
 
-  log("starting state-dev on", BASE);
+  // state-dev creates the run's database; the file service, which shares
+  // it, starts once it exists.
+  const filesToken = `e2e-files-${randomUUID()}`;
+  log("starting state-dev on", BASE, "database", dbName);
   const svcOut = openSync(join(DIR, "state-dev.log"), "a");
   const svc = spawn(bin, [], {
     env: {
       ...process.env,
+      SUMI_FILESVC_URL: `http://127.0.0.1:${PORT + 1}`,
+      SUMI_FILESVC_TOKEN: filesToken,
       SUMI_DB_URL: DB_URL,
+      SUMI_DB_CREATE: "1",
       SUMI_CORE_STATE_TOKEN: ADMIN,
       SUMI_STATE_LISTEN: `127.0.0.1:${PORT}`,
       // Arms the connection store so a seeded api_key reaches the binding.
@@ -236,7 +284,11 @@ async function main() {
     stdio: ["ignore", svcOut, svcOut],
   });
   children.push(svc);
-  process.on("exit", () => svc.kill("SIGKILL"));
+  // Every service this run started, the file service included, ends with it:
+  // a surviving file service would keep the database's writer lock.
+  process.on("exit", () => {
+    for (const c of children) c.kill("SIGKILL");
+  });
   for (const deadline = Date.now() + 30_000; ; ) {
     try {
       if ((await fetch(`${BASE}/health`)).ok) break;
@@ -246,6 +298,15 @@ async function main() {
     if (Date.now() > deadline) fail("state-dev did not become healthy");
     await sleep(200);
   }
+
+  log("starting the workspace file service…");
+  await startFileService({
+    dbUrl: DB_URL,
+    port: PORT + 1,
+    outDir: binDir,
+    children,
+    token: filesToken,
+  });
 
   const created = await req("POST", "/internal/core/personas", ADMIN, {
     persona_id: personaId,
@@ -260,6 +321,16 @@ async function main() {
   const P = `/internal/core/personas/${personaId}`;
   const facts = async () =>
     (await req("GET", `${P}/usage/facts?limit=100`, ptoken)).json.facts;
+  // The one turn fact of an input. Facts list by recorded_at, a wall-clock
+  // time that can step backwards on a dev host, so never pick one by its
+  // position in the list.
+  const factFor = async (inputId) => {
+    const own = (await facts()).filter(
+      (f) => f.input_id === inputId && f.phase === "turn",
+    );
+    assert.equal(own.length, 1, `one turn fact for ${inputId}`);
+    return own[0];
+  };
   const outboxFor = async (inputId) =>
     (await req("GET", `${P}/outbox?after_seq=0`, ptoken)).json.outbox.filter(
       (o) => o.payload.input_id === inputId,
@@ -403,16 +474,38 @@ async function main() {
   const pad = "x".repeat(44 * 1024);
   await say(`memory seed one ${pad}`);
   await say(`memory seed two ${pad}`);
+  const memoryRounds = () =>
+    existsSync(memoryLog)
+      ? readFileSync(memoryLog, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+          .filter((r) => r.chunk === 1)
+      : [];
   await waitFor(
-    async () => (await facts()).some((f) => f.phase === "memory"),
-    "a memory-phase usage fact",
+    async () => memoryRounds().some((r) => r.stage === "confirm"),
+    "chunk 1's memory branch confirms",
     45_000,
   );
+  await waitFor(
+    async () =>
+      (await facts()).filter((f) => f.phase === "memory").length ===
+      memoryRounds().length,
+    "one memory-phase fact per branch round",
+  );
   fs = await facts();
-  const memFact = fs.find((f) => f.phase === "memory");
-  check(memFact.funding.kind === "operator", "memory fact funding", memFact);
-  assert.equal(memFact.status, "reported");
-  assert.equal(memFact.cost_minor, 1400);
+  const memFacts = fs.filter((f) => f.phase === "memory");
+  check(
+    memFacts.length >= 5 &&
+      memFacts.every(
+        (f) =>
+          f.funding.kind === "operator" &&
+          f.status === "reported" &&
+          f.cost_minor === 1400,
+      ),
+    "every memory round is an operator-funded reported fact",
+    { memFacts, rounds: memoryRounds() },
+  );
   const spent = fs.reduce((a, f) => a + (f.cost_minor ?? 0), 0);
   log("memory fact landed; spent so far:", spent);
 
@@ -470,9 +563,8 @@ async function main() {
   // estimate as uncertain spend — 'admission_estimate', inspectable,
   // never silently zero and never releasing the hold back as allowance.
   writeFileSync(join(DIR, "drop-usage"), "");
-  await say("usage mystery four");
-  fs = await facts();
-  const unknown = fs.at(-1);
+  const mysteryId = await say("usage mystery four");
+  const unknown = await factFor(mysteryId);
   assert.equal(unknown.status, "unknown", "unreported usage is inspectable");
   assert.equal(unknown.input_tokens, null);
   assert.equal(unknown.cost_basis, "admission_estimate");
@@ -589,9 +681,8 @@ async function main() {
   r = await req("POST", `${P}/bind`, ADMIN, { human_id: human });
   check(r.status === 200, `bind persona ${r.status}`, r.text);
 
-  await say("usage conn one");
-  fs = await facts();
-  const connFact = fs.at(-1);
+  const connOneId = await say("usage conn one");
+  const connFact = await factFor(connOneId);
   assert.equal(connFact.funding.kind, "connection", "connection funding");
   assert.equal(connFact.funding.id, conn1);
   assert.equal(connFact.cost_minor, 1400);
@@ -600,9 +691,9 @@ async function main() {
   // --- 8: a connection switch attributes the next call, never rewrites the old
   r = await select(conn2);
   check(r.status === 200, `select conn2 ${r.status}`, r.text);
-  await say("usage conn two");
+  const connTwoId = await say("usage conn two");
+  const conn2Fact = await factFor(connTwoId);
   fs = await facts();
-  const conn2Fact = fs.at(-1);
   assert.equal(conn2Fact.funding.id, conn2, "new call attributes to conn-2");
   assert.equal(
     fs.find((f) => f.fact_id === connFact.fact_id)?.funding.id,
@@ -638,8 +729,7 @@ async function main() {
       (await outboxFor(switchedId)).some((o) => o.kind === "turn_completed"),
     "parked input resumes after the funding change",
   );
-  fs = await facts();
-  const resumed = fs.at(-1);
+  const resumed = await factFor(switchedId);
   assert.equal(resumed.funding.kind, "connection");
   assert.equal(resumed.funding.id, conn1, "resumed call ran on conn-1");
 
@@ -727,6 +817,7 @@ async function main() {
   };
   writeFileSync(join(DIR, "summary.json"), JSON.stringify(summary, null, 2));
   log("summary", JSON.stringify(summary, null, 1));
+  log("database left for inspection:", dbName);
   child.kill("SIGTERM");
   await once(child, "exit");
   svc.kill("SIGTERM");

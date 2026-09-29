@@ -198,7 +198,9 @@ func TestResidualStealFencesCachedIntended(t *testing.T) {
 	// connections and pump goroutine survive — the replacement
 	// acquires the same logical runner and adopts first.
 	var terminated bool
-	if err := s.pool.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, old.PID()).Scan(&terminated); err != nil || !terminated {
+	// Without a timeout, true only means the termination signal was sent;
+	// wait for the backend to exit and release its session advisory lock.
+	if err := s.pool.QueryRow(ctx, `SELECT pg_terminate_backend($1, 10000)`, old.PID()).Scan(&terminated); err != nil || !terminated {
 		t.Fatalf("kill lock conn: %v %v", terminated, err)
 	}
 	fresh, err := s.TryAcquireTerminalRunnerLock(ctx, "runner-a")

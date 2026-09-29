@@ -71,7 +71,7 @@ jobs:
       - name: Run durable-plan e2e (real Go state service + real PostgreSQL)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:plan
 
-      - name: Run memory e2e (real Go state service + real PostgreSQL)
+      - name: Run memory branch e2e (real Go state + file service + real PostgreSQL)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:memory
 
       - name: Run jobs e2e (real runner + real PostgreSQL)
@@ -80,7 +80,7 @@ jobs:
       - name: Run workerd smoke (local wrangler dev + real state service)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd
 
-      - name: Run workerd memory lifecycle e2e (local wrangler dev + real state service)
+      - name: Run workerd memory branch lifecycle e2e (local wrangler dev + real state and file services)
         env:
           SUMI_E2E_PSQL: psql ${{ env.SUMI_TEST_DB_URL }} -Atc
         run: corepack pnpm --filter @sumi/agent-core test:e2e:workerd:memory
@@ -88,7 +88,7 @@ jobs:
       - name: Run Local→Cloud transfer e2e (two state services, two PostgreSQL databases)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:portable
 
-      - name: Run Local→Cloud memory-continuity e2e (carried chunks, fenced claims resume)
+      - name: Run Local→Cloud memory-continuity e2e (carried fragments, carried branch resumes)
         run: corepack pnpm --filter @sumi/agent-core test:e2e:portable:memory
 
       - name: Check local-host launcher syntax
@@ -98,7 +98,16 @@ jobs:
           bash -n deploy/local-host/self-test-ownership.sh
 
       - name: Run local-host install/launcher self-test
-        run: bash deploy/local-host/self-test.sh
+        # Memory e2es bind the file service database to their own workspace
+        # root. This install uses a different root and therefore needs its
+        # own database; sharing it would violate file-version ownership.
+        env:
+          SUMI_TEST_DB_URL: postgres://sumi:sumi-dev@localhost:5432/local_host_self_test?sslmode=disable
+        run: |
+          docker exec "${{ job.services.postgres.id }}" \
+            psql -U sumi -d sumi -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE local_host_self_test'
+          bash deploy/local-host/self-test.sh
 
       # Two managed installs side by side on real Docker: distinct volumes/
       # containers/ports, cross-install purge isolation, orphan refusal,
@@ -111,10 +120,16 @@ jobs:
       # real model calls or secrets, no Cloudflare deployment, no remote
       # database. The workerd smoke exercises the Durable Object wake path via
       # local wrangler dev; deployed-worker alarm scheduling is not covered.
-      # The workerd memory e2e scripts an OpenAI-compatible SSE endpoint to
-      # exercise preparation lifetime (a branch past the 25s turn budget, a
-      # provider failure, a killed host); local workerd does not enforce the
-      # deployed 15-minute alarm wall time.
+      # The memory e2es run the real workspace file service (apps/files) on
+      # the same database so the state service advertises file.read and
+      # file.write, and script the memory branch protocol (read source, write
+      # a draft, reread, review, confirm) — lifecycle and durability, not
+      # memory quality. The workerd memory e2e serves that script from an
+      # OpenAI-compatible SSE endpoint to exercise branch lifetime (a round
+      # past the 25s fetch-drain budget completing on alarms, a provider
+      # failure paused and retried at its recorded time, a killed host
+      # resumed from the checkpointed draft); local workerd does not enforce
+      # the deployed 15-minute alarm wall time.
       # The local-host self-test installs into disposable dirs against the
       # ephemeral Postgres and additionally covers restart persistence and
       # SIGKILL mid-turn recovery.

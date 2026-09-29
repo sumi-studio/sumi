@@ -56,14 +56,14 @@ type AwaitingRuntime struct {
 // a runtime working on schedule is never rescued.
 const MemoryRescueGrace = 15 * time.Minute
 
-// memoryRescueSQL selects a persona's memory work overdue by the grace
-// ($3): a sealed chunk past its backoff (or its sealing), or a chunk left
-// 'preparing' by a writer that is gone. The caller also requires no live
-// writer lease.
-const memoryRescueSQL = `EXISTS (SELECT 1 FROM core_memory_chunks mc
-				WHERE mc.persona_id = p.persona_id
-				  AND ((mc.status = 'sealed' AND COALESCE(mc.not_before, mc.created_at) <= now() - $3::interval)
-				       OR (mc.status = 'preparing' AND mc.claimed_at <= now() - $3::interval)))`
+// A rescue can resume a durable branch. Sealed ranges without an actual
+// parent snapshot wait for the next main consultation; an alarm cannot invent
+// that snapshot. Indefinitely paused branches are visible but do not spin.
+const memoryRescueSQL = `EXISTS (SELECT 1 FROM core_memory_branches mb
+ JOIN core_memory_chunks mc USING(persona_id,chunk_seq)
+ WHERE mb.persona_id=p.persona_id AND mc.status='preparing'
+ AND ((mb.status='running' AND mb.updated_at<=now()-$3::interval)
+ OR (mb.status='paused' AND mb.retry_at<=now()-$3::interval)))`
 
 // PersonasAwaitingRuntime lists active personas whose work needs a runtime
 // and whose writer lease is absent or expired: due inputs and schedules, and

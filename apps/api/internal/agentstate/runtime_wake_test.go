@@ -142,7 +142,7 @@ func TestRuntimeWakerWakesPendingWorkWithoutLiveWriter(t *testing.T) {
 		t.Fatalf("re-woken inside the gap: %d", n)
 	}
 	// A live writer owns the work: no wake while its lease lasts.
-	r := do(t, mux, "POST", "/internal/core/personas/"+busy+"/writer/acquire", testAdminSecret, `{"holder_id":"h","ttl_ms":30000}`)
+	r := do(t, mux, "POST", "/internal/core/personas/"+busy+"/writer/acquire", testAdminSecret, `{"protocol":"agentic-memory-v1","holder_id":"h","ttl_ms":30000}`)
 	if r.Code != 200 {
 		t.Fatalf("acquire: %d %s", r.Code, r.Body)
 	}
@@ -482,7 +482,7 @@ func TestNextWorkRouteAndInactiveCode(t *testing.T) {
 	if _, err := srv.Store().pool.Exec(context.Background(), `UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, pa); err != nil {
 		t.Fatal(err)
 	}
-	r = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", testAdminSecret, `{"holder_id":"h","ttl_ms":30000}`)
+	r = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", testAdminSecret, `{"protocol":"agentic-memory-v1","holder_id":"h","ttl_ms":30000}`)
 	if r.Code != 409 || !strings.Contains(r.Body.String(), `"code":"persona_inactive"`) {
 		t.Fatalf("inactive acquire: %d %s", r.Code, r.Body)
 	}
@@ -532,7 +532,15 @@ func TestRuntimeSweepRescuesOnlyOverdueMemory(t *testing.T) {
 	if selected(pa) != nil {
 		t.Fatal("inactive persona swept")
 	}
-	// Active again, no input or schedule: the memory-only work is rescued.
+	// An unsnapshotted target cannot make progress on an alarm.
+	exec(`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, pa)
+	if selected(pa) != nil {
+		t.Fatal("sealed target without live snapshot was repeatedly rescued")
+	}
+	// A saved branch can resume without a new main conversation.
+	exec(`UPDATE core_memory_chunks SET status='preparing' WHERE persona_id=$1`, pa)
+	exec(`INSERT INTO core_memory_branches (persona_id,chunk_seq,snapshot,status,updated_at) VALUES ($1,1,'{}','running',now()-interval '2 hours')`, pa)
+	// Active again, no input or schedule: the saved work is rescued.
 	exec(`UPDATE core_personas SET authority = 'active' WHERE persona_id = $1`, pa)
 	a := selected(pa)
 	if a == nil || !a.MemoryOnly {
@@ -550,20 +558,24 @@ func TestRuntimeSweepRescuesOnlyOverdueMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A retry backoff set just now is on schedule again, however old the chunk.
-	exec(`UPDATE core_memory_chunks SET not_before = now() + interval '1 minute' WHERE persona_id = $1`, pa)
+	exec(`UPDATE core_memory_branches SET status='paused', retry_at = now() + interval '1 minute' WHERE persona_id = $1`, pa)
 	if selected(pa) != nil {
 		t.Fatal("chunk inside its retry backoff rescued")
 	}
-	exec(`UPDATE core_memory_chunks SET not_before = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
+	exec(`UPDATE core_memory_branches SET retry_at = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
 	if selected(pa) == nil {
 		t.Fatal("retry overdue past the grace not rescued (e.g. a planned wake the platform gave up on)")
 	}
 	// A branch left 'preparing' by a writer that is gone.
-	exec(`UPDATE core_memory_chunks SET status = 'preparing', not_before = NULL, claimed_at = now() WHERE persona_id = $1`, pa)
+	exec(`UPDATE core_memory_branches SET retry_at=NULL WHERE persona_id=$1`, pa)
+	if selected(pa) != nil {
+		t.Fatal("indefinitely paused branch was rescued")
+	}
+	exec(`UPDATE core_memory_branches SET status='running', updated_at=now() WHERE persona_id=$1`, pa)
 	if selected(pa) != nil {
 		t.Fatal("recent preparation rescued")
 	}
-	exec(`UPDATE core_memory_chunks SET claimed_at = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
+	exec(`UPDATE core_memory_branches SET updated_at = now() - interval '20 minutes' WHERE persona_id = $1`, pa)
 	if a := selected(pa); a == nil || !a.MemoryOnly {
 		t.Fatalf("orphaned preparation not rescued: %+v", a)
 	}
@@ -598,7 +610,10 @@ func TestRuntimeWakerPacesMemoryRescue(t *testing.T) {
 	pa := pid(t)
 	mustPersona(t, s, pa)
 	if _, err := s.pool.Exec(ctx, `INSERT INTO core_memory_chunks (persona_id, chunk_seq, first_seq, last_seq, est_tokens, status, created_at)
-		VALUES ($1, 1, 1, 10, 12000, 'sealed', now() - interval '1 hour')`, pa); err != nil {
+		VALUES ($1, 1, 1, 10, 12000, 'preparing', now() - interval '1 hour')`, pa); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO core_memory_branches (persona_id,chunk_seq,snapshot,status,updated_at) VALUES ($1,1,'{}','running',now()-interval '1 hour')`, pa); err != nil {
 		t.Fatal(err)
 	}
 	if n := waker.Sweep(ctx); n != 1 {

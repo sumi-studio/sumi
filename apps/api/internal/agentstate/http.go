@@ -25,6 +25,11 @@ import (
 // a client error (400), not a database domain violation (500).
 var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
+// A runtime using the removed one-shot memory contract must not acquire a
+// writer after the API has switched to durable branches. Deployment fences
+// existing leases before restarting the API; this guards new acquisitions.
+const coreRuntimeProtocol = "agentic-memory-v1"
+
 // Server exposes the persona-scoped state contract over HTTP.
 //
 // Two credential scopes exist, both deliberately explicit:
@@ -171,10 +176,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /internal/core/personas/{persona}/model/intent", s.clearModelIntent)
 	mux.HandleFunc("GET /internal/core/personas/{persona}/memory", s.memoryStatus)
 	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/maintain", s.memoryMaintain)
-	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/claim", s.claimMemoryChunk)
-	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/complete", s.completeMemoryChunk)
-	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/fail", s.failMemoryChunk)
-	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/chunks/{chunk}/reshelve", s.reshelveMemoryChunk)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/branches/claim", s.claimMemoryBranch)
+	mux.HandleFunc("POST /internal/core/personas/{persona}/memory/branches/{chunk}/checkpoint", s.saveMemoryBranch)
 	// Usage accounting: admission is writer-fenced (a fenced-out generation
 	// must not hold new reservations); recording is persona-scoped but not
 	// fenced — the spend already happened and a replaced writer must still
@@ -506,6 +509,7 @@ func (s *Server) acquireWriter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		Protocol string `json:"protocol"`
 		HolderID string `json:"holder_id"`
 		TTLms    int64  `json:"ttl_ms"`
 	}
@@ -514,6 +518,13 @@ func (s *Server) acquireWriter(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.HolderID == "" || req.TTLms <= 0 {
 		writeError(w, http.StatusBadRequest, "holder_id and positive ttl_ms required")
+		return
+	}
+	if req.Protocol != coreRuntimeProtocol {
+		writeJSON(w, http.StatusUpgradeRequired, map[string]string{
+			"error": "Core runtime and state service protocols do not match; update the runtime",
+			"code":  "runtime_protocol_mismatch",
+		})
 		return
 	}
 	lease, err := s.store.AcquireWriter(r.Context(), personaID, req.HolderID, time.Duration(req.TTLms)*time.Millisecond)
@@ -835,135 +846,6 @@ func (s *Server) memoryMaintain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
-}
-
-// claimMemoryChunk claims the oldest sealable chunk for asynchronous L1
-// preparation. Concurrent same-generation callers may each hold a distinct
-// claim briefly; pacing and generation fencing converge them. The response
-// carries the covered events verbatim plus the rendered parent context at
-// claim time.
-func (s *Server) claimMemoryChunk(w http.ResponseWriter, r *http.Request) {
-	personaID, ok := s.scope(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		Generation   int64 `json:"generation"`
-		ContextLimit int   `json:"context_limit"`
-	}
-	if !decode(w, r, &req, s.maxBody) {
-		return
-	}
-	if !requireGen(w, req.Generation) {
-		return
-	}
-	claimed, err := s.store.ClaimMemoryChunk(r.Context(), personaID, req.Generation, req.ContextLimit)
-	if err != nil {
-		storeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, claimed)
-}
-
-// completeMemoryChunk shelves the finished replacement candidate ('prepared')
-// or records the model's KEEP_UNCHANGED decision ('kept'). Completion alone
-// never changes the sent context — application is a separate, threshold-
-// gated step.
-func (s *Server) completeMemoryChunk(w http.ResponseWriter, r *http.Request) {
-	personaID, ok := s.scope(w, r)
-	if !ok {
-		return
-	}
-	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "chunk must be an integer")
-		return
-	}
-	var req struct {
-		Generation    int64  `json:"generation"`
-		Replacement   string `json:"replacement"`
-		KeepUnchanged bool   `json:"keep_unchanged"`
-	}
-	if !decode(w, r, &req, s.maxBody) {
-		return
-	}
-	if !requireGen(w, req.Generation) {
-		return
-	}
-	chunk, err := s.store.CompleteMemoryChunk(r.Context(), personaID, req.Generation,
-		chunkSeq, req.Replacement, req.KeepUnchanged)
-	if err != nil {
-		storeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
-}
-
-// failMemoryChunk records a failed preparation attempt: retryable failures
-// return the chunk to the shelf with backoff; an exhausted or non-retryable
-// failure is terminal ('failed'), visible rather than silently skipped.
-func (s *Server) failMemoryChunk(w http.ResponseWriter, r *http.Request) {
-	personaID, ok := s.scope(w, r)
-	if !ok {
-		return
-	}
-	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "chunk must be an integer")
-		return
-	}
-	var req struct {
-		Generation int64  `json:"generation"`
-		Error      string `json:"error"`
-		Retryable  bool   `json:"retryable"`
-	}
-	if !decode(w, r, &req, s.maxBody) {
-		return
-	}
-	if !requireGen(w, req.Generation) {
-		return
-	}
-	chunk, err := s.store.FailMemoryChunk(r.Context(), personaID, req.Generation,
-		chunkSeq, req.Error, req.Retryable)
-	if err != nil {
-		storeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
-}
-
-// reshelveMemoryChunk returns a claimed chunk to the shelf when no model
-// request could be made — an unusable binding or a budget-denied call.
-// No verdict, no attempt spent; the chunk stays in the pipeline with its
-// budgets intact until a usable funding/binding state exists.
-func (s *Server) reshelveMemoryChunk(w http.ResponseWriter, r *http.Request) {
-	personaID, ok := s.scope(w, r)
-	if !ok {
-		return
-	}
-	chunkSeq, err := strconv.ParseInt(r.PathValue("chunk"), 10, 64)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "chunk must be an integer")
-		return
-	}
-	var req struct {
-		Generation int64  `json:"generation"`
-		Reason     string `json:"reason"`
-		DelayMs    int64  `json:"delay_ms"`
-	}
-	if !decode(w, r, &req, s.maxBody) {
-		return
-	}
-	if !requireGen(w, req.Generation) {
-		return
-	}
-	chunk, err := s.store.ReshelveMemoryChunk(r.Context(), personaID, req.Generation,
-		chunkSeq, req.Reason, req.DelayMs)
-	if err != nil {
-		storeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"chunk": chunk})
 }
 
 // admitUsage is the pre-call boundary: the core reserves the priced

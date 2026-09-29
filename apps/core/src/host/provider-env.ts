@@ -51,6 +51,7 @@
  */
 
 import {
+  type ModelBindingSnapshot,
   ModelError,
   type ModelEvent,
   type ModelFailureCause,
@@ -58,6 +59,10 @@ import {
   type ModelRequest,
 } from "../provider.ts";
 import { AnthropicProvider } from "../providers/anthropic.ts";
+import {
+  assertBindingSnapshot,
+  snapshotFor,
+} from "../providers/binding-snapshot.ts";
 import { CHATGPT_BASE_URL } from "../providers/chatgpt-codex.ts";
 import { FixtureProvider } from "../providers/fixture.ts";
 import { MockProvider } from "../providers/mock.ts";
@@ -191,6 +196,25 @@ export class SelectedModelProvider implements ModelProvider {
     await this.resolve();
   }
 
+  async snapshotBinding(): Promise<ModelBindingSnapshot> {
+    return (await this.resolvePinned()).snapshot;
+  }
+
+  private async resolvePinned(expected?: ModelBindingSnapshot) {
+    const resolved = await this.resolve();
+    const underlying = await resolved.provider.snapshotBinding?.();
+    const snapshot = await snapshotFor(
+      resolved.provider.name,
+      { persona: this.opts.persona, identity: resolved.identity, underlying },
+      resolved.identity.selection === "api"
+        ? resolved.identity.model
+        : underlying?.model,
+      underlying?.reasoningEffort,
+    );
+    assertBindingSnapshot(expected, snapshot);
+    return { ...resolved, snapshot };
+  }
+
   /**
    * The metered call path: resolve the selected funding, admit the
    * priced estimate under the writer generation BEFORE any provider
@@ -201,7 +225,9 @@ export class SelectedModelProvider implements ModelProvider {
    * idempotent.
    */
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
-    const { provider, identity } = await this.resolve();
+    const { provider, identity } = request.bindingSnapshot
+      ? await this.resolvePinned(request.bindingSnapshot)
+      : await this.resolve();
     if (request.generation === undefined) {
       throw new Error("a metered call requires the writer generation");
     }
@@ -233,7 +259,16 @@ export class SelectedModelProvider implements ModelProvider {
     // 'unavailable' error — every other outcome may have sent bytes.
     let notSent = false;
     try {
-      for await (const ev of provider.stream(request)) {
+      // Translate the verified connection-scoped pin into this adapter's pin.
+      // This also prevents an adapter from silently rewriting a pinned prefix
+      // when retrying a refused request.
+      const boundRequest: ModelRequest = {
+        ...request,
+        bindingSnapshot: request.bindingSnapshot
+          ? await provider.snapshotBinding?.()
+          : undefined,
+      };
+      for await (const ev of provider.stream(boundRequest)) {
         if (ev.type !== "done") {
           yield ev;
           continue;
