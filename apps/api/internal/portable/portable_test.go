@@ -322,6 +322,19 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	local, cloud := newPlacement(t), newPlacement(t)
 	pid := newID(t)
 	localGen := liveSecretary(t, local, pid)
+	beforeMove := must(local.state.Events(ctx, pid, 0, 1000))
+	var calls, results int
+	for _, event := range beforeMove {
+		if event.Kind == "tool_call" {
+			calls++
+		}
+		if event.Kind == "tool_result" {
+			results++
+		}
+	}
+	if calls != 3 || results != 3 {
+		t.Fatalf("source must retain the three completed operations before transfer: calls=%d results=%d", calls, results)
+	}
 	cloudID := must(cloud.svc.PlacementID(ctx))
 	if other := must(cloud.svc.PlacementID(ctx)); other != cloudID {
 		t.Fatalf("placement id is not stable: %s then %s", cloudID, other)
@@ -334,10 +347,10 @@ func TestTransferContinuesTheSameSecretary(t *testing.T) {
 	if rec.Cut.GenerationHighWater != localGen+1 {
 		t.Fatalf("epoch = %d, want %d", rec.Cut.GenerationHighWater, localGen+1)
 	}
-	// Each mid-turn journal.note first journaled its input (received_seq), so
-	// the journal holds 5 events: in-1's input_received + note + commit, and
-	// in-2's input_received + note (its turn never committed).
-	want := Continuity{JournalEvents: 5, Notes: 2, QueuedInputs: 1, ClaimedInputs: 1, RunningTurns: 1,
+	// Carry the complete source journal, including the completed operation
+	// experience from the interrupted turn. The row comparison below checks
+	// that its actual contents and ordering survive, not only its count.
+	want := Continuity{JournalEvents: int64(len(beforeMove)), Notes: 2, QueuedInputs: 1, ClaimedInputs: 1, RunningTurns: 1,
 		UnfinishedPlans: 1, PendingSchedules: 1, UndeliveredOut: 1}
 	if rec.Continuity != want {
 		t.Fatalf("continuity = %+v, want %+v", rec.Continuity, want)
