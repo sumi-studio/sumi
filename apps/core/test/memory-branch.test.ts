@@ -937,7 +937,7 @@ test("a control protocol fault recovers on a successful review, after source rea
 });
 
 for (const mode of ["resume", "rebranch"] as const) {
-  test(`non-retryable provider refusal preserves the draft until explicit ${mode}`, async () => {
+  test(`enforced spend limit preserves the draft until explicit ${mode}`, async () => {
     const { state, g } = await fixture();
     const requests: ModelRequest[] = [];
     const writer = scripted(state, requests);
@@ -948,8 +948,12 @@ for (const mode of ["resume", "rebranch"] as const) {
         attempts++;
         if (attempts === 2) {
           throw new ModelError(
-            "OpenAI error: project_spend_limit_exceeded (insufficient_quota)",
-            { retryable: false },
+            "OpenAI error: project_spend_limit_exceeded; sk-private-fixture https://example.invalid/private-account",
+            {
+              retryable: false,
+              refusal: "spend_limit",
+              cause: "model_usage_limit",
+            },
           );
         }
         yield* writer.stream(request);
@@ -967,12 +971,16 @@ for (const mode of ["resume", "rebranch"] as const) {
     const savedPrefix = structuredClone(b.snapshot);
     assert.ok(savedDraft, "the refusal happened after a draft was saved");
     assert.equal(b.state!.status, "paused");
-    assert.equal(b.state!.pause_reason, "provider_refusal");
+    assert.equal(b.state!.pause_reason, "spend_limit");
     assert.equal(b.state!.retry_at, null);
     assert.equal(b.state!.in_flight, null);
     assert.equal(b.state!.model_calls, 2);
-    assert.match(b.state!.issue!.message, /project_spend_limit_exceeded/);
-    assert.equal(b.state!.issue!.code, "memory_provider_refused");
+    assert.match(b.state!.issue!.message, /enforced spending limit/);
+    assert.doesNotMatch(
+      b.state!.issue!.message,
+      /sk-private|https?:|private-account/,
+    );
+    assert.equal(b.state!.issue!.code, "memory_spend_limit");
     assert.equal(b.chunk.replacement, null);
 
     // Simulate restoring the saved branch after a process restart. Both
@@ -1000,11 +1008,8 @@ for (const mode of ["resume", "rebranch"] as const) {
     const notices = () =>
       state.inputs.filter((i) => i.kind === "memory_status");
     assert.equal(notices().length, 1, "idle ticks must not repeat the issue");
-    assert.equal(notices()[0]!.payload.code, "memory_provider_refused");
-    assert.match(
-      String(notices()[0]!.payload.text),
-      /project_spend_limit_exceeded/,
-    );
+    assert.equal(notices()[0]!.payload.code, "memory_spend_limit");
+    assert.match(String(notices()[0]!.payload.text), /enforced spending limit/);
     assert.equal(state.outboxEntries.length, 0);
     const status = await state.memoryStatus(p);
     assert.equal(status.claimable, 0);
@@ -1043,8 +1048,10 @@ for (const mode of ["resume", "rebranch"] as const) {
 for (const disposition of [
   { retryable: true },
   { retryable: false, unavailable: true },
+  { retryable: false },
+  { retryable: false, cause: "model_usage_limit" as const },
 ]) {
-  test(`temporary/unavailable provider failure keeps paced retries: ${JSON.stringify(disposition)}`, async () => {
+  test(`failure without an explicit spending refusal keeps paced retries: ${JSON.stringify(disposition)}`, async () => {
     const { state, g } = await fixture();
     let attempts = 0;
     const provider: ModelProvider = {

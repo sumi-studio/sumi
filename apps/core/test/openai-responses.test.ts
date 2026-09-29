@@ -511,13 +511,13 @@ test("nested and top-level SSE errors keep their diagnostics and classification 
       event: { type: "error", error: quota },
       code: quota.code,
       retryable: false,
-      refusal: undefined,
+      refusal: "spend_limit",
     },
     {
       event: { type: "error", code: quota.code, message: quota.message },
       code: quota.code,
       retryable: false,
-      refusal: undefined,
+      refusal: "spend_limit",
     },
     {
       event: {
@@ -555,6 +555,10 @@ test("nested and top-level SSE errors keep their diagnostics and classification 
           assert.ok(error.message.includes(code));
           assert.equal(error.retryable, retryable);
           assert.equal(error.refusal, refusal);
+          assert.equal(
+            error.cause,
+            code === quota.code ? "model_usage_limit" : undefined,
+          );
           assert.doesNotMatch(
             error.message,
             /https?:|proj_private|test-key|sk-private|private-token/,

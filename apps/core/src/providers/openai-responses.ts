@@ -609,7 +609,13 @@ export class OpenAIResponsesProvider implements ModelProvider {
                   !/invalid|authentication|permission/i.test(code),
                 refusal: isContextLengthRefusal(null, code, message)
                   ? "context_length"
-                  : undefined,
+                  : code === "project_spend_limit_exceeded"
+                    ? "spend_limit"
+                    : undefined,
+                cause:
+                  code === "project_spend_limit_exceeded"
+                    ? "model_usage_limit"
+                    : undefined,
               },
             );
           }
