@@ -432,7 +432,11 @@ func (s *Store) SaveMemoryBranch(ctx context.Context, persona string, generation
 	return result, nil
 }
 func (s *Store) memoryBranchNotice(ctx context.Context, tx pgx.Tx, persona string, seq, revision int64, transition string, issue *branchIssue) error {
-	payload := map[string]any{"text": fmt.Sprintf("[Memory mechanism %s] %s Draft and branch progress are saved. This is an operational event, not a message from another person and not an instruction to post into Messaging.", transition, issue.Message), "chunk_seq": seq, "transition": transition, "code": issue.Code}
+	text := fmt.Sprintf("[Memory mechanism occurred] %s Draft and branch progress are saved.", issue.Message)
+	if transition == "recovered" {
+		text = fmt.Sprintf("[Memory mechanism recovered] Memory preparation has progressed past the previously reported %s problem.", issue.Code)
+	}
+	payload := map[string]any{"text": text, "chunk_seq": seq, "transition": transition, "code": issue.Code}
 	_, err := tx.Exec(ctx, `INSERT INTO core_inputs(persona_id,input_id,kind,payload,actor_kind,source_surface,attention,status) VALUES($1,$2,'memory_status',$3,'memory','core_memory','observe','queued') ON CONFLICT(persona_id,input_id) DO NOTHING`, persona, fmt.Sprintf("memory:%d:%d:%s", seq, revision, transition), payload)
 	return err
 }

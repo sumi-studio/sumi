@@ -1752,6 +1752,13 @@ export function inputReceivedEvent(input: Input, turn: Turn): EventInput {
       message_change:
         typeof p.message_change === "string" ? p.message_change : null,
       attachments: Array.isArray(p.attachments) ? p.attachments : null,
+      ...(input.actor_kind === "memory" && input.source_surface === "core_memory"
+        ? {
+            chunk_seq: Number.isSafeInteger(p.chunk_seq) ? p.chunk_seq : null,
+            transition: typeof p.transition === "string" ? p.transition : null,
+            code: typeof p.code === "string" ? p.code : null,
+          }
+        : {}),
       attempt: turn.attempt,
     },
   };
@@ -1803,6 +1810,9 @@ export function assemble(
           endReason: p.end_reason,
           exitCode: p.exit_code,
           exitSignal: p.exit_signal,
+          chunkSeq: p.chunk_seq,
+          transition: p.transition,
+          code: p.code,
           attention: input.attention,
           change: typeof p.message_change === "string" ? p.message_change : "",
         });

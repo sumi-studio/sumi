@@ -43,6 +43,9 @@ export type InputProvenance = {
   endReason?: unknown;
   exitCode?: unknown;
   exitSignal?: unknown;
+  chunkSeq?: unknown;
+  transition?: unknown;
+  code?: unknown;
   attention: string;
   /** "edited"/"deleted" when the input reports a change to an
    * already-delivered message rather than a new message. */
@@ -84,7 +87,15 @@ export function inputMarker(p: InputProvenance): string {
             Number.isSafeInteger(p.exitCode) ? ` exit_code=${p.exitCode}` : "",
             str(p.exitSignal) && ` exit_signal=${clean(str(p.exitSignal))}`,
           ].join("")
-        : "";
+        : p.surface === "core_memory" && p.actorKind === "memory"
+          ? [
+              Number.isSafeInteger(p.chunkSeq) && Number(p.chunkSeq) > 0
+                ? ` chunk_seq=${p.chunkSeq}`
+                : "",
+              str(p.transition) && ` transition=${clean(str(p.transition))}`,
+              str(p.code) && ` code=${clean(str(p.code))}`,
+            ].join("")
+          : "";
   const change =
     p.change === "edited"
       ? " — edited"
@@ -279,6 +290,9 @@ export function eventMessage(ev: Event): ChatMessage | null {
               endReason: p.end_reason,
               exitCode: p.exit_code,
               exitSignal: p.exit_signal,
+              chunkSeq: p.chunk_seq,
+              transition: p.transition,
+              code: p.code,
               attention: str(p.attention),
               change: str(p.message_change),
             });

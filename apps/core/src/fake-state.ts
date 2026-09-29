@@ -3690,13 +3690,20 @@ export class FakeState implements StateClient {
           this.addInput(
             persona,
             id,
-            `[Memory mechanism ${transition}] ${issue.message}`,
+            transition === "recovered"
+              ? `[Memory mechanism recovered] Memory preparation has progressed past the previously reported ${issue.code} problem.`
+              : `[Memory mechanism occurred] ${issue.message} Draft and branch progress are saved.`,
             "memory_status",
           );
           const input = this.inputs[this.inputs.length - 1]!;
           input.actor_kind = "memory";
           input.source_surface = "core_memory";
           input.attention = "observe";
+          Object.assign(input.payload, {
+            chunk_seq: chunkSeq,
+            transition,
+            code: issue.code,
+          });
         }
       }
     }
