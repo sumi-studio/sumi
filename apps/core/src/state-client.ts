@@ -1,8 +1,8 @@
 import type {
   MemoryBranch,
   MemoryBranchState,
-  MemorySnapshot,
   MemoryPolicy,
+  MemorySnapshot,
 } from "./memory-branch.ts";
 import { ModelError } from "./provider.ts";
 import type {
@@ -541,6 +541,7 @@ export class HttpStateClient implements StateClient {
       "POST",
       `/internal/core/personas/${persona}/writer/acquire`,
       {
+        protocol: "agentic-memory-v1",
         holder_id: holder,
         ttl_ms: ttlMs,
       },

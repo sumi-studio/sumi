@@ -1,6 +1,6 @@
 -- Durable private memory branches; no one-shot API compatibility.
 CREATE TABLE public.core_memory_branches (
- persona_id public.uuidv7 NOT NULL,
+ persona_id public.uuidv7 NOT NULL REFERENCES public.core_personas(persona_id) ON DELETE CASCADE,
  chunk_seq bigint NOT NULL,
  snapshot text NOT NULL,
   previous_attempts text NOT NULL DEFAULT '[]',

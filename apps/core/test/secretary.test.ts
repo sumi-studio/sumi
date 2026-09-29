@@ -313,11 +313,14 @@ test("durable plan: crash after an effect → retry continues the recorded plan 
   const evs = await state.events(PERSONA, 0);
   const texts = evs.filter((e) => e.kind === "note").map((e) => e.payload.text);
   assert.deepEqual(texts.sort(), ["note-A0", "note-A1"]);
-  assert.ok(
-    evs.some(
-      (e) => e.kind === "tool_result" && e.payload.replayed === true,
-    ),
-    "position 0 replayed its stored receipt",
+  // Position 0's receipt was journaled at its claim; the retry replays
+  // the stored receipt (the note stays single) and does not journal it again.
+  assert.deepEqual(
+    evs
+      .filter((e) => e.kind === "tool_result")
+      .map((e) => e.payload.call_index),
+    [0, 1],
+    "each position's result is journaled once",
   );
   const outbox = await state.outbox(PERSONA, 0);
   assert.equal(outbox.length, 1);
@@ -610,7 +613,7 @@ test("a store replaying a receipt for a different request is still caught client
   assert.match(failed.error ?? "", /diverged retry/);
 });
 
-test("assemble flattens tool results to assistant text (no orphaned tool role)", () => {
+test("assemble renders a result whose call is outside the view as a note, never an orphaned tool role", () => {
   const context: Event[] = [
     {
       persona_id: PERSONA,
@@ -651,8 +654,14 @@ test("assemble flattens tool results to assistant text (no orphaned tool role)",
     0,
     "no orphaned role:tool messages",
   );
-  const flat = messages.find((m) => m.content.includes("[tool journal.note]"));
-  assert.equal(flat?.role, "assistant");
+  // The receipt is not presented as the secretary's own speech.
+  assert.equal(messages.filter((m) => m.role === "assistant").length, 0);
+  const note = messages.find((m) => m.content.includes("Result of your"));
+  assert.equal(note?.role, "user");
+  assert.equal(
+    note?.content,
+    '[Result of your earlier call journal.note (call_id c0) (journal seq 1); the call itself is outside this context]\n{"seq":1,"kind":"note"}',
+  );
 });
 
 test("assemble shows Messaging provenance a reply can be addressed to", () => {

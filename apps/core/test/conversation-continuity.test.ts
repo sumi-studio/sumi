@@ -145,9 +145,9 @@ test("an unanswered request from a failed turn is marked, and a long gap is visi
   const view = journalView(sent).map((m) => m.content);
   assert.deepEqual(view, [
     "[Received 2026-09-17 04:56:57 UTC]\n[human] hello",
-    "[turn failed: no model connection was selected — this turn ended without a completed reply]",
+    "[turn failed: no model connection was selected — this request stopped here without finishing normally. What is recorded above for it happened as shown — for example, a message you sent stays sent; nothing further runs for it]",
     "[Received 2026-09-17 04:57:03 UTC; approximately 5 seconds since the previous incoming message]\n[human] please gather information",
-    "[turn failed: no model connection was selected — this turn ended without a completed reply]",
+    "[turn failed: no model connection was selected — this request stopped here without finishing normally. What is recorded above for it happened as shown — for example, a message you sent stays sent; nothing further runs for it]",
   ]);
   assert.equal(
     sent.messages.at(-1)?.content,
@@ -320,7 +320,7 @@ test("a reply the store rejects is downgraded to a marked failure the next model
   assert.deepEqual(view, [
     "[Received 2026-09-20 09:00:00 UTC]\n[human] book the usual table",
     "reply from model-a",
-    "[turn failed — this turn ended without a completed reply]",
+    "[turn failed — this request stopped here without finishing normally. What is recorded above for it happened as shown — for example, a message you sent stays sent; nothing further runs for it]",
   ]);
 });
 
@@ -334,7 +334,7 @@ test("a downgraded reply whose events cannot be stored at all still leaves a mar
     { kind: "turn_failed", payload: { error_kind: null, record_lost: true } },
   ]);
   assert.deepEqual(view, [
-    "[turn failed — this turn ended without a completed reply; its record could not be stored]",
+    "[turn failed — this turn's closing records could not be stored. Tool calls it ran are recorded above with their results as they happened — for example, a message you sent stays sent — but any reply it ended with is not shown here]",
   ]);
 });
 
@@ -355,7 +355,7 @@ test("a terminal failure whose events cannot be stored keeps its marker and caus
     },
   ]);
   assert.deepEqual(view, [
-    "[turn failed: no model connection was selected — this turn ended without a completed reply; its record could not be stored]",
+    "[turn failed: no model connection was selected — this turn's closing records could not be stored. Tool calls it ran are recorded above with their results as they happened — for example, a message you sent stays sent — but any reply it ended with is not shown here]",
   ]);
 });
 

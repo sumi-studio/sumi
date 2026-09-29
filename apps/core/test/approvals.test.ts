@@ -151,9 +151,23 @@ test("message.send waits for the human, then sends exactly once after approval a
     1,
     "the resumed input is journaled once",
   );
+  // The parked attempt journaled what it had experienced — the input, its
+  // deciding text, the request — before the decision; the resumed attempt
+  // replayed the same plan without recording those again.
   assert.deepEqual(
-    evs.slice(0, 2).map((e) => e.kind),
-    ["approval_requested", "approval_decided"],
+    evs.slice(0, 4).map((e) => e.kind),
+    [
+      "input_received",
+      "assistant_message",
+      "approval_requested",
+      "approval_decided",
+    ],
+  );
+  assert.equal(
+    evs.filter((e) => e.kind === "assistant_message" && e.payload.round === 0)
+      .length,
+    1,
+    "the round's text is journaled once",
   );
   const [after] = await state.listApprovals(PERSONA, appr.approval_id);
   assert.ok(after?.consumed_at, "the one-shot grant was consumed");

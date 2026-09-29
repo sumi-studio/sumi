@@ -344,7 +344,7 @@ check(
   "the local core stopped because its writer generation was fenced",
   { exit: localExit, tail: localCore.output().slice(-1500) },
 );
-const lateAcquire = await req(LOCAL, "POST", `/internal/core/personas/${pid}/writer/acquire`, localToken, { holder_id: "local-core-2", ttl_ms: 4000 });
+const lateAcquire = await req(LOCAL, "POST", `/internal/core/personas/${pid}/writer/acquire`, localToken, { holder_id: "local-core-2", ttl_ms: 4000, protocol: "agentic-memory-v1" });
 check(lateAcquire.status === 409, "no new local writer after the seal", lateAcquire.text);
 const lateInput = await submit(LOCAL, pid, localToken, "in-late", "sent to local after the seal");
 check(lateInput.status === 409, "new local input refused explicitly after the seal", lateInput.text);
@@ -399,7 +399,7 @@ const cloudPersona = await req(CLOUD, "POST", "/internal/core/personas", CLOUD_A
 check(cloudPersona.status === 200 && cloudPersona.json.created === false && cloudPersona.json.persona.authority === "staged", "cloud persona exists as staged, not re-created", cloudPersona.text);
 const cloudToken = cloudPersona.json.persona_token;
 check(cloudToken !== localToken, "cloud issues its own persona token");
-r = await req(CLOUD, "POST", `/internal/core/personas/${pid}/writer/acquire`, cloudToken, { holder_id: "cloud-core", ttl_ms: 4000 });
+r = await req(CLOUD, "POST", `/internal/core/personas/${pid}/writer/acquire`, cloudToken, { holder_id: "cloud-core", ttl_ms: 4000, protocol: "agentic-memory-v1" });
 check(r.status === 409, "staged persona cannot acquire a writer", r.text);
 r = await submit(CLOUD, pid, cloudToken, "in-early", "sent to cloud before activation");
 check(r.status === 409, "staged persona refuses inputs", r.text);
@@ -593,7 +593,7 @@ const after = await inputStatus(CLOUD, pid, cloudToken, "in-after");
 check(after.turn?.status === "done", "new cloud input answered", after);
 st = await req(LOCAL, "GET", `/internal/core/personas/${pid}/state`, localToken);
 check(st.json.latest_event_seq === localEvents.length && st.json.persona.authority === "transferred", "local did not change after the move");
-r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/writer/acquire`, localToken, { holder_id: "local-core", ttl_ms: 4000 });
+r = await req(LOCAL, "POST", `/internal/core/personas/${pid}/writer/acquire`, localToken, { holder_id: "local-core", ttl_ms: 4000, protocol: "agentic-memory-v1" });
 check(r.status === 409, "local still cannot run the moved secretary", r.text);
 
 if (EVIDENCE) {

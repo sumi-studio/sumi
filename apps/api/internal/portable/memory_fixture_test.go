@@ -11,6 +11,7 @@ import (
 
 type claimedMemoryFixture struct {
 	Chunk           *agentstate.MemoryChunk
+	TargetEvents    []agentstate.Event
 	TargetFragments []agentstate.MemoryBlock
 }
 

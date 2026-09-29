@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -1547,6 +1548,15 @@ func (s *Store) CommitTurn(ctx context.Context, personaID, turnID string, genera
 	if err != nil {
 		return nil, err
 	}
+	// An attempt that parked (approval, budget) or requeued (transient
+	// failure) journals what it experienced so far — a round's text, the
+	// calls it ran and their results, the approval it asked for — so other
+	// inputs served meanwhile see them. The attempt that resumes the same
+	// input replays that recorded plan and presents the same experiences
+	// again: they are the same facts, not new history, and are dropped.
+	if events, err = withoutJournaledExperience(ctx, tx, personaID, t.InputID, events); err != nil {
+		return nil, err
+	}
 	var base int64
 	if err := tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(seq), 0) FROM core_events WHERE persona_id = $1`,
@@ -1946,6 +1956,14 @@ func (s *Store) Recover(ctx context.Context, personaID string, generation int64)
 	if err := rows.Err(); err != nil {
 		return res, err
 	}
+	// What an interrupted turn already did is in the journal (recorded at
+	// its operations); say that its request stopped there and resumes, so
+	// nothing served before the resume reads it as a finished exchange.
+	for i, tid := range res.InterruptedTurns {
+		if err := markInterruptedTx(ctx, tx, s, personaID, tid, interruptedInputs[i]); err != nil {
+			return res, err
+		}
+	}
 	inRows, err := tx.Query(ctx, `
 		UPDATE core_inputs SET status = 'queued', claimed_generation = NULL, turn_id = NULL
 		WHERE persona_id = $1 AND status = 'claimed' AND (
@@ -2053,41 +2071,73 @@ func ensureInputReceived(ctx context.Context, tx pgx.Tx, personaID, inputID, tur
 	if t, ok := in.Payload["text"].(string); ok {
 		text = t
 	}
-	// The same provenance the core's commit writes for this input: whichever
-	// lands first is the one durable receipt, so both must carry it.
+	// The same provenance the core's commit writes for this input
+	// (secretary.ts inputReceivedEvent), field for field and typed the same
+	// way: whichever lands first is the one durable receipt — and a tool
+	// call journals it at its claim, before the turn commits — so both must
+	// carry it.
 	strOrNil := func(s string) any {
 		if s == "" {
 			return nil
 		}
 		return s
 	}
+	str := func(v any) any {
+		if s, ok := v.(string); ok {
+			return s
+		}
+		return nil
+	}
+	num := func(v any) any {
+		if n, ok := v.(float64); ok {
+			return n
+		}
+		return nil
+	}
+	integer := func(v any) any {
+		if n, ok := v.(float64); ok && n == math.Trunc(n) && math.Abs(n) <= 1<<53-1 {
+			return n
+		}
+		return nil
+	}
+	list := func(v any) any {
+		if a, ok := v.([]any); ok {
+			return a
+		}
+		return nil
+	}
+	actor, _ := in.Payload["actor"].(map[string]any)
+	place, _ := in.Payload["place"].(map[string]any)
 	payload := map[string]any{
 		"input_id":       in.InputID,
 		"kind":           in.Kind,
 		"text":           text,
 		"actor_kind":     in.ActorKind,
 		"actor_id":       strOrNil(in.ActorID),
-		"actor_display":  nil,
+		"actor_display":  str(actor["display_name"]),
 		"source_surface": in.SourceSurface,
 		"thread_id":      strOrNil(in.ThreadID),
-		"place_name":     nil,
-		"place_kind":     nil,
+		"place_name":     str(place["name"]),
+		"place_kind":     str(place["kind"]),
 		"attention":      in.Attention,
 		"occurred_at":    in.OccurredAt,
 		"received_at":    in.CreatedAt,
 		// Pinned at receipt: a later compaction never re-measures the gap.
 		"previous_received_at": in.PreviousReceivedAt,
+		"event_id":             str(in.Payload["event_id"]),
+		"message_id":           str(in.Payload["message_id"]),
+		"message_seq":          num(in.Payload["message_seq"]),
+		"workspace_id":         str(in.Payload["workspace_id"]),
+		"message_revision":     integer(in.Payload["message_revision"]),
+		"session_id":           str(in.Payload["session_id"]),
+		"status":               str(in.Payload["status"]),
+		"end_reason":           str(in.Payload["end_reason"]),
+		"exit_code":            integer(in.Payload["exit_code"]),
+		"exit_signal":          str(in.Payload["exit_signal"]),
+		"reason":               str(in.Payload["reason"]),
+		"message_change":       str(in.Payload["message_change"]),
+		"attachments":          list(in.Payload["attachments"]),
 		"attempt":              attempt,
-	}
-	if actor, ok := in.Payload["actor"].(map[string]any); ok {
-		payload["actor_display"] = actor["display_name"]
-	}
-	if place, ok := in.Payload["place"].(map[string]any); ok {
-		payload["place_name"] = place["name"]
-		payload["place_kind"] = place["kind"]
-	}
-	for _, k := range []string{"event_id", "message_id", "message_seq", "reason", "message_change"} {
-		payload[k] = in.Payload[k]
 	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
@@ -2278,6 +2328,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 			return nil, false, fmt.Errorf("schedule.set: %w", dataErr(err))
 		}
 		return map[string]any{"schedule": sch}, true, nil
+	case "memory.resume":
+		response, err := s.resumeMemory(ctx, tx, personaID, request)
+		return response, true, err
 	case "journal.note":
 		text, _ := request["text"].(string)
 		if text == "" {
@@ -2349,6 +2402,22 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 // A delegated registered effect (e.g. messaging.send) is claimable the same
 // way: its Apply runs in this same transaction.
 func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, *ToolApproval, bool, error) {
+	op, approval, fresh, err := s.claimOperation(ctx, personaID, turnID, generation, operationID, tool, callIndex, request)
+	if err != nil && claimRejected(err) {
+		// Nothing was applied and the claim rolled back; the rejection is
+		// still what this call did, recorded where it happened.
+		if jerr := s.journalRejectedClaim(ctx, personaID, turnID, generation, callIndex, tool, request, err); jerr != nil {
+			return Operation{}, nil, false, jerr
+		}
+	}
+	return op, approval, fresh, err
+}
+
+// claimOperation is ClaimOperation's claim transaction. Every outcome it
+// commits is journaled in the same transaction (experience.go): the call
+// before its effect runs, the result the moment it is recorded, a parked
+// call as its approval request.
+func (s *Store) claimOperation(ctx context.Context, personaID, turnID string, generation int64, operationID, tool string, callIndex int, request map[string]any) (Operation, *ToolApproval, bool, error) {
 	if !s.claimableTool(tool) {
 		// This slice has no external executor; claiming an unregistered tool
 		// would record a permanently dangling 'running' operation. Reject at
@@ -2412,6 +2481,7 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 	if !planned {
 		return Operation{}, nil, false, fmt.Errorf("%w: claim is not call %d of the recorded plan", ErrTurnConflict, callIndex)
 	}
+	pos, _ := planPosition(plan, callIndex)
 	// Effect identity is server-owned: derived from the turn's input and the
 	// plan position. A caller-chosen key could otherwise mint a second
 	// effect for the same planned call.
@@ -2479,10 +2549,15 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		return Operation{}, nil, false, fmt.Errorf("claim operation: %w", dataErr(err))
 	}
 	if requiredBy != "" {
-		return s.claimGated(ctx, tx, personaID, inputID, callIndex, op, flat[callIndex].Route, requiredBy, freshInsert)
+		return s.claimGated(ctx, tx, personaID, turnID, inputID, pos, op, flat[callIndex].Route, requiredBy, freshInsert)
 	}
 	if !freshInsert {
-		// Stored receipt or finalized denial record — replay as-is.
+		// Stored receipt or finalized denial record — replay as-is. Its
+		// experience was journaled when it was recorded; the journal keeps
+		// it once.
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, nil); err != nil {
+			return Operation{}, nil, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
 		}
@@ -2504,6 +2579,9 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			personaID, op.OperationID, denialResponse(denied)).
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 			return Operation{}, nil, false, fmt.Errorf("finish denied operation: %w", dataErr(err))
+		}
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, denied); err != nil {
+			return Operation{}, nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
@@ -2529,13 +2607,20 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 			return Operation{}, nil, false, fmt.Errorf("finish blocked operation: %w", dataErr(err))
 		}
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, nil); err != nil {
+			return Operation{}, nil, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
 		}
 		return op, nil, true, nil
 	}
 	// Fresh claim: apply the state-internal effect and finish the record in
-	// the same transaction.
+	// the same transaction. The call is journaled first, so whatever the
+	// effect records follows its cause.
+	if err := s.journalExperienceTx(ctx, tx, personaID, turnID, inputID, pos.decided()...); err != nil {
+		return Operation{}, nil, false, err
+	}
 	response, internal, err := s.internalToolResponse(ctx, tx, personaID, turnID, inputID, tool, callIndex, idemKey, request)
 	if err == nil && !internal {
 		// A registered tool with no effect case must not sit 'running'
@@ -2553,6 +2638,9 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 		personaID, operationID, generation, response).
 		Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 		return Operation{}, nil, false, fmt.Errorf("finish internal operation: %w", dataErr(err))
+	}
+	if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, nil); err != nil {
+		return Operation{}, nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Operation{}, nil, false, err
@@ -2572,12 +2660,21 @@ func (s *Store) ClaimOperation(ctx context.Context, personaID, turnID string, ge
 // and is the authority for what happens next: pending → the caller parks;
 // approved → the one-shot grant is consumed and the effect applied in this
 // same transaction; denied → the stored failed operation is returned.
-func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID string, callIndex int, op Operation, route, requiredBy string, freshInsert bool) (Operation, *ToolApproval, bool, error) {
+//
+// turnID is the claiming turn — the one the journal attributes the call's
+// records to; the operation keeps the turn that first claimed it.
+func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, turnID, inputID string, pos callExperience, op Operation, route, requiredBy string, freshInsert bool) (Operation, *ToolApproval, bool, error) {
+	callIndex := pos.index
 	if op.Status != "awaiting_approval" {
 		// Done or finalized-failed (denied): replay the stored record, with
-		// the decision that produced it.
+		// the decision that produced it. A human's denial finalized the
+		// operation outside any claim; its record lands here, at the point
+		// the resumed turn meets it.
 		a, err := s.approvalForCall(ctx, tx, personaID, inputID, callIndex, false)
 		if err != nil {
+			return Operation{}, nil, false, err
+		}
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, a); err != nil {
 			return Operation{}, nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -2602,6 +2699,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 				personaID, op.OperationID, map[string]any{"error": verr.Error()}).
 				Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 				return Operation{}, nil, false, fmt.Errorf("finish invalid operation: %w", dataErr(err))
+			}
+			if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, nil); err != nil {
+				return Operation{}, nil, false, err
 			}
 			if err := tx.Commit(ctx); err != nil {
 				return Operation{}, nil, false, err
@@ -2632,6 +2732,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 	}
 	switch a.Status {
 	case "pending":
+		if err := s.journalExperienceTx(ctx, tx, personaID, turnID, inputID, pos.awaiting(a)...); err != nil {
+			return Operation{}, nil, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
 		}
@@ -2640,6 +2743,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		if a.ConsumedAt != nil {
 			// The grant was already consumed — the operation finalized in
 			// that transaction, so replay the stored record.
+			if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, a); err != nil {
+				return Operation{}, nil, false, err
+			}
 			if err := tx.Commit(ctx); err != nil {
 				return Operation{}, nil, false, err
 			}
@@ -2655,6 +2761,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		}
 		now := time.Now()
 		a.ConsumedAt = &now
+		if err := s.journalExperienceTx(ctx, tx, personaID, turnID, inputID, pos.decided()...); err != nil {
+			return Operation{}, nil, false, err
+		}
 		response, internal, err := s.internalToolResponse(ctx, tx, personaID, op.TurnID, inputID, op.Tool, callIndex, op.IdempotencyKey, op.Request)
 		if err == nil && !internal {
 			// An approved call whose tool has no registered in-store effect
@@ -2682,6 +2791,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 				Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 				return Operation{}, nil, false, fmt.Errorf("finish failed approved operation: %w", dataErr(err))
 			}
+			if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, a); err != nil {
+				return Operation{}, nil, false, err
+			}
 			if err := tx.Commit(ctx); err != nil {
 				return Operation{}, nil, false, err
 			}
@@ -2694,6 +2806,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 			personaID, op.OperationID, response).
 			Scan(&op.Status, &op.Response, &op.CompletedAt); err != nil {
 			return Operation{}, nil, false, fmt.Errorf("finish approved operation: %w", dataErr(err))
+		}
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, a); err != nil {
+			return Operation{}, nil, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
@@ -2708,6 +2823,9 @@ func (s *Store) claimGated(ctx context.Context, tx pgx.Tx, personaID, inputID st
 		// The resolve path finalized the operation failed in the same
 		// transaction; replay the stored outcome — never re-run, never
 		// silently re-prompt.
+		if err := s.journalOutcomeTx(ctx, tx, personaID, turnID, inputID, pos, op, a); err != nil {
+			return Operation{}, nil, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return Operation{}, nil, false, err
 		}
@@ -2816,6 +2934,9 @@ func (s *Store) CompleteOperation(ctx context.Context, personaID, operationID st
 	}
 	if err != nil {
 		return Operation{}, fmt.Errorf("complete operation: %w", err)
+	}
+	if err := s.journalCompletedTx(ctx, tx, personaID, op); err != nil {
+		return Operation{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Operation{}, err

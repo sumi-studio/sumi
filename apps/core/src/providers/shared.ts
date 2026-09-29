@@ -6,7 +6,12 @@
  * and event shapes stay inside each adapter — nothing here knows a wire.
  */
 
-import { ModelError, type ToolCall, type ToolSpec } from "../provider.ts";
+import {
+  type ChatMessage,
+  ModelError,
+  type ToolCall,
+  type ToolSpec,
+} from "../provider.ts";
 
 /**
  * Honest client identity sent on every provider request. Providers and
@@ -129,6 +134,73 @@ export function routeEnvelope(
 /** Serialize a decided call for replay in the envelope shape. */
 export function encodeCallArguments(call: ToolCall): string {
   return JSON.stringify({ route: call.route, input: call.arguments });
+}
+
+/**
+ * Make the call ids of one request acceptable to the wire it is sent on,
+ * unique wherever Sumi chooses them, and link each tool result to its
+ * call's final id.
+ *
+ * Recorded ids come from whichever provider decided them, so a request can
+ * carry the same id twice — two turns of a provider with sequential ids, or
+ * a history call and the current turn's call — or an id another wire
+ * rejects. `valid` states the wire's own documented constraint.
+ *
+ * Assignment is incremental: a message's ids depend only on the messages
+ * before it, never on what follows, so a request extended with more rounds
+ * (the next round of a turn, a branch appended to a frozen prefix)
+ * serializes its prefix exactly as before. The first valid use of an id
+ * keeps it; a later invalid or repeated one gets `sumi_call_<n>` (the lowest
+ * n not yet used).
+ *
+ * `opaque` names the assistant rounds whose recorded continuation is
+ * replayed on this request: its opaque items reference the round's call
+ * ids, so a valid one is kept verbatim even if an earlier message used it.
+ * The provider minted that id after receiving the same preceding messages,
+ * so such a repeat is the provider's own and is replayed as it happened —
+ * earlier ids are not renamed and the continuation is not rewritten. If a
+ * wire refuses the repeat, a pinned request reports the refusal. Only an
+ * unpinned request may use the adapter's explicit continuation-less resend
+ * (no round opaque), where every id is Sumi's to assign.
+ *
+ * A tool message takes the id of the first unresolved call of its round
+ * carrying its recorded id, so results stay paired in order even when one
+ * round repeated an id.
+ */
+export function disambiguateCallIds(
+  messages: ChatMessage[],
+  valid: (id: string) => boolean,
+  opaque: (m: ChatMessage) => boolean = () => false,
+): ChatMessage[] {
+  const used = new Set<string>();
+  let next = 0;
+  const fresh = () => {
+    while (used.has(`sumi_call_${next}`)) next++;
+    return `sumi_call_${next}`;
+  };
+  let round: { from: string; to: string; resolved: boolean }[] = [];
+  return messages.map((m) => {
+    if (m.role === "assistant" && m.toolCalls?.length) {
+      round = [];
+      const verbatim = opaque(m);
+      const toolCalls = m.toolCalls.map((c) => {
+        const id =
+          valid(c.id) && (verbatim || !used.has(c.id)) ? c.id : fresh();
+        used.add(id);
+        round.push({ from: c.id, to: id, resolved: false });
+        return id === c.id ? c : { ...c, id };
+      });
+      return { ...m, toolCalls };
+    }
+    if (m.role === "tool" && m.toolCallId !== undefined) {
+      const call = round.find((c) => !c.resolved && c.from === m.toolCallId);
+      if (!call) return m;
+      call.resolved = true;
+      return call.to === m.toolCallId ? m : { ...m, toolCallId: call.to };
+    }
+    if (m.role !== "tool") round = [];
+    return m;
+  });
 }
 
 /**

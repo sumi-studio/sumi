@@ -176,6 +176,82 @@ test("the subscription lite wire keeps the same prefix when memory changes effor
   });
 });
 
+test("memory rounds with reused call IDs keep the frozen native history and effort boundary", async () => {
+  for (const subscription of [false, true]) {
+    const bodies: WireBody[] = [];
+    const record = (body: string) => {
+      bodies.push(JSON.parse(body));
+      return Promise.resolve(response());
+    };
+    const provider = subscription
+      ? new OpenAIResponsesProvider({
+          ...config(),
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          chatgpt: {
+            accountId: "private-account",
+            reasoningEffort: "high",
+            send: record,
+          },
+        })
+      : new OpenAIResponsesProvider(config(), (_url, init) =>
+          record(String(init?.body)),
+        );
+    const call = {
+      id: "repeated",
+      name: "file.read",
+      route: "normal" as const,
+      arguments: { path: "notes.md" },
+    };
+    const frozen: ModelRequest = {
+      ...parent,
+      bindingSnapshot: await provider.snapshotBinding(),
+      messages: [
+        ...parent.messages,
+        { role: "assistant", content: "", toolCalls: [call] },
+        { role: "tool", content: "Earlier note", toolCallId: call.id },
+        { role: "user", content: "Read it again." },
+        { role: "assistant", content: "", toolCalls: [call] },
+        { role: "tool", content: "Updated note", toolCallId: call.id },
+      ],
+    };
+    await consume(provider, frozen);
+    const branch: ModelRequest = {
+      ...frozen,
+      phase: "memory",
+      reasoningEffort: "medium",
+      reasoningEffortAfter: frozen.messages.length,
+      messages: [
+        ...frozen.messages,
+        { role: "user", content: "Review the private memory source." },
+        { role: "assistant", content: "", toolCalls: [call] },
+        { role: "tool", content: "Private source", toolCallId: call.id },
+      ],
+    };
+    await consume(provider, branch);
+    const [before, after] = bodies;
+    assert.ok(before && after);
+    assert.equal(
+      JSON.stringify(after.input.slice(0, before.input.length)),
+      JSON.stringify(before.input),
+    );
+    assert.deepEqual(after.input[before.input.length], {
+      type: "configuration_update",
+      reasoning: { effort: "medium" },
+    });
+    const ids = after.input
+      .filter((item) => item.type === "function_call")
+      .map((item) => item.call_id);
+    assert.equal(new Set(ids).size, 3);
+    assert.deepEqual(
+      after.input
+        .filter((item) => item.type === "function_call_output")
+        .map((item) => item.call_id),
+      ids,
+    );
+    assert.equal(JSON.stringify(after.tools), JSON.stringify(before.tools));
+  }
+});
+
 test("invalid or unsupported effort updates fail before contacting a provider", async () => {
   let calls = 0;
   const send = async () => {

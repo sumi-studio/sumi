@@ -142,7 +142,7 @@ func TestRuntimeWakerWakesPendingWorkWithoutLiveWriter(t *testing.T) {
 		t.Fatalf("re-woken inside the gap: %d", n)
 	}
 	// A live writer owns the work: no wake while its lease lasts.
-	r := do(t, mux, "POST", "/internal/core/personas/"+busy+"/writer/acquire", testAdminSecret, `{"holder_id":"h","ttl_ms":30000}`)
+	r := do(t, mux, "POST", "/internal/core/personas/"+busy+"/writer/acquire", testAdminSecret, `{"protocol":"agentic-memory-v1","holder_id":"h","ttl_ms":30000}`)
 	if r.Code != 200 {
 		t.Fatalf("acquire: %d %s", r.Code, r.Body)
 	}
@@ -482,7 +482,7 @@ func TestNextWorkRouteAndInactiveCode(t *testing.T) {
 	if _, err := srv.Store().pool.Exec(context.Background(), `UPDATE core_personas SET authority = 'transferred' WHERE persona_id = $1`, pa); err != nil {
 		t.Fatal(err)
 	}
-	r = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", testAdminSecret, `{"holder_id":"h","ttl_ms":30000}`)
+	r = do(t, mux, "POST", "/internal/core/personas/"+pa+"/writer/acquire", testAdminSecret, `{"protocol":"agentic-memory-v1","holder_id":"h","ttl_ms":30000}`)
 	if r.Code != 409 || !strings.Contains(r.Body.String(), `"code":"persona_inactive"`) {
 		t.Fatalf("inactive acquire: %d %s", r.Code, r.Body)
 	}

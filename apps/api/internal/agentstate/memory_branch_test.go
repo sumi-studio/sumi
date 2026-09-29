@@ -389,3 +389,40 @@ func TestMemoryBranchAllLayersSealReviewRestartApply(t *testing.T) {
 		t.Fatal("later raw tail disappeared")
 	}
 }
+
+func TestMemorySnapshotDoesNotConsumePartOfNativeMessage(t *testing.T) {
+	index := 1
+	snap := BranchSnapshot{Messages: []json.RawMessage{json.RawMessage(`{"role":"system","content":"same"}`), json.RawMessage(`{"role":"assistant","content":"both calls"}`)}, Ranges: []BranchSourceRange{{FirstSeq: 1, LastSeq: 1}, {FirstSeq: 2, LastSeq: 2, MessageIndex: &index}, {FirstSeq: 3, LastSeq: 3, MessageIndex: &index}, {FirstSeq: 4, LastSeq: 4}, {FirstSeq: 5, LastSeq: 5}, {FirstSeq: 6, LastSeq: 6, MessageIndex: &index}}}
+	if snapshotCovers(snap, 1, 5) {
+		t.Fatal("part of a native assistant call group was admitted")
+	}
+	if !snapshotCovers(snap, 1, 6) {
+		t.Fatal("whole native group was refused")
+	}
+}
+
+func TestMemorySealKeepsNativeDecisionAcrossInterleavedInput(t *testing.T) {
+	s, _ := newStore(t)
+	p := pid(t)
+	mustPersona(t, s, p)
+	g := acquireWriter(t, s, p, time.Minute)
+	commitEvents(t, s, p, "first", []EventInput{
+		{Kind: "input_received", Payload: map[string]any{"text": "first"}},
+		{Kind: "assistant_message", Payload: map[string]any{"text": bigText(), "round": 0}},
+		{Kind: "tool_call", Payload: map[string]any{"tool": "file.write", "call_id": "one", "round": 0, "request": map[string]any{"path": "one"}}},
+		{Kind: "tool_result", Payload: map[string]any{"tool": "file.write", "call_id": "one", "round": 0, "response": map[string]any{"ok": true}}},
+	})
+	commitEvents(t, s, p, "interleaved", []EventInput{{Kind: "input_received", Payload: map[string]any{"text": "different input while recovering"}}})
+	commitEvents(t, s, p, "first", []EventInput{
+		{Kind: "tool_call", Payload: map[string]any{"tool": "file.write", "call_id": "two", "round": 0, "request": map[string]any{"path": "two"}}},
+		{Kind: "tool_result", Payload: map[string]any{"tool": "file.write", "call_id": "two", "round": 0, "response": map[string]any{"ok": true}}},
+	})
+	commitEvents(t, s, p, "later", []EventInput{{Kind: "input_received", Payload: map[string]any{"text": "later boundary"}}})
+	if _, e := s.MemoryMaintain(context.Background(), p, g); e != nil {
+		t.Fatal(e)
+	}
+	var count, last int
+	if e := s.pool.QueryRow(context.Background(), `SELECT count(*),max(last_seq) FROM core_memory_chunks WHERE persona_id=$1`, p).Scan(&count, &last); e != nil || count != 1 || last != 7 {
+		t.Fatalf("cut native decision: %d %d %v", count, last, e)
+	}
+}

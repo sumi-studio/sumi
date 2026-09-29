@@ -145,6 +145,7 @@ export async function runMemoryPreparation(
         signal,
       );
     let state = branch.state!;
+    if (state.rebranch_requested) return "idle";
     if (state.in_flight) {
       const resumed = structuredClone(state);
       resumed.in_flight = null;
@@ -152,7 +153,7 @@ export async function runMemoryPreparation(
       if (resumed.interruptions >= resumed.policy.maxConsecutiveFailures) {
         resumed.status = "paused";
         resumed.pause_reason = "interrupted_round";
-        resumed.retry_at = null;
+        resumed.retry_at = new Date(Date.now() + 15 * 60_000).toISOString();
         resumed.issue = {
           code: "memory_round_interrupted",
           message:
@@ -208,7 +209,7 @@ export async function runMemoryPreparation(
       state.status = "running";
       state.pause_reason = null;
       state.retry_at = null;
-      state.policy = policy;
+      if (changedPolicy) state.policy = policy;
       if (changedBinding) {
         state.effective_binding = currentBinding;
         state.failures = 0;
@@ -233,8 +234,13 @@ export async function runMemoryPreparation(
       state = branch.state!;
       if (signal.aborted) return "idle";
       if (
-        state.rounds >= state.policy.maxRounds ||
-        (state.policy.maxTokens > 0 && state.tokens >= state.policy.maxTokens)
+        (state.model_calls ?? state.rounds) >=
+          (state.execution_budget?.rounds ?? state.policy.maxRounds) +
+            (state.budget_extension?.rounds ?? 0) ||
+        ((state.execution_budget?.tokens ?? state.policy.maxTokens) > 0 &&
+          state.tokens >=
+            (state.execution_budget?.tokens ?? state.policy.maxTokens) +
+              (state.budget_extension?.tokens ?? 0))
       ) {
         const paused = structuredClone(state);
         paused.status = "paused";
@@ -243,7 +249,7 @@ export async function runMemoryPreparation(
         paused.issue = {
           code: "memory_budget_exhausted",
           message:
-            "Memory preparation reached its configured execution budget. Draft and progress remain saved; a larger budget can resume this exact branch.",
+            "Memory preparation reached its configured execution budget. Draft and progress remain saved; memory.resume can explicitly grant more work, or the configured budget can be increased.",
         };
         await checkpoint(deps, branch, paused, signal);
         return "worked";
@@ -251,6 +257,7 @@ export async function runMemoryPreparation(
       // Persist admission before model execution. Repeated host/commit failures
       // remain observable after a restart, even when the failed save never landed.
       const admitted = structuredClone(state);
+      admitted.model_calls = (state.model_calls ?? state.rounds) + 1;
       admitted.in_flight = {
         round: state.rounds,
         started_at: new Date().toISOString(),
@@ -360,7 +367,7 @@ export async function runMemoryPreparation(
           !unavailable &&
           paused.failures >= paused.policy.maxConsecutiveFailures
         ) {
-          paused.retry_at = null;
+          paused.retry_at = new Date(Date.now() + 15 * 60_000).toISOString();
           paused.issue = {
             code: "memory_provider_failure",
             message:
@@ -373,7 +380,20 @@ export async function runMemoryPreparation(
       const next = await advanceMemoryBranch(branch, decision);
       next.in_flight = null;
       next.interruptions = 0;
-      if (next.failures === 0 && next.status !== "paused") next.issue = null;
+      if (next.failures === 0 && next.status !== "paused") {
+        const completed = next.status === "prepared" || next.status === "kept";
+        // Recovery must exercise the mechanism that failed. A successful
+        // private read cannot establish that confirmation storage works.
+        // Clearing in the submitted checkpoint is atomic with its success:
+        // if that save is rejected, the durable issue remains unchanged.
+        const recovered =
+          next.issue?.code === "memory_checkpoint_rejected"
+            ? completed
+            : next.issue?.code === "memory_control_protocol"
+              ? completed || next.review?.opened_round === next.rounds
+              : true;
+        if (recovered) next.issue = null;
+      }
       try {
         branch = await checkpoint(deps, branch, next, signal);
       } catch (e) {
@@ -384,7 +404,8 @@ export async function runMemoryPreparation(
           const failed = structuredClone(branch.state!);
           failed.status = "paused";
           failed.pause_reason = "checkpoint_rejected";
-          failed.retry_at = null;
+          failed.retry_at = new Date(Date.now() + 15 * 60_000).toISOString();
+          failed.in_flight = null;
           failed.issue = {
             code: "memory_checkpoint_rejected",
             message:

@@ -223,9 +223,12 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 	}
 	commit := CommitRequest{Outcome: "complete",
 		Events: []EventInput{received("in-1", 2),
-			{Kind: "tool_call", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "request": noteReq}},
-			{Kind: "tool_result", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "response": op2.Response}},
-			{Kind: "assistant_message", Payload: map[string]any{"text": "noted"}}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "reply", "round": 0}},
+			{Kind: "tool_call", Payload: map[string]any{"call_id": "c1", "tool": "journal.note", "request": noteReq,
+				"route": "normal", "round": 0, "call_index": 0}},
+			{Kind: "tool_result", Payload: map[string]any{"call_id": "c1", "tool": "journal.note",
+				"call_index": 0, "response": op2.Response}},
+			{Kind: "assistant_message", Payload: map[string]any{"text": "noted", "round": 1}}},
 		Output: map[string]any{"text": "noted"}}
 	if _, err := s.CommitTurn(ctx, pa, "t-1b", l2.Generation, commit); err != nil {
 		t.Fatalf("commit t-1b: %v", err)
@@ -254,7 +257,11 @@ func TestNoteFollowsInputExactlyOnceAcrossRetry(t *testing.T) {
 			noteSeq = e.Seq
 		}
 	}
-	want := "input_received,note,tool_call,tool_result,assistant_message"
+	// The call and its result were journaled by the claim that ran the
+	// note (the note between them, as the effect's own record), the
+	// interrupted attempt is marked, and the retried commit adds only its
+	// final reply.
+	want := "input_received,assistant_message,tool_call,note,tool_result,turn_paused,assistant_message"
 	if count != 1 || strings.Join(kinds, ",") != want || receivedSeq >= noteSeq {
 		t.Fatalf("in-1 records: %v (input_received x%d)", kinds, count)
 	}

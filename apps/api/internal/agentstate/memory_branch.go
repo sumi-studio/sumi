@@ -30,10 +30,11 @@ type BranchSourceRange struct {
 	ChunkSeq     *int64 `json:"chunk_seq,omitempty"`
 }
 type MemoryBranch struct {
-	Chunk    *MemoryChunk    `json:"chunk"`
-	Snapshot BranchSnapshot  `json:"snapshot"`
-	State    json.RawMessage `json:"state"`
-	Revision int64           `json:"revision"`
+	Chunk           *MemoryChunk    `json:"chunk"`
+	Snapshot        BranchSnapshot  `json:"snapshot"`
+	State           json.RawMessage `json:"state"`
+	Revision        int64           `json:"revision"`
+	PreviousAttempt json.RawMessage `json:"previous_attempt,omitempty"`
 }
 type branchCandidate struct {
 	Text    string `json:"text"`
@@ -58,6 +59,7 @@ type branchCheckpoint struct {
 	Review      *branchReview     `json:"review"`
 	Final       *branchReview     `json:"final"`
 	Rounds      int64             `json:"rounds"`
+	ModelCalls  int64             `json:"model_calls"`
 	Tokens      int64             `json:"tokens"`
 	RetryAt     *time.Time        `json:"retry_at"`
 	PauseReason *string           `json:"pause_reason"`
@@ -106,6 +108,18 @@ func validateBranchSnapshot(snap *BranchSnapshot) error {
 	return nil
 }
 func snapshotCovers(snap BranchSnapshot, first, last int64) bool {
+	// A grouped native message cannot be partly attributed to a target.
+	selected := map[int]bool{}
+	for _, r := range snap.Ranges {
+		if r.MessageIndex != nil && r.FirstSeq >= first && r.LastSeq <= last {
+			selected[*r.MessageIndex] = true
+		}
+	}
+	for _, r := range snap.Ranges {
+		if r.MessageIndex != nil && selected[*r.MessageIndex] && (r.FirstSeq < first || r.LastSeq > last) {
+			return false
+		}
+	}
 	ranges := append([]BranchSourceRange(nil), snap.Ranges...)
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i].FirstSeq < ranges[j].FirstSeq })
 	next := first
@@ -163,8 +177,17 @@ func (s *Store) snapshotMatchesChunk(ctx context.Context, db contextQuerier, per
 func (s *Store) readMemoryBranch(ctx context.Context, db contextQuerier, persona string, seq int64) (*MemoryBranch, error) {
 	b := &MemoryBranch{}
 	var snapshot []byte
-	if err := db.QueryRow(ctx, `SELECT snapshot, state, revision FROM core_memory_branches WHERE persona_id=$1 AND chunk_seq=$2`, persona, seq).Scan(&snapshot, &b.State, &b.Revision); err != nil {
+	var previous string
+	if err := db.QueryRow(ctx, `SELECT snapshot, state, revision, previous_attempts FROM core_memory_branches WHERE persona_id=$1 AND chunk_seq=$2`, persona, seq).Scan(&snapshot, &b.State, &b.Revision, &previous); err != nil {
 		return nil, err
+	}
+	if len(b.State) == 0 {
+		var attempts []struct {
+			State json.RawMessage `json:"state"`
+		}
+		if json.Unmarshal([]byte(previous), &attempts) == nil && len(attempts) > 0 {
+			b.PreviousAttempt = attempts[len(attempts)-1].State
+		}
 	}
 	if err := json.Unmarshal(snapshot, &b.Snapshot); err != nil {
 		return nil, err
@@ -189,6 +212,9 @@ func (s *Store) ClaimMemoryBranch(ctx context.Context, persona string, generatio
 	if err = requireMemoryGeneration(ctx, tx, persona, generation); err != nil {
 		return nil, err
 	}
+	if err = s.restartRequestedMemory(ctx, tx, persona, snapshot); err != nil {
+		return nil, err
+	}
 	var policy any
 	if len(policies) > 0 && len(policies[0]) > 0 {
 		policy = policies[0]
@@ -203,8 +229,15 @@ func (s *Store) ClaimMemoryBranch(ctx context.Context, persona string, generatio
 		}
 	}
 	var seq int64
-	err = tx.QueryRow(ctx, `SELECT b.chunk_seq FROM core_memory_branches b JOIN core_memory_chunks c USING(persona_id,chunk_seq) WHERE b.persona_id=$1 AND c.status='preparing' AND (b.status='running' OR b.retry_at<=statement_timestamp() OR ($2::jsonb IS NOT NULL AND b.state::jsonb->'policy'<>$2::jsonb AND b.state::jsonb->>'pause_reason'='configured_budget') OR ($3::text IS NOT NULL AND $3<>COALESCE(b.state::jsonb->'effective_binding'->>'fingerprint',b.snapshot::jsonb->'binding'->>'fingerprint'))) ORDER BY b.chunk_seq LIMIT 1`, persona, policy, selectedFingerprint).Scan(&seq)
+	err = tx.QueryRow(ctx, `SELECT b.chunk_seq FROM core_memory_branches b JOIN core_memory_chunks c USING(persona_id,chunk_seq) WHERE b.persona_id=$1 AND c.status='preparing' AND COALESCE(b.state::jsonb->>'rebranch_requested','false')<>'true' AND (b.status='running' OR b.retry_at<=statement_timestamp() OR ($2::jsonb IS NOT NULL AND b.state::jsonb->'policy'<>$2::jsonb AND b.state::jsonb->>'pause_reason'='configured_budget') OR ($3::text IS NOT NULL AND $3<>COALESCE(b.state::jsonb->'effective_binding'->>'fingerprint',b.snapshot::jsonb->'binding'->>'fingerprint'))) ORDER BY b.chunk_seq LIMIT 1`, persona, policy, selectedFingerprint).Scan(&seq)
 	if errors.Is(err, pgx.ErrNoRows) {
+		var waiting bool
+		if e := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM core_memory_chunks WHERE persona_id=$1 AND status='preparing')`, persona).Scan(&waiting); e != nil {
+			return nil, e
+		}
+		if waiting {
+			return nil, nil
+		} // one durable branch, including an explicit pause
 		if snapshot == nil {
 			return nil, nil
 		}
@@ -292,7 +325,7 @@ func (s *Store) SaveMemoryBranch(ctx context.Context, persona string, generation
 	if next.Status != "running" && next.Status != "paused" && next.Status != "prepared" && next.Status != "kept" {
 		return nil, fmt.Errorf("%w: invalid branch status", ErrBadRequest)
 	}
-	if len(next.Messages) == 0 || next.Rounds < 0 || next.Tokens < 0 {
+	if len(next.Messages) == 0 || next.Rounds < 0 || next.ModelCalls < 0 || next.Tokens < 0 {
 		return nil, fmt.Errorf("%w: invalid branch progress", ErrBadRequest)
 	}
 	if next.Candidate != nil && (next.Candidate.Version < 1 || next.Candidate.SHA256 != branchHash([]byte(next.Candidate.Text))) {
@@ -330,7 +363,7 @@ func (s *Store) SaveMemoryBranch(ctx context.Context, persona string, generation
 			return nil, err
 		}
 	}
-	if next.Rounds < old.Rounds || next.Tokens < old.Tokens || len(next.Messages) < len(old.Messages) {
+	if next.Rounds < old.Rounds || next.ModelCalls < old.ModelCalls || next.Tokens < old.Tokens || len(next.Messages) < len(old.Messages) {
 		return nil, fmt.Errorf("%w: progress cannot move backwards", ErrMemoryConflict)
 	}
 	for i := range old.Messages {
@@ -366,6 +399,12 @@ func (s *Store) SaveMemoryBranch(ctx context.Context, persona string, generation
 		}
 		if err != nil {
 			return nil, err
+		}
+	}
+	if len(b.State) == 0 && len(b.PreviousAttempt) > 0 {
+		var prior branchCheckpoint
+		if json.Unmarshal(b.PreviousAttempt, &prior) == nil {
+			old.Issue = prior.Issue
 		}
 	}
 	if !reflect.DeepEqual(old.Issue, next.Issue) {

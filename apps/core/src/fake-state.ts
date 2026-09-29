@@ -14,12 +14,14 @@ import {
   StateError,
 } from "./state-client.ts";
 import { isInternalActor } from "./memory.ts";
+import { inputReceivedEvent } from "./secretary.ts";
 import type {
   Approval,
   ApprovalDecision,
   CommitRequest,
   Decision,
   Event,
+  EventInput,
   FundingRef,
   Input,
   Job,
@@ -179,6 +181,7 @@ export const TOOL_AUTHORITY: Record<
 > = {
   "schedule.set": { requiresApproval: false, elevatedOnly: false },
   "journal.note": { requiresApproval: false, elevatedOnly: false },
+  "memory.resume": { requiresApproval: false, elevatedOnly: false },
   "job.start": { requiresApproval: false, elevatedOnly: false },
   "job.status": { requiresApproval: false, elevatedOnly: false },
   "job.cancel": { requiresApproval: false, elevatedOnly: false },
@@ -194,6 +197,120 @@ export const TOOL_AUTHORITY: Record<
   "message.send": { requiresApproval: false, elevatedOnly: true },
   conversation_history: { requiresApproval: false, elevatedOnly: false },
 };
+
+/**
+ * The identity of a journaled experience within one input's resolution
+ * lineage (Go experienceKey): a round's deciding text by round, a call and
+ * its result by the call's flat plan index, an approval request by its
+ * approval. null for records that carry no such identity.
+ */
+export function experienceKey(
+  kind: string,
+  payload: Record<string, unknown>,
+): string | null {
+  const n = (v: unknown) => (Number.isSafeInteger(v) ? String(v) : null);
+  switch (kind) {
+    case "assistant_message": {
+      const r = n(payload.round);
+      return r === null ? null : `${kind}:${r}`;
+    }
+    case "tool_call":
+    case "tool_result": {
+      const i = n(payload.call_index);
+      return i === null ? null : `${kind}:${i}`;
+    }
+    case "approval_requested":
+      return typeof payload.approval_id === "string" && payload.approval_id
+        ? `${kind}:${payload.approval_id}`
+        : null;
+    default:
+      return null;
+  }
+}
+
+/** One planned call's place in its input's plan (Go callExperience). */
+type CallPosition = {
+  round: number;
+  text: string;
+  call: PlanCall;
+  index: number;
+};
+
+/** The round's deciding text (if any) and the call as decided — what the
+ * Core journals for it (secretary.ts executeCall), keyed the same way. */
+function decidedEvents(pos: CallPosition): EventInput[] {
+  return [
+    ...(pos.text !== ""
+      ? [
+          {
+            kind: "assistant_message",
+            payload: { text: pos.text, round: pos.round },
+          },
+        ]
+      : []),
+    {
+      kind: "tool_call",
+      payload: {
+        tool: pos.call.tool,
+        call_id: pos.call.call_id ?? "",
+        request: pos.call.request,
+        route: pos.call.route,
+        round: pos.round,
+        call_index: pos.index,
+      },
+    },
+  ];
+}
+
+/** A finalized operation's result as the model is fed it; null while it
+ * has none (running, parked) — no outcome is invented. */
+function resultEvent(
+  pos: CallPosition,
+  op: Operation,
+  approval: Approval | null,
+): EventInput | null {
+  const p: Record<string, unknown> = {
+    tool: pos.call.tool,
+    call_id: pos.call.call_id ?? "",
+    call_index: pos.index,
+  };
+  if (op.status === "done") {
+    p.response = op.response;
+  } else if (op.status === "failed") {
+    const r = op.response as Record<string, unknown> | null;
+    p.error =
+      r !== null && typeof r === "object" && "error" in r
+        ? String(r.error)
+        : "operation failed";
+    if (approval?.status === "denied") p.denied = true;
+  } else {
+    return null;
+  }
+  return { kind: "tool_result", payload: p as Json };
+}
+
+/** A parked call: decided, planned, waiting on a human, not run. */
+function awaitingEvents(pos: CallPosition, a: Approval): EventInput[] {
+  const [text] = decidedEvents(pos).filter(
+    (e) => e.kind === "assistant_message",
+  );
+  return [
+    ...(text ? [text] : []),
+    {
+      kind: "approval_requested",
+      payload: {
+        tool: pos.call.tool,
+        call_id: pos.call.call_id ?? "",
+        route: pos.call.route,
+        round: pos.round,
+        call_index: pos.index,
+        approval_id: a.approval_id,
+        required_by: a.required_by,
+        request: pos.call.request,
+      },
+    },
+  ];
+}
 
 // Go validates wake_at with time.RFC3339Nano — a bare date ("2026-09-14")
 // or any non-RFC3339 shape is rejected even though new Date() would parse
@@ -236,6 +353,27 @@ function validateToolRequest(
       }
       return null;
     }
+    case "memory.resume":
+      return Number.isSafeInteger(request.chunk_seq) &&
+        Number(request.chunk_seq) > 0 &&
+        ["resume", "rebranch"].includes(String(request.mode)) &&
+        Number.isSafeInteger(request.additional_rounds) &&
+        Number(request.additional_rounds) > 0 &&
+        Number(request.additional_rounds) <= 128 &&
+        (request.additional_tokens === undefined ||
+          (Number.isSafeInteger(request.additional_tokens) &&
+            Number(request.additional_tokens) >= 0 &&
+            Number(request.additional_tokens) <= 100000000)) &&
+        Object.keys(request).every((k) =>
+          [
+            "chunk_seq",
+            "mode",
+            "additional_rounds",
+            "additional_tokens",
+          ].includes(k),
+        )
+        ? null
+        : "bad request: invalid memory.resume request";
     case "journal.note":
       return typeof request.text === "string" && request.text !== ""
         ? null
@@ -714,6 +852,27 @@ export class FakeState implements StateClient {
         t.status = "interrupted";
         t.finished_at = new Date().toISOString();
         interrupted.push(t.turn_id);
+        // Go markInterruptedTx: a turn that already journaled experience
+        // says its request stopped there and resumes.
+        const received = this.receivedSeq.get(`${persona}|${t.input_id}`);
+        if (
+          received !== undefined &&
+          this.eventLog.some(
+            (e) =>
+              e.persona_id === persona &&
+              e.seq >= received &&
+              e.turn_id === t.turn_id,
+          )
+        ) {
+          this.eventLog.push({
+            persona_id: persona,
+            seq: this.nextSeq(this.seq, persona),
+            turn_id: t.turn_id,
+            kind: "turn_paused",
+            payload: { reason: "interrupted" },
+            created_at: new Date().toISOString(),
+          });
+        }
       }
     }
     for (const i of this.inputs) {
@@ -1563,6 +1722,12 @@ export class FakeState implements StateClient {
         throw new StateError(400, `input_received names absent input ${id}`);
       }
     }
+    // An experience an earlier attempt of this input already journaled —
+    // a round's text, a call and its result, an approval request, recorded
+    // when that attempt parked or requeued — is the same fact again when
+    // the resumed attempt re-presents its plan: the first record stays
+    // (Go withoutJournaledExperience).
+    const experienced = this.lineageExperience(persona, turn.input_id);
     const emitted = new Set<string>();
     for (const ev of req.events) {
       if (ev.kind === "input_received") {
@@ -1571,6 +1736,11 @@ export class FakeState implements StateClient {
           continue;
         }
         emitted.add(key);
+      }
+      const exp = experienceKey(ev.kind, ev.payload);
+      if (exp !== null) {
+        if (experienced.has(exp)) continue;
+        experienced.add(exp);
       }
       const seq = this.nextSeq(this.seq, persona);
       this.eventLog.push({
@@ -1805,6 +1975,14 @@ export class FakeState implements StateClient {
       .slice(0, limit);
   }
 
+  /**
+   * Go ClaimOperation: the claim and its journaling are one transaction.
+   * The call is journaled with its outcome — a receipt, a stored failure,
+   * a parked approval request — at the claim itself (Go experience.go), so
+   * an effect is never known only to the operation ledger; an execution
+   * error rolls the journal back with the claim, and a deterministic
+   * rejection is journaled as the call's result, fenced like the claim.
+   */
   async claimOperation(
     persona: string,
     generation: number,
@@ -1820,6 +1998,167 @@ export class FakeState implements StateClient {
     approval: Approval | null;
     fresh: boolean;
   }> {
+    const mark = {
+      events: this.eventLog.length,
+      seq: this.seq.get(persona),
+      received: new Map(this.receivedSeq),
+    };
+    try {
+      const res = this.claim(persona, generation, op);
+      const turn = this.turns.get(op.turnId)!;
+      const pos = this.planPosition(persona, turn.input_id, op.callIndex)!;
+      const { operation, approval } = res;
+      if (
+        operation.status === "awaiting_approval" &&
+        approval?.status === "pending"
+      ) {
+        this.journalExperience(persona, turn, awaitingEvents(pos, approval));
+      } else {
+        this.journalOutcome(persona, turn, pos, operation, approval);
+      }
+      return res;
+    } catch (e) {
+      this.eventLog.length = mark.events;
+      if (mark.seq === undefined) this.seq.delete(persona);
+      else this.seq.set(persona, mark.seq);
+      this.receivedSeq = mark.received;
+      if (e instanceof StateError && e.status === 400) {
+        this.journalRejectedClaim(persona, generation, op, e.message);
+      }
+      throw e;
+    }
+  }
+
+  /** Go journalRejectedClaim: only the live turn's recorded plan position. */
+  private journalRejectedClaim(
+    persona: string,
+    generation: number,
+    op: {
+      turnId: string;
+      tool: string;
+      callIndex: number;
+      request: Record<string, unknown>;
+    },
+    cause: string,
+  ) {
+    const lease = this.leases.get(persona);
+    const turn = this.turns.get(op.turnId);
+    if (
+      !lease ||
+      lease.generation !== generation ||
+      !turn ||
+      turn.persona_id !== persona ||
+      turn.generation !== generation ||
+      turn.status !== "running"
+    ) {
+      return;
+    }
+    const pos = this.planPosition(persona, turn.input_id, op.callIndex);
+    if (
+      !pos ||
+      pos.call.tool !== op.tool ||
+      !jsonEqual(pos.call.request, op.request ?? {})
+    ) {
+      return;
+    }
+    this.journalExperience(persona, turn, [
+      ...decidedEvents(pos),
+      {
+        kind: "tool_result",
+        payload: {
+          tool: op.tool,
+          call_id: pos.call.call_id ?? "",
+          call_index: op.callIndex,
+          error: cause.replaceAll("\0", ""),
+        },
+      },
+    ]);
+  }
+
+  /** A flat call index's place in the input's recorded plan. */
+  private planPosition(
+    persona: string,
+    inputId: string,
+    callIndex: number,
+  ): CallPosition | null {
+    const plan = this.plans.get(`${persona}|${inputId}`);
+    if (!plan || callIndex < 0) return null;
+    let n = callIndex;
+    for (const [round, d] of plan.plan.entries()) {
+      if (n < d.calls.length) {
+        return { round, text: d.text, call: d.calls[n]!, index: callIndex };
+      }
+      n -= d.calls.length;
+    }
+    return null;
+  }
+
+  /** Go journalExperienceTx: the input once, then each record the input's
+   * lineage has not journaled yet (experienceKey), attributed to turn. */
+  private journalExperience(persona: string, turn: Turn, events: EventInput[]) {
+    this.ensureInputReceived(persona, turn);
+    const experienced = this.lineageExperience(persona, turn.input_id);
+    for (const ev of events) {
+      const exp = experienceKey(ev.kind, ev.payload);
+      if (exp !== null) {
+        if (experienced.has(exp)) continue;
+        experienced.add(exp);
+      }
+      this.eventLog.push({
+        persona_id: persona,
+        seq: this.nextSeq(this.seq, persona),
+        turn_id: turn.turn_id,
+        kind: ev.kind,
+        payload: ev.payload,
+        created_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  /** Go journalOutcomeTx: the call with its finalized outcome, if any. */
+  private journalOutcome(
+    persona: string,
+    turn: Turn,
+    pos: CallPosition,
+    op: Operation,
+    approval: Approval | null,
+  ) {
+    const res = resultEvent(pos, op, approval);
+    if (res) {
+      this.journalExperience(persona, turn, [...decidedEvents(pos), res]);
+    }
+  }
+
+  /** Keys of the experience every turn serving the input journaled. */
+  private lineageExperience(persona: string, inputId: string): Set<string> {
+    const lineage = new Set(
+      [...this.turns.values()]
+        .filter((t) => t.persona_id === persona && t.input_id === inputId)
+        .map((t) => t.turn_id),
+    );
+    return new Set(
+      this.eventLog
+        .filter((e) => e.persona_id === persona && lineage.has(e.turn_id))
+        .map((e) => experienceKey(e.kind, e.payload))
+        .filter((k) => k !== null),
+    );
+  }
+
+  private claim(
+    persona: string,
+    generation: number,
+    op: {
+      operationId: string;
+      turnId: string;
+      tool: string;
+      callIndex: number;
+      request: Record<string, unknown>;
+    },
+  ): {
+    operation: Operation;
+    approval: Approval | null;
+    fresh: boolean;
+  } {
     // Unregistered tools are rejected at the boundary (Go ErrUnknownTool →
     // 400), before the fence check — a dangling 'running' op is never
     // recorded for a tool no executor can finish. Go's claimableTool is
@@ -1887,13 +2226,7 @@ export class FakeState implements StateClient {
         return { operation: existing, approval: null, fresh: true };
       }
       if (existing.status === "awaiting_approval") {
-        return this.claimGated(
-          persona,
-          turn.input_id,
-          op.callIndex,
-          existing,
-          false,
-        );
+        return this.claimGated(persona, turn, op.callIndex, existing, false);
       }
       // A replayed job.* receipt carries the job's state now next to the
       // original result (Go withCurrentJobTx); the stored receipt stays.
@@ -1998,6 +2331,13 @@ export class FakeState implements StateClient {
       };
       return { operation, approval: null, fresh: true };
     }
+    // The call is journaled before its effect runs, so anything the effect
+    // records follows its cause (Go claimOperation).
+    this.journalExperience(
+      persona,
+      turn,
+      decidedEvents(this.planPosition(persona, turn.input_id, op.callIndex)!),
+    );
     try {
       this.applyInternal(
         persona,
@@ -2068,11 +2408,12 @@ export class FakeState implements StateClient {
    */
   private claimGated(
     persona: string,
-    inputId: string,
+    claiming: Turn,
     callIndex: number,
     op: Operation,
     freshInsert: boolean,
   ): { operation: Operation; approval: Approval | null; fresh: boolean } {
+    const inputId = claiming.input_id;
     const appr = this.approvalFor(persona, inputId, callIndex);
     if (!appr) {
       throw new StateError(
@@ -2091,6 +2432,11 @@ export class FakeState implements StateClient {
     // approved, unconsumed: the one-shot grant is consumed and the effect
     // applied in the same step — exactly-once under the granted provenance.
     appr.consumed_at = new Date().toISOString();
+    this.journalExperience(
+      persona,
+      claiming,
+      decidedEvents(this.planPosition(persona, inputId, callIndex)!),
+    );
     try {
       this.applyInternal(persona, inputId, callIndex, op.turn_id, op);
     } catch (e) {
@@ -2194,6 +2540,83 @@ export class FakeState implements StateClient {
       operation.response = {
         seq,
         kind: "secretary_message",
+      };
+    } else if (operation.tool === "memory.resume") {
+      const error = validateToolRequest(operation.tool, op);
+      if (error) throw new StateError(400, error);
+      const b = this.memoryBranches.get(`${persona}|${op.chunk_seq}`);
+      if (
+        !b?.state ||
+        b.state.status !== "paused" ||
+        b.chunk.status !== "preparing"
+      )
+        throw new StateError(
+          400,
+          "memory.resume requires a paused unfinished branch",
+        );
+      if (
+        op.mode === "resume" &&
+        b.state.pause_reason === "private_tools_missing"
+      )
+        throw new StateError(400, "frozen tools cannot change; use rebranch");
+      const st = structuredClone(b.state);
+      st.review = null;
+      st.final = null;
+      st.source_read = [];
+      st.candidate_read = [];
+      st.in_flight = null;
+      st.failures = 0;
+      st.interruptions = 0;
+      const rounds = Number(op.additional_rounds),
+        tokens = Number(op.additional_tokens ?? 0);
+      if (op.mode === "rebranch") {
+        const limit = st.execution_budget?.tokens ?? st.policy.maxTokens;
+        const restartTokens =
+          limit > 0
+            ? Math.max(
+                0,
+                limit + (st.budget_extension?.tokens ?? 0) - st.tokens,
+              ) + tokens
+            : tokens;
+        if (limit > 0 && restartTokens === 0)
+          throw new StateError(
+            400,
+            "exhausted token cap requires additional_tokens",
+          );
+        st.rebranch_requested = true;
+        st.restart_budget = { rounds, tokens: restartTokens };
+        st.pause_reason = "rebranch_requested";
+        st.retry_at = null;
+      } else {
+        const limit = st.execution_budget?.tokens ?? st.policy.maxTokens;
+        if (
+          limit > 0 &&
+          limit + (st.budget_extension?.tokens ?? 0) + tokens <= st.tokens
+        )
+          throw new StateError(
+            400,
+            "exhausted token cap requires additional_tokens",
+          );
+        st.budget_extension = {
+          rounds: (st.budget_extension?.rounds ?? 0) + rounds,
+          tokens: (st.budget_extension?.tokens ?? 0) + tokens,
+        };
+        st.rebranch_requested = false;
+        st.pause_reason = "resume_requested";
+        st.retry_at = new Date().toISOString();
+      }
+      st.messages.push({
+        role: "user",
+        content: `[Memory recovery selected by the main secretary] mode=${op.mode}, additional_rounds=${rounds}, additional_tokens=${tokens}. This is a finite execution grant, not a change to your draft. Read source and candidate again and open a new confirmation.`,
+      });
+      b.state = st;
+      b.revision++;
+      operation.response = {
+        chunk_seq: op.chunk_seq,
+        mode: op.mode,
+        additional_rounds: rounds,
+        additional_tokens: tokens,
+        waiting_for_parent_snapshot: op.mode === "rebranch",
       };
     } else if (operation.tool === "journal.note") {
       const text = op.text;
@@ -2713,6 +3136,17 @@ export class FakeState implements StateClient {
     const tail = this.eventLog.filter(
       (e) => e.persona_id === persona && e.seq > covered,
     );
+    const roundKey = (e: Event) =>
+      ["assistant_message", "tool_call", "tool_result"].includes(e.kind) &&
+      e.payload.round !== undefined
+        ? `${e.turn_id}:${JSON.stringify(e.payload.round)}`
+        : null;
+    const roundEnds = new Map<string, number>();
+    for (const e of tail) {
+      const key = roundKey(e);
+      if (key !== null) roundEnds.set(key, e.seq);
+    }
+    let activeRoundEnd = -1;
     const pending = new Set<string>();
     let windowEst = 0;
     let windowStart = -1;
@@ -2720,7 +3154,7 @@ export class FakeState implements StateClient {
     let prevKind = "";
     for (const e of tail) {
       let cut = false;
-      if (windowStart >= 0 && pending.size === 0) {
+      if (windowStart >= 0 && pending.size === 0 && e.seq > activeRoundEnd) {
         switch (e.kind) {
           case "input_received":
             cut = windowEst >= L0_CHUNK_MIN_TOKENS;
@@ -2768,6 +3202,9 @@ export class FakeState implements StateClient {
       } else if (e.kind === "tool_result" && typeof callId === "string") {
         pending.delete(callId);
       }
+      const key = roundKey(e);
+      if (key !== null)
+        activeRoundEnd = Math.max(activeRoundEnd, roundEnds.get(key)!);
       prevKind = e.kind;
     }
     // Live raw = every not-yet-applied layer-1 chunk plus the unsealed
@@ -2990,27 +3427,27 @@ export class FakeState implements StateClient {
     this.mustHold(persona, generation);
     if (Date.parse(this.leases.get(persona)!.expires_at) <= Date.now())
       throw new FencedError();
-    const active = [...this.memoryBranches.values()].find(
-      (b) =>
-        b.chunk.persona_id === persona &&
-        b.chunk.status === "preparing" &&
-        (!b.state ||
-          b.state.status === "running" ||
-          (b.state.retry_at !== null &&
-            Date.parse(b.state.retry_at) <= Date.now()) ||
-          (b.state.pause_reason === "configured_budget" &&
-            policy &&
-            !jsonEqual(policy, b.state.policy)) ||
-          (snapshot?.binding &&
-            (b.state.effective_binding ?? b.snapshot.binding)?.fingerprint !==
-              snapshot.binding.fingerprint)),
-    );
-    if (active) {
-      active.chunk.claimed_generation = generation;
-      return structuredClone(active);
-    }
-    if (!snapshot) return null;
     const covers = (first: number, last: number) => {
+      if (!snapshot) return false;
+      const selected = new Set(
+        snapshot.ranges
+          .filter(
+            (r) =>
+              r.first_seq >= first &&
+              r.last_seq <= last &&
+              r.message_index !== undefined,
+          )
+          .map((r) => r.message_index),
+      );
+      if (
+        snapshot.ranges.some(
+          (r) =>
+            r.message_index !== undefined &&
+            selected.has(r.message_index) &&
+            (r.first_seq < first || r.last_seq > last),
+        )
+      )
+        return false;
       let next = first;
       for (const r of [...snapshot.ranges].sort(
         (a, b) => a.first_seq - b.first_seq,
@@ -3023,6 +3460,7 @@ export class FakeState implements StateClient {
       return next === last + 1;
     };
     const matches = (c: MemoryChunk) =>
+      !!snapshot &&
       covers(c.first_seq, c.last_seq) &&
       (c.layer === 1
         ? !snapshot.ranges.some(
@@ -3048,6 +3486,59 @@ export class FakeState implements StateClient {
               )
             );
           }));
+    if (
+      snapshot &&
+      ["file.read", "file.write"].every((name) =>
+        snapshot!.tools.some((t) => t.name === name),
+      )
+    ) {
+      const waiting = [...this.memoryBranches.values()].find(
+        (b) =>
+          b.chunk.persona_id === persona &&
+          b.chunk.status === "preparing" &&
+          b.state?.rebranch_requested &&
+          matches(b.chunk),
+      );
+      if (waiting) {
+        const key = `${persona}|${waiting.chunk.chunk_seq}`;
+        const prior = structuredClone(waiting);
+        delete prior.previous_attempt;
+        const history = this.memoryBranchAttempts.get(key) ?? [];
+        history.push(prior);
+        this.memoryBranchAttempts.set(key, history);
+        waiting.previous_attempt = structuredClone(waiting.state!);
+        waiting.state = null;
+        waiting.snapshot = structuredClone(snapshot);
+        waiting.revision++;
+      }
+    }
+    const active = [...this.memoryBranches.values()].find(
+      (b) =>
+        b.chunk.persona_id === persona &&
+        b.chunk.status === "preparing" &&
+        !b.state?.rebranch_requested &&
+        (!b.state ||
+          b.state.status === "running" ||
+          (b.state.retry_at !== null &&
+            Date.parse(b.state.retry_at) <= Date.now()) ||
+          (b.state.pause_reason === "configured_budget" &&
+            policy &&
+            !jsonEqual(policy, b.state.policy)) ||
+          (snapshot?.binding &&
+            (b.state.effective_binding ?? b.snapshot.binding)?.fingerprint !==
+              snapshot.binding.fingerprint)),
+    );
+    if (active) {
+      active.chunk.claimed_generation = generation;
+      return structuredClone(active);
+    }
+    if (
+      [...this.memoryBranches.values()].some(
+        (b) => b.chunk.persona_id === persona && b.chunk.status === "preparing",
+      )
+    )
+      return null;
+    if (!snapshot) return null;
     const pressure = [0, 0, 0];
     const counted = new Set<number>();
     for (const r of snapshot.ranges) {
@@ -3147,7 +3638,8 @@ export class FakeState implements StateClient {
     const old = b.state;
     if (
       old &&
-      (state.rounds < old.rounds ||
+      ((state.model_calls ?? 0) < (old.model_calls ?? 0) ||
+        state.rounds < old.rounds ||
         state.tokens < old.tokens ||
         old.messages.some((m, i) => !jsonEqual(m, state.messages[i])))
     )
@@ -3183,9 +3675,11 @@ export class FakeState implements StateClient {
       b.chunk.claimed_generation = null;
       b.chunk.claimed_at = null;
     }
-    if (!jsonEqual(old?.issue ?? null, state.issue)) {
+    const oldIssue =
+      old?.issue ?? (!old ? b.previous_attempt?.issue : null) ?? null;
+    if (!jsonEqual(oldIssue, state.issue)) {
       const transition = state.issue ? "occurred" : "recovered",
-        issue = state.issue ?? old?.issue;
+        issue = state.issue ?? oldIssue;
       if (issue) {
         const id = `memory:${chunkSeq}:${revision + 1}:${transition}`;
         if (
@@ -3211,7 +3705,8 @@ export class FakeState implements StateClient {
     return structuredClone(b);
   }
 
-  /** Go ensureInputReceived: journal the turn's input once, before a note. */
+  /** Go ensureInputReceived: journal the turn's input once, before the
+   * first record of its experience a claim journals. */
   private ensureInputReceived(persona: string, turn: Turn) {
     const key = `${persona}|${turn.input_id}`;
     if (this.receivedSeq.has(key)) return;
@@ -3225,17 +3720,9 @@ export class FakeState implements StateClient {
       seq,
       turn_id: turn.turn_id,
       kind: "input_received",
-      payload: {
-        input_id: input.input_id,
-        kind: input.kind,
-        text:
-          typeof input.payload.text === "string" ? input.payload.text : null,
-        actor_kind: input.actor_kind,
-        source_surface: input.source_surface,
-        received_at: input.created_at,
-        previous_received_at: input.previous_received_at ?? null,
-        attempt: turn.attempt,
-      },
+      // The receipt the Core would commit for the same input (Go builds
+      // the same fields): whichever lands first is the one that stands.
+      payload: inputReceivedEvent(input, turn).payload,
       created_at: new Date().toISOString(),
     });
     this.receivedSeq.set(key, seq);
@@ -3258,6 +3745,17 @@ export class FakeState implements StateClient {
         op.status = failed ? "failed" : "done";
         op.response = response;
         op.completed_at = new Date().toISOString();
+        // Go journalCompletedTx: the call and the receipt it was given,
+        // attributed to the finalizing turn.
+        const turn = this.turns.get(op.turn_id);
+        const index = Number(op.idempotency_key.split(":tool:").pop());
+        const pos =
+          turn && Number.isSafeInteger(index)
+            ? this.planPosition(persona, turn.input_id, index)
+            : null;
+        if (turn && pos && pos.call.tool === op.tool) {
+          this.journalOutcome(persona, turn, pos, op, null);
+        }
         return op;
       }
     }

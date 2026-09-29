@@ -581,6 +581,23 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
   },
   {
     internal: true,
+    name: "memory.resume",
+    description:
+      "Resume your paused memory preparation after its reported problem has been addressed. Choose resume to keep the exact saved context and draft; choose rebranch when that context cannot run (for example missing file tools or context capacity), to wait for a new actual consultation containing the same source records and usable tools. The old attempt remains archived and its draft must be reviewed again. Supply a finite additional_rounds budget (1–128); additional_tokens is required if the existing token cap is exhausted. This starts paid model work, not a message to your person. Do not repeatedly grant new budgets for the same unresolved problem.",
+    parameters: {
+      type: "object",
+      properties: {
+        chunk_seq: { type: "integer", minimum: 1 },
+        mode: { type: "string", enum: ["resume", "rebranch"] },
+        additional_rounds: { type: "integer", minimum: 1, maximum: 128 },
+        additional_tokens: { type: "integer", minimum: 0, maximum: 100000000 },
+      },
+      required: ["chunk_seq", "mode", "additional_rounds"],
+      additionalProperties: false,
+    },
+  },
+  {
+    internal: true,
     name: "journal.note",
     description:
       "Append a durable note to your journal. Use for facts, decisions, or memories worth keeping across restarts.",

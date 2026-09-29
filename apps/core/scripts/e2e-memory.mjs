@@ -1,31 +1,45 @@
 #!/usr/bin/env node
 /**
- * E2E for the memory layer: REAL Go state service + REAL PostgreSQL + real
- * Node core child processes with a deterministic scripted provider
- * (docs/agent/memory-preparation-and-replacement-2026-09-08).
+ * E2E for the memory layer: REAL Go state service + REAL PostgreSQL + the
+ * REAL workspace file service + real Node core child processes. The model is
+ * scripted: ordinary turns answer with a padded reply, and memory branches
+ * run the private-workspace protocol through memoryAgentRound
+ * (memory-e2e-support.mjs) — read the frozen source, write a draft, reread
+ * that version and the source, review, confirm in a later round.
  *
  * Covers:
- *   1. A sealed chunk's L1 branch runs while the conversation continues; a
- *      correction served during preparation still sees the raw original,
- *      and the branch keeps the parent's system prompt and tools.
- *   2. The finished candidate waits below the 40k live limit and is applied
- *      only once the live raw estimate crosses it; the next request renders
- *      the replacement at the chunk's original position, before later raw
- *      records and the correction.
- *   3. SIGKILL while another chunk is preparing → a new process acquires a
- *      new generation → the chunk is prepared again; the same persona keeps
- *      its applied memory, the correction and a contiguous journal, and the
- *      original records stay readable through conversation_history.
+ *   1. A sealed chunk is claimed automatically at an actual model boundary:
+ *      the branch's frozen prefix is exactly what a parent request sent (plus
+ *      the reply it received), with the same tool definitions, and its
+ *      rounds run while the conversation continues — a correction served
+ *      meanwhile still sees the raw original.
+ *   2. SIGKILL while the branch holds its review round, after its draft was
+ *      checkpointed → a new process takes a new generation and continues the
+ *      durable transcript: same prefix, the killed process's draft, no new
+ *      write — review and confirm only.
+ *   3. The confirmed draft waits below the 40k live limit and is applied only
+ *      once the live raw estimate crosses it; the next request renders it at
+ *      chunk 1's original position with every later message still raw after
+ *      it, and conversation_history opens the original records. The journal
+ *      stays contiguous across the crash, and the branch never reached the
+ *      workspace file service or journaled a tool call.
  *
- * The scripted provider proves persistence, ordering and recovery. It does
- * not show that a real model writes a faithful replacement or remembers
+ * The file service is real because the state service advertises file.read
+ * and file.write only when one is configured; the branch's own file
+ * operations are private checkpoints and must never reach it.
+ *
+ * The scripted model proves persistence, ordering and recovery. It does not
+ * show that a real model writes a faithful replacement or remembers
  * naturally over a long life.
  *
- * It registers its own admin and persona, so it can share a database with the
- * other e2e scripts; state-dev applies migrations on startup.
+ * It registers its own admin and persona. SUMI_TEST_DB_URL must be a
+ * disposable database: state-dev applies migrations there and the file
+ * service binds its canonical root to it (a stable temp directory per
+ * database URL), as a local install shares one database.
  *
  *   SUMI_TEST_DB_URL=postgres://… [SUMI_E2E_DIR=<artifacts>] \
  *   [SUMI_E2E_PORT=9521] node scripts/e2e-memory.mjs
+ *   (the file service listens on SUMI_E2E_PORT+1)
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -41,6 +55,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  MEMORY_INSTRUCTION_PREFIX,
+  memoryAgentRound,
+  memoryBranchView,
+  memoryPathsInWorkspace,
+  messageDigest,
+  startFileService,
+} from "./memory-e2e-support.mjs";
+
 
 const CHILD = process.argv.includes("--child");
 const SELFTEST = process.argv.includes("--selftest");
@@ -131,7 +154,10 @@ async function childMain() {
     return v;
   };
   const dir = env("SUMI_E2E_DIR");
-  const gated = process.env.SUMI_BRANCH_GATE === "1";
+  // A branch of chunk >= SUMI_BRANCH_HOLD_FROM holds its SUMI_BRANCH_HOLD
+  // stage's model call open until DIR gains release-<chunk>.
+  const holdStage = process.env.SUMI_BRANCH_HOLD ?? "";
+  const holdFrom = Number(process.env.SUMI_BRANCH_HOLD_FROM ?? 1);
   // ~11k estimated tokens per reply: each exchange clears the 10k seal.
   const pad = "x".repeat(44 * 1024);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -139,42 +165,59 @@ async function childMain() {
   class ScriptedProvider {
     name = "scripted-memory";
     async *stream(req) {
+      const view =
+        req.phase === "memory" ? memoryBranchView(req.messages) : null;
+      if (req.phase === "memory" && !view)
+        throw new Error("memory request without its branch instruction");
+      const decision = view
+        ? memoryAgentRound(view, { label: `pid ${process.pid}` })
+        : null;
       appendFileSync(
         join(dir, `requests-${process.pid}.jsonl`),
         JSON.stringify({
           pid: process.pid,
           turnId: req.turnId,
+          phase: req.phase ?? "turn",
           round: req.round,
+          chunk: view?.chunk,
+          stage: decision?.stage,
           tools: req.tools.map((t) => t.name),
+          digests: req.messages.map(messageDigest),
           messages: req.messages.map((m) => ({
             role: m.role,
             chars: m.content.length,
             content: m.content.slice(0, 600),
+            ...(m.toolCalls
+              ? {
+                  toolCalls: m.toolCalls.map((c) => ({
+                    name: c.name,
+                    arguments: c.arguments,
+                  })),
+                }
+              : {}),
           })),
+          ...(decision
+            ? { decision: { text: decision.text, calls: decision.calls } }
+            : {}),
         }) + "\n",
       );
       const last = req.messages[req.messages.length - 1].content;
-      const branch = /^memory-l1-(\d+)$/.exec(req.turnId);
-      if (branch) {
-        const chunk = Number(branch[1]);
-        console.log(`[child ${process.pid}] branch consulted chunk=${chunk}`);
-        while (gated && !existsSync(join(dir, `release-${chunk}`))) {
+      if (view) {
+        console.log(
+          `[child ${process.pid}] branch chunk=${view.chunk} round=${req.round} stage=${decision.stage}`,
+        );
+        while (
+          decision.stage === holdStage &&
+          view.chunk >= holdFrom &&
+          !existsSync(join(dir, `release-${view.chunk}`))
+        ) {
           if (req.signal?.aborted)
             throw new DOMException("aborted", "AbortError");
           await sleep(100);
         }
-        const target = JSON.parse(
-          last.slice(
-            last.indexOf("compact_target\n") + "compact_target\n".length,
-          ),
-        );
-        const said = target.events
-          .filter((e) => e.kind === "input_received")
-          .map((e) => String(e.payload.text ?? "").slice(0, 60));
-        yield {
-          type: "text",
-          delta: `L1 chunk ${chunk}: the human said ${said.join(" / ")}`,
-        };
+        if (decision.text) yield { type: "text", delta: decision.text };
+        for (const call of decision.calls)
+          yield { type: "tool_call", call: { ...call, route: "normal" } };
         yield { type: "done", usage: {} };
         return;
       }
@@ -202,7 +245,10 @@ async function childMain() {
         yield { type: "done", usage: {} };
         return;
       }
-      const label = last.replace(/^\[Received [^\]]*\]\n/, "").replace(/^\[\w+\] /, "").slice(0, 24);
+      const label = last
+        .replace(/^\[Received [^\]]*\]\n/, "")
+        .replace(/^\[\w+\] /, "")
+        .slice(0, 24);
       yield { type: "text", delta: `ack ${label} ${pad}` };
       yield { type: "done", usage: {} };
     }
@@ -246,7 +292,7 @@ async function main() {
     console.error("e2e-memory: SUMI_TEST_DB_URL required — real PostgreSQL");
     process.exit(2);
   }
-  // Artifacts (request log, child and state-dev logs, summary) default to a
+  // Artifacts (request log, child and service logs, summary) default to a
   // disposable directory; SUMI_E2E_DIR keeps them somewhere durable.
   const DIR =
     process.env.SUMI_E2E_DIR ??
@@ -260,6 +306,7 @@ async function main() {
   const children = [];
 
   const log = (...a) => console.log("[e2e-memory]", ...a);
+  let passed = 0;
   const fail = (msg, evidence) => {
     console.error("[e2e-memory] FAIL:", msg);
     if (evidence !== undefined)
@@ -269,8 +316,13 @@ async function main() {
   };
   const assert = (cond, msg, evidence) => {
     if (!cond) fail(msg, evidence);
+    passed++;
+    log(`ok ${passed} - ${msg}`);
   };
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  process.on("exit", () => {
+    for (const c of children) c.kill("SIGKILL");
+  });
 
   function uuidv7() {
     const now = Date.now().toString(16).padStart(12, "0");
@@ -311,11 +363,20 @@ async function main() {
   );
   if (build.status !== 0) fail("go build failed");
 
+  log("starting the workspace file service…");
+  const files = await startFileService({
+    dbUrl: DB_URL,
+    port: PORT + 1,
+    outDir: binDir,
+    children,
+  });
+
   log("starting state-dev on", BASE);
   const svcOut = openSync(join(DIR, "state-dev.log"), "a");
   const svc = spawn(bin, [], {
     env: {
       ...process.env,
+      ...files.env,
       SUMI_DB_URL: DB_URL,
       SUMI_CORE_STATE_TOKEN: ADMIN,
       SUMI_STATE_LISTEN: `127.0.0.1:${PORT}`,
@@ -323,7 +384,6 @@ async function main() {
     stdio: ["ignore", svcOut, svcOut],
   });
   children.push(svc);
-  process.on("exit", () => svc.kill("SIGKILL"));
   for (const deadline = Date.now() + 30_000; ; ) {
     try {
       if ((await fetch(`${BASE}/health`)).ok) break;
@@ -338,14 +398,16 @@ async function main() {
     persona_id: personaId,
     display_name: "e2e memory secretary",
   });
-  assert(
-    created.status === 201,
-    `createPersona ${created.status}`,
-    created.text,
-  );
+  if (created.status !== 201) fail(`createPersona ${created.status}`, created.text);
   const ptoken = created.json.persona_token;
 
   const P = `/internal/core/personas/${personaId}`;
+  const tools = (await req("GET", `${P}/tools`, ptoken)).json?.tools ?? [];
+  assert(
+    tools.includes("file.read") && tools.includes("file.write"),
+    "the state service advertises the workspace file tools",
+    tools,
+  );
   const mem = async () => (await req("GET", `${P}/memory`, ptoken)).json;
   const events = async () =>
     (await req("GET", `${P}/events?after_seq=0&limit=1000`, ptoken)).json
@@ -358,15 +420,33 @@ async function main() {
     readdirSync(DIR)
       .filter((f) => /^requests-\d+\.jsonl$/.test(f))
       .flatMap((f) => parseRequestLog(readFileSync(join(DIR, f), "utf8")));
-  const turnRequestFor = (text) =>
+  const turnRequests = () => requests().filter((r) => r.phase !== "memory");
+  const branchRequests = (chunk, pid) =>
     requests()
       .filter(
         (r) =>
-          !r.turnId.startsWith("memory-l1-") &&
+          r.phase === "memory" &&
+          r.chunk === chunk &&
+          (pid === undefined || r.pid === pid),
+      )
+      .sort((a, b) => a.round - b.round);
+  const turnRequestFor = (text) =>
+    turnRequests()
+      .filter(
+        (r) =>
           r.round === 0 &&
           r.messages[r.messages.length - 1].content.includes(text),
       )
       .at(-1);
+  /** The frozen parent prefix of a branch request: everything before the
+   * branch instruction. */
+  const prefixOf = (r) =>
+    r.digests.slice(
+      0,
+      r.messages.findIndex((m) =>
+        m.content.startsWith(MEMORY_INSTRUCTION_PREFIX),
+      ),
+    );
   async function waitFor(fn, what, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
@@ -375,6 +455,9 @@ async function main() {
         fail(`timed out waiting for ${what}`, {
           memory: await mem(),
           events: (await events()).map((e) => `${e.seq}:${e.kind}`),
+          branch: requests()
+            .filter((r) => r.phase === "memory")
+            .map((r) => `${r.pid} chunk ${r.chunk} r${r.round} ${r.stage}`),
         });
       }
       await sleep(100);
@@ -390,7 +473,7 @@ async function main() {
       actor_id: "e2e",
       source_surface: "e2e",
     });
-    assert(r.status >= 200 && r.status < 300, `submit ${r.status}`, r.text);
+    if (r.status < 200 || r.status >= 300) fail(`submit ${r.status}`, r.text);
     await waitFor(
       async () => (await outboxFor(inputId)).length > 0,
       `reply to "${text.slice(0, 32)}"`,
@@ -420,49 +503,120 @@ async function main() {
         /writer acquired \{"generation":(\d+)/g,
       ),
     ].map((m) => Number(m[1]));
-  const isFragment = (m, chunk) =>
-    m.content.startsWith("[Memory fragment") &&
-    m.content.includes(`L1 chunk ${chunk}: the human said`);
+  const raw = (m, text) =>
+    new RegExp(`^(?:\\[Received [^\\]]*\\]\\n)?\\[human\\] ${text}`).test(
+      m.content,
+    );
+  const writesIn = (r) =>
+    r.messages.flatMap((m) =>
+      (m.toolCalls ?? []).filter((c) => c.name === "file.write"),
+    );
 
-  // --- 1: preparation runs alongside the conversation ----------------------
-  let child = spawnChild(1, { SUMI_BRANCH_GATE: "1" });
+  // --- 1: automatic claim at an actual boundary; branch alongside turns -----
+  let child = spawnChild(1, { SUMI_BRANCH_HOLD: "review" });
+  const pid1 = child.pid;
   await say("COLOR=amber is my favorite color");
   await say("second topic: the train schedule");
-  await waitFor(async () => (await mem()).preparing === 1, "chunk 1 preparing");
-  log("chunk 1 preparing; sending a correction while the branch waits");
+  await waitFor(
+    async () => (await mem()).preparing === 1,
+    "chunk 1 claimed without any explicit trigger",
+  );
+  await waitFor(
+    async () => branchRequests(1).some((r) => r.stage === "review"),
+    "chunk 1's branch reaches its review round",
+  );
+  const before = branchRequests(1, pid1);
+  const stages1 = before.map((r) => r.stage);
+  assert(
+    stages1.filter((s) => s === "read_source").length >= 2 &&
+      stages1.indexOf("write") === stages1.lastIndexOf("write") &&
+      stages1.indexOf("write") > stages1.lastIndexOf("read_source") &&
+      stages1.indexOf("reread") > stages1.indexOf("write") &&
+      stages1.at(-1) === "review",
+    "the branch paged the source, wrote one draft, reread it and the source, then asked for review",
+    stages1,
+  );
+  const prefix = prefixOf(before[0]);
+  const parent = turnRequests().find(
+    (t) =>
+      JSON.stringify(t.digests) === JSON.stringify(prefix) ||
+      (JSON.stringify(t.digests) === JSON.stringify(prefix.slice(0, -1)) &&
+        before[0].messages[prefix.length - 1].role === "assistant"),
+  );
+  assert(
+    parent && prefix.length > 2,
+    "the branch prefix is exactly an actual parent request (and the reply it received)",
+    { prefix, turns: turnRequests().map((t) => t.digests) },
+  );
+  assert(
+    before.every(
+      (r) =>
+        JSON.stringify(prefixOf(r)) === JSON.stringify(prefix) &&
+        JSON.stringify(r.tools) === JSON.stringify(parent.tools),
+    ),
+    "every branch round keeps that frozen prefix and the parent's tool definitions",
+  );
+  log("chunk 1 held at review; sending a correction while the branch waits");
   await say("CORRECTION=violet: I said amber, but it is violet");
   const during = turnRequestFor("CORRECTION=violet");
   assert(
-    during?.messages.some((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] COLOR=amber/.test(m.content)),
-    "the correction turn must see the raw original while chunk 1 prepares",
-    during,
+    during?.messages.some((m) => raw(m, "COLOR=amber")),
+    "the correction turn sees the raw original while chunk 1 prepares",
+    during?.messages.map((m) => m.content.slice(0, 60)),
   );
-  const branch1 = requests().find((r) => r.turnId === "memory-l1-1");
+  const heldShape = await mem();
   assert(
-    branch1 && branch1.messages[0].content === during.messages[0].content,
-    "branch keeps the parent's system prompt",
-    branch1?.messages[0],
+    heldShape.preparing === 1 && heldShape.prepared === 0,
+    "nothing is prepared while the branch waits for its review",
+    heldShape,
   );
-  assert(
-    JSON.stringify(branch1.tools) === JSON.stringify(during.tools),
-    "branch keeps the parent's tool definitions",
-    { branch: branch1.tools, parent: during.tools },
-  );
+
+  // --- 2: crash mid-branch; the durable transcript continues ---------------
+  const beforeKill = await events();
+  log("SIGKILL child 1 while chunk 1's review round is in flight");
+  child.kill("SIGKILL");
+  await once(child, "exit");
+  // The restarted process runs chunk 1 freely and holds later chunks at
+  // review, so only chunk 1 can be applied below.
   writeFileSync(join(DIR, "release-1"), "");
+  child = spawnChild(2, { SUMI_BRANCH_HOLD: "review", SUMI_BRANCH_HOLD_FROM: "2" });
+  const pid2 = child.pid;
+  await waitFor(
+    async () => branchRequests(1, pid2).some((r) => r.stage === "confirm"),
+    "the restarted process confirms chunk 1",
+    45_000,
+  );
   await waitFor(
     async () => (await mem()).prepared + (await mem()).applied >= 1,
     "chunk 1 prepared",
+  );
+  const resumed = branchRequests(1, pid2);
+  assert(
+    JSON.stringify(resumed.map((r) => r.stage)) ===
+      JSON.stringify(["review", "confirm"]),
+    "the restarted branch continued at review, without reading or writing again",
+    resumed.map((r) => r.stage),
+  );
+  assert(
+    JSON.stringify(prefixOf(resumed[0])) === JSON.stringify(prefix),
+    "the restarted branch has the same frozen prefix",
+  );
+  const restoredWrites = writesIn(resumed[0]);
+  assert(
+    restoredWrites.length === 1 &&
+      restoredWrites[0].arguments.content_text.includes(`draft by pid ${pid1}`),
+    "the restarted branch's transcript carries the killed process's durable draft",
+    restoredWrites,
   );
   const shelved = await mem();
   assert(
     shelved.applied === 0 &&
       shelved.live_raw_tokens <= shelved.live_limit_tokens,
-    "the prepared candidate waits while live raw is at or under 40k",
+    "the confirmed replacement waits while live raw is at or under 40k",
     shelved,
   );
-  log("chunk 1 shelved", shelved);
 
-  // --- 2: application after crossing 40k, in place -------------------------
+  // --- 3: application after crossing 40k, in place -------------------------
   await say("fourth: dinner plans for Friday");
   await say("fifth: the weekend trip");
   await waitFor(
@@ -474,59 +628,36 @@ async function main() {
   await say("sixth: which color do I like now?");
   const after = turnRequestFor("sixth: which color");
   const at = (pred) => after.messages.findIndex(pred);
-  const frag = at((m) => isFragment(m, 1));
-  const m2 = at((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] second topic/.test(m.content));
-  const corr = at((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] CORRECTION=violet/.test(m.content));
+  const frag = at(
+    (m) =>
+      m.content.startsWith("[Memory fragment") &&
+      m.content.includes("L1 chunk 1 ("),
+  );
+  const order = [
+    frag,
+    at((m) => raw(m, "second topic")),
+    at((m) => raw(m, "CORRECTION=violet")),
+    at((m) => raw(m, "fourth")),
+    at((m) => raw(m, "fifth")),
+    after.messages.length - 1,
+  ];
   assert(
-    frag > 0 && frag < m2 && m2 < corr,
-    "replacement renders at chunk 1's original position, before later raw records and the correction",
-    {
-      frag,
-      m2,
-      corr,
-      roles: after.messages.map((m) => m.content.slice(0, 60)),
-    },
+    frag > 0 && order.every((v, i) => i === 0 || v > order[i - 1]),
+    "the replacement renders at chunk 1's original position; every later message stays raw after it",
+    { order, messages: after.messages.map((m) => m.content.slice(0, 60)) },
   );
   assert(
-    !after.messages.some((m) => /^(?:\[Received [^\]]*\]\n)?\[human\] COLOR=amber/.test(m.content)),
+    after.messages[frag].content.includes(`draft by pid ${pid1}`) &&
+      after.messages[frag].content.includes("COLOR=amber"),
+    "the applied text is the draft written before the crash",
+    after.messages[frag].content,
+  );
+  assert(
+    !after.messages.some((m) => raw(m, "COLOR=amber")),
     "applied originals no longer render raw",
   );
 
-  // --- 3: crash during preparation, restart, same life ---------------------
-  await waitFor(
-    async () => (await mem()).preparing === 1,
-    "chunk 2 preparing behind its gate",
-  );
-  const beforeKill = await events();
-  log("SIGKILL child 1 while chunk 2 prepares");
-  child.kill("SIGKILL");
-  await once(child, "exit");
-  child = spawnChild(2, { SUMI_BRANCH_GATE: "0" });
-  await waitFor(
-    async () =>
-      requests().some((r) => r.turnId === "memory-l1-2" && r.pid === child.pid),
-    "chunk 2 prepared again by the restarted process",
-    45_000,
-  );
-  await waitFor(
-    async () => {
-      const s = await mem();
-      return s.preparing === 0 && s.sealed === 0;
-    },
-    "memory shelf settles after restart",
-    45_000,
-  );
   await say("HISTORY: open chunk_seq=1");
-  const hist = turnRequestFor("HISTORY: open chunk_seq=1");
-  assert(
-    hist.messages.some((m) => isFragment(m, 1)),
-    "applied memory still renders after the restart",
-    hist.messages.map((m) => m.content.slice(0, 80)),
-  );
-  assert(
-    hist.messages.some((m) => m.content.includes("CORRECTION=violet")),
-    "the correction is still in the sent context after the restart",
-  );
   const finalEvents = await events();
   const historyResult = finalEvents
     .filter(
@@ -554,6 +685,20 @@ async function main() {
     ),
     "pre-crash records are unchanged after restart",
   );
+  assert(
+    !finalEvents.some(
+      (e) => e.kind === "tool_call" && String(e.payload.tool).startsWith("file."),
+    ) && memoryPathsInWorkspace(files.root).length === 0,
+    "branch file operations never reached the journal or the workspace file service",
+    memoryPathsInWorkspace(files.root),
+  );
+  const branchTranscripts = requests().filter((r) => r.phase === "memory");
+  assert(
+    !branchTranscripts.some((r) =>
+      r.messages.some((m) => m.content.includes("memory_control_error")),
+    ),
+    "no branch round was refused by the protocol",
+  );
   const g1 = generationsOf(1);
   const g2 = generationsOf(2);
   assert(
@@ -567,19 +712,23 @@ async function main() {
   const summary = {
     persona_id: personaId,
     generations: { before_crash: g1[0], after_restart: g2[0] },
+    branch_rounds: branchTranscripts.map(
+      (r) => `pid ${r.pid} chunk ${r.chunk} round ${r.round}: ${r.stage}`,
+    ),
+    memory_while_held: heldShape,
     memory_when_shelved: shelved,
     memory_after_apply: applied,
     memory_final: await mem(),
+    fragment: after.messages[frag].content,
     journal_records: finalEvents.length,
-    branch_requests: requests()
-      .filter((r) => r.turnId.startsWith("memory-l1-"))
-      .map((r) => ({ turnId: r.turnId, pid: r.pid })),
+    checks: passed,
   };
   writeFileSync(join(DIR, "summary.json"), JSON.stringify(summary, null, 2));
   log("summary", JSON.stringify(summary));
   log(
-    "PASS — memory preparation, application and restart on real PG + real Go + real Node",
+    `PASS — ${passed} checks: automatic memory branch, durable restart and in-place application on real PG + real Go + real filesvc + real Node`,
   );
   svc.kill("SIGTERM");
+  files.proc.kill("SIGTERM");
   process.exit(0);
 }

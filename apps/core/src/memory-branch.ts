@@ -55,6 +55,12 @@ export interface MemoryBranchState {
   review: MemoryReview | null;
   final: MemoryReview | null;
   rounds: number;
+  /** Durable admissions include failed/interrupted requests, bounding retries. */
+  model_calls?: number;
+  budget_extension?: { rounds: number; tokens: number };
+  rebranch_requested?: boolean;
+  restart_budget?: { rounds: number; tokens: number };
+  execution_budget?: { rounds: number; tokens: number };
   tokens: number;
   failures: number;
   status: "running" | "paused" | "prepared" | "kept";
@@ -76,6 +82,7 @@ export interface MemoryBranch {
   snapshot: MemorySnapshot;
   state: MemoryBranchState | null;
   revision: number;
+  previous_attempt?: MemoryBranchState;
 }
 export interface MemoryDecision {
   text: string;
@@ -130,20 +137,27 @@ export function memorySource(branch: MemoryBranch): string {
       r.first_seq >= branch.chunk.first_seq &&
       r.last_seq <= branch.chunk.last_seq,
   );
+  const byMessage = new Map<number, MemorySourceRange[]>();
+  for (const r of ranges)
+    if (r.message_index !== undefined) {
+      const group = byMessage.get(r.message_index) ?? [];
+      group.push(r);
+      byMessage.set(r.message_index, group);
+    }
   return JSON.stringify({
     first_seq: branch.chunk.first_seq,
     last_seq: branch.chunk.last_seq,
-    records: ranges.flatMap((r) =>
-      r.message_index === undefined
-        ? []
-        : [
-            {
-              first_seq: r.first_seq,
-              last_seq: r.last_seq,
-              message: branch.snapshot.messages[r.message_index],
-            },
-          ],
-    ),
+    records: [...byMessage.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([index, group]) => ({
+        first_seq: Math.min(...group.map((r) => r.first_seq)),
+        last_seq: Math.max(...group.map((r) => r.last_seq)),
+        journal_ranges: group.map((r) => ({
+          first_seq: r.first_seq,
+          last_seq: r.last_seq,
+        })),
+        message: branch.snapshot.messages[index],
+      })),
   });
 }
 export function memoryInstruction(branch: MemoryBranch): string {
@@ -168,20 +182,31 @@ export function initialMemoryState(
       throw new Error(`invalid memory policy ${k}`);
   }
   return {
-    messages: [{ role: "user", content: memoryInstruction(branch) }],
-    candidate: null,
+    messages: [
+      {
+        role: "user",
+        content:
+          memoryInstruction(branch) +
+          (branch.previous_attempt
+            ? "\nThis is a new attempt from a newly observed parent context, not continuation of the old cache prefix. The previous attempt remains archived. Its candidate, if any, is an unreviewed draft; read the current source and candidate before reviewing."
+            : ""),
+      },
+    ],
+    candidate: branch.previous_attempt?.candidate ?? null,
     candidate_read: [],
     source_read: [],
     review: null,
     final: null,
     rounds: 0,
+    model_calls: 0,
     tokens: 0,
     failures: 0,
     status: "running",
     pause_reason: null,
     retry_at: null,
-    issue: null,
+    issue: branch.previous_attempt?.issue ?? null,
     policy,
+    execution_budget: branch.previous_attempt?.restart_budget,
     effective_binding: branch.snapshot.binding,
     binding_changes: [],
     in_flight: null,
@@ -448,6 +473,7 @@ export async function advanceMemoryBranch(
     if (state.failures >= state.policy.maxConsecutiveFailures) {
       state.status = "paused";
       state.pause_reason = "control_protocol";
+      state.retry_at = new Date(Date.now() + 15 * 60_000).toISOString();
       state.issue = {
         code: "memory_control_protocol",
         message:

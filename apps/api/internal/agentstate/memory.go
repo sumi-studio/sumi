@@ -361,12 +361,12 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	// preparation targets where a meaningful unit boundary exists. A turn's
 	// deciding text and the calls/results it started are one unit: a cut
 	// before a tool_call would separate the rationale from its effects, and
-	// a turn with no interior boundary seals whole past the limit. Tool
-	// calls and results commit inside one turn transaction, so a dangling
-	// call can never sit at a turn boundary — the pending set is defensive
-	// depth.
+	// a turn with no interior boundary seals whole past the limit. Native
+	// calls from one decision may be journaled across recovery, with another
+	// input in between. Keep that whole known round together; the pending
+	// set also prevents sealing a call whose result has not been recorded.
 	rows, err := tx.Query(ctx, `
-		SELECT seq, kind, payload FROM core_events
+		SELECT seq, turn_id, kind, payload FROM core_events
 		WHERE persona_id = $1 AND seq > $2 ORDER BY seq`, personaID, covered)
 	if err != nil {
 		return st, err
@@ -374,12 +374,13 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	type evRow struct {
 		seq     int64
 		kind    string
+		turnID  string
 		payload map[string]any
 	}
 	var tail []evRow
 	for rows.Next() {
 		var e evRow
-		if err := rows.Scan(&e.seq, &e.kind, &e.payload); err != nil {
+		if err := rows.Scan(&e.seq, &e.turnID, &e.kind, &e.payload); err != nil {
 			rows.Close()
 			return st, err
 		}
@@ -389,6 +390,20 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 	if err := rows.Err(); err != nil {
 		return st, err
 	}
+	roundKey := func(e evRow) string {
+		r, ok := e.payload["round"]
+		if !ok || (e.kind != "assistant_message" && e.kind != "tool_call" && e.kind != "tool_result") {
+			return ""
+		}
+		return fmt.Sprintf("%s:%v", e.turnID, r)
+	}
+	roundEnds := map[string]int64{}
+	for _, e := range tail {
+		if key := roundKey(e); key != "" {
+			roundEnds[key] = e.seq
+		}
+	}
+	var activeRoundEnd int64 = -1
 	var window []evRow
 	pending := map[string]bool{}
 	seal := func(first, lastSeq, est int64) error {
@@ -412,7 +427,7 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 		// before an assistant_message directly continuing a tool flow (it
 		// follows a tool_result): the flow's results and its continuation
 		// stay together.
-		if windowStart >= 0 && len(pending) == 0 {
+		if windowStart >= 0 && len(pending) == 0 && e.seq > activeRoundEnd {
 			cut := false
 			switch e.kind {
 			case "input_received":
@@ -445,6 +460,9 @@ func (s *Store) MemoryMaintain(ctx context.Context, personaID string, generation
 			if id, ok := e.payload["call_id"].(string); ok {
 				delete(pending, id)
 			}
+		}
+		if key := roundKey(e); key != "" && roundEnds[key] > activeRoundEnd {
+			activeRoundEnd = roundEnds[key]
 		}
 		prevKind = e.kind
 	}

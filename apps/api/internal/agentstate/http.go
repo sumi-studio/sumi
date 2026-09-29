@@ -25,6 +25,11 @@ import (
 // a client error (400), not a database domain violation (500).
 var uuidv7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
+// A runtime using the removed one-shot memory contract must not acquire a
+// writer after the API has switched to durable branches. Deployment fences
+// existing leases before restarting the API; this guards new acquisitions.
+const coreRuntimeProtocol = "agentic-memory-v1"
+
 // Server exposes the persona-scoped state contract over HTTP.
 //
 // Two credential scopes exist, both deliberately explicit:
@@ -504,6 +509,7 @@ func (s *Server) acquireWriter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		Protocol string `json:"protocol"`
 		HolderID string `json:"holder_id"`
 		TTLms    int64  `json:"ttl_ms"`
 	}
@@ -512,6 +518,13 @@ func (s *Server) acquireWriter(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.HolderID == "" || req.TTLms <= 0 {
 		writeError(w, http.StatusBadRequest, "holder_id and positive ttl_ms required")
+		return
+	}
+	if req.Protocol != coreRuntimeProtocol {
+		writeJSON(w, http.StatusUpgradeRequired, map[string]string{
+			"error": "Core runtime and state service protocols do not match; update the runtime",
+			"code":  "runtime_protocol_mismatch",
+		})
 		return
 	}
 	lease, err := s.store.AcquireWriter(r.Context(), personaID, req.HolderID, time.Duration(req.TTLms)*time.Millisecond)

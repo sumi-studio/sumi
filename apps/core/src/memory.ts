@@ -227,8 +227,36 @@ const FAILURE_REASONS: Record<string, string> = {
   model_usage_limit: "the selected subscription's usage limit was reached",
 };
 
-/** Map one journal event to the model-visible message, or null for kinds
- * with no context rendering (e.g. internal bookkeeping). */
+/**
+ * How a terminal failure reads in later context. It never claims that
+ * nothing was said or done: a request can fail after its tool calls took
+ * effect (a Messaging send, an edit), and those stay true. Each call is
+ * journaled with its result at the claim that ran it, so they appear above
+ * the marker even when the failing attempt's own records are not in hand;
+ * when the closing commit could not be stored, what is missing is only
+ * what the turn had not journaled yet — its closing reply.
+ */
+function turnFailedText(p: Record<string, unknown>): string {
+  const why = FAILURE_REASONS[str(p.error_kind)];
+  const head = `[turn failed${why ? `: ${why}` : ""} — `;
+  if (p.record_lost === true) {
+    return (
+      head +
+      "this turn's closing records could not be stored. Tool calls it ran are recorded above with their results as they happened " +
+      "— for example, a message you sent stays sent — but any reply it ended with is not shown here]"
+    );
+  }
+  return (
+    head +
+    "this request stopped here without finishing normally. " +
+    "What is recorded above for it happened as shown — for example, a message you sent stays sent; nothing further runs for it]"
+  );
+}
+
+/** Map one standalone journal event to the model-visible message, or null
+ * for kinds with no standalone rendering. tool_call and tool_result are not
+ * standalone: renderJournalContext renders them as the provider-native
+ * pairs they were when the model decided them. */
 export function eventMessage(ev: Event): ChatMessage | null {
   const p = ev.payload;
   switch (ev.kind) {
@@ -262,35 +290,274 @@ export function eventMessage(ev: Event): ChatMessage | null {
         content: `${receipt ? `${receipt}\n` : ""}${who} ${inputBodyText(p)}`,
       };
     }
-    case "turn_failed": {
+    case "turn_failed":
       // The requester was told; the secretary must be too, or an
       // unanswered input reads as a request still waiting for it.
-      const why = FAILURE_REASONS[str(p.error_kind)];
-      const lost =
-        p.record_lost === true ? "; its record could not be stored" : "";
-      return {
-        role: "user",
-        content: `[turn failed${why ? `: ${why}` : ""} — this turn ended without a completed reply${lost}]`,
-      };
-    }
+      return { role: "user", content: turnFailedText(p) };
     case "assistant_message":
       return { role: "assistant", content: String(p.text ?? "") };
     case "note":
       return { role: "assistant", content: `[note] ${String(p.text ?? "")}` };
-    case "tool_result":
-      // Flattened to assistant text: a bare role:"tool" message with no
-      // preceding assistant tool_calls is rejected by chat-completions
-      // providers. The journal keeps the structured record; the model gets
-      // the result inline.
+    case "turn_paused":
+      // An attempt that parked on usage budget, requeued after a transient
+      // model error, or stopped with its host (recovery marks it) leaves
+      // what it did so far in the journal; the request is not over, and its
+      // resuming attempt continues from there without running those calls
+      // again.
       return {
-        role: "assistant",
-        content: `[tool ${String(p.tool ?? "?")}] ${JSON.stringify(
-          p.response ?? (p.error ? { error: p.error } : {}),
-        )}`,
+        role: "user",
+        content:
+          p.reason === "budget"
+            ? "[This request paused here: its next model call is waiting for usage budget. " +
+              "What is recorded above for it happened as shown; it continues when budget allows, " +
+              "and the calls above are not run again.]"
+            : p.reason === "interrupted"
+              ? "[This request stopped here when its run was interrupted. " +
+                "What is recorded above for it happened as shown; it resumes later, " +
+                "and the calls above are not run again.]"
+              : "[This request paused here after a temporary model error. " +
+                "What is recorded above for it happened as shown; it is retried later, " +
+                "and the calls above are not run again.]",
       };
+    case "approval_requested": {
+      // A parked call: decided, durably planned, and not run. Its outcome
+      // (or denial) is journaled as an ordinary call/result pair by the
+      // attempt that resumes it, so this is a status note, not a call.
+      const approval = str(p.approval_id);
+      return {
+        role: "user",
+        content:
+          `[Approval requested: your ${str(p.route) || "elevated"} call ${str(p.tool) || "?"}` +
+          `${str(p.call_id) ? ` (call_id ${str(p.call_id)})` : ""} is waiting for a human decision` +
+          `${approval ? ` (approval_id ${approval})` : ""}; it has not run at this point. ` +
+          `Requested input: ${JSON.stringify(p.request ?? {})}]`,
+      };
+    }
+    case "approval_decided": {
+      const by = str(p.decided_by_kind);
+      return {
+        role: "user",
+        content:
+          `[Approval decided: ${str(p.decision) || "?"}${by ? ` by ${by}` : ""} for your ` +
+          `${str(p.route) || "elevated"} call ${str(p.tool) || "?"}` +
+          `${str(p.approval_id) ? ` (approval_id ${str(p.approval_id)})` : ""}. ` +
+          "What the call then did is recorded when its request resumes.]",
+      };
+    }
     default:
       return null;
   }
+}
+
+/**
+ * The model-facing content of one recorded tool result — the same bytes
+ * the model received live when the round's results were fed back in the
+ * turn (secretary.ts feeds `response`, or `{error}` for a failed call), so
+ * a later turn or a restart reads the same result.
+ */
+export function toolResultContent(p: Record<string, unknown>): string {
+  return JSON.stringify(
+    p.response ?? (p.error !== undefined ? { error: p.error } : {}),
+  );
+}
+
+type RenderItem = {
+  seq: number;
+  message: ChatMessage;
+  sources?: MemorySourceRange[];
+};
+
+/**
+ * One model round as the journal recorded it: the round's deciding text
+ * and the calls it decided, each with the result the model was fed.
+ */
+type RoundGroup = {
+  seq: number;
+  turnId: string;
+  round: unknown;
+  text: string | null;
+  calls: { ev: Event; result: Event | null }[];
+  /** Records journaled while a call awaited its result — what the call's
+   * own effect recorded (a note) — rendered after the round's results. */
+  after: RenderItem[];
+};
+
+/**
+ * Render the journal records themselves, in seq order. A round's
+ * assistant_message and the tool_call/tool_result records of the same
+ * turn and round become the provider-native pair the model produced and
+ * received live: one assistant message carrying the text and the decided
+ * calls, then one tool message per result, in call order. The call's
+ * arguments are what the secretary chose to do (the sent message body, the
+ * edit); the result is what the effect actually returned (a receipt, or an
+ * error). Neither is rewritten as the other's speech.
+ *
+ * Representing a call re-executes nothing: only calls streamed by the
+ * current consultation are ever planned and claimed.
+ *
+ * Every assistant tool call is followed by its result, as every provider
+ * wire requires. A record whose partner is outside the rendered view — the
+ * raw window can begin between a call and its result — renders as an
+ * explicit note instead of an unpaired native call or result.
+ *
+ * Call ids stay as recorded (a missing one is named after the call's
+ * journal seq). They came from whichever provider decided them and can
+ * repeat across turns; each provider adapter makes them valid and unique
+ * for its own wire at serialization (disambiguateCallIds), where the
+ * current turn's calls and opaque continuations are also in view.
+ */
+function renderEvents(events: Event[]): RenderItem[] {
+  const out: RenderItem[] = [];
+  let group: RoundGroup | null = null;
+
+  const wireId = (ev: Event): string =>
+    str(ev.payload.call_id) || `sumi_call_${ev.seq}`;
+  const callLabel = (p: Record<string, unknown>) =>
+    `${str(p.tool) || "?"}${str(p.call_id) ? ` (call_id ${str(p.call_id)})` : ""}`;
+
+  const flush = () => {
+    const g = group;
+    group = null;
+    if (!g) return;
+    const paired = g.calls.filter((c) => c.result !== null);
+    const ids = paired.map((c) => wireId(c.ev));
+    if (g.text !== null || paired.length > 0) {
+      out.push({
+        seq: g.seq,
+        sources: [
+          ...(g.text !== null ? [g.seq] : []),
+          ...paired.map((c) => c.ev.seq),
+        ].map((seq) => ({ first_seq: seq, last_seq: seq })),
+        message: {
+          role: "assistant",
+          content: g.text ?? "",
+          ...(paired.length > 0
+            ? {
+                toolCalls: paired.map((c, i) => ({
+                  id: ids[i]!,
+                  name: str(c.ev.payload.tool),
+                  route:
+                    c.ev.payload.route === "elevated" ? "elevated" : "normal",
+                  arguments: (c.ev.payload.request ?? {}) as Record<
+                    string,
+                    unknown
+                  >,
+                })),
+              }
+            : {}),
+        },
+      });
+    }
+    paired.forEach((c, i) => {
+      out.push({
+        seq: g.seq,
+        sources: [{ first_seq: c.result!.seq, last_seq: c.result!.seq }],
+        message: {
+          role: "tool",
+          toolCallId: ids[i]!,
+          name: str(c.ev.payload.tool),
+          content: toolResultContent(c.result!.payload),
+        },
+      });
+    });
+    for (const c of g.calls) {
+      if (c.result !== null) continue;
+      out.push({
+        seq: g.seq,
+        sources: [{ first_seq: c.ev.seq, last_seq: c.ev.seq }],
+        message: {
+          role: "user",
+          content:
+            `[Your ${c.ev.payload.route === "elevated" ? "elevated " : ""}call ${callLabel(c.ev.payload)} ` +
+            `(journal seq ${c.ev.seq}) with input ${JSON.stringify(c.ev.payload.request ?? {})} ` +
+            "has no recorded result in this context.]",
+        },
+      });
+    }
+    out.push(...g.after);
+  };
+
+  for (const ev of events) {
+    const p = ev.payload;
+    if (ev.kind === "assistant_message") {
+      flush();
+      group = {
+        seq: ev.seq,
+        turnId: ev.turn_id,
+        round: p.round,
+        text: String(p.text ?? ""),
+        calls: [],
+        after: [],
+      };
+      continue;
+    }
+    if (ev.kind === "tool_call") {
+      const open = group as RoundGroup | null;
+      if (!open || open.turnId !== ev.turn_id || open.round !== p.round) {
+        flush();
+        group = {
+          seq: ev.seq,
+          turnId: ev.turn_id,
+          round: p.round,
+          text: null,
+          calls: [],
+          after: [],
+        };
+      }
+      group!.calls.push({ ev, result: null });
+      continue;
+    }
+    if (ev.kind === "tool_result") {
+      // The flat plan position identifies the call exactly; the model's
+      // call_id is only unique when the provider made it so.
+      const call = (group as RoundGroup | null)?.calls.find(
+        (c) =>
+          c.result === null &&
+          (Number.isSafeInteger(p.call_index)
+            ? c.ev.payload.call_index === p.call_index
+            : c.ev.payload.call_id === p.call_id),
+      );
+      if (call) {
+        call.result = ev;
+        continue;
+      }
+      flush();
+      out.push({
+        seq: ev.seq,
+        sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+        message: {
+          role: "user",
+          content:
+            `[Result of your earlier call ${callLabel(p)} (journal seq ${ev.seq}); ` +
+            `the call itself is outside this context]\n${toolResultContent(p)}`,
+        },
+      });
+      continue;
+    }
+    const m = eventMessage(ev);
+    const open = group as RoundGroup | null;
+    if (open?.calls.some((c) => c.result === null)) {
+      // An effect records inside its claim, between its call and its
+      // result (a journal.note): it follows the round's results rather
+      // than splitting a call from its result.
+      if (m)
+        open.after.push({
+          seq: ev.seq,
+          message: m,
+          sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+        });
+      continue;
+    }
+    flush();
+    if (m)
+      out.push({
+        seq: ev.seq,
+        message: m,
+        sources: [{ first_seq: ev.seq, last_seq: ev.seq }],
+      });
+  }
+  flush();
+  return out;
 }
 
 /** A temporary notice that older raw records are outside the sent context —
@@ -347,7 +614,7 @@ export function renderJournalContext(
   const items: {
     seq: number;
     message: ChatMessage;
-    source?: MemorySourceRange;
+    sources?: MemorySourceRange[];
   }[] = [];
   if (memoryOmitted) {
     items.push({
@@ -365,42 +632,41 @@ export function renderJournalContext(
     items.push({
       seq: b.first_seq,
       message: memoryBlockMessage(b),
-      source: {
-        first_seq: b.first_seq,
-        last_seq: b.last_seq,
-        layer: b.layer,
-        chunk_seq: b.chunk_seq,
-      },
+      sources: [
+        {
+          first_seq: b.first_seq,
+          last_seq: b.last_seq,
+          layer: b.layer,
+          chunk_seq: b.chunk_seq,
+        },
+      ],
     });
   }
   for (const x of extras) {
     items.push(x);
   }
-  for (const ev of events) {
-    const m = eventMessage(ev);
-    if (m)
-      items.push({
-        seq: ev.seq,
-        message: m,
-        source: { first_seq: ev.seq, last_seq: ev.seq },
-      });
-    else sourceRanges?.push({ first_seq: ev.seq, last_seq: ev.seq });
-  }
-  // Array sort is stable: ties keep the order pushed above.
+  const rendered = renderEvents(events);
+  items.push(...rendered);
+  const mapped = new Set(
+    rendered.flatMap((i) => (i.sources ?? []).map((r) => r.first_seq)),
+  );
+  for (const ev of events)
+    if (!mapped.has(ev.seq))
+      sourceRanges?.push({ first_seq: ev.seq, last_seq: ev.seq });
+  // Stable order keeps each native assistant call followed by its results.
   return items
     .sort((a, b) => a.seq - b.seq)
-    .map((i, index) => {
-      if (i.source)
-        sourceRanges?.push({ ...i.source, message_index: index + 1 });
-      return i.message;
+    .map((item, index) => {
+      for (const source of item.sources ?? [])
+        sourceRanges?.push({ ...source, message_index: index + 1 });
+      return item.message;
     });
 }
 
 /**
  * Estimated tokens of one journal record — the same ~4-bytes-per-token
- * accounting the state service uses (estPayloadTokens). Used here only to
- * size the temporary working view after a provider capacity refusal; it is
- * not provider billing and never writes durable state.
+ * accounting the state service uses (estPayloadTokens). Includes serialized tool arguments and results; this is a capacity
+ * heuristic, not provider billing.
  */
 export function estEventTokens(
   kind: string,

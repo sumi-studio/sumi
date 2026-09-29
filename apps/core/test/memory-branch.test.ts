@@ -612,3 +612,326 @@ test("a final native call without another parent consultation is not reused as a
     await secretary.stop();
   }
 });
+
+async function requestResume(
+  state: FakeState,
+  g: number,
+  mode: "resume" | "rebranch",
+  rounds = 8,
+) {
+  const input = `resume-${crypto.randomUUID()}`,
+    turn = `turn-${input}`;
+  state.addInput(p, input, "resume memory");
+  await state.loadTurn(p, g, turn, 5000);
+  const request = { chunk_seq: 1, mode, additional_rounds: rounds };
+  await state.savePlan(p, g, {
+    turnId: turn,
+    round: 0,
+    text: "",
+    calls: [
+      {
+        call_id: "resume-call",
+        tool: "memory.resume",
+        route: "normal",
+        request,
+      },
+    ],
+    usage: {},
+  });
+  const op = {
+    operationId: `${turn}:op:0`,
+    turnId: turn,
+    tool: "memory.resume",
+    callIndex: 0,
+    request,
+  };
+  const first = await state.claimOperation(p, g, op);
+  const revision = state.memoryBranches.get(`${p}|1`)!.revision;
+  const replay = await state.claimOperation(p, g, op);
+  assert.deepEqual(replay.operation.response, first.operation.response);
+  assert.equal(
+    state.memoryBranches.get(`${p}|1`)!.revision,
+    revision,
+    "replayed operation must not grant budget twice",
+  );
+}
+test("same-binding recovery is paced, counts failed admissions and stops at the finite budget", async () => {
+  const { state, g } = await fixture();
+  let calls = 0;
+  const provider: ModelProvider = {
+    name: "outage",
+    async *stream() {
+      calls++;
+      throw new Error("broken transport");
+    },
+  };
+  for (let i = 0; i < 3; i++) {
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+      snapshot: snapshot(),
+      policy: { maxRounds: 3, maxConsecutiveFailures: 2 },
+    });
+    const b = state.memoryBranches.get(`${p}|1`)!;
+    assert.ok(b.state!.retry_at);
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+      snapshot: snapshot(),
+      policy: { maxRounds: 3, maxConsecutiveFailures: 2 },
+    });
+    assert.equal(calls, i + 1, "backoff must not issue a request");
+    b.state!.retry_at = new Date(0).toISOString();
+  }
+  await runMemoryPreparation({
+    personaId: p,
+    generation: g,
+    state,
+    provider,
+    snapshot: snapshot(),
+    policy: { maxRounds: 3, maxConsecutiveFailures: 2 },
+  });
+  const b = state.memoryBranches.get(`${p}|1`)!;
+  assert.equal(b.state!.pause_reason, "configured_budget");
+  assert.equal(b.state!.model_calls, 3);
+  assert.equal(calls, 3);
+  await requestResume(state, g, "resume", 8);
+  const requests: ModelRequest[] = [];
+  await runMemoryPreparation({
+    personaId: p,
+    generation: g,
+    state,
+    provider: scripted(state, requests),
+    policy: { maxRounds: 3, maxConsecutiveFailures: 2 },
+  });
+  assert.equal(state.memoryBranches.get(`${p}|1`)!.state!.status, "prepared");
+  assert.deepEqual(state.memoryBranches.get(`${p}|1`)!.snapshot, snapshot());
+  assert.equal(
+    state.inputs.filter(
+      (i) =>
+        i.kind === "memory_status" &&
+        i.payload.text
+          ?.toString()
+          .includes("mechanism occurred] The memory branch repeatedly failed"),
+    ).length,
+    1,
+  );
+});
+test("explicit rebranch waits for a real matching parent source, archives the old attempt and rereviews its draft", async () => {
+  const { state, g } = await fixture();
+  const original = snapshot();
+  original.tools = [];
+  let b = (await state.claimMemoryBranch(p, g, original))!;
+  let st = initialMemoryState(b, {
+    ...DEFAULT_MEMORY_POLICY,
+    maxTokens: 10000,
+  });
+  st = await advanceMemoryBranch(
+    { ...b, state: st },
+    decision("", [
+      call("file.write", {
+        path: memoryPaths(1).candidate,
+        content_text: "ミナの応募は未定。",
+        expect_version: "none",
+      }),
+    ]),
+  );
+  b = await state.saveMemoryBranch(p, g, 1, b.revision, st);
+  await runMemoryPreparation({
+    personaId: p,
+    generation: g,
+    state,
+    provider: scripted(state, []),
+  });
+  await requestResume(state, g, "rebranch", 5);
+  assert.equal(await state.claimMemoryBranch(p, g), null);
+  const wrong = snapshot();
+  wrong.ranges[0]!.chunk_seq = 999;
+  wrong.ranges[0]!.layer = 1;
+  assert.equal(
+    await state.claimMemoryBranch(p, g, wrong),
+    null,
+    "same seq with another source cannot restart",
+  );
+  assert.equal(
+    await state.claimMemoryBranch(p, g, original),
+    null,
+    "still missing the frozen private tools",
+  );
+  const requests: ModelRequest[] = [];
+  await runMemoryPreparation({
+    personaId: p,
+    generation: g,
+    state,
+    provider: scripted(state, requests),
+    snapshot: snapshot(),
+  });
+  b = state.memoryBranches.get(`${p}|1`)!;
+  assert.equal(b.state!.status, "prepared");
+  assert.equal(b.state!.candidate!.version, 1);
+  assert.equal(b.state!.execution_budget!.rounds, 5);
+  assert.equal(
+    b.state!.execution_budget!.tokens,
+    10000 - st.tokens,
+    "rebranch retains the remaining token cap",
+  );
+  assert.equal(
+    requests.length,
+    3,
+    "reuse draft but reread, review and confirm anew",
+  );
+  assert.match(requests[0]!.messages.at(-1)!.content, /new attempt/);
+  assert.equal(state.memoryBranchAttempts.get(`${p}|1`)!.length, 1);
+  assert.deepEqual(
+    state.memoryBranchAttempts.get(`${p}|1`)![0]!.snapshot,
+    original,
+  );
+});
+
+for (const outcome of ["prepared", "kept"] as const) {
+  test(`a rejected ${outcome} checkpoint recovers only when final storage succeeds, not on a private read`, async () => {
+    const { state, g } = await fixture();
+    let b = (await state.claimMemoryBranch(p, g, snapshot()))!;
+    b.state = initialMemoryState(b, DEFAULT_MEMORY_POLICY);
+    if (outcome === "prepared") await draft(b);
+    await read(b);
+    if (outcome === "prepared") await review(b);
+    else await step(b, JSON.stringify({ action: "review_keep" }));
+    b = await state.saveMemoryBranch(p, g, 1, b.revision, b.state!);
+    const save = state.saveMemoryBranch.bind(state);
+    let rejectFinal = true,
+      rejectCount = 0,
+      readFirst = false;
+    const durableReads: string[] = [];
+    state.saveMemoryBranch = async (...args) => {
+      if (args[4].status === outcome && rejectFinal) {
+        rejectCount++;
+        throw new StateError(400, "persistent final-store fault");
+      }
+      const previousRound = state.memoryBranches.get(`${p}|1`)!.state!.rounds;
+      const saved = await save(...args);
+      if (
+        args[4].rounds > previousRound &&
+        args[4].messages.at(-1)?.role === "tool"
+      )
+        durableReads.push(args[4].issue?.code ?? "none");
+      return saved;
+    };
+    const provider: ModelProvider = {
+      name: "retry reads before confirming",
+      async *stream() {
+        if (readFirst) {
+          readFirst = false;
+          yield {
+            type: "tool_call",
+            call: call("file.read", { path: memoryPaths(1).source }),
+          };
+          yield { type: "done", usage: { finish_reason: "tool_calls" } };
+        } else {
+          yield {
+            type: "text",
+            delta: confirmation(state.memoryBranches.get(`${p}|1`)!),
+          };
+          yield { type: "done", usage: { finish_reason: "stop" } };
+        }
+      },
+    };
+    const notices = () =>
+      state.inputs
+        .filter((i) => i.kind === "memory_status")
+        .map(
+          (i) =>
+            String(i.payload.text).match(/mechanism (occurred|recovered)/)![1],
+        );
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+    });
+    assert.deepEqual(notices(), ["occurred"]);
+    state.memoryBranches.get(`${p}|1`)!.state!.retry_at = new Date(
+      0,
+    ).toISOString();
+    readFirst = true;
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+    });
+    assert.equal(rejectCount, 2);
+    assert.deepEqual(durableReads, ["memory_checkpoint_rejected"]);
+    assert.deepEqual(
+      notices(),
+      ["occurred"],
+      "an unrelated read must not recover and re-announce the same failure",
+    );
+    rejectFinal = false;
+    readFirst = true;
+    state.memoryBranches.get(`${p}|1`)!.state!.retry_at = new Date(
+      0,
+    ).toISOString();
+    await runMemoryPreparation({
+      personaId: p,
+      generation: g,
+      state,
+      provider,
+    });
+    assert.deepEqual(durableReads, [
+      "memory_checkpoint_rejected",
+      "memory_checkpoint_rejected",
+    ]);
+    assert.equal(state.memoryBranches.get(`${p}|1`)!.state!.status, outcome);
+    assert.equal(state.memoryBranches.get(`${p}|1`)!.state!.issue, null);
+    assert.deepEqual(notices(), ["occurred", "recovered"]);
+  });
+}
+test("a control protocol fault recovers on a successful review, after source reads retain the fault", async () => {
+  const { state, g } = await fixture();
+  let b = (await state.claimMemoryBranch(p, g, snapshot()))!;
+  b.state = initialMemoryState(b, DEFAULT_MEMORY_POLICY);
+  await draft(b);
+  for (let i = 0; i < DEFAULT_MEMORY_POLICY.maxConsecutiveFailures; i++)
+    await step(b, "not a control response");
+  assert.equal(b.state!.issue!.code, "memory_control_protocol");
+  b = await state.saveMemoryBranch(p, g, 1, b.revision, b.state!);
+  state.memoryBranches.get(`${p}|1`)!.state!.retry_at = new Date(
+    0,
+  ).toISOString();
+  const save = state.saveMemoryBranch.bind(state);
+  const evidence: { role: string; issue: string | null; review: boolean }[] =
+    [];
+  state.saveMemoryBranch = async (...args) => {
+    const saved = await save(...args);
+    if (!args[4].in_flight)
+      evidence.push({
+        role: args[4].messages.at(-1)!.role,
+        issue: args[4].issue?.code ?? null,
+        review: !!args[4].review,
+      });
+    return saved;
+  };
+  await runMemoryPreparation({
+    personaId: p,
+    generation: g,
+    state,
+    provider: scripted(state, []),
+  });
+  assert.ok(
+    evidence.some(
+      (e) =>
+        e.role === "tool" && e.issue === "memory_control_protocol" && !e.review,
+    ),
+  );
+  assert.ok(evidence.some((e) => e.review && e.issue === null));
+  assert.equal(state.memoryBranches.get(`${p}|1`)!.state!.status, "prepared");
+  assert.equal(
+    state.inputs.filter((i) => i.kind === "memory_status").length,
+    2,
+  );
+});
