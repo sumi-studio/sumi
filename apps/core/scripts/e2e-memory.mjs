@@ -56,7 +56,6 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  MEMORY_INSTRUCTION_PREFIX,
   memoryAgentRound,
   memoryBranchView,
   memoryPathsInWorkspace,
@@ -441,12 +440,7 @@ async function main() {
   /** The frozen parent prefix of a branch request: everything before the
    * branch instruction. */
   const prefixOf = (r) =>
-    r.digests.slice(
-      0,
-      r.messages.findIndex((m) =>
-        m.content.startsWith(MEMORY_INSTRUCTION_PREFIX),
-      ),
-    );
+    r.digests.slice(0, memoryBranchView(r.messages).prefix.length);
   async function waitFor(fn, what, timeoutMs = 30_000) {
     const deadline = Date.now() + timeoutMs;
     for (;;) {

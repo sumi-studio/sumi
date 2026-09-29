@@ -1,4 +1,9 @@
 import { estTextTokens } from "./memory.ts";
+import { L0_TO_L1_INSTRUCTION } from "./memory-instructions/l0-to-l1.ts";
+import { L1_TO_L2_INSTRUCTION } from "./memory-instructions/l1-to-l2.ts";
+import { L2_TO_L2_INSTRUCTION } from "./memory-instructions/l2-to-l2.ts";
+import { memoryTaskHeader } from "./memory-instructions/task.ts";
+import { memoryWorkspaceInstruction } from "./memory-instructions/workspace.ts";
 /** Durable, private workspace of one asynchronous memory branch. No ordinary
  * tool executor is reachable from this module. Every effect is a checkpoint. */
 import type {
@@ -99,20 +104,14 @@ export const MEMORY_CHECKS = [
   "satisfied_with_this_version",
 ] as const;
 const CHECK_EXPLANATIONS = {
-  source_and_speakers: "原文と文脈に照らし、誰の発言・行為・観測かを保った",
-  sequence_and_changes: "順序、途中で変わった理解や訂正を保った",
+  source_and_speakers:
+    "今回の対象と照らし、誰の言葉・行為・観測・理解なのかを見直した",
+  sequence_and_changes: "出来事の経過と、途中で変わった理解を見直した",
   uncertainty_and_relationship:
-    "未確定のことや共に過ごした具体を、確定事項や仕事の一覧に変えていない",
-  no_new_conclusions:
-    "対象外の出来事・教訓・後からの解釈や真偽の評価を当時の事実として足していない",
+    "未確定のことや、人とのやり取りの具体がどう残るかを見直した",
+  no_new_conclusions: "対象の経験と、この整理中に考えたことを混同していない",
   satisfied_with_this_version:
-    "この版を読み直し、全体として納得できる。必要な修正後にも再度見直した",
-};
-export const COMPACTION_PURPOSES = {
-  l1: "対象はまだ整理していない出来事。まず重複する外枠や同じ本文の再掲を減らす。同じ言葉や行為が再び起きた事実は消さない。原文のまま残す部分があってよい。",
-  l2: "対象は以前整理したL1断片。断片間の重複やつながりを整理する。抽象化そのものを目的にせず、その期間のやり取りを辿れる形にする。",
-  reintegrate:
-    "対象はL2断片の再整理。まとまり方を変えてよいが、矛盾や理解の変化を消して一貫した人物像や物語へ揃えない。",
+    "確認対象の版を読み直し、今回の整理の目的に照らして全体に納得できる",
 };
 export function memoryPaths(chunk: number) {
   return {
@@ -165,13 +164,30 @@ export function memoryInstruction(branch: MemoryBranch): string {
   const sourceLayer = branch.snapshot.ranges.find(
     (r) => r.first_seq === branch.chunk.first_seq,
   )?.layer;
-  const purpose =
+  const transition =
     branch.chunk.layer === 1
-      ? COMPACTION_PURPOSES.l1
+      ? "l0_to_l1"
       : sourceLayer === 2
-        ? COMPACTION_PURPOSES.reintegrate
-        : COMPACTION_PURPOSES.l2;
-  return `ここからは非同期の記憶整理の分岐。上のmessagesとtool definitionsは発火時点のまま固定されている。本体はその後も別のやり取りを続け得る。この分岐の新しい経験を本体の過去として足さない。\n\n${purpose}\n対象はjournal seq ${branch.chunk.first_seq}〜${branch.chunk.last_seq}。前後は読み解くために使い、置換する出来事とそのときの理解は対象内に保つ。発言者、言葉や数値、順序、観測と解釈、仮の考えと未確認、理解が変わった過程を区別する。今の仕事への有用性だけで選ばず、人と共に過ごした具体を一律に課題一覧・固定属性・教訓へ変えない。必要な表現は長く残してよい。一定の圧縮率や見出しはない。元の対話に訂正や否定がない限り、発言者の違いから誤り・創作・誤解を新しく判定しない。他の人が同じ内容を言っていないこと、沈黙や非復唱を否定の証拠にしない。誰が何を言ったかを残すことと、後から真偽を査定することは異なる。既存の人名・道具名・IDは勝手に改称せず同じ表記を使う。\n\nこの分岐で実行できるのはnormal routeのfile.readとfile.writeだけ。読めるのは ${source} と ${candidate}、書けるのは ${candidate} のみ。sourceは上の固定文脈に含まれる対象のコピーで、更新されない。別のpath、terminal、Messaging、conversation_history、その他の探索や外部操作は実行できない。tool definitionsは元のままだが実行権限はこの範囲に限定される。\n\n初稿をcandidateへ書く。次にsourceとその版のcandidateを最後まで読み、上の自分の文脈と照合し、全体を見直す。直したら、修正版とsourceをもう一度読んで見直す。短くしたことだけで終わりにしない。file.readはoffset/lenでページを続けられる。file.writeの最初はexpect_version:"none"、更新は直前のversionを指定する。\n\n納得できたら、ツールなしの本文で厳密なJSON {"action":"review","version":候補のversion,"sha256":"候補のsha256"} を返す。確認画面が返るので、その対象版とchecklistを見て、別の応答で {"action":"confirm","version":同じversion,"sha256":"同じhash","token":"確認画面のtoken","checks":{各checkの名前:true}} と確定する。修正すれば以前の確認は無効になる。チェックの自己申告は内容品質を証明しないので、実際に読んで判断する。\n\n今回は置換しないと判断した場合は、sourceを最後まで読み、{"action":"review_keep"} でその判断の確認を開く。保持も同じconfirm形式で確定する。検討や草稿はこの分岐内に留まり、本体や人間へ逐一報告しない。仕組みの異常は実行側が別に記録する。`;
+        ? "l2_to_l2"
+        : "l1_to_l2";
+  const purpose = {
+    l0_to_l1: L0_TO_L1_INSTRUCTION,
+    l1_to_l2: L1_TO_L2_INSTRUCTION,
+    l2_to_l2: L2_TO_L2_INSTRUCTION,
+  }[transition];
+  const task = memoryTaskHeader({
+    transition,
+    chunk_seq: branch.chunk.chunk_seq,
+    first_seq: branch.chunk.first_seq,
+    last_seq: branch.chunk.last_seq,
+  });
+  return `${task}\n\n${purpose}\n\n${memoryWorkspaceInstruction({
+    firstSeq: branch.chunk.first_seq,
+    lastSeq: branch.chunk.last_seq,
+    source,
+    candidate,
+    checks: MEMORY_CHECKS,
+  })}`;
 }
 export function initialMemoryState(
   branch: MemoryBranch,

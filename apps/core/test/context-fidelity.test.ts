@@ -5,6 +5,7 @@ import { FakeState } from "../src/fake-state.ts";
 import { renderJournalContext } from "../src/memory.ts";
 import { MEMORY_CHECKS, memoryPaths } from "../src/memory-branch.ts";
 import { runMemoryPreparation } from "../src/memory-compaction.ts";
+import { memoryTaskFromInstruction } from "../src/memory-instructions/task.ts";
 import {
   type ChatMessage,
   ModelError,
@@ -115,14 +116,13 @@ function memoryRound(req: ModelRequest): {
   calls: { id: string; name: string; arguments: Record<string, unknown> }[];
 } {
   const start = req.messages.findIndex(
-    (m) =>
-      m.role === "user" &&
-      m.content.startsWith("ここからは非同期の記憶整理の分岐"),
+    (m) => m.role === "user" && memoryTaskFromInstruction(m.content) !== null,
   );
+  assert.ok(start >= 0, "memory request carries its task metadata");
   const own = req.messages.slice(start + 1);
-  const chunk = Number(
-    /memory\/(\d+)\/source\.json/.exec(req.messages[start]!.content)![1],
-  );
+  const chunk = memoryTaskFromInstruction(
+    req.messages[start]!.content,
+  )!.chunk_seq;
   const paths = memoryPaths(chunk);
   const last = own.at(-1);
   const modal =
