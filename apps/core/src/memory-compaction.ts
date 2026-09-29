@@ -353,6 +353,22 @@ export async function runMemoryPreparation(
         const unavailable =
           e instanceof BudgetWaitError ||
           (e instanceof ModelError && e.unavailable);
+        if (e instanceof ModelError && !e.retryable && !unavailable) {
+          const reason = Array.from(e.message.replaceAll("\u0000", "\uFFFD"))
+            .slice(0, 2000)
+            .join("");
+          paused.pause_reason = "provider_refusal";
+          paused.retry_at = null;
+          paused.issue = {
+            code: "memory_provider_refused",
+            message:
+              "Memory preparation was refused by the selected provider and will not retry automatically. " +
+              `Provider response: ${reason} ` +
+              "The frozen context and draft remain saved; memory.resume can continue after the refusal has been addressed.",
+          };
+          await checkpoint(deps, branch, paused, signal);
+          return "worked";
+        }
         paused.pause_reason = unavailable
           ? "model_unavailable"
           : "provider_error";
