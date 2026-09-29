@@ -98,7 +98,16 @@ jobs:
           bash -n deploy/local-host/self-test-ownership.sh
 
       - name: Run local-host install/launcher self-test
-        run: bash deploy/local-host/self-test.sh
+        # Memory e2es bind the file service database to their own workspace
+        # root. This install uses a different root and therefore needs its
+        # own database; sharing it would violate file-version ownership.
+        env:
+          SUMI_TEST_DB_URL: postgres://sumi:sumi-dev@localhost:5432/local_host_self_test?sslmode=disable
+        run: |
+          docker exec "${{ job.services.postgres.id }}" \
+            psql -U sumi -d sumi -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE local_host_self_test'
+          bash deploy/local-host/self-test.sh
 
       # Two managed installs side by side on real Docker: distinct volumes/
       # containers/ports, cross-install purge isolation, orphan refusal,
