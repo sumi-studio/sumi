@@ -97,6 +97,7 @@ var toolAuthority = map[string]struct {
 }{
 	"schedule.set":         {internal: true},
 	"journal.note":         {internal: true},
+	"skill.read":           {internal: true, readOnly: true},
 	"memory.resume":        {internal: true},
 	"conversation_history": {internal: true, readOnly: true},
 	// Jobs (merged slice): ordinary internal effects under the secretary's
@@ -186,6 +187,9 @@ func validateToolRequest(tool string, request map[string]any) error {
 		}
 	case "memory.resume":
 		_, err := parseMemoryResumeRequest(request)
+		return err
+	case "skill.read":
+		_, err := readSkill(request)
 		return err
 	case "journal.note":
 		if text, _ := request["text"].(string); text == "" {

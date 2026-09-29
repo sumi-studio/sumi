@@ -2272,6 +2272,9 @@ func (s *Store) internalToolResponse(ctx context.Context, tx pgx.Tx, personaID, 
 		return resp, resp != nil, err
 	}
 	switch tool {
+	case "skill.read":
+		response, err := readSkill(request)
+		return response, true, err
 	case "schedule.set":
 		scheduleID, _ := request["schedule_id"].(string)
 		if scheduleID == "" {

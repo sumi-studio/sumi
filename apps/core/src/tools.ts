@@ -1,4 +1,5 @@
 import type { ToolSpec } from "./provider.ts";
+import { renderSkillCatalog, SKILL_CATALOG } from "./skills.ts";
 
 /**
  * Tool registry. The core hands `specs` to the model and routes each tool
@@ -33,6 +34,25 @@ export interface RegisteredTool extends ToolSpec {
 }
 
 export const INTERNAL_TOOLS: RegisteredTool[] = [
+  {
+    internal: true,
+    name: "skill.read",
+    description:
+      "Read one bundled Sumi app usage guide by its catalog name. The result contains the complete Markdown guide and its revision. Read a guide when its usage information helps with the current activity; reading every guide is not required. Guides do not grant permissions or make tools available. Available guides:\n" +
+      renderSkillCatalog(),
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          enum: SKILL_CATALOG.map((skill) => skill.name),
+          description: "the exact guide name from this catalog",
+        },
+      },
+      required: ["name"],
+      additionalProperties: false,
+    },
+  },
   {
     internal: true,
     delegated: true,
@@ -213,7 +233,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "messaging.send",
     description:
-      "Post a message into a shared Messaging place (channel, thread, DM, or group DM) as yourself, so the people and secretaries there see it. Use the place_id shown in the input's marker; pass its message_id as reply_to to answer that message directly. Attach files you uploaded through messaging.upload_attachment by passing their attachment ids. This is for genuinely replying — do not post merely to acknowledge ambient messages.",
+      "Post a message into a shared Messaging place (channel, thread, DM, or group DM) as yourself under your app membership and posting permissions. The normal route posts under that authority; elevated explicitly requests human approval first. Use the place_id shown in a Messaging input or tool result; pass a message_id from the same place as reply_to to answer that message. Attach files uploaded through messaging.upload_attachment by their attachment ids. This tool creates the actual shared message; model response text alone does not post into Messaging.",
     parameters: {
       type: "object",
       properties: {
@@ -583,11 +603,15 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "memory.resume",
     description:
-      "Resume your paused memory preparation after its reported problem has been addressed. Choose resume to keep the exact saved context and draft; choose rebranch when that context cannot run (for example missing file tools or context capacity), to wait for a new actual consultation containing the same source records and usable tools. The old attempt remains archived and its draft must be reviewed again. Supply a finite additional_rounds budget (1–128); additional_tokens is required if the existing token cap is exhausted. This starts paid model work, not a message to your person. Do not repeatedly grant new budgets for the same unresolved problem.",
+      "Resume a paused memory preparation identified by chunk_seq in its memory status or mechanism notice. Choose resume to keep the exact saved context and draft; choose rebranch when that context cannot run (for example missing file tools or context capacity), to wait for a new actual consultation containing the same source records and usable tools. The old attempt remains archived and its draft must be reviewed again. Supply a finite additional_rounds budget (1–128); additional_tokens is required if the existing token cap is exhausted. This starts model work through your configured connection and adds budget; it does not repair the reported cause or send a message to your person.",
     parameters: {
       type: "object",
       properties: {
-        chunk_seq: { type: "integer", minimum: 1 },
+        chunk_seq: {
+          type: "integer",
+          minimum: 1,
+          description: "chunk_seq from the memory status or mechanism notice",
+        },
         mode: { type: "string", enum: ["resume", "rebranch"] },
         additional_rounds: { type: "integer", minimum: 1, maximum: 128 },
         additional_tokens: { type: "integer", minimum: 0, maximum: 100000000 },
@@ -600,21 +624,21 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "journal.note",
     description:
-      "Append a durable note to your journal. Use for facts, decisions, or memories worth keeping across restarts.",
+      "Append a note in your own words to your durable journal and return its sequence number. It adds a new entry; it does not rewrite earlier records or pin content in future model context. Inputs, your responses, and tool results are already recorded by the runtime, so notes are not required to record those experiences.",
     parameters: {
       type: "object",
       properties: {
         text: { type: "string", description: "the note content" },
-        kind: { type: "string", description: "optional note kind/tag" },
       },
       required: ["text"],
+      additionalProperties: false,
     },
   },
   {
     internal: true,
     name: "message.send",
     description:
-      "Send a message into the shared channel as yourself. This is an outward-facing act: it only runs as an elevated call, waiting for an explicit human approval before it is delivered. A normal-route call is blocked without asking the human.",
+      "Create a secretary_message in your outward delivery outbox. This tool has no Messaging place_id; posting to a Messaging conversation uses messaging.send. It only runs as an elevated call, waiting for explicit human approval before recording the message. A normal-route call is blocked without asking the human. The receipt records the outbox entry, not that anyone has read it.",
     parameters: {
       type: "object",
       properties: {
@@ -802,7 +826,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "terminal.open",
     description:
-      "Open a persistent interactive terminal session in your Linux workspace — a real PTY shell that keeps running even after you stop. You and your person share the same session: either of you can watch it and type into it. Returns a session_id; output accumulates in a durable scrollback you read with terminal.read, and you write keystrokes with terminal.write. Use it for long builds, servers, watchers, or anything interactive — the session survives disconnects until it exits or is ended with terminal.close.",
+      "Open an interactive PTY shell in your Linux workspace. You and your person share the session and can watch or type into it. Returns a session_id; read output and current status with terminal.read, send keystrokes with terminal.write. The process continues across viewer or secretary disconnects while its execution host remains alive. A lost host can end the session as lost; reconnecting does not recreate that process.",
     parameters: {
       type: "object",
       properties: {
@@ -818,7 +842,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "terminal.list",
     description:
-      "List your terminal sessions — live ones you can reattach to and recently ended ones with their exit results. Reconnecting to an existing session is always better than opening a duplicate.",
+      "List your terminal sessions: live sessions you can read and write, and recently ended sessions with their outcomes. Returns the session_id needed for terminal operations.",
     parameters: {
       type: "object",
       properties: {},
@@ -879,7 +903,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "terminal.write",
     description:
-      "Send input to a live terminal session — bytes the PTY receives as if typed (include \\n to run a command line). Returns an acceptance receipt: 'intended' means queued for delivery in order, NOT yet typed. The runner delivers asynchronously; check terminal.read for your input's echo to confirm it landed. If the input later ends 'unknown' the stream may have delivered a prefix — never blind-resend. Rejected with an error when your person holds exclusive control.",
+      "Send input to a live terminal session — bytes the PTY receives as if typed (include \\n to run a command line). Returns an acceptance receipt: intended means queued for ordered delivery. Read terminal.inputs for delivery status and terminal.read for output; programs may disable input echo, and written does not mean a command has finished. If delivery becomes unknown, a prefix may already have reached the process, so resending is a new input that can duplicate effects. Rejected when your person holds exclusive control.",
     parameters: {
       type: "object",
       properties: {
@@ -928,7 +952,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     internal: true,
     name: "terminal.eof",
     description:
-      "Send end-of-input (Ctrl-D) to a live terminal session's PTY — asks the shell to exit cleanly.",
+      "Send end-of-input (Ctrl-D) to a live terminal session's PTY. Its effect depends on the foreground program: it may finish an input read, or exit a shell at an empty prompt. It does not directly close the session.",
     parameters: {
       type: "object",
       properties: {
@@ -955,7 +979,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "call.join",
     description:
-      "Join the live voice/video call in a Messaging place as yourself. Only works while a call is actually running there; use the place_id from the input. Returns a call session you can speak and leave through. You may stay silent and listen — joining does not oblige you to speak.",
+      "Join an existing live voice/video call in a Messaging place as yourself. A call_started input announces a call; call.state shows its current state. Pass the place_id from the input or tool result. Returns a call session_id for call.say and call.leave. Other participants' speech can arrive as call_utterance inputs with speaker and timing information. Joining does not start a new call or produce an utterance.",
     parameters: {
       type: "object",
       properties: {
@@ -993,7 +1017,7 @@ export const INTERNAL_TOOLS: RegisteredTool[] = [
     delegated: true,
     name: "call.leave",
     description:
-      "Leave a call you joined. The media bridge disconnects and the session ends; use this when the call is over or your presence is no longer wanted.",
+      "Leave a call you joined. Your media bridge disconnects and your participation session ends; other participants' call remains open.",
     parameters: {
       type: "object",
       properties: {
