@@ -23,6 +23,7 @@ import {
 } from "./chatgpt-codex.ts";
 import {
   assertExtraHeaders,
+  disambiguateCallIds,
   encodeCallArguments,
   httpError,
   isContextLengthRefusal,
@@ -631,8 +632,11 @@ export class OpenAIResponsesProvider implements ModelProvider {
 /**
  * Convert the journal's message list into Responses `instructions` +
  * `input` items. Assistant tool calls replay as `function_call` items
- * carrying the recorded call_id verbatim; tool results feed back as
- * `function_call_output` keyed by that same call_id.
+ * carrying the recorded call_id; tool results feed back as
+ * `function_call_output` keyed by that same call_id. A call_id only has
+ * to be non-empty and unique within the input: a repeated or empty one is
+ * renamed (disambiguateCallIds), except the ids a replayed continuation
+ * references, which stay verbatim — as do the continuation's own item ids.
  */
 function toInput(
   messages: ChatMessage[],
@@ -650,7 +654,17 @@ function toInput(
   let replaying = false;
   const system: string[] = [];
   const input: Record<string, unknown>[] = [];
-  for (const m of messages) {
+  // A round's recorded continuation is replayed when its scope matches;
+  // only then do its opaque items reference its call ids.
+  const replays = (m: ChatMessage) =>
+    dialect !== "standard" &&
+    replayScope !== undefined &&
+    m.continuation?.scope === replayScope;
+  for (const m of disambiguateCallIds(
+    messages,
+    (id) => id !== "",
+    (m) => !omitReasoning && replays(m),
+  )) {
     switch (m.role) {
       case "system":
         system.push(m.content);
@@ -707,12 +721,7 @@ function toInput(
         // A round's recorded continuation replays in the round's own
         // output order: its encrypted reasoning items byte-for-byte, the
         // text and calls at the positions the provider emitted them.
-        const cont =
-          dialect !== "standard" &&
-          replayScope !== undefined &&
-          m.continuation?.scope === replayScope
-            ? m.continuation.output
-            : [];
+        const cont = replays(m) ? m.continuation!.output : [];
         for (const o of cont) {
           const entry = continuationEntry(o);
           if (entry?.type === "reasoning") {

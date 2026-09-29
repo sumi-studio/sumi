@@ -8,6 +8,7 @@ import {
 } from "../provider.ts";
 import {
   assertExtraHeaders,
+  disambiguateCallIds,
   httpError,
   isContextLengthRefusal,
   networkError,
@@ -301,12 +302,17 @@ function messagesUrl(baseUrl: string): string {
   return base.endsWith("/v1") ? `${base}/messages` : `${base}/v1/messages`;
 }
 
+/** Anthropic's documented tool_use id pattern. */
+const TOOL_USE_ID = /^[a-zA-Z0-9_-]+$/;
+
 /**
  * Convert the journal's message list into Anthropic `system` +
  * `messages`. Tool results are `tool_result` blocks inside a user
  * message — consecutive tool messages coalesce into one user turn — and
  * consecutive same-role messages merge, since the API requires strict
- * user/assistant alternation.
+ * user/assistant alternation. A tool_use id must match the documented
+ * ^[a-zA-Z0-9_-]+$ and be unique in the request; any other recorded id is
+ * renamed with its result (disambiguateCallIds).
  */
 function toMessages(
   messages: ChatMessage[],
@@ -322,7 +328,7 @@ function toMessages(
     if (last && last.role === role) last.content.push(block);
     else out.push({ role, content: [block] });
   };
-  for (const m of messages) {
+  for (const m of disambiguateCallIds(messages, (id) => TOOL_USE_ID.test(id))) {
     switch (m.role) {
       case "system":
         system.push(m.content);

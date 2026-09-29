@@ -338,6 +338,9 @@ export class Secretary {
           outcome: "fail",
           retryable: false,
           error: `attempt cap ${maxAttempts} exceeded for input`,
+          // Every call an earlier attempt ran is already journaled — the
+          // store records a call with its result at the claim that ran or
+          // rejected it — so the failure marker follows what happened.
           events: [inputReceivedEvent(input, turn)],
         });
         this.log("input abandoned at attempt cap", {
@@ -382,6 +385,8 @@ export class Secretary {
           outcome: "fail",
           retryable: false,
           error: `recurring internal error: ${truncateText(msg, RECORDED_ERROR_BYTES)}`,
+          // This attempt's events are not in hand here, but each call it
+          // ran was journaled with its result at its claim.
           events: [inputReceivedEvent(input, turn)],
         });
         this.log("turn failed after recurring internal error", {
@@ -815,6 +820,7 @@ export class Secretary {
             turn,
             call,
             results.length,
+            r,
             events,
           );
           if (res === null) return; // divergent — failure committed
@@ -825,12 +831,15 @@ export class Secretary {
             // notification; an authenticated decision requeues the input
             // and the next attempt resumes this exact call. The turn is
             // recorded awaiting — never auto-executed after a restart.
-            // Only the request itself is journaled now: the resuming attempt
-            // replays this plan and journals the whole turn once, so the
-            // input and its reply are not recorded twice.
+            // Everything this request experienced so far is journaled now —
+            // the input, each round's text, the calls that ran with their
+            // results, and the request itself — so inputs served while it
+            // waits see what was already done. The resuming attempt replays
+            // this plan and presents the same records again; the store
+            // keeps the first (experienceKey), so nothing is recorded twice.
             await this.commitTurnFinal(turn, {
               outcome: "await",
-              events: events.filter((e) => e.kind === "approval_requested"),
+              events,
             });
             this.log("turn awaiting approval", {
               turn_id: turn.turn_id,
@@ -925,16 +934,35 @@ export class Secretary {
    * feed back to the model, "awaited" when the call parked behind a pending
    * human decision, or null when a plan-boundary failure was committed and
    * the turn is over.
+   *
+   * Every result fed back is journaled as a tool_call/tool_result pair
+   * carrying the decided round and route, so a later context renders the
+   * same call and the same result the model saw in this turn. The store
+   * journals the same records at the claim that ran, rejected or parked
+   * the call, so they stand even if this turn never commits; the turn's
+   * commit presents them again and the store keeps the first.
    */
   private async executeCall(
     turn: Turn,
     call: PlanCall,
     flatIndex: number,
+    round: number,
     events: EventInput[],
   ): Promise<{ result: unknown; replayed: boolean } | "awaited" | null> {
     const { state, personaId } = this.cfg;
     const gen = turn.generation;
     const callId = call.call_id ?? "";
+    const callEvent: EventInput = {
+      kind: "tool_call",
+      payload: {
+        tool: call.tool,
+        call_id: callId,
+        request: call.request,
+        route: call.route,
+        round,
+        call_index: flatIndex,
+      },
+    };
     let claim: Awaited<ReturnType<StateClient["claimOperation"]>>;
     try {
       claim = await state.claimOperation(personaId, gen, {
@@ -952,13 +980,15 @@ export class Secretary {
         // the tool result rather than abandoning the whole turn. The
         // tool_call event still journals first — the journal shows the
         // decided call and its rejection symmetrically.
-        events.push({
-          kind: "tool_call",
-          payload: { tool: call.tool, call_id: callId, request: call.request },
-        });
+        events.push(callEvent);
         events.push({
           kind: "tool_result",
-          payload: { tool: call.tool, call_id: callId, error: msg },
+          payload: {
+            tool: call.tool,
+            call_id: callId,
+            call_index: flatIndex,
+            error: msg,
+          },
         });
         return { result: { error: msg }, replayed: false };
       }
@@ -988,6 +1018,8 @@ export class Secretary {
           tool: call.tool,
           call_id: callId,
           route: call.route,
+          round,
+          call_index: flatIndex,
           approval_id: approval?.approval_id ?? null,
           required_by: approval?.required_by ?? null,
           request: call.request,
@@ -1005,47 +1037,40 @@ export class Secretary {
       );
       return null;
     }
-    if (operation.status === "running") {
-      // A prior attempt crashed after claiming but before the receipt was
-      // recorded. For internal tools this cannot happen (effect+receipt are
-      // one tx) — running state implies an external executor we don't have
-      // yet; fail the op rather than silently re-run an ambiguous effect.
-      await state.completeOperation(
+    let op = operation;
+    if (op.status === "running") {
+      // A prior attempt stopped after claiming but before the receipt was
+      // recorded. The effect is never re-run: whether it took place is
+      // unknown, and the operation is finalized with a receipt saying so.
+      // That stored receipt is what the model is fed and the journal
+      // records, here and on every later attempt — and if another attempt
+      // finalized the operation first, its stored record is the result.
+      const stored = await state.completeOperation(
         personaId,
-        operation.operation_id,
+        op.operation_id,
         gen,
-        {
-          error:
-            "operation left running by prior attempt; external execution not implemented in this slice",
-        },
+        { error: UNKNOWN_OUTCOME },
         true,
       );
-      return { result: { error: "uncompleted operation" }, replayed: false };
+      // A reply that is not a finalized record still means the receipt
+      // asked for is the one on file — never an empty result.
+      op =
+        stored?.status === "failed" || stored?.status === "done"
+          ? stored
+          : { ...op, status: "failed", response: { error: UNKNOWN_OUTCOME } };
     }
-    events.push({
-      kind: "tool_call",
-      payload: {
-        tool: call.tool,
-        call_id: callId,
-        request: call.request,
-        route: call.route,
-      },
-    });
-    if (operation.status === "failed") {
+    events.push(callEvent);
+    if (op.status === "failed") {
       // Durable denial (or another finalized failure): the decided call
       // must not be silently retried or bypassed — the failure itself is
       // the result the model sees, journaled as denied.
-      const err =
-        operation.response !== null &&
-        typeof operation.response === "object" &&
-        "error" in operation.response
-          ? String((operation.response as { error: unknown }).error)
-          : "operation failed";
+      const err = receiptError(op.response) ?? "operation failed";
       events.push({
         kind: "tool_result",
         payload: {
           tool: call.tool,
           call_id: callId,
+          call_index: flatIndex,
           error: err,
           denied: approval?.status === "denied" || undefined,
           replayed: !fresh,
@@ -1058,11 +1083,12 @@ export class Secretary {
       payload: {
         tool: call.tool,
         call_id: callId,
-        response: operation.response,
+        call_index: flatIndex,
+        response: op.response,
         replayed: !fresh,
       },
     });
-    return { result: operation.response, replayed: !fresh };
+    return { result: op.response, replayed: !fresh };
   }
 
   /**
@@ -1158,14 +1184,16 @@ export class Secretary {
         if (!this.running) throw e; // fence lost mid-stream — leave the turn
         if (e instanceof BudgetWaitError) {
           // Budget admission denied the call: no provider request was
-          // sent and nothing this round produced is journaled — the
-          // resuming attempt re-plans the round and journals once. The
-          // turn commits 'await' carrying the denied funding; the input
-          // parks until a budget or funding change requeues it, exactly
-          // like an approval wait, and spends no attempt.
+          // sent and this round produced nothing. The earlier rounds'
+          // experience is journaled with a pause marker (pausedEvents) so
+          // inputs served meanwhile see it; the resuming attempt re-plans
+          // this round and its replayed records are kept once by the
+          // store. The turn commits 'await' carrying the denied funding;
+          // the input parks until a budget or funding change requeues it,
+          // exactly like an approval wait, and spends no attempt.
           await this.commitTurnFinal(turn, {
             outcome: "await",
-            events: [],
+            events: pausedEvents(events, "budget"),
             wait: {
               kind: "budget",
               funding: e.wait.funding,
@@ -1256,11 +1284,12 @@ export class Secretary {
         // wall-clock budget measured from the input's submission — a
         // seconds-long provider outage must not lose a request (F1). The
         // attempt cap still bounds inputs that die before recording a
-        // failure; committed-transient retries are bounded by time, and a
-        // retryable failure leaves no partial journal — the next attempt
-        // re-emits its full event set. A capacity refusal that could not
-        // be recovered is deterministic too — it records its honest reason
-        // and never spends the transient budget.
+        // failure; committed-transient retries are bounded by time. A
+        // retryable failure journals the earlier rounds' experience with a
+        // pause marker (pausedEvents); the next attempt re-emits its full
+        // event set and the store keeps each record once. A capacity
+        // refusal that could not be recovered is deterministic too — it
+        // records its honest reason and never spends the transient budget.
         const withinBudget =
           activeAgeMs(input) <
           (this.cfg.providerRetryBudgetMs ?? PROVIDER_RETRY_BUDGET_MS);
@@ -1290,7 +1319,7 @@ export class Secretary {
           error: `model: ${truncateText(detail, RECORDED_ERROR_BYTES)}`,
           error_kind: mErr?.cause,
           retry_after_ms: retryable ? mErr?.retryAfterMs : undefined,
-          events: retryable ? [] : events,
+          events: retryable ? pausedEvents(events, "retry") : events,
         });
         // Bound the log line too — a provider error can be megabytes.
         this.log("turn failed at model", {
@@ -1537,6 +1566,38 @@ export class Secretary {
   }
 }
 
+/**
+ * The result a call left running by a stopped attempt reads as — stored as
+ * its operation's receipt, so every later attempt and the journal carry the
+ * same words. Its effect may or may not have happened; nothing re-runs it.
+ */
+const UNKNOWN_OUTCOME =
+  "uncompleted operation: a prior attempt left it running and it was not retried; whether its effect took place is unknown";
+
+/** The error text a finalized failure receipt carries, or null. */
+function receiptError(response: unknown): string | null {
+  return response !== null &&
+    typeof response === "object" &&
+    "error" in response
+    ? String((response as { error: unknown }).error)
+    : null;
+}
+
+/**
+ * What an attempt that pauses without finishing (budget wait, transient
+ * model failure) journals: its experience so far and a marker that the
+ * request continues later. An attempt that only received its input has
+ * nothing to show yet and journals nothing, as before — its input is
+ * journaled by whichever attempt first records experience or an outcome.
+ */
+function pausedEvents(
+  events: EventInput[],
+  reason: "budget" | "retry",
+): EventInput[] {
+  if (!events.some((e) => e.kind !== "input_received")) return [];
+  return [...events, { kind: "turn_paused", payload: { reason } }];
+}
+
 /** Append the terminal-failure journal marker unless the events already
  * carry one — a tier retrying an already-marked request adds no second. */
 function withFailureMarker(
@@ -1668,7 +1729,7 @@ const SYSTEM =
   "After tool calls complete, their results are returned to you — then reply to the user, truthfully reflecting what actually happened. " +
   "Keep replies brief and honest; do not claim abilities you do not have.";
 
-function inputReceivedEvent(input: Input, turn: Turn): EventInput {
+export function inputReceivedEvent(input: Input, turn: Turn): EventInput {
   const p = input.payload as Record<string, unknown>;
   const actor = (p.actor ?? {}) as Record<string, unknown>;
   const place = (p.place ?? {}) as Record<string, unknown>;

@@ -7,6 +7,7 @@ import {
 } from "../provider.ts";
 import {
   assertExtraHeaders,
+  disambiguateCallIds,
   encodeCallArguments,
   httpError,
   isContextLengthRefusal,
@@ -127,7 +128,12 @@ export class OpenAIProvider implements ModelProvider {
               ...(this.cfg.maxOutputTokens
                 ? { max_tokens: this.cfg.maxOutputTokens }
                 : {}),
-              messages: request.messages.map((m) => ({
+              // Chat Completions documents no id charset; ids only have to
+              // be non-empty and unique within the request.
+              messages: disambiguateCallIds(
+                request.messages,
+                (id) => id !== "",
+              ).map((m) => ({
                 role: m.role,
                 content: m.content,
                 ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
