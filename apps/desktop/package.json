@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.18"
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   },
   "exports": {
     "./browser": "./dist/browser/runtime.js",
@@ -24,8 +24,8 @@
     "dev:browser:connected": "pnpm build && electron dist/browser-connected.js"
   },
   "devDependencies": {
-    "@types/node": "^24.13.2",
-    "electron": "44.4.3",
+    "@types/node": "^24.19.2",
+    "electron": "44.9.1",
     "typescript": "~6.0.3"
   }
 }

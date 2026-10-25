@@ -1,5 +1,5 @@
 # Local multi-secretary host for the same Core deployed to Cloudflare.
-FROM node:22-bookworm-slim
+FROM node:22.23.4-bookworm-slim
 WORKDIR /opt/sumi
 RUN corepack enable
 COPY . .

@@ -1,7 +1,7 @@
 # Development image for the Sumi React + Vite frontend.
 # Production serves a static build elsewhere; this image is intentionally the
 # local development server used by the full Compose stack.
-FROM node:22-bookworm-slim
+FROM node:22.23.4-bookworm-slim
 WORKDIR /src
 
 RUN corepack enable && corepack prepare pnpm@latest --activate

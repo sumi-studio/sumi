@@ -8,3 +8,11 @@ allowBuilds:
   electron: true
   protobufjs: false
   workerd: false
+minimumReleaseAgeExclude:
+  - miniflare@5.20261019.2-beta
+  - wrangler@4.152.0
+overrides:
+  "body-parser": "2.4.0"
+  "miniflare>undici": "7.30.1"
+  katex: 0.18.2
+  "@firebase/firestore>@grpc/grpc-js": 1.13.6

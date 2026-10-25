@@ -17,6 +17,9 @@
     "@sumi/typescript-config": "workspace:*",
     "json-schema-to-typescript": "^15.0.4",
     "openapi-typescript": "^7.13.0",
-    "typescript": "^6.0.3"
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   }
 }

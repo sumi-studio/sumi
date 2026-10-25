@@ -12,7 +12,7 @@ a cutover.
 - `S` must contain the build and validation scripts used below.
 - This build path is Linux-only because bounded Docker inspection terminates a
   dedicated process group.
-- Git 2.40 or newer, Node.js 20.19 or newer (the repository engine minimum),
+- Git 2.40 or newer, Node.js 22.23.4+, 24.22.1+, or 26.12.1+ within supported release lines (the repository engine minimums),
   and Docker must be on `PATH`.
 - Repository-local `$GIT_DIR/info/attributes` must not exist. System, global,
   and repository-configured attribute files are ignored; the accepted tree's

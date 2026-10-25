@@ -10,7 +10,10 @@
   },
   "devDependencies": {
     "@sumi/typescript-config": "workspace:*",
-    "@types/node": "^24.13.2",
+    "@types/node": "^24.19.2",
     "typescript": "~6.0.3"
+  },
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
   }
 }

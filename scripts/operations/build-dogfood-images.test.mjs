@@ -2048,14 +2048,14 @@ test("root operability and the runbook expose the supported build contract", asy
     packageJson.scripts["test:operability"],
     /scripts\/operations\/build-dogfood-images\.test\.mjs/,
   );
-  assert.equal(packageJson.engines.node, ">=20.19");
+  assert.equal(packageJson.engines.node, "^22.23.4 || ^24.22.1 || >=26.12.1");
 
   const runbook = await readFile(
     join(sourceRoot, "docs/operations/immutable-dogfood-image-build.md"),
     "utf8",
   );
   assert.match(runbook, /Linux-only/);
-  assert.match(runbook, /Node\.js 20\.19 or newer/);
+  assert.match(runbook, /Node\.js 22\.23\.4/);
   assert.match(runbook, /local Docker `default` context/);
   assert.match(runbook, /does not attest reproducible\s+dependency/);
   assert.match(runbook, /operational exclusivity/);

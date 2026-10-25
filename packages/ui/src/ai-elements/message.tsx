@@ -1,14 +1,11 @@
 import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
 import { createMathPlugin } from "@streamdown/math";
+import type { DiagramPlugin } from "@streamdown/mermaid";
 import { CheckIcon, CopyIcon, PencilIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes } from "react";
 import { memo, useEffect, useRef, useState } from "react";
-import {
-  type DiagramPlugin,
-  type LinkSafetyConfig,
-  Streamdown,
-} from "streamdown";
+import { type LinkSafetyConfig, Streamdown } from "streamdown";
 import { Button } from "../components/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../components/tooltip";
 import { cn } from "../lib/utils";

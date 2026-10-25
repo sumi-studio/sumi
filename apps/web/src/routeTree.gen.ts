@@ -9,33 +9,23 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as TerminalRouteImport } from './routes/terminal'
-import { Route as FeedbackRouteImport } from './routes/feedback'
-import { Route as DirectRouteImport } from './routes/direct'
-import { Route as BrowserRouteImport } from './routes/browser'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as BrowserRouteImport } from './routes/browser'
+import { Route as DirectRouteImport } from './routes/direct'
+import { Route as FeedbackRouteImport } from './routes/feedback'
+import { Route as TerminalRouteImport } from './routes/terminal'
 import { Route as WWorkspaceIdRouteImport } from './routes/w.$workspaceId'
 import { Route as WWorkspaceIdIndexRouteImport } from './routes/w.$workspaceId.index'
 import { Route as WWorkspaceIdMessagingRouteImport } from './routes/w.$workspaceId.messaging'
 import { Route as WWorkspaceIdMessagingIndexRouteImport } from './routes/w.$workspaceId.messaging.index'
-import { Route as WWorkspaceIdMessagingTThreadIdRouteImport } from './routes/w.$workspaceId.messaging.t.$threadId'
-import { Route as WWorkspaceIdMessagingGroupDmIdRouteImport } from './routes/w.$workspaceId.messaging.group.$dmId'
-import { Route as WWorkspaceIdMessagingDmDmIdRouteImport } from './routes/w.$workspaceId.messaging.dm.$dmId'
 import { Route as WWorkspaceIdMessagingCChannelIdRouteImport } from './routes/w.$workspaceId.messaging.c.$channelId'
+import { Route as WWorkspaceIdMessagingDmDmIdRouteImport } from './routes/w.$workspaceId.messaging.dm.$dmId'
+import { Route as WWorkspaceIdMessagingGroupDmIdRouteImport } from './routes/w.$workspaceId.messaging.group.$dmId'
+import { Route as WWorkspaceIdMessagingTThreadIdRouteImport } from './routes/w.$workspaceId.messaging.t.$threadId'
 
-const TerminalRoute = TerminalRouteImport.update({
-  id: '/terminal',
-  path: '/terminal',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const FeedbackRoute = FeedbackRouteImport.update({
-  id: '/feedback',
-  path: '/feedback',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const DirectRoute = DirectRouteImport.update({
-  id: '/direct',
-  path: '/direct',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BrowserRoute = BrowserRouteImport.update({
@@ -43,9 +33,19 @@ const BrowserRoute = BrowserRouteImport.update({
   path: '/browser',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const DirectRoute = DirectRouteImport.update({
+  id: '/direct',
+  path: '/direct',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const FeedbackRoute = FeedbackRouteImport.update({
+  id: '/feedback',
+  path: '/feedback',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TerminalRoute = TerminalRouteImport.update({
+  id: '/terminal',
+  path: '/terminal',
   getParentRoute: () => rootRouteImport,
 } as any)
 const WWorkspaceIdRoute = WWorkspaceIdRouteImport.update({
@@ -69,16 +69,10 @@ const WWorkspaceIdMessagingIndexRoute =
     path: '/',
     getParentRoute: () => WWorkspaceIdMessagingRoute,
   } as any)
-const WWorkspaceIdMessagingTThreadIdRoute =
-  WWorkspaceIdMessagingTThreadIdRouteImport.update({
-    id: '/t/$threadId',
-    path: '/t/$threadId',
-    getParentRoute: () => WWorkspaceIdMessagingRoute,
-  } as any)
-const WWorkspaceIdMessagingGroupDmIdRoute =
-  WWorkspaceIdMessagingGroupDmIdRouteImport.update({
-    id: '/group/$dmId',
-    path: '/group/$dmId',
+const WWorkspaceIdMessagingCChannelIdRoute =
+  WWorkspaceIdMessagingCChannelIdRouteImport.update({
+    id: '/c/$channelId',
+    path: '/c/$channelId',
     getParentRoute: () => WWorkspaceIdMessagingRoute,
   } as any)
 const WWorkspaceIdMessagingDmDmIdRoute =
@@ -87,10 +81,16 @@ const WWorkspaceIdMessagingDmDmIdRoute =
     path: '/dm/$dmId',
     getParentRoute: () => WWorkspaceIdMessagingRoute,
   } as any)
-const WWorkspaceIdMessagingCChannelIdRoute =
-  WWorkspaceIdMessagingCChannelIdRouteImport.update({
-    id: '/c/$channelId',
-    path: '/c/$channelId',
+const WWorkspaceIdMessagingGroupDmIdRoute =
+  WWorkspaceIdMessagingGroupDmIdRouteImport.update({
+    id: '/group/$dmId',
+    path: '/group/$dmId',
+    getParentRoute: () => WWorkspaceIdMessagingRoute,
+  } as any)
+const WWorkspaceIdMessagingTThreadIdRoute =
+  WWorkspaceIdMessagingTThreadIdRouteImport.update({
+    id: '/t/$threadId',
+    path: '/t/$threadId',
     getParentRoute: () => WWorkspaceIdMessagingRoute,
   } as any)
 
@@ -195,25 +195,11 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/terminal': {
-      id: '/terminal'
-      path: '/terminal'
-      fullPath: '/terminal'
-      preLoaderRoute: typeof TerminalRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/feedback': {
-      id: '/feedback'
-      path: '/feedback'
-      fullPath: '/feedback'
-      preLoaderRoute: typeof FeedbackRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/direct': {
-      id: '/direct'
-      path: '/direct'
-      fullPath: '/direct'
-      preLoaderRoute: typeof DirectRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/browser': {
@@ -223,11 +209,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BrowserRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/direct': {
+      id: '/direct'
+      path: '/direct'
+      fullPath: '/direct'
+      preLoaderRoute: typeof DirectRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/feedback': {
+      id: '/feedback'
+      path: '/feedback'
+      fullPath: '/feedback'
+      preLoaderRoute: typeof FeedbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/terminal': {
+      id: '/terminal'
+      path: '/terminal'
+      fullPath: '/terminal'
+      preLoaderRoute: typeof TerminalRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/w/$workspaceId': {
@@ -258,18 +258,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WWorkspaceIdMessagingIndexRouteImport
       parentRoute: typeof WWorkspaceIdMessagingRoute
     }
-    '/w/$workspaceId/messaging/t/$threadId': {
-      id: '/w/$workspaceId/messaging/t/$threadId'
-      path: '/t/$threadId'
-      fullPath: '/w/$workspaceId/messaging/t/$threadId'
-      preLoaderRoute: typeof WWorkspaceIdMessagingTThreadIdRouteImport
-      parentRoute: typeof WWorkspaceIdMessagingRoute
-    }
-    '/w/$workspaceId/messaging/group/$dmId': {
-      id: '/w/$workspaceId/messaging/group/$dmId'
-      path: '/group/$dmId'
-      fullPath: '/w/$workspaceId/messaging/group/$dmId'
-      preLoaderRoute: typeof WWorkspaceIdMessagingGroupDmIdRouteImport
+    '/w/$workspaceId/messaging/c/$channelId': {
+      id: '/w/$workspaceId/messaging/c/$channelId'
+      path: '/c/$channelId'
+      fullPath: '/w/$workspaceId/messaging/c/$channelId'
+      preLoaderRoute: typeof WWorkspaceIdMessagingCChannelIdRouteImport
       parentRoute: typeof WWorkspaceIdMessagingRoute
     }
     '/w/$workspaceId/messaging/dm/$dmId': {
@@ -279,11 +272,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof WWorkspaceIdMessagingDmDmIdRouteImport
       parentRoute: typeof WWorkspaceIdMessagingRoute
     }
-    '/w/$workspaceId/messaging/c/$channelId': {
-      id: '/w/$workspaceId/messaging/c/$channelId'
-      path: '/c/$channelId'
-      fullPath: '/w/$workspaceId/messaging/c/$channelId'
-      preLoaderRoute: typeof WWorkspaceIdMessagingCChannelIdRouteImport
+    '/w/$workspaceId/messaging/group/$dmId': {
+      id: '/w/$workspaceId/messaging/group/$dmId'
+      path: '/group/$dmId'
+      fullPath: '/w/$workspaceId/messaging/group/$dmId'
+      preLoaderRoute: typeof WWorkspaceIdMessagingGroupDmIdRouteImport
+      parentRoute: typeof WWorkspaceIdMessagingRoute
+    }
+    '/w/$workspaceId/messaging/t/$threadId': {
+      id: '/w/$workspaceId/messaging/t/$threadId'
+      path: '/t/$threadId'
+      fullPath: '/w/$workspaceId/messaging/t/$threadId'
+      preLoaderRoute: typeof WWorkspaceIdMessagingTThreadIdRouteImport
       parentRoute: typeof WWorkspaceIdMessagingRoute
     }
   }
